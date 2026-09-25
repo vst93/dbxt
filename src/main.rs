@@ -75,13 +75,67 @@ enum LayoutMode {
 }
 
 fn layout_mode(cols: u16) -> LayoutMode {
-    if cols < 46 {
+    if cols < 50 {
         LayoutMode::Narrow
     } else if cols < 100 {
         LayoutMode::Mid
     } else {
         LayoutMode::Wide
     }
+}
+
+/// Effective collapse state of a pane. A manual override always wins; otherwise
+/// (on anything but a wide terminal) unfocused aux panes collapse to a one-line
+/// strip so the focused pane owns the space.
+fn pane_eff_collapsed(app: &App, pane: usize) -> bool {
+    if let Some(v) = app.pane_override.get(pane).copied().flatten() {
+        return v;
+    }
+    if app.layout_mode == LayoutMode::Wide {
+        return false;
+    }
+    match pane {
+        PANE_SIDEBAR => app.focus != Focus::Sidebar,
+        PANE_EDITOR => !matches!(app.focus, Focus::Editor | Focus::CmdInput),
+        _ => false,
+    }
+}
+
+fn pane_name(pane: usize) -> &'static str {
+    match pane {
+        PANE_SIDEBAR => "侧栏",
+        PANE_EDITOR => "编辑器",
+        _ => "结果区",
+    }
+}
+
+fn toggle_pane_collapse(app: &mut App) {
+    let pane = match app.focus {
+        Focus::Sidebar => PANE_SIDEBAR,
+        Focus::Editor | Focus::CmdInput => PANE_EDITOR,
+        Focus::Preview => PANE_RESULTS,
+    };
+    let cur = pane_eff_collapsed(app, pane);
+    app.pane_override[pane] = Some(!cur);
+    app.status = if cur {
+        format!("已展开{}", pane_name(pane))
+    } else {
+        format!("已收起{}", pane_name(pane))
+    };
+}
+
+fn cycle_focus(app: &mut App, forward: bool) {
+    let order: Vec<Focus> = if app.backend_kind == Backend::Sql {
+        vec![Focus::Sidebar, Focus::Editor, Focus::Preview]
+    } else {
+        vec![Focus::Sidebar, Focus::Editor, Focus::CmdInput, Focus::Preview]
+    };
+    let next = match order.iter().position(|f| *f == app.focus) {
+        Some(i) if forward => (i + 1) % order.len(),
+        Some(i) => (i + order.len() - 1) % order.len(),
+        None => 0,
+    };
+    app.focus = order[next];
 }
 
 /// Which kind of content the results pane currently shows.
@@ -221,6 +275,33 @@ struct TableDataReq {
 struct Confirm {
     sql: String,
     reasons: Vec<String>,
+}
+
+#[derive(Clone, Copy, PartialEq)]
+enum EditKind {
+    Update,
+    Insert,
+}
+
+/// A diff-style confirmation layer for a generated write. UPDATE edits let the
+/// new value be typed inline; INSERT shows the row that is about to be added.
+#[derive(Clone)]
+struct EditDialog {
+    kind: EditKind,
+    cfg: Box<ConnectionConfig>,
+    db: String,
+    table: String,
+    // UPDATE fields
+    column: String,
+    data_type: Option<String>,
+    old: Val,
+    new_input: TextArea<'static>,
+    where_clause: String,
+    keys: Vec<String>,
+    no_pk: bool,
+    // INSERT fields
+    insert_sql: String,
+    insert_preview: Vec<(String, String)>,
 }
 
 /// A modal showing one cell's full, untruncated value.
@@ -823,7 +904,15 @@ struct Rects {
     picker_visible: bool,
     db_picker: Rect,
     db_picker_visible: bool,
+    /// Clickable horizontal scrollbar track (bottom border of the result grid).
+    hbar: Rect,
+    hbar_visible: bool,
 }
+
+/// Panes that can be collapsed in the responsive layout.
+const PANE_SIDEBAR: usize = 0;
+const PANE_EDITOR: usize = 1;
+const PANE_RESULTS: usize = 2;
 
 struct App {
     backend: Arc<LocalBackend>,
@@ -868,6 +957,18 @@ struct App {
 
     // WHERE filter prompt (modal text input)
     filter_prompt: Option<TextArea<'static>>,
+
+    // cell edit dialog: diff-style confirmation before any write is sent
+    edit_dialog: Option<EditDialog>,
+    // a write is in flight; on success refresh the current page instead of
+    // replacing the grid with the DML result
+    pending_write: bool,
+    // success message kept until the refreshed page lands so it is not lost
+    pending_write_msg: Option<String>,
+    // queued edits for one transactional batch commit (Ctrl-S)
+    batch: Vec<String>,
+    // manual per-pane collapse override (None = auto: collapse when unfocused)
+    pane_override: [Option<bool>; 3],
 
     // help overlay
     help_open: bool,
@@ -1065,6 +1166,11 @@ async fn run_app(mut terminal: ratatui::DefaultTerminal, backend: Arc<LocalBacke
         cell_popup: None,
         row_popup: None,
         filter_prompt: None,
+        edit_dialog: None,
+        pending_write: false,
+        pending_write_msg: None,
+        batch: Vec::new(),
+        pane_override: [None; 3],
         help_open: false,
         help_scroll: 0,
         table_meta: None,
@@ -1285,6 +1391,9 @@ fn apply_op_result(app: &mut App, res: OpResult, tx: &Tx) {
                 page + 1,
                 rows
             );
+            if let Some(msg) = app.pending_write_msg.take() {
+                app.status = format!("{msg} · 已刷新（第 {} 页）", page + 1);
+            }
         }
         OpResult::TableColumns { table, columns } => {
             // Only keep metadata that belongs to the table on screen.
@@ -1298,9 +1407,30 @@ fn apply_op_result(app: &mut App, res: OpResult, tx: &Tx) {
             // A statement that returned no columns is a write/DDL, and one that
             // reports affected rows (e.g. `INSERT … RETURNING`) changed data too:
             // any cached COUNT(*) may be stale now.
-            if r.columns.is_empty() || r.affected_rows > 0 {
+            let is_write = r.columns.is_empty() || r.affected_rows > 0;
+            if is_write {
                 app.count_cache.clear();
             }
+            // A write launched from the edit dialog refreshes the current page
+            // instead of replacing the grid with the DML result.
+            if app.pending_write && is_write {
+                app.pending_write = false;
+                let affected = r.affected_rows;
+                let note = format!("{}ms", r.execution_time_ms);
+                if app.page_state.is_some() && app.grid_kind == GridKind::TableData {
+                    let sel = app.sel;
+                    let ps = app.page_state.clone().unwrap();
+                    let msg = format!("✓ 影响 {affected} 行 · {note}");
+                    app.pending_write_msg = Some(msg.clone());
+                    reload_table_view(app, tx, ps.filter.clone(), ps.order_by.clone(), ps.page);
+                    app.pending_sel = Some(sel);
+                    app.status = format!("{msg} · 已刷新当前页");
+                } else {
+                    app.status = format!("✓ 影响 {affected} 行 · {note}");
+                }
+                return;
+            }
+            app.pending_write = false;
             let note = note_of(&r);
             let grid = Grid::from_query(r.columns.clone(), &r.rows, note.clone());
             app.status = format!("{} · {} · {}", app.selected_name(), grid.rows.len(), note);
@@ -1321,6 +1451,8 @@ fn apply_op_result(app: &mut App, res: OpResult, tx: &Tx) {
             let n = outcomes.len();
             let errors = outcomes.iter().filter(|o| o.error.is_some()).count();
             let affected: u64 = outcomes.iter().map(|o| o.affected).sum();
+            let was_batch = app.pending_write;
+            app.pending_write = false;
             app.script = Some(ScriptView {
                 outcomes,
                 sel: 0,
@@ -1335,7 +1467,16 @@ fn apply_op_result(app: &mut App, res: OpResult, tx: &Tx) {
             app.col_cursor = 0;
             app.cell_popup = None;
             app.focus = Focus::Preview;
-            app.status = format!("脚本 · {n} 条语句 · 影响 {affected} 行 · {errors} 错误 · Enter 看结果");
+            if was_batch {
+                app.status = if errors == 0 {
+                    format!("✓ 批量提交成功 · {n} 条语句 · 影响 {affected} 行")
+                } else {
+                    format!("✗ 批量提交失败 · {errors} 错误 · 影响 {affected} 行（事务可能已回滚）· Enter 看详情")
+                };
+            } else {
+                app.status =
+                    format!("脚本 · {n} 条语句 · 影响 {affected} 行 · {errors} 错误 · Enter 看结果");
+            }
         }
         OpResult::Redis(s) => {
             app.cmd_output.push(s);
@@ -1391,6 +1532,8 @@ fn apply_op_result(app: &mut App, res: OpResult, tx: &Tx) {
             app.page_pending = false;
             app.pending_sel = None;
             app.pending_focus = None;
+            app.pending_write = false;
+            app.pending_write_msg = None;
             app.status = format!("✗ {e}");
         }
     }
@@ -1484,6 +1627,12 @@ fn key(app: &mut App, tx: &Tx, k: KeyEvent) {
     // confirmation overlay swallows everything else
     if app.confirm.is_some() {
         confirm_key(app, tx, k);
+        return;
+    }
+
+    // diff-style edit confirmation layer is modal too
+    if app.edit_dialog.is_some() {
+        edit_dialog_key(app, tx, k);
         return;
     }
 
@@ -1582,6 +1731,62 @@ fn browse_key(app: &mut App, tx: &Tx, k: KeyEvent) {
         && !matches!(app.focus, Focus::Editor | Focus::CmdInput)
     {
         open_db_picker(app);
+        return;
+    }
+
+    // transactional batch queue: Ctrl-S commits, Ctrl-X discards
+    if k.modifiers.contains(KeyModifiers::CONTROL) && k.code == KeyCode::Char('s') {
+        commit_batch(app, tx);
+        return;
+    }
+    if k.modifiers.contains(KeyModifiers::CONTROL) && k.code == KeyCode::Char('x') {
+        if app.batch.is_empty() {
+            app.status = "批量队列为空（编辑时按 b 加入）".into();
+        } else {
+            let n = app.batch.len();
+            app.batch.clear();
+            app.status = format!("已清空批量队列（{n} 条）");
+        }
+        return;
+    }
+
+    // responsive layout: Alt-1/2/3 focus a pane and reset the collapse overrides
+    if k.modifiers.contains(KeyModifiers::ALT) {
+        match k.code {
+            KeyCode::Char('1') => {
+                app.focus = Focus::Sidebar;
+                app.pane_override = [None; 3];
+                return;
+            }
+            KeyCode::Char('2') => {
+                app.focus = Focus::Editor;
+                app.pane_override = [None; 3];
+                return;
+            }
+            KeyCode::Char('3') => {
+                app.focus = Focus::Preview;
+                app.pane_override = [None; 3];
+                return;
+            }
+            _ => {}
+        }
+    }
+
+    // Tab / Shift-Tab cycle panes; B toggles the focused pane's collapse state.
+    if k.code == KeyCode::Tab && k.modifiers.is_empty() {
+        cycle_focus(app, true);
+        return;
+    }
+    if k.code == KeyCode::BackTab {
+        cycle_focus(app, false);
+        return;
+    }
+    if k.code == KeyCode::Char('B')
+        && !k.modifiers.contains(KeyModifiers::CONTROL)
+        && !k.modifiers.contains(KeyModifiers::ALT)
+        && !matches!(app.focus, Focus::Editor | Focus::CmdInput)
+    {
+        toggle_pane_collapse(app);
         return;
     }
 
@@ -2378,7 +2583,7 @@ fn mouse(app: &mut App, tx: &Tx, m: MouseEvent) {
     let r = app.rects;
     match m.kind {
         MouseEventKind::Down(MouseButton::Left) => {
-            if app.confirm.is_some() {
+            if app.confirm.is_some() || app.edit_dialog.is_some() {
                 return;
             }
             if app.cell_popup.is_some() {
@@ -2418,15 +2623,28 @@ fn mouse(app: &mut App, tx: &Tx, m: MouseEvent) {
                 return;
             }
             if rect_contains(r.editor, m.column, m.row) {
+                if pane_eff_collapsed(app, PANE_EDITOR) {
+                    app.pane_override[PANE_EDITOR] = Some(false);
+                }
                 app.focus = Focus::Editor;
                 return;
             }
             if rect_contains(r.results, m.column, m.row) {
+                if pane_eff_collapsed(app, PANE_RESULTS) {
+                    app.pane_override[PANE_RESULTS] = Some(false);
+                    app.focus = Focus::Preview;
+                    return;
+                }
                 app.focus = Focus::Preview;
                 result_click(app, m.column, m.row);
                 return;
             }
             if rect_contains(r.sidebar, m.column, m.row) {
+                if pane_eff_collapsed(app, PANE_SIDEBAR) {
+                    app.pane_override[PANE_SIDEBAR] = Some(false);
+                    app.focus = Focus::Sidebar;
+                    return;
+                }
                 app.focus = Focus::Sidebar;
                 if app.selected.is_some() {
                     sidebar_click(app, tx, m.column, m.row);
@@ -2484,6 +2702,9 @@ fn col_at_x(app: &App, rel_x: i32) -> Option<usize> {
 }
 
 fn result_click(app: &mut App, x: u16, y: u16) {
+    if hbar_click(app, x, y) {
+        return;
+    }
     let area = app.rects.results;
     let rel = y as i32 - area.y as i32 - 2; // skip border + header row
     let rel_x = x as i32 - area.x as i32 - 1;
@@ -2519,6 +2740,39 @@ fn result_click(app: &mut App, x: u16, y: u16) {
         }
     }
     app.sel = idx;
+}
+
+/// Clicking the horizontal progress bar jumps the column window to the clicked
+/// position. Returns true when the click was on the bar (and handled).
+fn hbar_click(app: &mut App, x: u16, y: u16) -> bool {
+    let r = app.rects.hbar;
+    if !app.rects.hbar_visible
+        || r.width == 0
+        || y != r.y
+        || x < r.x
+        || x >= r.x + r.width
+    {
+        return false;
+    }
+    let Some(grid) = active_grid(app) else {
+        return true;
+    };
+    let ncols = grid.columns.len();
+    if ncols == 0 {
+        return true;
+    }
+    let frozen = app.grid_frozen;
+    let total = ncols.saturating_sub(frozen).max(1);
+    let rel = (x - r.x) as usize;
+    let frac = if r.width > 1 {
+        rel as f64 / (r.width - 1) as f64
+    } else {
+        0.0
+    };
+    let target = frozen + (frac * (total.saturating_sub(1)) as f64).round() as usize;
+    app.col_cursor = target.min(ncols - 1);
+    app.col_offset = app.col_cursor;
+    true
 }
 
 fn sidebar_click(app: &mut App, tx: &Tx, x: u16, y: u16) {
@@ -2671,7 +2925,8 @@ fn preview_key(app: &mut App, tx: &Tx, k: KeyEvent) {
                 app.ddl_scroll = 0;
             }
         }
-        KeyCode::Char('s') => sort_column(app, tx),
+        KeyCode::Char('s') => sort_column(app, tx, false),
+        KeyCode::Char('S') => sort_column(app, tx, true),
         // `f` filters; Shift-F clears. Freeze-first-column moves to `z`.
         KeyCode::Char('F') => clear_filter(app, tx),
         KeyCode::Char('f') if k.modifiers.contains(KeyModifiers::SHIFT) => clear_filter(app, tx),
@@ -2971,9 +3226,57 @@ fn val_literal(v: &Val, data_type: Option<&str>) -> String {
     }
 }
 
-/// `e` — generate an `UPDATE` for the focused cell, prefilled into the editor.
-/// The statement is never run directly; it goes through the normal run path
-/// (including the dangerous-statement confirmation).
+/// New value typed in the edit dialog → SQL literal. An empty box means the
+/// empty string; `NULL` (any case) means SQL NULL.
+fn new_value_literal(input: &str, data_type: Option<&str>) -> String {
+    let t = input.trim();
+    if t.eq_ignore_ascii_case("null") {
+        return "NULL".to_string();
+    }
+    val_literal(&Val::Text(t.to_string()), data_type)
+}
+
+fn build_update_sql(
+    cfg: &ConnectionConfig,
+    table: &str,
+    column: &str,
+    data_type: Option<&str>,
+    input: &str,
+    where_clause: &str,
+) -> String {
+    let q = |name: &str| quote_table_identifier(Some(cfg.db_type), name);
+    format!(
+        "UPDATE {}\nSET {} = {}\nWHERE {};",
+        q(table),
+        q(column),
+        new_value_literal(input, data_type),
+        where_clause
+    )
+}
+
+impl EditDialog {
+    fn update_sql(&self) -> String {
+        build_update_sql(
+            &self.cfg,
+            &self.table,
+            &self.column,
+            self.data_type.as_deref(),
+            &self.new_input.lines().join(" "),
+            &self.where_clause,
+        )
+    }
+    fn sql(&self) -> String {
+        match self.kind {
+            EditKind::Update => self.update_sql(),
+            EditKind::Insert => self.insert_sql.clone(),
+        }
+    }
+}
+
+/// `e` — open a diff-style confirmation layer for the focused cell. The user
+/// types the new value, sees old → new plus the WHERE clause, and only then is
+/// the UPDATE sent (Enter). Esc cancels, `v` hands the SQL to the editor, `b`
+/// queues it for one transactional batch commit.
 fn edit_cell(app: &mut App) {
     if !in_table_data_view(app) {
         app.focus = Focus::Editor;
@@ -3018,7 +3321,6 @@ fn edit_cell(app: &mut App) {
     };
 
     let q = |name: &str| quote_table_identifier(Some(cfg.db_type), name);
-    let set_val = val_literal(&val, column_type(app, &ps.table, &col).as_deref());
     let mut conds: Vec<String> = Vec::new();
     for k in &keys {
         let Some(ci) = grid.columns.iter().position(|c| c == k) else {
@@ -3038,27 +3340,37 @@ fn edit_cell(app: &mut App) {
     } else {
         conds.join(" AND ")
     };
-    let mut sql = String::new();
-    if no_pk {
-        sql.push_str("-- ⚠ 未检测到主键：WHERE 用全部列匹配，请确认条件唯一\n");
-    }
-    sql.push_str(&format!(
-        "UPDATE {}\nSET {} = {}\nWHERE {};",
-        q(&ps.table),
-        q(&col),
-        set_val,
-        where_clause
-    ));
-    app.set_editor_text(&sql);
-    app.focus = Focus::Editor;
-    app.status = if no_pk {
-        "已生成 UPDATE（无主键 → 全部列匹配，请先核对）· Ctrl-J 执行".into()
-    } else {
-        format!("已生成 UPDATE（主键 {}）· Ctrl-J 执行", keys.join(", "))
+
+    let dt = column_type(app, &ps.table, &col);
+    let initial = match &val {
+        Val::Null => "NULL".to_string(),
+        Val::Text(s) => s.clone(),
     };
+    let mut ta = TextArea::from(initial.split('\n').collect::<Vec<_>>());
+    ta.set_placeholder_text("新值：NULL / 数字 / 文本");
+    ta.move_cursor(CursorMove::End);
+    app.edit_dialog = Some(EditDialog {
+        kind: EditKind::Update,
+        cfg: Box::new(cfg),
+        db: app.current_db(),
+        table: ps.table.clone(),
+        column: col.clone(),
+        data_type: dt,
+        old: val,
+        new_input: ta,
+        where_clause,
+        keys,
+        no_pk,
+        insert_sql: String::new(),
+        insert_preview: Vec::new(),
+    });
+    app.status = format!(
+        "编辑 {col} → Enter 确认提交 · Esc 取消 · Ctrl-V 转编辑器 · Ctrl-T 加入批量"
+    );
 }
 
-/// `i` — prefill an `INSERT` template built from the table's column list.
+/// `i` — open the diff layer with an `INSERT` template built from the table's
+/// column list. Enter submits, `v` hands the SQL to the editor.
 fn quick_insert(app: &mut App) {
     if !in_table_data_view(app) {
         app.status = "仅表格浏览支持快速插入".into();
@@ -3090,24 +3402,126 @@ fn quick_insert(app: &mut App) {
     }
     let q = |name: &str| quote_table_identifier(Some(cfg.db_type), name);
     let col_list = cols.iter().map(|c| q(&c.name)).collect::<Vec<_>>().join(", ");
-    let vals = cols
-        .iter()
-        .map(|c| {
-            if is_numeric_type(&c.data_type) {
-                "0".to_string()
-            } else if c.is_nullable {
-                "NULL".to_string()
-            } else {
-                "''".to_string()
-            }
-        })
-        .collect::<Vec<_>>()
-        .join(", ");
-    let sql = format!("INSERT INTO {} ({})\nVALUES ({});", q(&ps.table), col_list, vals);
-    app.set_editor_text(&sql);
-    app.focus = Focus::Editor;
-    app.status = "已生成 INSERT 模板 · 填写值后 Ctrl-J 执行".into();
+    let mut preview: Vec<(String, String)> = Vec::new();
+    let mut vals: Vec<String> = Vec::new();
+    for c in &cols {
+        let v = if is_numeric_type(&c.data_type) {
+            "0".to_string()
+        } else if c.is_nullable {
+            "NULL".to_string()
+        } else {
+            "''".to_string()
+        };
+        vals.push(v.clone());
+        preview.push((fix_double_encoding(&c.name), v));
+    }
+    let sql = format!(
+        "INSERT INTO {} ({})\nVALUES ({});",
+        q(&ps.table),
+        col_list,
+        vals.join(", ")
+    );
+    app.edit_dialog = Some(EditDialog {
+        kind: EditKind::Insert,
+        cfg: Box::new(cfg),
+        db: app.current_db(),
+        table: ps.table.clone(),
+        column: String::new(),
+        data_type: None,
+        old: Val::Null,
+        new_input: TextArea::default(),
+        where_clause: String::new(),
+        keys: Vec::new(),
+        no_pk: false,
+        insert_sql: sql,
+        insert_preview: preview,
+    });
+    app.status = format!(
+        "插入 {} → Enter 确认提交 · Esc 取消 · v 转编辑器微调 · b 加入批量",
+        ps.table
+    );
 }
+
+/// Keys for the diff-style edit confirmation layer. UPDATE has a live text
+/// input, so its commands use Ctrl combos (plain letters must reach the input).
+fn edit_dialog_key(app: &mut App, tx: &Tx, k: KeyEvent) {
+    let Some(mut d) = app.edit_dialog.take() else {
+        return;
+    };
+    let ctrl = k.modifiers.contains(KeyModifiers::CONTROL);
+    let plain = k.modifiers.is_empty();
+    let insert = d.kind == EditKind::Insert;
+    let to_editor = ctrl && k.code == KeyCode::Char('v') || (insert && plain && k.code == KeyCode::Char('v'));
+    let to_batch = ctrl && k.code == KeyCode::Char('t') || (insert && plain && k.code == KeyCode::Char('b'));
+    if k.code == KeyCode::Esc {
+        app.status = "已取消编辑".into();
+    } else if k.code == KeyCode::Enter {
+        submit_edit_sql(app, tx, d.sql());
+    } else if to_editor {
+        let sql = d.sql();
+        app.set_editor_text(&sql);
+        app.focus = Focus::Editor;
+        app.status = "已转入编辑器微调 · Ctrl-J 执行".into();
+    } else if to_batch {
+        let sql = d.sql();
+        app.batch.push(sql);
+        app.status = format!(
+            "已加入批量队列（{} 条）· Ctrl-S 打包提交 · Ctrl-X 清空",
+            app.batch.len()
+        );
+    } else {
+        if d.kind == EditKind::Update {
+            d.new_input.input(k);
+        }
+        app.edit_dialog = Some(d);
+    }
+}
+
+/// Send a generated write. It still passes the dangerous-statement gate so a
+/// write that somehow lacks a bound WHERE gets a second confirmation.
+fn submit_edit_sql(app: &mut App, tx: &Tx, sql: String) {
+    let mut reason = detect_danger(&sql);
+    if reason.is_none() && one_line(&sql).to_ascii_lowercase().contains("where 1 = 1") {
+        reason = Some("WHERE 恒真（1 = 1），会作用于整张表".into());
+    }
+    if let Some(reason) = reason {
+        app.confirm = Some(Confirm {
+            sql,
+            reasons: vec![reason],
+        });
+        return;
+    }
+    app.push_history(&sql);
+    app.pending_write = true;
+    execute_sql(app, tx, sql);
+}
+
+/// Ctrl-S — run every queued edit inside one transaction.
+fn commit_batch(app: &mut App, tx: &Tx) {
+    if app.batch.is_empty() {
+        app.status = "批量队列为空（编辑时按 b 加入）".into();
+        return;
+    }
+    let n = app.batch.len();
+    let mut script = String::from("BEGIN;\n");
+    for s in &app.batch {
+        let s = s.trim().trim_end_matches(';');
+        script.push_str(s);
+        script.push_str(";\n");
+    }
+    script.push_str("COMMIT;");
+    app.batch.clear();
+    app.push_history(&script);
+    app.pending_write = true;
+    app.loading = true;
+    app.status = format!("提交批量事务（{n} 条）…");
+    let Some(cfg) = app.selected.clone() else {
+        return;
+    };
+    let db = app.current_db();
+    spawn_op(&app.backend, tx, Op::Query(Box::new(cfg), db, script));
+}
+
 
 // ── filter / sort ──
 
@@ -3119,7 +3533,20 @@ fn open_filter_prompt(app: &mut App) {
     let Some(ps) = app.page_state.clone() else {
         return;
     };
-    let mut ta = TextArea::from(ps.filter.split('\n').collect::<Vec<_>>());
+    // Prefill with the focused column so a filter is one `f` away; an existing
+    // filter is loaded for editing instead.
+    let initial = if ps.filter.trim().is_empty() {
+        match (active_grid(app), app.selected.as_ref()) {
+            (Some(grid), Some(cfg)) => match grid.columns.get(app.col_cursor) {
+                Some(col) => format!("{} = ", quote_table_identifier(Some(cfg.db_type), col)),
+                None => String::new(),
+            },
+            _ => String::new(),
+        }
+    } else {
+        ps.filter.clone()
+    };
+    let mut ta = TextArea::from(initial.split('\n').collect::<Vec<_>>());
     ta.set_placeholder_text("例: city = 'Beijing'（留空回车 = 清除）");
     ta.move_cursor(CursorMove::End);
     app.filter_prompt = Some(ta);
@@ -3142,7 +3569,62 @@ fn clear_filter(app: &mut App, tx: &Tx) {
 }
 
 /// `s` — sort by the focused column, toggling ASC ↔ DESC.
-fn sort_column(app: &mut App, tx: &Tx) {
+/// Parse a generated ORDER BY expression into `(column, desc)` keys.
+fn parse_order_by(order_by: Option<&str>) -> Vec<(String, bool)> {
+    let Some(o) = order_by else {
+        return Vec::new();
+    };
+    let mut out = Vec::new();
+    for part in o.split(',') {
+        let part = part.trim();
+        if part.is_empty() {
+            continue;
+        }
+        let (name, desc) = if let Some(n) = part
+            .strip_suffix(" DESC")
+            .or_else(|| part.strip_suffix(" desc"))
+        {
+            (n.trim(), true)
+        } else if let Some(n) = part
+            .strip_suffix(" ASC")
+            .or_else(|| part.strip_suffix(" asc"))
+        {
+            (n.trim(), false)
+        } else {
+            (part, false)
+        };
+        out.push((unquote_ident(name), desc));
+    }
+    out
+}
+
+/// Strip the dialect quoting from a single identifier.
+fn unquote_ident(s: &str) -> String {
+    let s = s.trim();
+    let chars: Vec<char> = s.chars().collect();
+    if chars.len() >= 2 {
+        let (a, b) = (chars[0], chars[chars.len() - 1]);
+        if (a == '`' && b == '`') || (a == '"' && b == '"') || (a == '[' && b == ']') {
+            return chars[1..chars.len() - 1].iter().collect();
+        }
+    }
+    s.to_string()
+}
+
+fn build_order_by(cfg: &ConnectionConfig, keys: &[(String, bool)]) -> Option<String> {
+    if keys.is_empty() {
+        return None;
+    }
+    let q = |n: &str| quote_table_identifier(Some(cfg.db_type), n);
+    Some(
+        keys.iter()
+            .map(|(c, d)| format!("{} {}", q(c), if *d { "DESC" } else { "ASC" }))
+            .collect::<Vec<_>>()
+            .join(", "),
+    )
+}
+
+fn sort_column(app: &mut App, tx: &Tx, append: bool) {
     if !in_table_data_view(app) {
         app.status = "仅表格浏览支持排序".into();
         return;
@@ -3159,16 +3641,33 @@ fn sort_column(app: &mut App, tx: &Tx) {
     let Some(col) = grid.columns.get(app.col_cursor).cloned() else {
         return;
     };
-    let q = quote_table_identifier(Some(cfg.db_type), &col);
-    let asc = format!("{q} ASC");
-    let desc = format!("{q} DESC");
-    let (next, dir) = match ps.order_by.as_deref() {
-        Some(o) if o == asc => (Some(desc), "降序"),
-        Some(o) if o == desc => (Some(asc), "升序"),
-        _ => (Some(asc), "升序"),
+    let mut keys = parse_order_by(ps.order_by.as_deref());
+    let existing = keys.iter().position(|(c, _)| c == &col);
+    if append {
+        match existing {
+            Some(i) => keys[i].1 = !keys[i].1,
+            None => keys.push((col.clone(), false)),
+        }
+    } else {
+        // Single-key sort: toggle direction when this column is already the
+        // only sort key, otherwise replace the sort with this column ascending.
+        let dir = match keys.first() {
+            Some((c, d)) if c == &col && keys.len() == 1 => !*d,
+            _ => false,
+        };
+        keys = vec![(col.clone(), dir)];
+    }
+    let next = build_order_by(&cfg, &keys);
+    let dir = if keys.first().map(|(_, d)| *d).unwrap_or(false) {
+        "降序"
+    } else {
+        "升序"
     };
     reload_table_view(app, tx, ps.filter.clone(), next, 0);
-    app.status = format!("按 {col} {dir}");
+    app.status = format!(
+        "按 {col} {dir}{}",
+        if append { "（附加排序键）" } else { "" }
+    );
 }
 
 fn drill_script(app: &mut App, idx: usize) {
@@ -3482,6 +3981,9 @@ fn ui(f: &mut Frame, app: &mut App) {
     if app.filter_prompt.is_some() {
         render_filter_prompt(f, f.area(), app);
     }
+    if app.edit_dialog.is_some() {
+        render_edit_dialog(f, f.area(), app);
+    }
     if app.help_open {
         render_help(f, f.area(), app);
     }
@@ -3592,6 +4094,9 @@ fn context_info(app: &App) -> String {
             parts.push(format!("列 {pin}{}-{}/{}", off + 1, off + vis, ncols));
         }
     }
+    if !app.batch.is_empty() {
+        parts.push(format!("批量 {} 待提交", app.batch.len()));
+    }
     parts.join(" · ")
 }
 
@@ -3626,6 +4131,8 @@ fn render_footer(f: &mut Frame, area: Rect, app: &App) {
         "行详情 · ↑↓ 滚动 · Esc/Enter 关闭".into()
     } else if app.cell_popup.is_some() {
         "单元格 · ↑↓ 滚动 · Esc/Enter 关闭".into()
+    } else if app.edit_dialog.is_some() {
+        "✎ 编辑确认 · Enter 提交 · Esc 取消 · Ctrl-V 转编辑器 · Ctrl-T 加入批量".into()
     } else if app.db_picker_open {
         "↑↓ 选择数据库 · Enter 切换 · r 刷新 · Esc 关闭".into()
     } else if app.confirm.is_some() {
@@ -3641,7 +4148,7 @@ fn render_footer(f: &mut Frame, area: Rect, app: &App) {
                 Focus::Editor => "Ctrl-J 运行 · ↑ 历史 · Tab 下一区".into(),
                 Focus::CmdInput => "Enter 执行 · Ctrl-L 换模式".into(),
                 Focus::Preview => {
-                    "↑↓ 行 · ←→ 列 · Enter 单元格 · e 编辑 · f 过滤 · ? 帮助".into()
+                    "↑↓ 行 · ←→ 列 · Enter 单元格 · e 编辑 · f 过滤 · B 收起 · ? 帮助".into()
                 }
             },
         }
@@ -3660,7 +4167,7 @@ fn render_footer(f: &mut Frame, area: Rect, app: &App) {
                     "Enter 执行 · [ ] 切 redis db · Ctrl-L 切 sql/redis/mongo · Esc 编辑器".into()
                 }
                 Focus::Preview => {
-                    "↑↓ 行(到边翻页) · n/p 翻页 · ←→/hl 列 · Enter 单元格 · o 整行 · e 编辑 · i 插入 · f 过滤 · s 排序 · z 钉首列 · t 字段/DDL · ? 帮助 · Esc 收起".into()
+                    "↑↓ 行(到边翻页) · ←→/hl 列 · Enter 单元格 · o 整行 · e 编辑 · i 插入 · f 过滤 · s/S 排序 · z 钉首列 · B 收起 · Ctrl-S 批量提交 · ? 帮助 · Esc 收起".into()
                 }
             },
         }
@@ -3675,37 +4182,70 @@ fn render_footer(f: &mut Frame, area: Rect, app: &App) {
 fn render_browse(f: &mut Frame, area: Rect, app: &mut App) {
     let mode = app.layout_mode;
     let has_cmd = app.backend_kind != Backend::Sql;
+    let sidebar_collapsed = pane_eff_collapsed(app, PANE_SIDEBAR);
+    let editor_collapsed = pane_eff_collapsed(app, PANE_EDITOR);
+    let results_collapsed = pane_eff_collapsed(app, PANE_RESULTS);
 
-    // sidebar placement: narrow → top strip; else left column
-    let (sidebar, main) = if mode == LayoutMode::Narrow {
-        let v = Layout::vertical([Constraint::Length(7), Constraint::Min(4)]).split(area);
-        (v[0], v[1])
+    // Stacked layout when the terminal is narrow or the sidebar is collapsed:
+    // the sidebar becomes a one-line strip above the editor / results column.
+    if mode == LayoutMode::Narrow || sidebar_collapsed {
+        let sidebar_h = if sidebar_collapsed {
+            1
+        } else {
+            7
+        };
+        let v = Layout::vertical([Constraint::Length(sidebar_h), Constraint::Min(4)]).split(area);
+        app.rects.sidebar = v[0];
+        if sidebar_collapsed {
+            render_sidebar_strip(f, v[0], app);
+        } else {
+            render_sidebar(f, v[0], app);
+        }
+        render_main_area(f, v[1], app, editor_collapsed, results_collapsed, has_cmd);
     } else {
         let sidebar_w = if mode == LayoutMode::Wide { 28 } else { 22 };
         let hz =
             Layout::horizontal([Constraint::Length(sidebar_w), Constraint::Min(20)]).split(area);
-        (hz[0], hz[1])
-    };
+        app.rects.sidebar = hz[0];
+        render_sidebar(f, hz[0], app);
+        render_main_area(f, hz[1], app, editor_collapsed, results_collapsed, has_cmd);
+    }
+}
 
-    app.rects.sidebar = sidebar;
-
-    render_sidebar(f, sidebar, app);
-
-    // main: editor / cmd input / results
+fn render_main_area(
+    f: &mut Frame,
+    area: Rect,
+    app: &mut App,
+    editor_collapsed: bool,
+    results_collapsed: bool,
+    has_cmd: bool,
+) {
+    let mode = app.layout_mode;
     let cmd_h = if has_cmd { 3 } else { 0 };
     let base_editor_h = if mode == LayoutMode::Narrow { 3 } else { 5 };
     // Narrow + Editor 焦点：同帧把编辑器 3→6 行（小屏 height<14 或放不下时不扩）
     let expand_editor = mode == LayoutMode::Narrow
         && app.focus == Focus::Editor
         && app.term_h >= 14
-        && main.height as usize >= 6 + cmd_h as usize + 5;
-    let editor_h = if expand_editor { 6 } else { base_editor_h };
+        && area.height as usize >= 6 + cmd_h as usize + 5;
+    let editor_h = if editor_collapsed {
+        1
+    } else if expand_editor {
+        6
+    } else {
+        base_editor_h
+    };
+    let results_c = if results_collapsed {
+        Constraint::Length(1)
+    } else {
+        Constraint::Min(5)
+    };
     let main_chunks = Layout::vertical([
         Constraint::Length(editor_h),
         Constraint::Length(cmd_h),
-        Constraint::Min(5),
+        results_c,
     ])
-    .split(main);
+    .split(area);
     app.rects.editor = main_chunks[0];
     app.rects.cmd = if has_cmd {
         main_chunks[1]
@@ -3713,14 +4253,18 @@ fn render_browse(f: &mut Frame, area: Rect, app: &mut App) {
         Rect::default()
     };
 
-    let focused = app.focus == Focus::Editor;
-    let block = Block::default()
-        .borders(Borders::ALL)
-        .title(" SQL ")
-        .border_set(border::ROUNDED)
-        .border_style(border_style(focused));
-    app.editor.set_block(block);
-    f.render_widget(&app.editor, main_chunks[0]);
+    if editor_collapsed {
+        render_editor_strip(f, main_chunks[0], app);
+    } else {
+        let focused = app.focus == Focus::Editor;
+        let block = Block::default()
+            .borders(Borders::ALL)
+            .title(" SQL ")
+            .border_set(border::ROUNDED)
+            .border_style(border_style(focused));
+        app.editor.set_block(block);
+        f.render_widget(&app.editor, main_chunks[0]);
+    }
 
     if has_cmd {
         let title = match app.backend_kind {
@@ -3740,7 +4284,79 @@ fn render_browse(f: &mut Frame, area: Rect, app: &mut App) {
 
     let res_area = main_chunks[2];
     app.rects.results = res_area;
-    render_results_pane(f, res_area, app);
+    if results_collapsed {
+        render_results_strip(f, res_area, app);
+    } else {
+        render_results_pane(f, res_area, app);
+    }
+}
+
+/// One-line summary shown in place of the sidebar when it is collapsed.
+fn render_sidebar_strip(f: &mut Frame, area: Rect, app: &mut App) {
+    let focused = app.focus == Focus::Sidebar;
+    let mut text = String::new();
+    if let Some(c) = &app.selected {
+        text.push_str(&format!("▸ {} · {} 表", truncate_disp(&c.name, 16), app.tables.len()));
+        let db = app.current_db();
+        if !db.is_empty() {
+            text.push_str(&format!(" · {}", fix_double_encoding(&db)));
+        }
+        if let Some(t) = app.selected_table() {
+            text.push_str(&format!(" · {}", fix_double_encoding(&t.name)));
+        }
+    } else {
+        text.push_str("▸ 未连接");
+    }
+    text.push_str(" · 点击/B 展开");
+    let style = if focused {
+        Style::default()
+            .fg(Color::Black)
+            .bg(Color::Green)
+            .add_modifier(Modifier::BOLD)
+    } else {
+        Style::default()
+            .fg(Color::Green)
+            .add_modifier(Modifier::BOLD)
+    };
+    f.render_widget(
+        Paragraph::new(truncate_disp(&text, area.width as usize)).style(style),
+        area,
+    );
+}
+
+/// One-line summary shown in place of the SQL editor when it is collapsed.
+fn render_editor_strip(f: &mut Frame, area: Rect, app: &mut App) {
+    let focused = app.focus == Focus::Editor;
+    let sql = app.editor_sql();
+    let first = sql.lines().find(|l| !l.trim().is_empty()).unwrap_or("");
+    let text = if first.is_empty() {
+        "SQL ▸ 空 · 点击/Tab 展开".to_string()
+    } else {
+        format!("SQL ▸ {} · 点击/Tab 展开", one_line(first))
+    };
+    let style = if focused {
+        Style::default()
+            .fg(Color::Black)
+            .bg(Color::Green)
+            .add_modifier(Modifier::BOLD)
+    } else {
+        Style::default().fg(Color::Gray)
+    };
+    f.render_widget(
+        Paragraph::new(truncate_disp(&text, area.width as usize)).style(style),
+        area,
+    );
+}
+
+/// One-line summary shown in place of the results pane when it is collapsed.
+fn render_results_strip(f: &mut Frame, area: Rect, app: &mut App) {
+    let n = result_row_count(app);
+    let text = format!("结果 ▸ {n} 行 · 点击/B 展开");
+    f.render_widget(
+        Paragraph::new(truncate_disp(&text, area.width as usize))
+            .style(Style::default().fg(Color::Gray)),
+        area,
+    );
 }
 
 fn border_style(focused: bool) -> Style {
@@ -3920,6 +4536,23 @@ fn render_grid(f: &mut Frame, area: Rect, app: &mut App, grid: &Grid, kind: Grid
     app.grid_frozen = frozen;
     app.grid_widths = widths.clone();
 
+    // Sort / filter marks only make sense for a browsed table.
+    let (sort_keys, filter_text) = if kind == GridKind::TableData {
+        match &app.page_state {
+            Some(ps) => (parse_order_by(ps.order_by.as_deref()), ps.filter.clone()),
+            None => (Vec::new(), String::new()),
+        }
+    } else {
+        (Vec::new(), String::new())
+    };
+    let sort_of = |name: &str| {
+        sort_keys
+            .iter()
+            .position(|(c, _)| c == name)
+            .map(|i| (sort_keys[i].1, i + 1))
+    };
+    let filt_of = |name: &str| !filter_text.is_empty() && filter_mentions(&filter_text, name);
+
     let h = (area.height as usize).saturating_sub(3).max(1);
     let nrows = grid.rows.len();
     let start = app
@@ -3937,10 +4570,13 @@ fn render_grid(f: &mut Frame, area: Rect, app: &mut App, grid: &Grid, kind: Grid
     left_widths.extend(widths[..frozen].iter().copied());
     let mut lheader: Vec<Cell> = vec![gutter_header_cell()];
     for (ci, w) in widths.iter().enumerate().take(frozen) {
+        let name = &grid.columns[ci];
         lheader.push(col_header_cell(
-            &fix_double_encoding(&grid.columns[ci]),
+            &fix_double_encoding(name),
             *w,
             ci == cc,
+            sort_of(name),
+            filt_of(name),
         ));
     }
     let mut lrows: Vec<Row> = Vec::new();
@@ -3988,10 +4624,13 @@ fn render_grid(f: &mut Frame, area: Rect, app: &mut App, grid: &Grid, kind: Grid
             };
             let mut rheader: Vec<Cell> = Vec::new();
             for (ci, w) in widths.iter().enumerate().skip(off).take(visible) {
+                let name = &grid.columns[ci];
                 rheader.push(col_header_cell(
-                    &fix_double_encoding(&grid.columns[ci]),
+                    &fix_double_encoding(name),
                     *w,
                     ci == cc,
+                    sort_of(name),
+                    filt_of(name),
                 ));
             }
             let mut rrows: Vec<Row> = Vec::new();
@@ -4020,6 +4659,160 @@ fn render_grid(f: &mut Frame, area: Rect, app: &mut App, grid: &Grid, kind: Grid
             f.render_widget(rtable, right_area);
         }
     }
+
+    // ── horizontal scroll progress bar (drawn on the bottom border) ──
+    app.rects.hbar_visible = false;
+    let scrollable_total = ncols.saturating_sub(frozen);
+    if visible > 0 && scrollable_total > visible && inner_w >= 14 {
+        let win_start = off.saturating_sub(frozen);
+        let pin = match frozen {
+            0 => String::new(),
+            1 => "1|".to_string(),
+            f => format!("1-{f}|"),
+        };
+        let label = format!("列 {pin}{}-{}/{}", off + 1, off + visible, ncols);
+        let track = inner_w;
+        let label_w = disp_width(&label);
+        let bar_len = if track > label_w + 6 {
+            track - label_w - 1
+        } else {
+            track
+        };
+        let (ts, tl) = scrollbar_geom(scrollable_total, win_start, visible, bar_len);
+        let tl = tl.max(1).min(bar_len);
+        let mut spans: Vec<Span> = Vec::new();
+        if ts > 0 {
+            spans.push(Span::styled(
+                "─".repeat(ts),
+                Style::default().fg(Color::DarkGray),
+            ));
+        }
+        spans.push(Span::styled(
+            "█".repeat(tl),
+            Style::default()
+                .fg(Color::LightGreen)
+                .add_modifier(Modifier::BOLD),
+        ));
+        let after = bar_len.saturating_sub(ts + tl);
+        if after > 0 {
+            spans.push(Span::styled(
+                "─".repeat(after),
+                Style::default().fg(Color::DarkGray),
+            ));
+        }
+        if bar_len < track {
+            let pad = track - bar_len - label_w;
+            if pad > 0 {
+                spans.push(Span::raw(" ".repeat(pad)));
+            }
+            spans.push(Span::styled(label, Style::default().fg(Color::Gray)));
+        }
+        let bar_area = Rect {
+            x: inner.x,
+            y: area.y + area.height - 1,
+            width: inner_w as u16,
+            height: 1,
+        };
+        f.render_widget(Paragraph::new(Line::from(spans)), bar_area);
+        app.rects.hbar = Rect {
+            x: inner.x,
+            y: bar_area.y,
+            width: bar_len as u16,
+            height: 1,
+        };
+        app.rects.hbar_visible = bar_len > 0;
+    }
+
+    // ── vertical position indicator (drawn on the right border) ──
+    let track_h = inner.height as usize;
+    if track_h >= 3 {
+        let win = h.min(nrows.saturating_sub(start)).max(1);
+        let (v_total, v_start) = match (&app.page_state, kind) {
+            (Some(ps), GridKind::TableData) => match ps.total {
+                Some(t) if (t as usize) > win => (t as usize, ps.page * ps.page_size + start),
+                _ => (nrows, start),
+            },
+            _ => (nrows, start),
+        };
+        if v_total > win {
+            let lines = vbar_lines(v_total, v_start, win, track_h);
+            let v_area = Rect {
+                x: area.x + area.width - 1,
+                y: inner.y,
+                width: 1,
+                height: inner.height,
+            };
+            f.render_widget(Paragraph::new(lines), v_area);
+        }
+    }
+}
+
+/// Thumb geometry for a scrollbar track: `(thumb_start, thumb_len)` within
+/// `track` cells for a window of `win_len` at `win_start` out of `total` items.
+fn scrollbar_geom(total: usize, win_start: usize, win_len: usize, track: usize) -> (usize, usize) {
+    if total == 0 || track == 0 {
+        return (0, 0);
+    }
+    let win_len = win_len.clamp(1, total);
+    if win_len >= total {
+        return (0, track);
+    }
+    let thumb_len = ((win_len * track) / total).max(1).min(track);
+    let max_start = total - win_len;
+    let travel = track - thumb_len;
+    let start = (win_start.min(max_start) * travel)
+        .checked_div(max_start)
+        .unwrap_or(0);
+    (start.min(travel), thumb_len)
+}
+
+fn vbar_lines(total: usize, start: usize, win: usize, height: usize) -> Vec<Line<'static>> {
+    let (ts, tl) = scrollbar_geom(total, start, win, height);
+    let tl = tl.max(1).min(height);
+    (0..height)
+        .map(|i| {
+            if i >= ts && i < ts + tl {
+                Line::from(Span::styled(
+                    "█",
+                    Style::default().fg(Color::LightGreen),
+                ))
+            } else {
+                Line::from(Span::styled("│", Style::default().fg(Color::DarkGray)))
+            }
+        })
+        .collect()
+}
+
+/// True when `col` appears as a whole identifier inside the filter expression
+/// (quote characters are ignored).
+fn filter_mentions(filter: &str, col: &str) -> bool {
+    if filter.trim().is_empty() || col.is_empty() {
+        return false;
+    }
+    let cleaned: String = filter
+        .chars()
+        .filter(|c| !matches!(c, '`' | '"' | '[' | ']'))
+        .collect();
+    let hay = cleaned.to_ascii_lowercase();
+    let needle = col.to_ascii_lowercase();
+    let (hb, nb) = (hay.as_bytes(), needle.as_bytes());
+    let (n, m) = (hb.len(), nb.len());
+    if m == 0 || m > n {
+        return false;
+    }
+    let ident = |b: u8| b.is_ascii_alphanumeric() || b == b'_';
+    let mut i = 0;
+    while i + m <= n {
+        if &hb[i..i + m] == nb {
+            let before_ok = i == 0 || !ident(hb[i - 1]);
+            let after_ok = i + m == n || !ident(hb[i + m]);
+            if before_ok && after_ok {
+                return true;
+            }
+        }
+        i += 1;
+    }
+    false
 }
 
 /// Table-structure field list: fixed percentage widths, but still shows the cell
@@ -4045,7 +4838,7 @@ fn render_columns_grid(
     let mut header = vec![gutter_header_cell()];
     header.extend(grid.columns.iter().enumerate().map(|(ci, c)| {
         let shown = fix_double_encoding(c);
-        col_header_cell(&shown, disp_width(&shown), ci == cc)
+        col_header_cell(&shown, disp_width(&shown), ci == cc, None, false)
     }));
     let rows: Vec<Row> = grid
         .rows
@@ -4089,18 +4882,49 @@ fn gutter_cell(i: usize, selected: bool) -> Cell<'static> {
     Cell::from(Span::styled(format!("{}", i + 1), style))
 }
 
-fn col_header_cell(name: &str, w: usize, current: bool) -> Cell<'static> {
+fn col_header_cell(
+    name: &str,
+    w: usize,
+    current: bool,
+    sort: Option<(bool, usize)>,
+    filtered: bool,
+) -> Cell<'static> {
+    let mut suffix = String::new();
+    if let Some((desc, rank)) = sort {
+        suffix.push(' ');
+        suffix.push(if desc { '▼' } else { '▲' });
+        if rank > 1 {
+            suffix.push_str(&rank.to_string());
+        }
+    }
+    if filtered {
+        suffix.push_str(" ⚑");
+    }
+    let sw = disp_width(&suffix);
+    let text = if w > sw {
+        format!("{}{}", truncate_disp(name, w - sw), suffix)
+    } else {
+        truncate_disp(suffix.trim_start(), w)
+    };
     let style = if current {
         Style::default()
             .fg(Color::Black)
             .bg(Color::Cyan)
+            .add_modifier(Modifier::BOLD)
+    } else if sort.is_some() {
+        Style::default()
+            .fg(Color::Yellow)
+            .add_modifier(Modifier::BOLD)
+    } else if filtered {
+        Style::default()
+            .fg(Color::LightMagenta)
             .add_modifier(Modifier::BOLD)
     } else {
         Style::default()
             .fg(Color::Cyan)
             .add_modifier(Modifier::BOLD)
     };
-    Cell::from(Span::styled(truncate_disp(name, w), style))
+    Cell::from(Span::styled(text, style))
 }
 
 fn highlight_style() -> Style {
@@ -4637,16 +5461,196 @@ fn render_text_popup(f: &mut Frame, area: Rect, title: &str, content: &str, scro
     );
 }
 
+fn render_edit_dialog(f: &mut Frame, area: Rect, app: &mut App) {
+    let Some(d) = app.edit_dialog.clone() else {
+        return;
+    };
+    let w = {
+        let avail = area.width.saturating_sub(4);
+        if avail < 34 {
+            area.width
+        } else {
+            avail.min(78)
+        }
+    };
+    let inner_w = w.saturating_sub(4).max(1) as usize;
+
+    match d.kind {
+        EditKind::Update => {
+            let old = match &d.old {
+                Val::Null => "NULL".to_string(),
+                Val::Text(s) => s.clone(),
+            };
+            let mut header_lines: Vec<Line> = Vec::new();
+            header_lines.push(Line::from(vec![
+                Span::styled("列   ", Style::default().fg(Color::DarkGray)),
+                Span::styled(
+                    d.column.clone(),
+                    Style::default()
+                        .fg(Color::Cyan)
+                        .add_modifier(Modifier::BOLD),
+                ),
+                Span::styled(
+                    format!(
+                        "  {}",
+                        d.data_type.clone().unwrap_or_else(|| "?".into())
+                    ),
+                    Style::default().fg(Color::DarkGray),
+                ),
+            ]));
+            header_lines.push(Line::from(vec![
+                Span::styled("旧值 ", Style::default().fg(Color::DarkGray)),
+                Span::styled(
+                    truncate_disp(&one_line(&old), inner_w.saturating_sub(6)),
+                    Style::default().fg(Color::Red),
+                ),
+            ]));
+            header_lines.push(Line::from(vec![
+                Span::styled("WHERE ", Style::default().fg(Color::DarkGray)),
+                Span::styled(
+                    truncate_disp(&one_line(&d.where_clause), inner_w.saturating_sub(6)),
+                    Style::default().fg(Color::Gray),
+                ),
+            ]));
+            if d.no_pk {
+                header_lines.push(Line::from(Span::styled(
+                    "⚠ 未检测到主键：WHERE 用全部列匹配，请确认条件唯一",
+                    Style::default().fg(Color::Yellow),
+                )));
+            } else {
+                header_lines.push(Line::from(vec![
+                    Span::styled("主键 ", Style::default().fg(Color::DarkGray)),
+                    Span::styled(
+                        truncate_disp(&d.keys.join(", "), inner_w.saturating_sub(6)),
+                        Style::default().fg(Color::Cyan),
+                    ),
+                ]));
+            }
+            let header_h = header_lines.len() as u16;
+            let h = (header_h + 3 + 1 + 2).min(area.height);
+            let x = area.x + (area.width.saturating_sub(w)) / 2;
+            let y = area.y + (area.height.saturating_sub(h)) / 2;
+            let box_area = Rect {
+                x,
+                y,
+                width: w,
+                height: h,
+            };
+            f.render_widget(Clear, box_area);
+            let block = Block::default()
+                .borders(Borders::ALL)
+                .title(Span::styled(
+                    format!(" ✎ 编辑 {}.{} ", d.db, d.table),
+                    Style::default()
+                        .fg(Color::Yellow)
+                        .add_modifier(Modifier::BOLD),
+                ))
+                .border_set(border::THICK)
+                .border_style(Style::default().fg(Color::Yellow));
+            let inner = block.inner(box_area);
+            f.render_widget(block, box_area);
+            let hdr_area = Rect {
+                x: inner.x,
+                y: inner.y,
+                width: inner.width,
+                height: header_h.min(inner.height),
+            };
+            f.render_widget(Paragraph::new(header_lines), hdr_area);
+            let ta_y = inner.y + header_h;
+            let ta_h = 3.min((inner.y + inner.height).saturating_sub(ta_y));
+            if ta_h > 0 {
+                let ta_area = Rect {
+                    x: inner.x,
+                    y: ta_y,
+                    width: inner.width,
+                    height: ta_h,
+                };
+                if let Some(dd) = app.edit_dialog.as_mut() {
+                    let b = Block::default()
+                        .borders(Borders::ALL)
+                        .title(" 新值 · Enter 提交 ")
+                        .border_set(border::ROUNDED)
+                        .border_style(Style::default().fg(Color::Green));
+                    dd.new_input.set_block(b);
+                    f.render_widget(&dd.new_input, ta_area);
+                }
+            }
+            let hint_y = ta_y + ta_h;
+            if hint_y < inner.y + inner.height {
+                let hint_area = Rect {
+                    x: inner.x,
+                    y: hint_y,
+                    width: inner.width,
+                    height: 1,
+                };
+                f.render_widget(
+                    Paragraph::new(truncate_disp(
+                        "Enter 提交 · Esc 取消 · Ctrl-V 转编辑器 · Ctrl-T 加入批量",
+                        inner_w,
+                    ))
+                    .style(Style::default().fg(Color::DarkGray)),
+                    hint_area,
+                );
+            }
+        }
+        EditKind::Insert => {
+            let mut lines: Vec<Line> = Vec::new();
+            lines.push(Line::from(Span::styled(
+                format!("新增一行到 {}.{}", d.db, d.table),
+                Style::default().fg(Color::Cyan),
+            )));
+            for (col, val) in d.insert_preview.iter().take(10) {
+                lines.push(Line::from(vec![
+                    Span::styled(
+                        truncate_disp(col, inner_w.saturating_sub(14)),
+                        Style::default().fg(Color::Gray),
+                    ),
+                    Span::raw(" = "),
+                    Span::styled(
+                        truncate_disp(val, 12),
+                        Style::default().fg(Color::Green),
+                    ),
+                ]));
+            }
+            lines.push(Line::from(Span::styled(
+                "Enter 提交 · Esc 取消 · v 转编辑器微调 · b 加入批量",
+                Style::default().fg(Color::DarkGray),
+            )));
+            let h = (lines.len() as u16 + 2).min(area.height);
+            let x = area.x + (area.width.saturating_sub(w)) / 2;
+            let y = area.y + (area.height.saturating_sub(h)) / 2;
+            let box_area = Rect {
+                x,
+                y,
+                width: w,
+                height: h,
+            };
+            f.render_widget(Clear, box_area);
+            let block = Block::default()
+                .borders(Borders::ALL)
+                .title(Span::styled(
+                    format!(" ➕ 插入 {}.{} ", d.db, d.table),
+                    Style::default()
+                        .fg(Color::Green)
+                        .add_modifier(Modifier::BOLD),
+                ))
+                .border_set(border::THICK)
+                .border_style(Style::default().fg(Color::Green));
+            f.render_widget(Paragraph::new(lines).block(block), box_area);
+        }
+    }
+}
+
 fn render_filter_prompt(f: &mut Frame, area: Rect, app: &mut App) {
     let w = {
         let avail = area.width.saturating_sub(4);
         if avail < 24 {
             area.width
         } else {
-            avail.min(70)
+            avail.min(74)
         }
     };
-    let h = 5.min(area.height);
+    let h = 7.min(area.height);
     let x = area.x + (area.width.saturating_sub(w)) / 2;
     let y = area.y + (area.height.saturating_sub(h)) / 2;
     let box_area = Rect {
@@ -4656,14 +5660,44 @@ fn render_filter_prompt(f: &mut Frame, area: Rect, app: &mut App) {
         height: h,
     };
     f.render_widget(Clear, box_area);
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .title(" WHERE 过滤 · Enter 应用 · Esc 取消 · 留空清除 ")
+        .border_set(border::ROUNDED)
+        .border_style(Style::default().fg(Color::Yellow));
+    let inner = block.inner(box_area);
+    f.render_widget(block, box_area);
+    // Leave two lines at the bottom for the syntax quick-reference.
+    let hint_h = 2u16.min(inner.height.saturating_sub(1));
+    let ta_h = inner.height.saturating_sub(hint_h).max(1);
+    let ta_area = Rect {
+        x: inner.x,
+        y: inner.y,
+        width: inner.width,
+        height: ta_h,
+    };
+    let hint_area = Rect {
+        x: inner.x,
+        y: inner.y + ta_h,
+        width: inner.width,
+        height: hint_h,
+    };
     if let Some(ta) = app.filter_prompt.as_mut() {
-        let block = Block::default()
-            .borders(Borders::ALL)
-            .title(" WHERE 过滤 · Enter 应用 · Esc 取消 ")
-            .border_set(border::ROUNDED)
-            .border_style(Style::default().fg(Color::Yellow));
-        ta.set_block(block);
-        f.render_widget(&*ta, box_area);
+        ta.set_block(Block::default());
+        f.render_widget(&*ta, ta_area);
+    }
+    if hint_h > 0 {
+        let hints = vec![
+            Line::from(Span::styled(
+                "语法: = != <> > < >= <= LIKE IN BETWEEN IS NULL · AND/OR · 字符串单引号",
+                Style::default().fg(Color::DarkGray),
+            )),
+            Line::from(Span::styled(
+                "MySQL 反引号 `col` · PG 双引号 \"col\"（区分大小写）",
+                Style::default().fg(Color::DarkGray),
+            )),
+        ];
+        f.render_widget(Paragraph::new(hints), hint_area);
     }
 }
 
@@ -4674,7 +5708,9 @@ const HELP_ROWS: &[(&str, &str)] = &[
     ("Ctrl-C", "退出"),
     ("Ctrl-L", "切换命令模式 SQL → Redis → MongoDB"),
     ("F5 / Ctrl-J", "执行当前 SQL"),
-    ("Tab", "切换区域 侧栏 → 编辑器 → 结果"),
+    ("Tab / Shift-Tab", "循环切换区域（侧栏 → 编辑器 → 结果）"),
+    ("Alt-1 / 2 / 3", "直接聚焦 侧栏 / 编辑器 / 结果"),
+    ("B", "收起 / 展开当前焦点区域"),
     ("?", "本帮助"),
     ("— 侧栏 —", ""),
     ("↑ ↓", "移动表列表"),
@@ -4690,16 +5726,24 @@ const HELP_ROWS: &[(&str, &str)] = &[
     ("n / p", "下一页 / 上一页"),
     ("Ctrl-F / Ctrl-B", "下一页 / 上一页"),
     ("← → / h l", "单元格光标（列窗口跟随）"),
+    ("底部进度条", "当前列窗口位置 · 点击可跳转"),
     ("Enter", "查看完整单元格"),
     ("o", "整行详情（纵向）"),
-    ("e", "编辑当前单元格 → 生成 UPDATE"),
-    ("i", "快速插入 → 生成 INSERT 模板"),
-    ("f", "WHERE 过滤（留空回车清除）"),
+    ("e", "编辑单元格 → diff 确认后提交"),
+    ("i", "快速插入 → diff 确认后提交"),
+    ("f", "WHERE 过滤（预填当前列）"),
     ("Shift-F", "清除过滤"),
     ("s", "按当前列升 / 降序"),
+    ("Shift-S", "附加排序键（多列排序）"),
     ("z", "钉住 / 取消首列"),
     ("t", "字段 ↔ DDL（表结构）"),
     ("Esc", "收起结果 / 关闭浮层"),
+    ("— 编辑确认层 —", ""),
+    ("Enter", "提交（UPDATE / INSERT）"),
+    ("Esc", "取消编辑"),
+    ("Ctrl-V", "将生成的 SQL 转入编辑器微调"),
+    ("Ctrl-T", "加入批量队列（Ctrl-S 打包事务提交）"),
+    ("Ctrl-S / Ctrl-X", "提交 / 清空批量队列"),
     ("— 编辑器 / 命令 —", ""),
     ("↑ ↓", "历史（首行 / 末行）"),
     ("[ ]", "Redis 逻辑库"),
@@ -5126,5 +6170,58 @@ mod tests {
         assert_eq!(fix_double_encoding("users"), "users");
         // A Latin-1 name whose bytes are not valid UTF-8 is left untouched.
         assert_eq!(fix_double_encoding("café"), "café");
+    }
+
+    #[test]
+    fn scrollbar_geometry_covers_full_track() {
+        // Everything visible → the whole track is the thumb.
+        assert_eq!(scrollbar_geom(10, 0, 10, 40), (0, 40));
+        // Half the content visible: thumb is half, at the start / end.
+        assert_eq!(scrollbar_geom(10, 0, 5, 40), (0, 20));
+        assert_eq!(scrollbar_geom(10, 5, 5, 40), (20, 20));
+        // Clamps beyond the ends.
+        assert_eq!(scrollbar_geom(10, 99, 5, 40), (20, 20));
+        assert_eq!(scrollbar_geom(0, 0, 1, 40), (0, 0));
+        assert_eq!(scrollbar_geom(10, 0, 5, 0), (0, 0));
+    }
+
+    #[test]
+    fn order_by_round_trips_through_parser() {
+        let keys = parse_order_by(Some("`id` DESC, `name` ASC"));
+        assert_eq!(
+            keys,
+            vec![("id".to_string(), true), ("name".to_string(), false)]
+        );
+        assert_eq!(parse_order_by(Some("\"a b\" DESC")), vec![("a b".into(), true)]);
+        assert!(parse_order_by(None).is_empty());
+    }
+
+    #[test]
+    fn identifier_unquoting_strips_dialect_quotes() {
+        assert_eq!(unquote_ident("`id`"), "id");
+        assert_eq!(unquote_ident("\"name\""), "name");
+        assert_eq!(unquote_ident("[col]"), "col");
+        assert_eq!(unquote_ident("plain"), "plain");
+    }
+
+    #[test]
+    fn filter_mentions_matches_whole_identifiers() {
+        assert!(filter_mentions("city = 'X' AND id > 3", "city"));
+        assert!(filter_mentions("`city` = 'X'", "city"));
+        assert!(filter_mentions("\"City\" = 'X'", "city"));
+        // Substrings inside a longer identifier must not match.
+        assert!(!filter_mentions("user_id = 3", "id"));
+        assert!(!filter_mentions("id_card = '3'", "id"));
+        assert!(!filter_mentions("", "id"));
+    }
+
+    #[test]
+    fn new_value_literal_handles_null_empty_and_typing() {
+        assert_eq!(new_value_literal("NULL", Some("int")), "NULL");
+        assert_eq!(new_value_literal("null", Some("varchar(10)")), "NULL");
+        assert_eq!(new_value_literal("", Some("varchar(10)")), "''");
+        assert_eq!(new_value_literal("42", Some("int")), "42");
+        assert_eq!(new_value_literal("42", Some("varchar(10)")), "'42'");
+        assert_eq!(new_value_literal("O'Brien", Some("text")), "'O''Brien'");
     }
 }
