@@ -6,15 +6,20 @@ A keyboard-and-mouse friendly terminal UI for databases, built on the [DBX](http
 
 ## Status
 
-Early working prototype. Verified end-to-end against real MySQL 8.4 and Redis servers:
+Early but usable. Verified end-to-end against real MySQL 8.4, Redis and MongoDB servers:
 
 - ✅ Launch, connection picker, in-TUI connection creation
-- ✅ Connect to MySQL, browse databases/tables (78 tables listed)
-- ✅ Run SQL, view results grid (adaptive column widths), see execution time
+- ✅ Connect to MySQL, browse databases/tables
+- ✅ **Table data browser**: `Enter` on a table runs a paginated `SELECT *` (50 rows per page, `n`/`p` to page), with a row-number gutter, content-sized columns, and the total row count
+- ✅ **Table structure**: `r` shows the field list (type / key / nullable / default / comment); `t` toggles the `SHOW CREATE TABLE` DDL (dialect-aware, built by the DBX kernel)
+- ✅ **Result grid**: the header stays in sync with `h`/`l` column scrolling, `NULL` (italic) and the empty string (`''`) render differently, and execution time / affected rows are shown
+- ✅ **DML**: `INSERT`/`UPDATE`/`DELETE` report affected rows; `DROP`/`TRUNCATE` and `WHERE`-less `UPDATE`/`DELETE` pop a red confirmation before running
+- ✅ **Multi-statement scripts**: `a; b; c;` runs as a batch and shows one row per statement; `Enter` drills into a statement's result set
+- ✅ **SQL editor**: multi-line, shell-style `↑`/`↓` history (seeded from DBX's shared query history), the results pane takes focus after a run
 - ✅ MySQL server errors surfaced verbatim in the status line
 - ✅ Adaptive layout at 120×32 (desktop) and 42×22 (narrow pane / phone portrait)
 - ✅ Redis: connect, `SET`/`GET`/`KEYS`/`DBSIZE`, quoted args, and `[`/`]` db switching verified end-to-end
-- ⚠️ MongoDB: command line implemented; basic operations verified but `use <db>` switching has a known bug (commands may target the wrong database until the connection is created with the target database preselected) — fix planned
+- ✅ MongoDB: `db.col.find({})`, `use <db>` database switching, and multi-row output verified end-to-end
 - ⚠️ Cross-platform release builds (Windows / macOS / Android-Termux) planned, not yet verified
 
 ## Relationship to DBX
@@ -99,31 +104,40 @@ DBX_DATA_DIR=/path/to/dir dbxt
 | Connection picker | `c` | new connection form |
 | Sidebar (connected) | `↑` `↓` | move in table list |
 | Sidebar | `←` `→` | switch database |
-| Sidebar | `Enter` / `r` | table structure |
+| Sidebar | `Enter` | browse table data (paginated `SELECT *`) |
+| Sidebar | `r` | table structure (fields + DDL) |
 | Sidebar | `o` | back to connection picker |
 | Anywhere | `Tab` | next area (sidebar → editor → results) |
+| Editor | `Enter` | new line |
+| Editor | `↑` / `↓` | history (on the first / last line) |
 | Editor | `Esc` | back to sidebar |
 | Redis input | `[` `]` | switch Redis database (db 0/1/2…) |
 | MongoDB input | `use dbname` + `Enter` | switch database |
-| Results | `↑` `↓` `j` `k` `PgUp` `PgDn` | scroll rows |
-| Results | `h` `l` | scroll columns (narrow screens) |
+| Results | `↑` `↓` `j` `k` | scroll rows |
+| Results | `PgUp` / `PgDn` | scroll a screen of rows |
+| Results | `n` / `p` | next / previous data page (table data) |
+| Results | `h` `l` | scroll columns |
+| Results | `t` | toggle fields ↔ DDL (structure view) |
+| Results | `Enter` | open a statement's result (script view) |
 | Results | `e` / `Esc` | back to editor / collapse |
+| Confirmation | `Enter` `y` / `Esc` `n` | run / cancel a dangerous statement |
 
 ### Mouse / touch
 
 Touch taps in terminals are delivered as mouse-down events, so this works on touch devices (including Android Termux) and through tmux mouse passthrough:
 
-- Click a row to select; click the same row again to confirm (connect, load structure)
+- Click a row to select; click the same row again to confirm (connect, browse data)
 - Click an area (editor, command input, results) to focus it
 - Wheel scrolls rows; horizontal wheel scrolls result columns
 
 ## Roadmap
 
-- [ ] Query history (DBX stores it in `dbx.db` already)
 - [ ] In-TUI connection editing / deletion
-- [ ] Result export (CSV)
+- [ ] Filtering and sorting in the data grid
+- [ ] Result export (CSV / JSON)
+- [ ] Persist dbxt-run SQL back into DBX's shared query history (it is read today)
+- [ ] Schema-aware SQL editing / autocomplete
 - [ ] Release builds for Windows, macOS (Intel/Apple Silicon), Linux (glibc + musl), Android Termux (aarch64 musl, static)
-- [ ] Schema-aware SQL editing
 
 ## License
 
