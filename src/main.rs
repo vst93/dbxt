@@ -281,6 +281,7 @@ struct App {
     editor: TextArea<'static>,
     results: Option<QueryView>,
     result_state: TableState,
+    col_offset: usize, // horizontal window into the result columns (Preview focus)
     loading: bool,
     status: String,
 
@@ -293,6 +294,7 @@ struct App {
     form: ConnForm,
 
     layout_mode: LayoutMode,
+    term_h: u16,
     rects: Rects,
 }
 
@@ -370,6 +372,7 @@ async fn run_app(mut terminal: ratatui::DefaultTerminal, backend: Arc<LocalBacke
         editor: TextArea::default(),
         results: None,
         result_state: TableState::default(),
+        col_offset: 0,
         loading: false,
         status: "加载连接…".into(),
         backend_kind: Backend::Sql,
@@ -379,6 +382,7 @@ async fn run_app(mut terminal: ratatui::DefaultTerminal, backend: Arc<LocalBacke
         mongo_db: String::new(),
         form: ConnForm::default(),
         layout_mode: LayoutMode::Mid,
+        term_h: 0,
         rects: Rects::default(),
     };
     app.editor.set_placeholder_text("SQL … (Ctrl-J / F5 执行)");
@@ -470,6 +474,7 @@ fn apply_op_result(app: &mut App, res: OpResult, tx: &Tx) {
             app.results = Some(view);
             app.show_columns = false;
             app.result_state.select(Some(0));
+            app.col_offset = 0; // new query → reset the column window
             app.focus = Focus::Preview;
         }
         OpResult::Redis(s) => {
@@ -554,6 +559,29 @@ fn browse_key(app: &mut App, tx: &Tx, k: KeyEvent) {
         return;
     }
 
+    // Preview 焦点：Left/Right 切库（与侧栏一致）；列窗口滚动只归 h/l 与鼠标
+    if app.focus == Focus::Preview {
+        match k.code {
+            KeyCode::Left => {
+                cycle_db(app, tx, false);
+                return;
+            }
+            KeyCode::Right => {
+                cycle_db(app, tx, true);
+                return;
+            }
+            KeyCode::Char('h') => {
+                move_col(app, -1);
+                return;
+            }
+            KeyCode::Char('l') => {
+                move_col(app, 1);
+                return;
+            }
+            _ => {}
+        }
+    }
+
     match app.focus {
         Focus::Sidebar => sidebar_key(app, tx, k),
         Focus::Editor => editor_key(app, tx, k),
@@ -627,6 +655,7 @@ fn sidebar_key(app: &mut App, tx: &Tx, k: KeyEvent) {
             app.columns.clear();
             app.databases.clear();
             app.results = None;
+            app.col_offset = 0;
             app.picker_open = true;
         }
         KeyCode::Char('r') => {
@@ -683,18 +712,8 @@ fn sidebar_key(app: &mut App, tx: &Tx, k: KeyEvent) {
                 }
             }
         }
-        KeyCode::Left | KeyCode::Char('h') => {
-            if app.databases.len() > 1 {
-                app.db_index = (app.db_index + app.databases.len() - 1) % app.databases.len();
-                reload_tables(app, tx);
-            }
-        }
-        KeyCode::Right | KeyCode::Char('l') => {
-            if app.databases.len() > 1 {
-                app.db_index = (app.db_index + 1) % app.databases.len();
-                reload_tables(app, tx);
-            }
-        }
+        KeyCode::Left | KeyCode::Char('h') => cycle_db(app, tx, false),
+        KeyCode::Right | KeyCode::Char('l') => cycle_db(app, tx, true),
         _ => {}
     }
 }
@@ -709,11 +728,58 @@ fn reload_tables(app: &mut App, tx: &Tx) {
         app.tables.clear();
         app.columns.clear();
         app.show_columns = false;
+        app.col_offset = 0;
         app.loading = true;
         let db = app.current_db();
         app.status = format!("切换到 {db} …");
         spawn_op(&app.backend, tx, Op::ListTables(Box::new(cfg), db));
     }
+}
+
+fn cycle_db(app: &mut App, tx: &Tx, forward: bool) {
+    let len = app.databases.len();
+    if len <= 1 {
+        return;
+    }
+    app.db_index = if forward {
+        (app.db_index + 1) % len
+    } else {
+        (app.db_index + len - 1) % len
+    };
+    reload_tables(app, tx);
+}
+
+// ── result column window ──
+
+fn result_visible_cols(app: &App, n: usize) -> usize {
+    if n == 0 {
+        return 0;
+    }
+    let w = app.rects.results.width.saturating_sub(2) as usize;
+    let max_cell = match app.layout_mode {
+        LayoutMode::Narrow => 12,
+        LayoutMode::Mid => 24,
+        LayoutMode::Wide => 42,
+    };
+    (w / (max_cell + 3)).clamp(1, n)
+}
+
+fn move_col(app: &mut App, delta: i32) {
+    // 表结构视图固定 4 列，不参与横向滚动
+    if app.show_columns {
+        return;
+    }
+    let Some(view) = app.results.as_ref() else {
+        return;
+    };
+    let n = view.columns.len();
+    if n == 0 {
+        return;
+    }
+    let visible = result_visible_cols(app, n);
+    let max = n.saturating_sub(visible);
+    let next = (app.col_offset.min(max) as i32 + delta).clamp(0, max as i32);
+    app.col_offset = next as usize;
 }
 
 // ── mouse / touch (touch tap = Mouse Down, wheel = Scroll) ──
@@ -729,6 +795,7 @@ fn connect_selected(app: &mut App, tx: &Tx) {
             app.picker_open = false;
             app.mongo_db = cfg.database.clone().unwrap_or_default();
             app.results = None;
+            app.col_offset = 0;
             app.cmd_output.clear();
             app.loading = true;
             app.status = format!("连接 {} ({})…", cfg.name, cfg.db_type.as_str());
@@ -794,6 +861,17 @@ fn mouse(app: &mut App, tx: &Tx, m: MouseEvent) {
         }
         MouseEventKind::ScrollUp => scroll(app, -1),
         MouseEventKind::ScrollDown => scroll(app, 1),
+        MouseEventKind::ScrollLeft => {
+            // Shift+水平滚轮：结果列窗口左移
+            if app.focus == Focus::Preview {
+                move_col(app, -1);
+            }
+        }
+        MouseEventKind::ScrollRight => {
+            if app.focus == Focus::Preview {
+                move_col(app, 1);
+            }
+        }
         _ => {}
     }
 }
@@ -1146,6 +1224,7 @@ fn save_form(app: &mut App, tx: &Tx) {
 fn ui(f: &mut Frame, app: &mut App) {
     let (w, h) = (f.area().width, f.area().height);
     app.layout_mode = layout_mode(w);
+    app.term_h = h;
     app.rects = Rects::default();
 
     let header_h = if h < 14 { 0 } else { 1 };
@@ -1180,6 +1259,7 @@ fn ui(f: &mut Frame, app: &mut App) {
         } else {
             app.status.clone()
         };
+        let msg = fit_status(&msg, chunks[2].width as usize);
         f.render_widget(Paragraph::new(msg).style(style), chunks[2]);
     }
     if footer_h > 0 {
@@ -1188,6 +1268,25 @@ fn ui(f: &mut Frame, app: &mut App) {
 
     if app.page == Page::Browse && app.picker_open && app.selected.is_none() {
         render_conn_picker(f, f.area(), app);
+    }
+}
+
+fn fit_status(msg: &str, width: usize) -> String {
+    let n = msg.chars().count();
+    if n <= width {
+        return msg.to_string();
+    }
+    if width == 0 {
+        return String::new();
+    }
+    if msg.starts_with('✗') {
+        // 错误：错误码 / 根因通常在尾部，保留尾部
+        let skip = n - (width - 1);
+        let tail: String = msg.chars().skip(skip).collect();
+        format!("…{tail}")
+    } else {
+        let head: String = msg.chars().take(width - 1).collect();
+        format!("{head}…")
     }
 }
 
@@ -1234,7 +1333,7 @@ fn render_footer(f: &mut Frame, area: Rect, app: &App) {
                 Focus::Sidebar => "↑↓ 表 · ←→ 库 · r 结构 · Tab SQL · o 换连接".into(),
                 Focus::Editor => "Ctrl-J 运行 · Tab 下一区 · Esc 侧栏".into(),
                 Focus::CmdInput => "Enter 执行 · Ctrl-L 换模式".into(),
-                Focus::Preview => "↑↓ 滚 · e 编辑 · Esc 收起".into(),
+                Focus::Preview => "↑↓ 滚 · ←→ 库 · h/l 列 · e 编辑 · Esc 收起".into(),
             },
         }
     } else {
@@ -1247,7 +1346,7 @@ fn render_footer(f: &mut Frame, area: Rect, app: &App) {
                 Focus::Sidebar => "↑↓ 表 · ←→ 切库 · Enter/r 表结构 · Tab SQL编辑器 · o 换连接 · Ctrl-L redis/mongo".into(),
                 Focus::Editor => "Ctrl-J/F5 运行 · Tab 下一区 · Esc 侧栏 · 支持粘贴".into(),
                 Focus::CmdInput => "Enter 执行 · [ ] 切 redis db · Ctrl-L 切 sql/redis/mongo · Esc 编辑器".into(),
-                Focus::Preview => "↑↓/jk 滚动 · PgUp/PgDn 翻页 · e 回编辑器 · Esc 收起".into(),
+                Focus::Preview => "↑↓/jk 滚动 · ←→ 切库 · h/l 列滚动 · PgUp/PgDn 翻页 · e 回编辑器 · Esc 收起".into(),
             },
         }
     };
@@ -1277,16 +1376,14 @@ fn render_browse(f: &mut Frame, area: Rect, app: &mut App) {
     render_sidebar(f, sidebar, app);
 
     // main: editor / cmd input / results
-    let editor_h = if mode == LayoutMode::Narrow { 3 } else { 5 };
-    let cmd_h = if has_cmd {
-        if mode == LayoutMode::Narrow {
-            3
-        } else {
-            3
-        }
-    } else {
-        0
-    };
+    let cmd_h = if has_cmd { 3 } else { 0 };
+    let base_editor_h = if mode == LayoutMode::Narrow { 3 } else { 5 };
+    // Narrow + Editor 焦点：同帧把编辑器 3→6 行（小屏 height<14 或放不下时不扩）
+    let expand_editor = mode == LayoutMode::Narrow
+        && app.focus == Focus::Editor
+        && app.term_h >= 14
+        && main.height as usize >= 6 + cmd_h as usize + 5;
+    let editor_h = if expand_editor { 6 } else { base_editor_h };
     let main_chunks = Layout::vertical([
         Constraint::Length(editor_h),
         Constraint::Length(cmd_h),
@@ -1547,12 +1644,19 @@ fn render_results(f: &mut Frame, area: Rect, app: &mut App) {
         LayoutMode::Wide => 42,
     };
     let n = view.columns.len();
-    let visible = (w / (max_cell + 3)).clamp(1, n);
+    let visible = result_visible_cols(app, n);
     let col_w = (w / visible).saturating_sub(2).clamp(5, max_cell);
+    // clamp the horizontal window and slice header + cells by col_offset..+visible
+    let max_off = n.saturating_sub(visible);
+    if app.col_offset > max_off {
+        app.col_offset = max_off;
+    }
+    let off = app.col_offset;
 
     let cols: Vec<String> = view
         .columns
         .iter()
+        .skip(off)
         .take(visible)
         .map(|c| truncate_cell(c, col_w))
         .collect();
@@ -1567,22 +1671,26 @@ fn render_results(f: &mut Frame, area: Rect, app: &mut App) {
     let rows = view.rows.iter().skip(start).take(h).map(|row| {
         Row::new(
             row.iter()
+                .skip(off)
                 .take(visible)
                 .map(|v| Cell::from(truncate_cell(v, col_w))),
         )
     });
 
+    let col_window = if off == 0 && visible >= n {
+        format!("{n}/{n}")
+    } else {
+        format!("{}-{}/{n}", off + 1, off + visible)
+    };
     let title = format!(
-        " 结果 · {}/{} 行 · {} {}/{} 列 · {} ",
+        " 结果 · {}/{} 行 · 列 {} · {} ",
         if start > 0 {
             format!("{start}–{}", (start + h).min(view.rows.len()))
         } else {
             format!("{}", h.min(view.rows.len()))
         },
         view.rows.len(),
-        "列",
-        visible,
-        n,
+        col_window,
         view.note
     );
     let table = Table::new(rows, widths)
