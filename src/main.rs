@@ -159,14 +159,18 @@ async fn run_op(backend: &LocalBackend, op: Op) -> OpResult {
             Ok(r) => OpResult::Query(Box::new(r)),
             Err(e) => OpResult::Error(format!("query: {e}")),
         },
-        Op::Redis(cfg, db, cmd) => match backend.execute_redis_command(&cfg, db, &cmd, false).await
-        {
-            Ok(r) => OpResult::Redis(match serde_json::to_string_pretty(&r.value) {
-                Ok(s) => s,
-                Err(_) => format!("{:?}", r.value),
-            }),
-            Err(e) => OpResult::Error(format!("redis: {e}")),
-        },
+        Op::Redis(cfg, db, cmd) => {
+            match backend.execute_redis_command(&cfg, db, &cmd, true).await {
+                // skip_safety_check = true: this is an interactive human console (like the DBX
+                // desktop Redis console, which defaults `blockDangerousRedisCommands` to false).
+                // Without it, dbx-core's allowlist blocks ordinary commands such as KEYS.
+                Ok(r) => OpResult::Redis(match serde_json::to_string_pretty(&r.value) {
+                    Ok(s) => s,
+                    Err(_) => format!("{:?}", r.value),
+                }),
+                Err(e) => OpResult::Error(format!("redis: {e}")),
+            }
+        }
         Op::Mongo(cfg, db, source) => match dbx_core::mongo_shell::parse(&source) {
             Ok(cmd) => match backend.execute_mongo_command(&cfg, &db, &cmd).await {
                 Ok(r) => {
@@ -1280,13 +1284,14 @@ fn fit_status(msg: &str, width: usize) -> String {
         return String::new();
     }
     if msg.starts_with('✗') {
-        // 错误：错误码 / 根因通常在尾部，保留尾部
+        // 错误：错误码 / 表名等根因在前中部，保留头部，尾部（诊断提示）截断
+        let head: String = msg.chars().take(width - 1).collect();
+        format!("{head}…")
+    } else {
+        // 普通消息：进度类根因常在尾部，保留尾部
         let skip = n - (width - 1);
         let tail: String = msg.chars().skip(skip).collect();
         format!("…{tail}")
-    } else {
-        let head: String = msg.chars().take(width - 1).collect();
-        format!("{head}…")
     }
 }
 
@@ -1437,14 +1442,38 @@ fn render_browse(f: &mut Frame, area: Rect, app: &mut App) {
     } else if app.results.is_some() {
         render_results(f, res_area, app);
     } else if has_cmd && !app.cmd_output.is_empty() {
-        let text = app.cmd_output.join("\n");
+        // Console log: keep the newest output visible by scrolling to the bottom.
+        // Approximate the wrapped row count from display widths (ratatui scroll is in
+        // wrapped rows, so this keeps recent results on screen in small terminals).
+        let inner_w = res_area.width.saturating_sub(2).max(1) as usize;
+        let inner_h = res_area.height.saturating_sub(2) as usize;
+        let lines: Vec<Line> = app
+            .cmd_output
+            .iter()
+            .map(|l| Line::raw(l.as_str()))
+            .collect();
+        let rows: usize = lines
+            .iter()
+            .map(|l| {
+                let w = l.width();
+                if w == 0 {
+                    1
+                } else {
+                    w.div_ceil(inner_w)
+                }
+            })
+            .sum();
+        let scroll_y = rows.saturating_sub(inner_h).min(u16::MAX as usize) as u16;
         f.render_widget(
-            Paragraph::new(text).wrap(Wrap { trim: false }).block(
-                Block::default()
-                    .borders(Borders::ALL)
-                    .title(" 输出 ")
-                    .border_set(border::ROUNDED),
-            ),
+            Paragraph::new(lines)
+                .wrap(Wrap { trim: false })
+                .scroll((scroll_y, 0))
+                .block(
+                    Block::default()
+                        .borders(Borders::ALL)
+                        .title(" 输出 ")
+                        .border_set(border::ROUNDED),
+                ),
             res_area,
         );
     } else {
@@ -1832,4 +1861,40 @@ fn render_conn_picker(f: &mut Frame, area: Rect, app: &mut App) {
                 .add_modifier(Modifier::BOLD),
         );
     f.render_stateful_widget(list, box_area, &mut app.conn_list);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::fit_status;
+
+    #[test]
+    fn short_message_is_untouched() {
+        assert_eq!(fit_status("ok", 10), "ok");
+    }
+
+    #[test]
+    fn error_keeps_head() {
+        let msg = "✗ query: Server error: `ERROR 1146 (42S02): Table 'mysql.users' doesn't exist` SQL text omitted from user-facing error; enable debug SQL diagnostics to inspect the original statement.";
+        let out = fit_status(msg, 30);
+        assert!(out.starts_with("✗ query: Server error:"));
+        assert!(out.ends_with('…'));
+        assert_eq!(out.chars().count(), 30);
+    }
+
+    #[test]
+    fn normal_message_keeps_tail() {
+        let msg = "loading tables for database mydb ... done";
+        let out = fit_status(msg, 12);
+        assert!(out.starts_with('…'));
+        assert!(out.ends_with("done"));
+        assert_eq!(out.chars().count(), 12);
+    }
+
+    #[test]
+    fn multibyte_is_char_safe() {
+        let msg = "✗ 错误：表不存在，这是一段很长的中文诊断信息";
+        let out = fit_status(msg, 8);
+        assert_eq!(out.chars().count(), 8);
+        assert!(out.starts_with('✗'));
+    }
 }

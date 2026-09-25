@@ -13,7 +13,8 @@ Early working prototype. Verified end-to-end against a real MySQL 8.4 server:
 - ✅ Run SQL, view results grid (adaptive column widths), see execution time
 - ✅ MySQL server errors surfaced verbatim in the status line
 - ✅ Adaptive layout at 120×32 (desktop) and 42×22 (narrow pane / phone portrait)
-- ⚠️ Redis / MongoDB command lines are implemented but not yet live-tested
+- ✅ Redis: connect, `SET`/`GET`/`KEYS`/`DBSIZE`, quoted args, and `[`/`]` db switching verified end-to-end
+- ⚠️ MongoDB command line is implemented but not yet live-tested
 - ⚠️ Cross-platform release builds (Windows / macOS / Android-Termux) planned, not yet verified
 
 ## Relationship to DBX
