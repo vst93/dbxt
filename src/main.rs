@@ -192,6 +192,14 @@ struct Confirm {
     reasons: Vec<String>,
 }
 
+/// A modal showing one cell's full, untruncated value.
+#[derive(Clone)]
+struct CellPopup {
+    title: String,
+    content: String,
+    scroll: u16,
+}
+
 // ─── text helpers ────────────────────────────────────────────────────────────
 
 fn disp_width(s: &str) -> usize {
@@ -671,6 +679,8 @@ struct Rects {
     results: Rect,
     picker: Rect,
     picker_visible: bool,
+    db_picker: Rect,
+    db_picker_visible: bool,
 }
 
 struct App {
@@ -706,8 +716,26 @@ struct App {
     grid_kind: GridKind,
     page_state: Option<PageState>,
     script: Option<ScriptView>,
-    sel: usize,
-    col_offset: usize,
+    sel: usize,       // cursor row inside the current page / result set
+    col_offset: usize, // leftmost column of the scrollable window
+    col_cursor: usize, // focused column (cell cursor)
+    vis_cols: usize,   // columns currently visible (set while rendering)
+    freeze_first: bool, // pin the first data column (row-number gutter is always pinned)
+    cell_popup: Option<CellPopup>,
+
+    // pagination hand-off between key handling and the async page load
+    pending_sel: Option<usize>,
+    page_pending: bool,
+
+    // database switcher overlay
+    db_picker_open: bool,
+    db_list: ListState,
+    pending_table: Option<String>,
+
+    // grid geometry captured while rendering, used to map clicks back to cells
+    grid_gutter: u16,
+    grid_frozen: usize,
+    grid_widths: Vec<usize>,
 
     confirm: Option<Confirm>,
 
@@ -872,6 +900,18 @@ async fn run_app(mut terminal: ratatui::DefaultTerminal, backend: Arc<LocalBacke
         script: None,
         sel: 0,
         col_offset: 0,
+        col_cursor: 0,
+        vis_cols: 0,
+        freeze_first: true,
+        cell_popup: None,
+        pending_sel: None,
+        page_pending: false,
+        db_picker_open: false,
+        db_list: ListState::default(),
+        pending_table: None,
+        grid_gutter: 0,
+        grid_frozen: 0,
+        grid_widths: Vec::new(),
         confirm: None,
         loading: false,
         spinner: 0,
@@ -942,6 +982,10 @@ fn apply_op_result(app: &mut App, res: OpResult, tx: &Tx) {
             app.ddl = None;
             app.page_state = None;
             app.col_offset = 0;
+            app.col_cursor = 0;
+            app.cell_popup = None;
+            app.pending_sel = None;
+            app.page_pending = false;
             app.set_placeholder();
             // auto-load tables for the selected database
             if let Some(cfg) = app.selected.clone() {
@@ -959,7 +1003,14 @@ fn apply_op_result(app: &mut App, res: OpResult, tx: &Tx) {
         OpResult::Tables(ts) => {
             let n = ts.len();
             app.tables = ts;
-            app.table_list.select(if n == 0 { None } else { Some(0) });
+            // Keep the previously selected table across a database switch when the
+            // new database also has a table with the same name; otherwise go to top.
+            let wanted = app.pending_table.take();
+            let sel = wanted
+                .as_deref()
+                .and_then(|name| app.tables.iter().position(|t| t.name == name))
+                .unwrap_or(0);
+            app.table_list.select(if n == 0 { None } else { Some(sel) });
             app.columns.clear();
             app.ddl = None;
             app.status = format!("{n} 个表/视图 · Enter 数据 · r 结构 · Tab 编辑SQL");
@@ -979,6 +1030,8 @@ fn apply_op_result(app: &mut App, res: OpResult, tx: &Tx) {
             app.script = None;
             app.sel = 0;
             app.col_offset = 0;
+            app.col_cursor = 0;
+            app.cell_popup = None;
             app.focus = Focus::Preview;
             app.status = format!("{table} 结构 · {n} 字段 · t 切换 DDL · Esc 返回");
         }
@@ -995,6 +1048,7 @@ fn apply_op_result(app: &mut App, res: OpResult, tx: &Tx) {
             page,
             table,
         } => {
+            app.page_pending = false;
             let rows = grid.rows.len();
             app.grid = Some(*grid);
             app.grid_kind = GridKind::TableData;
@@ -1008,8 +1062,19 @@ fn apply_op_result(app: &mut App, res: OpResult, tx: &Tx) {
             app.script = None;
             app.ddl = None;
             app.struct_view = StructView::Fields;
-            app.sel = 0;
-            app.col_offset = 0;
+            // `pending_sel` carries the cursor across a page turn: `Some(0)` when the
+            // cursor ran off the bottom, `Some(usize::MAX)` off the top, or the
+            // relative index preserved by an explicit page turn.
+            app.sel = app
+                .pending_sel
+                .take()
+                .map(|s| s.min(rows.saturating_sub(1)))
+                .unwrap_or(0);
+            app.cell_popup = None;
+            // Keep the horizontal window across pages; only clamp the cell cursor.
+            let ncols = app.grid.as_ref().map(|g| g.columns.len()).unwrap_or(0);
+            app.col_cursor = app.col_cursor.min(ncols.saturating_sub(1));
+            app.col_offset = app.col_offset.min(ncols.saturating_sub(1));
             app.focus = Focus::Preview;
             let total_txt = total
                 .map(|t| format!("共 {t} 行"))
@@ -1034,6 +1099,8 @@ fn apply_op_result(app: &mut App, res: OpResult, tx: &Tx) {
             app.struct_view = StructView::Fields;
             app.sel = 0;
             app.col_offset = 0;
+            app.col_cursor = 0;
+            app.cell_popup = None;
             app.focus = Focus::Preview;
         }
         OpResult::Script(outcomes) => {
@@ -1051,6 +1118,8 @@ fn apply_op_result(app: &mut App, res: OpResult, tx: &Tx) {
             app.struct_view = StructView::Fields;
             app.sel = 0;
             app.col_offset = 0;
+            app.col_cursor = 0;
+            app.cell_popup = None;
             app.focus = Focus::Preview;
             app.status = format!("脚本 · {n} 条语句 · 影响 {affected} 行 · {errors} 错误 · Enter 看结果");
         }
@@ -1087,6 +1156,8 @@ fn apply_op_result(app: &mut App, res: OpResult, tx: &Tx) {
             spawn_op(&app.backend, tx, Op::ListConnections);
         }
         OpResult::Error(e) => {
+            app.page_pending = false;
+            app.pending_sel = None;
             app.status = format!("✗ {e}");
         }
     }
@@ -1178,6 +1249,10 @@ fn key(app: &mut App, tx: &Tx, k: KeyEvent) {
         app.ddl = None;
         app.page_state = None;
         app.struct_view = StructView::Fields;
+        app.col_offset = 0;
+        app.col_cursor = 0;
+        app.cell_popup = None;
+        app.db_picker_open = false;
         app.set_placeholder();
         return;
     }
@@ -1205,6 +1280,18 @@ fn confirm_key(app: &mut App, tx: &Tx, k: KeyEvent) {
 }
 
 fn browse_key(app: &mut App, tx: &Tx, k: KeyEvent) {
+    // Cell detail popup swallows input while open.
+    if app.cell_popup.is_some() {
+        popup_key(app, k);
+        return;
+    }
+
+    // Database switcher overlay (`d`) is modal.
+    if app.db_picker_open {
+        db_picker_key(app, tx, k);
+        return;
+    }
+
     // run from anywhere (browse page)
     if (k.modifiers.contains(KeyModifiers::CONTROL) && k.code == KeyCode::Char('j'))
         || k.code == KeyCode::F(5)
@@ -1213,27 +1300,15 @@ fn browse_key(app: &mut App, tx: &Tx, k: KeyEvent) {
         return;
     }
 
-    // Preview 焦点：Left/Right 切库（与侧栏一致）；列窗口滚动只归 h/l 与鼠标
-    if app.focus == Focus::Preview {
-        match k.code {
-            KeyCode::Left => {
-                cycle_db(app, tx, false);
-                return;
-            }
-            KeyCode::Right => {
-                cycle_db(app, tx, true);
-                return;
-            }
-            KeyCode::Char('h') => {
-                move_col(app, -1);
-                return;
-            }
-            KeyCode::Char('l') => {
-                move_col(app, 1);
-                return;
-            }
-            _ => {}
-        }
+    // `d` opens the database list from any non-text area: one uniform gesture for
+    // SQL databases, MongoDB databases and Redis logical DBs.
+    if k.code == KeyCode::Char('d')
+        && k.modifiers.is_empty()
+        && app.selected.is_some()
+        && !matches!(app.focus, Focus::Editor | Focus::CmdInput)
+    {
+        open_db_picker(app);
+        return;
     }
 
     match app.focus {
@@ -1241,6 +1316,100 @@ fn browse_key(app: &mut App, tx: &Tx, k: KeyEvent) {
         Focus::Editor => editor_key(app, tx, k),
         Focus::CmdInput => cmd_input_key(app, tx, k),
         Focus::Preview => preview_key(app, tx, k),
+    }
+}
+
+// ── database switcher overlay ──
+
+/// Entries shown by the `d` overlay. Redis exposes its 16 logical databases;
+/// everything else lists the server's schemas/databases.
+fn db_entries(app: &App) -> Vec<String> {
+    if app.backend_kind == Backend::Redis {
+        (0..16).map(|i| format!("db{i}")).collect()
+    } else {
+        app.databases.clone()
+    }
+}
+
+fn db_current_index(app: &App) -> usize {
+    if app.backend_kind == Backend::Redis {
+        app.redis_db as usize
+    } else {
+        app.db_index
+    }
+}
+
+fn open_db_picker(app: &mut App) {
+    let n = db_entries(app).len();
+    if n == 0 {
+        app.status = "没有可切换的数据库".into();
+        return;
+    }
+    app.db_picker_open = true;
+    let cur = db_current_index(app).min(n - 1);
+    app.db_list.select(Some(cur));
+}
+
+fn db_picker_key(app: &mut App, tx: &Tx, k: KeyEvent) {
+    let n = db_entries(app).len();
+    match k.code {
+        KeyCode::Esc | KeyCode::Char('q') => {
+            app.db_picker_open = false;
+        }
+        KeyCode::Char('d') if k.modifiers.is_empty() => {
+            app.db_picker_open = false;
+        }
+        KeyCode::Up | KeyCode::Char('k') => {
+            if n > 0 {
+                let i = app.db_list.selected().map(|i| i.saturating_sub(1)).unwrap_or(0);
+                app.db_list.select(Some(i));
+            }
+        }
+        KeyCode::Down | KeyCode::Char('j') => {
+            if n > 0 {
+                let i = app
+                    .db_list
+                    .selected()
+                    .map(|i| (i + 1).min(n - 1))
+                    .unwrap_or(0);
+                app.db_list.select(Some(i));
+            }
+        }
+        KeyCode::Home => {
+            if n > 0 {
+                app.db_list.select(Some(0));
+            }
+        }
+        KeyCode::End => {
+            if n > 0 {
+                app.db_list.select(Some(n - 1));
+            }
+        }
+        KeyCode::Enter => {
+            if let Some(i) = app.db_list.selected() {
+                db_picker_apply(app, tx, i);
+            }
+        }
+        _ => {}
+    }
+}
+
+fn db_picker_apply(app: &mut App, tx: &Tx, idx: usize) {
+    app.db_picker_open = false;
+    match app.backend_kind {
+        Backend::Redis => {
+            app.redis_db = idx as u32;
+            app.set_placeholder();
+            app.status = format!("redis db → {idx}");
+        }
+        _ => {
+            if idx < app.databases.len() {
+                app.db_index = idx;
+                let db = app.current_db();
+                app.status = format!("切换数据库 → {db}");
+                reload_tables(app, tx);
+            }
+        }
     }
 }
 
@@ -1308,6 +1477,8 @@ fn sidebar_key(app: &mut App, tx: &Tx, k: KeyEvent) {
             app.ddl = None;
             app.page_state = None;
             app.col_offset = 0;
+            app.col_cursor = 0;
+            app.cell_popup = None;
             app.picker_open = true;
         }
         KeyCode::Char('r') => load_structure(app, tx),
@@ -1334,6 +1505,7 @@ fn sidebar_key(app: &mut App, tx: &Tx, k: KeyEvent) {
             }
         }
         KeyCode::Enter => open_table_data(app, tx),
+        // ←/→ (and h/l) stay as a fast shortcut; `d` is the discoverable list.
         KeyCode::Left | KeyCode::Char('h') => cycle_db(app, tx, false),
         KeyCode::Right | KeyCode::Char('l') => cycle_db(app, tx, true),
         _ => {}
@@ -1371,7 +1543,11 @@ fn open_table_data(app: &mut App, tx: &Tx) {
     app.ddl = None;
     app.struct_view = StructView::Fields;
     app.col_offset = 0;
+    app.col_cursor = 0;
+    app.cell_popup = None;
     app.sel = 0;
+    app.pending_sel = Some(0);
+    app.page_pending = true;
     app.page_state = Some(PageState {
         table: table.0.clone(),
         page: 0,
@@ -1395,18 +1571,26 @@ fn open_table_data(app: &mut App, tx: &Tx) {
     );
 }
 
-fn goto_page(app: &mut App, tx: &Tx, page: usize) {
+/// Fetch `page`, moving the cursor to `pending_sel` when the result lands.
+/// Returns false when a page load is already in flight, so a held-down key cannot
+/// stack duplicate queries.
+fn goto_page(app: &mut App, tx: &Tx, page: usize, pending_sel: Option<usize>) -> bool {
+    if app.page_pending {
+        return false;
+    }
     let Some(ps) = app.page_state.clone() else {
-        return;
+        return false;
     };
     let Some(cfg) = app.selected.clone() else {
-        return;
+        return false;
     };
     let table_type = app
         .tables
         .iter()
         .find(|t| t.name == ps.table)
         .map(|t| t.table_type.clone());
+    app.page_pending = true;
+    app.pending_sel = pending_sel;
     app.loading = true;
     app.status = format!("加载 {} 第 {} 页…", ps.table, page + 1);
     spawn_op(
@@ -1421,10 +1605,147 @@ fn goto_page(app: &mut App, tx: &Tx, page: usize) {
             ps.page_size,
         ),
     );
+    true
+}
+
+/// Rows the results pane can show at once (header + borders excluded).
+fn viewport_rows(app: &App) -> usize {
+    app.rects.results.height.saturating_sub(3).max(1) as usize
+}
+
+/// One-row cursor move, flipping the page when the cursor runs off an edge so
+/// browsing is continuous (no "turn page, then hunt for the row").
+fn cursor_step(app: &mut App, tx: &Tx, dir: i32) -> bool {
+    let n = result_row_count(app);
+    if n == 0 {
+        return false;
+    }
+    if dir > 0 {
+        if app.sel + 1 < n {
+            app.sel += 1;
+            return true;
+        }
+        if let Some(ps) = app.page_state.clone() {
+            if ps.has_next {
+                return goto_page(app, tx, ps.page + 1, Some(0));
+            }
+        }
+        false
+    } else {
+        if app.sel > 0 {
+            app.sel -= 1;
+            return true;
+        }
+        if let Some(ps) = app.page_state.clone() {
+            if ps.page > 0 {
+                // usize::MAX is clamped to the last row when the page arrives.
+                return goto_page(app, tx, ps.page - 1, Some(usize::MAX));
+            }
+        }
+        false
+    }
+}
+
+fn move_cursor(app: &mut App, tx: &Tx, delta: i32) {
+    if app.struct_view == StructView::Ddl && app.ddl.is_some() {
+        return;
+    }
+    if let Some(s) = &mut app.script {
+        if s.drilled.is_none() {
+            let n = s.outcomes.len();
+            if n == 0 {
+                return;
+            }
+            let next = (s.sel as i32 + delta).clamp(0, n as i32 - 1);
+            s.sel = next as usize;
+            return;
+        }
+    }
+    let steps = delta.unsigned_abs() as usize;
+    let dir = if delta < 0 { -1 } else { 1 };
+    for _ in 0..steps {
+        if !cursor_step(app, tx, dir) {
+            break;
+        }
+    }
+}
+
+/// Screen-at-a-time scroll that carries over the page boundary.
+fn screen_move(app: &mut App, tx: &Tx, dir: i32) {
+    if app.struct_view == StructView::Ddl && app.ddl.is_some() {
+        return;
+    }
+    let screen = viewport_rows(app);
+    if let Some(s) = &mut app.script {
+        if s.drilled.is_none() {
+            let n = s.outcomes.len();
+            if n == 0 {
+                return;
+            }
+            let next = (s.sel as i32 + dir * screen as i32).clamp(0, n as i32 - 1);
+            s.sel = next as usize;
+            return;
+        }
+    }
+    let n = result_row_count(app);
+    if n == 0 {
+        return;
+    }
+    if dir > 0 {
+        if app.sel + screen < n {
+            app.sel = (app.sel + screen).min(n - 1);
+            return;
+        }
+        if let Some(ps) = app.page_state.clone() {
+            if ps.has_next {
+                let carry = (app.sel + screen).saturating_sub(n);
+                let target = carry.min(ps.page_size.saturating_sub(1));
+                goto_page(app, tx, ps.page + 1, Some(target));
+                return;
+            }
+        }
+        app.sel = n - 1;
+    } else {
+        if app.sel >= screen {
+            app.sel -= screen;
+            return;
+        }
+        if let Some(ps) = app.page_state.clone() {
+            if ps.page > 0 {
+                let carry = screen - app.sel;
+                let target = ps.page_size.saturating_sub(carry);
+                goto_page(app, tx, ps.page - 1, Some(target));
+                return;
+            }
+        }
+        app.sel = 0;
+    }
+}
+
+/// Explicit page turn (`n`/`p`/Ctrl-F/Ctrl-B): keep the cursor at the same
+/// relative row so the view does not jump back to the top.
+fn page_turn(app: &mut App, tx: &Tx, forward: bool) {
+    let Some(ps) = app.page_state.clone() else {
+        screen_move(app, tx, if forward { 1 } else { -1 });
+        return;
+    };
+    if forward && !ps.has_next {
+        app.status = "已经是最后一页".into();
+        return;
+    }
+    if !forward && ps.page == 0 {
+        app.status = "已经是第一页".into();
+        return;
+    }
+    let target = if forward { ps.page + 1 } else { ps.page - 1 };
+    goto_page(app, tx, target, Some(app.sel));
 }
 
 fn reload_tables(app: &mut App, tx: &Tx) {
     if let Some(cfg) = app.selected.clone() {
+        // Remember the current table so a same-named table can be re-selected in
+        // the new database.
+        app.pending_table = app.selected_table().map(|t| t.name.clone());
         app.tables.clear();
         app.columns.clear();
         app.ddl = None;
@@ -1432,6 +1753,10 @@ fn reload_tables(app: &mut App, tx: &Tx) {
         app.script = None;
         app.page_state = None;
         app.col_offset = 0;
+        app.col_cursor = 0;
+        app.cell_popup = None;
+        app.pending_sel = None;
+        app.page_pending = false;
         app.loading = true;
         let db = app.current_db();
         app.status = format!("切换到 {db} …");
@@ -1505,11 +1830,9 @@ fn visible_cols(grid: &Grid, off: usize, avail: usize, max_cell: usize) -> usize
     count.max(1)
 }
 
-fn move_col(app: &mut App, delta: i32) {
-    // 表结构字段视图固定列，不参与横向滚动
-    if app.grid_kind == GridKind::Columns {
-        return;
-    }
+/// Move the focused cell one column left/right. The visible window follows the
+/// cursor, which is what makes horizontal browsing feel like scrolling a table.
+fn move_col_cursor(app: &mut App, delta: i32) {
     let Some(grid) = app.grid.as_ref() else {
         return;
     };
@@ -1517,8 +1840,79 @@ fn move_col(app: &mut App, delta: i32) {
     if n == 0 {
         return;
     }
-    let next = (app.col_offset.min(n - 1) as i32 + delta).clamp(0, n as i32 - 1);
-    app.col_offset = next as usize;
+    let next = (app.col_cursor as i32 + delta).clamp(0, n as i32 - 1);
+    app.col_cursor = next as usize;
+}
+
+/// Absolute row number (1-based) of the cursor across all pages.
+fn abs_row(page: usize, page_size: usize, sel: usize) -> usize {
+    page * page_size + sel + 1
+}
+
+/// Total page count for a known row total (at least one page).
+fn page_count(total: u64, page_size: usize) -> usize {
+    if page_size == 0 {
+        return 1;
+    }
+    ((total as usize).div_ceil(page_size)).max(1)
+}
+
+/// How many leading data columns to pin. The row-number gutter is always pinned;
+/// the first data column is pinned only when the toggle is on, the grid is wide
+/// enough to still scroll, and there is room for at least one more column.
+fn effective_frozen(
+    freeze_first: bool,
+    grid: &Grid,
+    gutter: usize,
+    inner_w: usize,
+    max_cell: usize,
+) -> usize {
+    if !freeze_first {
+        return 0;
+    }
+    let n = grid.columns.len();
+    if n < 3 {
+        return 0;
+    }
+    let w0 = natural_width(grid, 0, max_cell);
+    if gutter + 1 + w0 + 1 + MIN_CELL_WIDTH <= inner_w {
+        1
+    } else {
+        0
+    }
+}
+
+/// The scrollable window `(off, visible)` that keeps `cursor` on screen, starting
+/// from the previous window origin `start` and never scrolling into the frozen
+/// prefix.
+fn window_for_cursor(
+    grid: &Grid,
+    cursor: usize,
+    start: usize,
+    avail: usize,
+    max_cell: usize,
+    frozen: usize,
+) -> (usize, usize) {
+    let n = grid.columns.len();
+    if n == 0 {
+        return (0, 0);
+    }
+    let mut off = start.max(frozen).min(n - 1);
+    let mut visible = visible_cols(grid, off, avail, max_cell).max(1);
+    if cursor < frozen {
+        return (off, visible);
+    }
+    let mut guard = 0usize;
+    while cursor >= off + visible && off + visible < n && guard <= n {
+        off += 1;
+        visible = visible_cols(grid, off, avail, max_cell).max(1);
+        guard += 1;
+    }
+    if cursor < off {
+        off = cursor;
+        visible = visible_cols(grid, off, avail, max_cell).max(1);
+    }
+    (off, visible)
 }
 
 // ── mouse / touch (touch tap = Mouse Down, wheel = Scroll) ──
@@ -1537,6 +1931,8 @@ fn connect_selected(app: &mut App, tx: &Tx) {
             app.ddl = None;
             app.page_state = None;
             app.col_offset = 0;
+            app.col_cursor = 0;
+            app.cell_popup = None;
             app.cmd_output.clear();
             app.set_placeholder();
             app.loading = true;
@@ -1559,27 +1955,7 @@ fn result_row_count(app: &App) -> usize {
     app.grid.as_ref().map(|g| g.rows.len()).unwrap_or(0)
 }
 
-fn result_scroll(app: &mut App, delta: i32) {
-    if let Some(s) = &mut app.script {
-        if s.drilled.is_none() {
-            let n = s.outcomes.len();
-            if n == 0 {
-                return;
-            }
-            let next = (s.sel as i32 + delta).clamp(0, n as i32 - 1);
-            s.sel = next as usize;
-            return;
-        }
-    }
-    let n = result_row_count(app);
-    if n == 0 {
-        return;
-    }
-    let next = (app.sel as i32 + delta).clamp(0, n as i32 - 1);
-    app.sel = next as usize;
-}
-
-fn scroll(app: &mut App, delta: i32) {
+fn scroll(app: &mut App, tx: &Tx, delta: i32) {
     // wheel never steals keyboard focus
     match app.focus {
         Focus::Sidebar => {
@@ -1604,7 +1980,7 @@ fn scroll(app: &mut App, delta: i32) {
                 let d = app.ddl_scroll as i32 + delta;
                 app.ddl_scroll = d.max(0) as u16;
             } else {
-                result_scroll(app, delta);
+                move_cursor(app, tx, delta);
             }
         }
         Focus::Editor => {
@@ -1625,6 +2001,23 @@ fn mouse(app: &mut App, tx: &Tx, m: MouseEvent) {
     match m.kind {
         MouseEventKind::Down(MouseButton::Left) => {
             if app.confirm.is_some() {
+                return;
+            }
+            if app.cell_popup.is_some() {
+                return;
+            }
+            if r.db_picker_visible && rect_contains(r.db_picker, m.column, m.row) {
+                let row_index = m.row as i32 - r.db_picker.y as i32 - 1;
+                if row_index >= 0 {
+                    let idx = row_index as usize;
+                    if idx < db_entries(app).len() {
+                        if app.db_list.selected() == Some(idx) {
+                            db_picker_apply(app, tx, idx);
+                        } else {
+                            app.db_list.select(Some(idx));
+                        }
+                    }
+                }
                 return;
             }
             // hit-test order: picker > cmd > editor > results > sidebar
@@ -1652,29 +2045,77 @@ fn mouse(app: &mut App, tx: &Tx, m: MouseEvent) {
             }
             if rect_contains(r.results, m.column, m.row) {
                 app.focus = Focus::Preview;
-                result_click(app, m.row);
+                result_click(app, m.column, m.row);
                 return;
             }
             if rect_contains(r.sidebar, m.column, m.row) {
                 app.focus = Focus::Sidebar;
                 if app.selected.is_some() {
-                    sidebar_click(app, tx, m.row);
+                    sidebar_click(app, tx, m.column, m.row);
                 }
             }
         }
-        MouseEventKind::ScrollUp => scroll(app, -1),
-        MouseEventKind::ScrollDown => scroll(app, 1),
-        MouseEventKind::ScrollLeft if app.focus == Focus::Preview => move_col(app, -1),
-        MouseEventKind::ScrollRight if app.focus == Focus::Preview => move_col(app, 1),
+        MouseEventKind::ScrollUp => {
+            if m.modifiers.contains(KeyModifiers::SHIFT) && app.focus == Focus::Preview {
+                move_col_cursor(app, -1);
+            } else {
+                scroll(app, tx, -1);
+            }
+        }
+        MouseEventKind::ScrollDown => {
+            if m.modifiers.contains(KeyModifiers::SHIFT) && app.focus == Focus::Preview {
+                move_col_cursor(app, 1);
+            } else {
+                scroll(app, tx, 1);
+            }
+        }
+        MouseEventKind::ScrollLeft if app.focus == Focus::Preview => move_col_cursor(app, -1),
+        MouseEventKind::ScrollRight if app.focus == Focus::Preview => move_col_cursor(app, 1),
         _ => {}
     }
 }
 
-fn result_click(app: &mut App, y: u16) {
+/// Map a click inside the results pane back to a column index using the geometry
+/// captured during the last render.
+fn col_at_x(app: &App, rel_x: i32) -> Option<usize> {
+    if rel_x < 0 {
+        return None;
+    }
+    let mut x = app.grid_gutter as i32;
+    if rel_x < x {
+        return None; // row-number gutter
+    }
+    for ci in 0..app.grid_frozen {
+        x += 1; // column spacing
+        let w = app.grid_widths.get(ci).copied().unwrap_or(MIN_CELL_WIDTH) as i32;
+        if rel_x < x + w {
+            return Some(ci);
+        }
+        x += w;
+    }
+    x += 1; // gap between the pinned block and the scrollable window
+    for k in 0..app.vis_cols {
+        let ci = app.col_offset + k;
+        let w = app.grid_widths.get(ci).copied().unwrap_or(MIN_CELL_WIDTH) as i32;
+        if rel_x < x + w {
+            return Some(ci);
+        }
+        x += w + 1;
+    }
+    None
+}
+
+fn result_click(app: &mut App, x: u16, y: u16) {
     let area = app.rects.results;
     let rel = y as i32 - area.y as i32 - 2; // skip border + header row
+    let rel_x = x as i32 - area.x as i32 - 1;
     if rel < 0 {
         return;
+    }
+    if app.grid_kind != GridKind::Columns {
+        if let Some(ci) = col_at_x(app, rel_x) {
+            app.col_cursor = ci;
+        }
     }
     let h = (area.height as usize).saturating_sub(3).max(1);
     if rel as usize >= h {
@@ -1702,20 +2143,26 @@ fn result_click(app: &mut App, y: u16) {
     app.sel = idx;
 }
 
-fn sidebar_click(app: &mut App, tx: &Tx, y: u16) {
+fn sidebar_click(app: &mut App, tx: &Tx, x: u16, y: u16) {
     let area = app.rects.sidebar;
     let rel = y as i32 - area.y as i32 - 1; // skip top border
     if rel < 0 {
         return;
     }
     // row 0 = connection header, then optional database selector row
-    let header = 1 + if app.databases.len() > 1 { 1 } else { 0 };
+    let header = 1 + if sidebar_db_row(app) { 1 } else { 0 };
+    if rel == 1 && sidebar_db_row(app) {
+        // clicking the database row opens the switcher
+        open_db_picker(app);
+        return;
+    }
     let table_row = rel - header;
     if table_row < 0 {
         return;
     }
+    let _ = x;
     let cap = (area.height as usize)
-        .saturating_sub(2 + if app.databases.len() > 1 { 1 } else { 0 })
+        .saturating_sub(2 + if sidebar_db_row(app) { 1 } else { 0 })
         .max(1);
     let sel = app.table_list.selected();
     let start = sel
@@ -1730,6 +2177,19 @@ fn sidebar_click(app: &mut App, tx: &Tx, y: u16) {
         open_table_data(app, tx);
     } else {
         app.table_list.select(Some(idx));
+    }
+}
+
+/// Whether the sidebar shows a database row under the connection header.
+fn sidebar_db_row(app: &App) -> bool {
+    app.selected.is_some() && !app.databases.is_empty()
+}
+
+fn sidebar_db_label(app: &App) -> String {
+    if app.backend_kind == Backend::Redis {
+        format!("redis db {} · d 切换", app.redis_db)
+    } else {
+        format!("{} · d 切换", app.current_db())
     }
 }
 
@@ -1786,13 +2246,22 @@ fn cmd_input_key(app: &mut App, tx: &Tx, k: KeyEvent) {
 }
 
 fn preview_key(app: &mut App, tx: &Tx, k: KeyEvent) {
-    let n = result_row_count(app);
-    let page = app
-        .rects
-        .results
-        .height
-        .saturating_sub(3)
-        .max(1) as usize;
+    // Ctrl-F / Ctrl-B page the result set.
+    if k.modifiers.contains(KeyModifiers::CONTROL) {
+        match k.code {
+            KeyCode::Char('f') => {
+                page_turn(app, tx, true);
+                return;
+            }
+            KeyCode::Char('b') => {
+                page_turn(app, tx, false);
+                return;
+            }
+            _ => {}
+        }
+    }
+    let screen = viewport_rows(app) as u16;
+    let ddl = app.struct_view == StructView::Ddl && app.ddl.is_some();
     match k.code {
         KeyCode::Esc => {
             if let Some(s) = &mut app.script {
@@ -1800,10 +2269,11 @@ fn preview_key(app: &mut App, tx: &Tx, k: KeyEvent) {
                     s.drilled = None;
                     app.sel = 0;
                     app.col_offset = 0;
+                    app.col_cursor = 0;
                     return;
                 }
             }
-            if app.struct_view == StructView::Ddl && app.ddl.is_some() {
+            if ddl {
                 app.struct_view = StructView::Fields;
                 return;
             }
@@ -1820,76 +2290,134 @@ fn preview_key(app: &mut App, tx: &Tx, k: KeyEvent) {
                 app.ddl_scroll = 0;
             }
         }
+        KeyCode::Char('f') if k.modifiers.is_empty() => {
+            app.freeze_first = !app.freeze_first;
+            app.status = if app.freeze_first {
+                "首列已钉住 · f 取消".into()
+            } else {
+                "首列已取消钉住 · f 钉住".into()
+            };
+        }
         KeyCode::Up | KeyCode::Char('k') => {
-            if app.struct_view == StructView::Ddl && app.ddl.is_some() {
+            if ddl {
                 app.ddl_scroll = app.ddl_scroll.saturating_sub(1);
             } else {
-                result_scroll(app, -1);
+                move_cursor(app, tx, -1);
             }
         }
         KeyCode::Down | KeyCode::Char('j') => {
-            if app.struct_view == StructView::Ddl && app.ddl.is_some() {
+            if ddl {
                 app.ddl_scroll = app.ddl_scroll.saturating_add(1);
             } else {
-                result_scroll(app, 1);
+                move_cursor(app, tx, 1);
+            }
+        }
+        KeyCode::Left | KeyCode::Char('h') => {
+            if !ddl {
+                move_col_cursor(app, -1);
+            }
+        }
+        KeyCode::Right | KeyCode::Char('l') => {
+            if !ddl {
+                move_col_cursor(app, 1);
             }
         }
         KeyCode::PageUp => {
-            if app.struct_view == StructView::Ddl && app.ddl.is_some() {
-                app.ddl_scroll = app.ddl_scroll.saturating_sub(page as u16);
-            } else if app.sel == 0 {
-                // at the top of a data page → step to the previous page
-                match app.page_state.clone() {
-                    Some(ps) if ps.page > 0 => goto_page(app, tx, ps.page - 1),
-                    _ => {}
-                }
+            if ddl {
+                app.ddl_scroll = app.ddl_scroll.saturating_sub(screen);
             } else {
-                result_scroll(app, -(page as i32));
+                screen_move(app, tx, -1);
             }
         }
         KeyCode::PageDown => {
-            if app.struct_view == StructView::Ddl && app.ddl.is_some() {
-                app.ddl_scroll = app.ddl_scroll.saturating_add(page as u16);
-            } else if n > 0 && app.sel + 1 >= n {
-                // at the bottom of a data page → step to the next page
-                match app.page_state.clone() {
-                    Some(ps) if ps.has_next => goto_page(app, tx, ps.page + 1),
-                    _ => {}
-                }
+            if ddl {
+                app.ddl_scroll = app.ddl_scroll.saturating_add(screen);
             } else {
-                result_scroll(app, page as i32);
+                screen_move(app, tx, 1);
             }
         }
-        KeyCode::Char('n') => {
-            if let Some(ps) = app.page_state.clone() {
-                if ps.has_next {
-                    goto_page(app, tx, ps.page + 1);
-                } else {
-                    app.status = "已经是最后一页".into();
+        KeyCode::Home => {
+            if !ddl {
+                app.sel = 0;
+            }
+        }
+        KeyCode::End => {
+            if !ddl {
+                let n = result_row_count(app);
+                if n > 0 {
+                    app.sel = n - 1;
                 }
             }
         }
-        KeyCode::Char('p') => {
-            if let Some(ps) = app.page_state.clone() {
-                if ps.page > 0 {
-                    goto_page(app, tx, ps.page - 1);
-                } else {
-                    app.status = "已经是第一页".into();
-                }
-            }
-        }
+        KeyCode::Char('n') => page_turn(app, tx, true),
+        KeyCode::Char('p') => page_turn(app, tx, false),
         KeyCode::Enter => {
             if let Some(s) = &app.script {
                 if s.drilled.is_none() {
                     let idx = s.sel;
                     drill_script(app, idx);
+                    return;
                 }
             }
+            open_cell_popup(app);
         }
-        _ => {
-            let _ = n;
+        _ => {}
+    }
+}
+
+fn popup_key(app: &mut App, k: KeyEvent) {
+    match k.code {
+        KeyCode::Esc | KeyCode::Char('q') | KeyCode::Enter => {
+            app.cell_popup = None;
+            return;
+        }
+        _ => {}
+    }
+    if let Some(popup) = &mut app.cell_popup {
+        match k.code {
+            KeyCode::Up | KeyCode::Char('k') => popup.scroll = popup.scroll.saturating_sub(1),
+            KeyCode::Down | KeyCode::Char('j') => popup.scroll = popup.scroll.saturating_add(1),
+            KeyCode::PageUp => popup.scroll = popup.scroll.saturating_sub(5),
+            KeyCode::PageDown => popup.scroll = popup.scroll.saturating_add(5),
+            _ => {}
         }
     }
+}
+
+/// 1-based absolute row number of the cursor across all pages.
+fn cursor_abs_row(app: &App) -> usize {
+    match &app.page_state {
+        Some(ps) => abs_row(ps.page, ps.page_size, app.sel),
+        None => app.sel + 1,
+    }
+}
+
+/// Show the focused cell's full value in a modal (truncated cells stay readable).
+fn open_cell_popup(app: &mut App) {
+    let Some(grid) = app.grid.as_ref() else {
+        return;
+    };
+    let Some(row) = grid.rows.get(app.sel) else {
+        return;
+    };
+    let Some(v) = row.get(app.col_cursor) else {
+        return;
+    };
+    let col = grid.columns.get(app.col_cursor).cloned().unwrap_or_default();
+    let content = match v {
+        Val::Null => "NULL".to_string(),
+        Val::Text(s) => s.clone(),
+    };
+    let title = format!(
+        "{col} · 第 {} 行 · {} 字符",
+        cursor_abs_row(app),
+        content.chars().count()
+    );
+    app.cell_popup = Some(CellPopup {
+        title,
+        content,
+        scroll: 0,
+    });
 }
 
 fn drill_script(app: &mut App, idx: usize) {
@@ -1898,6 +2426,7 @@ fn drill_script(app: &mut App, idx: usize) {
             s.drilled = Some(idx);
             app.sel = 0;
             app.col_offset = 0;
+            app.col_cursor = 0;
         }
     }
 }
@@ -2187,8 +2716,14 @@ fn ui(f: &mut Frame, app: &mut App) {
     if app.page == Page::Browse && app.picker_open && app.selected.is_none() {
         render_conn_picker(f, f.area(), app);
     }
+    if app.db_picker_open {
+        render_db_picker(f, f.area(), app);
+    }
     if let Some(confirm) = app.confirm.clone() {
         render_confirm(f, f.area(), &confirm);
+    }
+    if let Some(popup) = app.cell_popup.clone() {
+        render_cell_popup(f, f.area(), &popup);
     }
 }
 
@@ -2266,30 +2801,35 @@ fn context_info(app: &App) -> String {
     if let Some(ps) = &app.page_state {
         let pages = ps
             .total
-            .map(|t| format!("{}", (t as usize).div_ceil(ps.page_size).max(1)))
+            .map(|t| page_count(t, ps.page_size).to_string())
             .unwrap_or_else(|| "?".into());
-        parts.push(format!("页 {}/{}", ps.page + 1, pages));
+        parts.push(format!("第 {}/{} 页", ps.page + 1, pages));
     }
     let n = result_row_count(app);
     if n > 0 {
-        parts.push(format!("行 {}/{}", (app.sel + 1).min(n), n));
+        let cur = cursor_abs_row(app);
+        let total_abs = app
+            .page_state
+            .as_ref()
+            .and_then(|ps| ps.total)
+            .map(|t| t as usize)
+            .unwrap_or(n);
+        parts.push(format!("行 {cur}/{total_abs}"));
     }
+    // Horizontal position is always visible for data grids so the user can tell
+    // at a glance that more columns exist off-screen. With a pinned prefix the
+    // label reads `列 1|3-8/21` (pinned | scrolled).
     if let Some(grid) = &app.grid {
         if app.grid_kind != GridKind::Columns && !grid.columns.is_empty() {
-            let max_cell = max_cell_width(app.layout_mode);
-            let inner_w = app.rects.results.width.saturating_sub(2) as usize;
-            let gutter = ((grid.rows.len() + 1).to_string().len()).max(2);
-            let avail = inner_w.saturating_sub(gutter + 1);
-            let off = app.col_offset.min(grid.columns.len().saturating_sub(1));
-            let visible = visible_cols(grid, off, avail, max_cell);
-            if off + visible < grid.columns.len() || off > 0 {
-                parts.push(format!(
-                    "列 {}-{}/{}",
-                    off + 1,
-                    off + visible,
-                    grid.columns.len()
-                ));
-            }
+            let ncols = grid.columns.len();
+            let off = app.col_offset.min(ncols - 1);
+            let vis = app.vis_cols.clamp(1, ncols - off);
+            let pin = match app.grid_frozen {
+                0 => String::new(),
+                1 => "1|".to_string(),
+                f => format!("1-{f}|"),
+            };
+            parts.push(format!("列 {pin}{}-{}/{}", off + 1, off + vis, ncols));
         }
     }
     parts.join(" · ")
@@ -2318,7 +2858,11 @@ fn render_status(f: &mut Frame, area: Rect, app: &App) {
 }
 
 fn render_footer(f: &mut Frame, area: Rect, app: &App) {
-    let text: String = if app.confirm.is_some() {
+    let text: String = if app.cell_popup.is_some() {
+        "单元格 · ↑↓ 滚动 · Esc/Enter 关闭".into()
+    } else if app.db_picker_open {
+        "↑↓ 选择数据库 · Enter 切换 · Esc 关闭".into()
+    } else if app.confirm.is_some() {
         "⚠ 危险操作 · Enter/y 执行 · Esc/n 取消".into()
     } else if app.layout_mode == LayoutMode::Narrow {
         match app.page {
@@ -2327,10 +2871,10 @@ fn render_footer(f: &mut Frame, area: Rect, app: &App) {
                 Focus::Sidebar if app.selected.is_none() => {
                     "↑↓ 连接 · Enter 选 · c 新建 · q 隐藏".into()
                 }
-                Focus::Sidebar => "↑↓ 表 · ←→ 库 · Enter 数据 · r 结构".into(),
+                Focus::Sidebar => "↑↓ 表 · d 切库 · Enter 数据 · r 结构".into(),
                 Focus::Editor => "Ctrl-J 运行 · ↑ 历史 · Tab 下一区".into(),
                 Focus::CmdInput => "Enter 执行 · Ctrl-L 换模式".into(),
-                Focus::Preview => "↑↓ 滚 · n/p 翻页 · h/l 列 · Esc 返回".into(),
+                Focus::Preview => "↑↓ 滚/翻页 · ←→ 列 · Enter 单元格 · Esc 返回".into(),
             },
         }
     } else {
@@ -2341,20 +2885,21 @@ fn render_footer(f: &mut Frame, area: Rect, app: &App) {
                     "↑↓ 选择连接 · Enter 连接 · c 新建连接 · q 显隐列表 · Tab 直接写SQL".into()
                 }
                 Focus::Sidebar => {
-                    "↑↓ 表 · ←→ 切库 · Enter 浏览数据 · r 表结构 · Tab SQL · o 换连接".into()
+                    "↑↓ 表 · d/←→ 切库 · Enter 浏览数据 · r 表结构 · Tab SQL · o 换连接".into()
                 }
                 Focus::Editor => "Ctrl-J/F5 运行 · Enter 换行 · ↑/↓ 历史 · Tab 下一区 · Esc 侧栏".into(),
                 Focus::CmdInput => {
                     "Enter 执行 · [ ] 切 redis db · Ctrl-L 切 sql/redis/mongo · Esc 编辑器".into()
                 }
                 Focus::Preview => {
-                    "↑↓/jk 滚动 · n/p 翻页 · h/l 列 · t 字段/DDL · e 编辑器 · Esc 收起 · NULL 斜体 · '' 空串".into()
+                    "↑↓ 行(到边自动翻页) · n/p/Ctrl-F 翻页 · ←→/hl 列 · f 钉首列 · Enter 单元格 · t 字段/DDL · Esc 收起".into()
                 }
             },
         }
     };
     f.render_widget(
-        Paragraph::new(text).style(Style::default().fg(Color::DarkGray)),
+        Paragraph::new(truncate_disp(&text, area.width as usize))
+            .style(Style::default().fg(Color::DarkGray)),
         area,
     );
 }
@@ -2568,88 +3113,43 @@ fn render_grid(f: &mut Frame, area: Rect, app: &mut App, grid: &Grid, kind: Grid
         return;
     }
 
-    let inner_w = area.width.saturating_sub(2) as usize;
     let total_rows = grid.rows.len();
-
-    // row-number gutter
     let gutter = ((total_rows + 1).to_string().len()).max(2) as u16;
 
     // Fixed layout for the structure field list; windowed layout for data grids.
     if kind == GridKind::Columns {
-        let widths = [
-            Constraint::Length(gutter),
-            Constraint::Percentage(22),
-            Constraint::Percentage(20),
-            Constraint::Length(5),
-            Constraint::Length(5),
-            Constraint::Percentage(22),
-            Constraint::Percentage(26),
-        ];
-        let mut header = vec![Cell::from(Span::styled(
-            "#",
-            Style::default().fg(Color::DarkGray),
-        ))];
-        header.extend(grid.columns.iter().map(|c| {
-            Cell::from(Span::styled(
-                c.clone(),
-                Style::default()
-                    .fg(Color::Cyan)
-                    .add_modifier(Modifier::BOLD),
-            ))
-        }));
-        let rows: Vec<Row> = grid
-            .rows
-            .iter()
-            .enumerate()
-            .map(|(i, row)| {
-                let mut cells = vec![Cell::from(Span::styled(
-                    format!("{}", i + 1),
-                    Style::default().fg(Color::DarkGray),
-                ))];
-                cells.extend(row.iter().map(|v| match v {
-                    Val::Text(s) if s.is_empty() => Cell::from(""),
-                    _ => cell_widget(v, 40),
-                }));
-                let mut r = Row::new(cells);
-                if i == app.sel {
-                    r = r.style(highlight_style());
-                }
-                r
-            })
-            .collect();
-        let table = Table::new(rows, widths)
-            .header(Row::new(header))
-            .column_spacing(1)
-            .block(block);
-        f.render_widget(table, area);
+        render_columns_grid(f, area, app, grid, block, gutter);
         return;
     }
 
+    let inner_w = area.width.saturating_sub(2) as usize;
     let max_cell = max_cell_width(app.layout_mode);
-    let avail = inner_w.saturating_sub(gutter as usize + 1);
     let ncols = grid.columns.len();
-    let off = app.col_offset.min(ncols.saturating_sub(1));
-    let visible = visible_cols(grid, off, avail, max_cell);
-    app.col_offset = off;
-
-    let widths: Vec<usize> = (off..off + visible)
+    let widths: Vec<usize> = (0..ncols)
         .map(|ci| natural_width(grid, ci, max_cell))
         .collect();
-
-    let mut header = vec![Cell::from(Span::styled(
-        "#",
-        Style::default().fg(Color::DarkGray),
-    ))];
-    for (i, ci) in (off..off + visible).enumerate() {
-        let name = grid.columns.get(ci).cloned().unwrap_or_default();
-        let w = widths.get(i).copied().unwrap_or(MIN_CELL_WIDTH);
-        header.push(Cell::from(Span::styled(
-            truncate_disp(&name, w),
-            Style::default()
-                .fg(Color::Cyan)
-                .add_modifier(Modifier::BOLD),
-        )));
-    }
+    let frozen = effective_frozen(app.freeze_first, grid, gutter as usize, inner_w, max_cell);
+    let left_w: usize = gutter as usize
+        + if frozen > 0 {
+            frozen + widths[..frozen].iter().sum::<usize>()
+        } else {
+            0
+        };
+    const GAP: usize = 1;
+    let avail = inner_w.saturating_sub(left_w + GAP).max(MIN_CELL_WIDTH);
+    let (off, visible) = window_for_cursor(
+        grid,
+        app.col_cursor,
+        app.col_offset,
+        avail,
+        max_cell,
+        frozen,
+    );
+    app.col_offset = off;
+    app.vis_cols = visible;
+    app.grid_gutter = gutter;
+    app.grid_frozen = frozen;
+    app.grid_widths = widths.clone();
 
     let h = (area.height as usize).saturating_sub(3).max(1);
     let nrows = grid.rows.len();
@@ -2657,21 +3157,127 @@ fn render_grid(f: &mut Frame, area: Rect, app: &mut App, grid: &Grid, kind: Grid
         .sel
         .saturating_sub(h / 2)
         .min(nrows.saturating_sub(h.min(nrows)));
+    let sel = app.sel;
+    let cc = app.col_cursor;
+
+    let inner = block.inner(area);
+    f.render_widget(block, area);
+
+    // ── pinned block: row-number gutter + optionally the first data column ──
+    let mut left_widths: Vec<usize> = vec![gutter as usize];
+    left_widths.extend(widths[..frozen].iter().copied());
+    let mut lheader: Vec<Cell> = vec![gutter_header_cell()];
+    for (ci, w) in widths.iter().enumerate().take(frozen) {
+        lheader.push(col_header_cell(&grid.columns[ci], *w, ci == cc));
+    }
+    let mut lrows: Vec<Row> = Vec::new();
+    for (i, row) in grid.rows.iter().enumerate().skip(start).take(h) {
+        let mut cells: Vec<Cell> = vec![gutter_cell(i, i == sel)];
+        for (ci, w) in widths.iter().enumerate().take(frozen) {
+            cells.push(match row.get(ci) {
+                Some(v) => cell_widget_hl(v, *w, i == sel && ci == cc),
+                None => Cell::from(""),
+            });
+        }
+        let mut r = Row::new(cells);
+        if i == sel {
+            r = r.style(highlight_style());
+        }
+        lrows.push(r);
+    }
+    let left_area = Rect {
+        x: inner.x,
+        y: inner.y,
+        width: (left_w.min(inner.width as usize)) as u16,
+        height: inner.height,
+    };
+    let ltable = Table::new(
+        lrows,
+        left_widths
+            .iter()
+            .map(|w| Constraint::Length(*w as u16))
+            .collect::<Vec<_>>(),
+    )
+    .header(Row::new(lheader))
+    .column_spacing(1);
+    f.render_widget(ltable, left_area);
+
+    // ── scrollable window ──
+    if visible > 0 && (inner.width as usize) > left_w + GAP {
+        let right_x = inner.x + (left_w + GAP) as u16;
+        let right_w = (inner.x + inner.width).saturating_sub(right_x);
+        if right_w > 0 {
+            let right_area = Rect {
+                x: right_x,
+                y: inner.y,
+                width: right_w,
+                height: inner.height,
+            };
+            let mut rheader: Vec<Cell> = Vec::new();
+            for (ci, w) in widths.iter().enumerate().skip(off).take(visible) {
+                rheader.push(col_header_cell(&grid.columns[ci], *w, ci == cc));
+            }
+            let mut rrows: Vec<Row> = Vec::new();
+            for (i, row) in grid.rows.iter().enumerate().skip(start).take(h) {
+                let mut cells: Vec<Cell> = Vec::new();
+                for (ci, w) in widths.iter().enumerate().skip(off).take(visible) {
+                    cells.push(match row.get(ci) {
+                        Some(v) => cell_widget_hl(v, *w, i == sel && ci == cc),
+                        None => Cell::from(""),
+                    });
+                }
+                let mut r = Row::new(cells);
+                if i == sel {
+                    r = r.style(highlight_style());
+                }
+                rrows.push(r);
+            }
+            let rtable = Table::new(
+                rrows,
+                (off..off + visible)
+                    .map(|ci| Constraint::Length(widths[ci] as u16))
+                    .collect::<Vec<_>>(),
+            )
+            .header(Row::new(rheader))
+            .column_spacing(1);
+            f.render_widget(rtable, right_area);
+        }
+    }
+}
+
+/// Table-structure field list: fixed percentage widths, but still shows the cell
+/// cursor and focused-cell highlight for consistency with data grids.
+fn render_columns_grid(
+    f: &mut Frame,
+    area: Rect,
+    app: &mut App,
+    grid: &Grid,
+    block: Block,
+    gutter: u16,
+) {
+    let widths = [
+        Constraint::Length(gutter),
+        Constraint::Percentage(22),
+        Constraint::Percentage(20),
+        Constraint::Length(5),
+        Constraint::Length(5),
+        Constraint::Percentage(22),
+        Constraint::Percentage(26),
+    ];
+    let cc = app.col_cursor;
+    let mut header = vec![gutter_header_cell()];
+    header.extend(grid.columns.iter().enumerate().map(|(ci, c)| {
+        col_header_cell(c, disp_width(c), ci == cc)
+    }));
     let rows: Vec<Row> = grid
         .rows
         .iter()
         .enumerate()
-        .skip(start)
-        .take(h)
         .map(|(i, row)| {
-            let mut cells = vec![Cell::from(Span::styled(
-                format!("{}", i + 1),
-                Style::default().fg(Color::DarkGray),
-            ))];
-            for (ci, v) in row.iter().enumerate().skip(off).take(visible) {
-                let w = widths.get(ci - off).copied().unwrap_or(MIN_CELL_WIDTH);
-                cells.push(cell_widget(v, w));
-            }
+            let mut cells = vec![gutter_cell(i, i == app.sel)];
+            cells.extend(row.iter().enumerate().map(|(ci, v)| {
+                cell_widget_hl(v, 40, i == app.sel && ci == cc)
+            }));
             let mut r = Row::new(cells);
             if i == app.sel {
                 r = r.style(highlight_style());
@@ -2679,14 +3285,44 @@ fn render_grid(f: &mut Frame, area: Rect, app: &mut App, grid: &Grid, kind: Grid
             r
         })
         .collect();
-
-    let mut constraints = vec![Constraint::Length(gutter)];
-    constraints.extend(widths.iter().map(|w| Constraint::Length(*w as u16)));
-    let table = Table::new(rows, constraints)
+    let table = Table::new(rows, widths)
         .header(Row::new(header))
         .column_spacing(1)
         .block(block);
     f.render_widget(table, area);
+}
+
+fn gutter_header_cell() -> Cell<'static> {
+    Cell::from(Span::styled(
+        "#",
+        Style::default().fg(Color::DarkGray),
+    ))
+}
+
+fn gutter_cell(i: usize, selected: bool) -> Cell<'static> {
+    let style = if selected {
+        Style::default()
+            .fg(Color::Black)
+            .bg(Color::LightGreen)
+            .add_modifier(Modifier::BOLD)
+    } else {
+        Style::default().fg(Color::DarkGray)
+    };
+    Cell::from(Span::styled(format!("{}", i + 1), style))
+}
+
+fn col_header_cell(name: &str, w: usize, current: bool) -> Cell<'static> {
+    let style = if current {
+        Style::default()
+            .fg(Color::Black)
+            .bg(Color::Cyan)
+            .add_modifier(Modifier::BOLD)
+    } else {
+        Style::default()
+            .fg(Color::Cyan)
+            .add_modifier(Modifier::BOLD)
+    };
+    Cell::from(Span::styled(truncate_disp(name, w), style))
 }
 
 fn highlight_style() -> Style {
@@ -2695,17 +3331,42 @@ fn highlight_style() -> Style {
         .add_modifier(Modifier::BOLD)
 }
 
-/// Render one cell: NULL and the empty string get distinct visual treatments.
-fn cell_widget(v: &Val, w: usize) -> Cell<'static> {
+fn focused_cell_style() -> Style {
+    Style::default()
+        .fg(Color::Black)
+        .bg(Color::LightCyan)
+        .add_modifier(Modifier::BOLD)
+}
+
+/// Render one cell, optionally marking it as the focused cell.
+fn cell_widget_hl(v: &Val, w: usize, focused: bool) -> Cell<'static> {
     match v {
         Val::Null => Cell::from(Span::styled(
             "NULL",
-            Style::default()
-                .fg(Color::DarkGray)
-                .add_modifier(Modifier::ITALIC),
+            if focused {
+                focused_cell_style()
+            } else {
+                Style::default()
+                    .fg(Color::DarkGray)
+                    .add_modifier(Modifier::ITALIC)
+            },
         )),
-        Val::Text(s) if s.is_empty() => Cell::from(Span::styled("''", Style::default().fg(Color::DarkGray))),
-        Val::Text(s) => Cell::from(Span::raw(truncate_disp(s, w))),
+        Val::Text(s) if s.is_empty() => Cell::from(Span::styled(
+            "''",
+            if focused {
+                focused_cell_style()
+            } else {
+                Style::default().fg(Color::DarkGray)
+            },
+        )),
+        Val::Text(s) => {
+            let text = truncate_disp(s, w);
+            if focused {
+                Cell::from(Span::styled(text, focused_cell_style()))
+            } else {
+                Cell::from(Span::raw(text))
+            }
+        }
     }
 }
 
@@ -2886,33 +3547,23 @@ fn render_sidebar(f: &mut Frame, area: Rect, app: &mut App) {
                 Style::default().add_modifier(Modifier::BOLD),
             ),
         ]));
-        // database selector row (only when >1)
-        if app.databases.len() > 1 {
-            let w = (area.width as usize).saturating_sub(4).max(8);
-            let dbs: Vec<String> = app
-                .databases
-                .iter()
-                .enumerate()
-                .map(|(i, d)| {
-                    if i == app.db_index {
-                        format!("[{d}]")
-                    } else {
-                        format!(" {d} ")
-                    }
-                })
-                .collect();
-            let mut joined = dbs.join("");
-            if disp_width(&joined) > w {
-                joined = dbs[app.db_index].clone();
-            }
-            lines.push(Line::from(Span::styled(
-                joined,
-                Style::default().fg(Color::Cyan),
-            )));
+        // database row: always visible when known, opens the `d` switcher on click
+        if sidebar_db_row(app) {
+            let label = sidebar_db_label(app);
+            let w = (area.width as usize).saturating_sub(4).max(6);
+            lines.push(Line::from(vec![
+                Span::styled("▤ ", Style::default().fg(Color::Cyan)),
+                Span::styled(
+                    truncate_disp(&label, w),
+                    Style::default()
+                        .fg(Color::Cyan)
+                        .add_modifier(Modifier::BOLD),
+                ),
+            ]));
         }
 
         let cap = (area.height as usize)
-            .saturating_sub(2 + if app.databases.len() > 1 { 1 } else { 0 })
+            .saturating_sub(2 + if sidebar_db_row(app) { 1 } else { 0 })
             .max(1);
         let sel = app.table_list.selected();
         let start = sel
@@ -3095,6 +3746,113 @@ fn render_conn_picker(f: &mut Frame, area: Rect, app: &mut App) {
                 .add_modifier(Modifier::BOLD),
         );
     f.render_stateful_widget(list, box_area, &mut app.conn_list);
+}
+
+fn render_db_picker(f: &mut Frame, area: Rect, app: &mut App) {
+    let entries = db_entries(app);
+    let cur = db_current_index(app);
+    let w = area.width.min(if app.layout_mode == LayoutMode::Narrow {
+        area.width
+    } else {
+        46
+    });
+    let h = (entries.len() as u16 + 2).clamp(3, area.height.saturating_sub(2));
+    let x = area.x + (area.width.saturating_sub(w)) / 2;
+    let y = area.y + (area.height.saturating_sub(h)) / 2;
+    let box_area = Rect {
+        x,
+        y,
+        width: w,
+        height: h,
+    };
+    app.rects.db_picker = box_area;
+    app.rects.db_picker_visible = true;
+    f.render_widget(Clear, box_area);
+
+    let items: Vec<ListItem> = entries
+        .iter()
+        .enumerate()
+        .map(|(i, name)| {
+            let style = if i == cur {
+                Style::default()
+                    .fg(Color::Green)
+                    .add_modifier(Modifier::BOLD)
+            } else {
+                Style::default()
+            };
+            let mark = if i == cur { "● " } else { "  " };
+            ListItem::new(Line::from(vec![
+                Span::styled(mark, style),
+                Span::styled(
+                    truncate_disp(name, (box_area.width as usize).saturating_sub(6)),
+                    style,
+                ),
+            ]))
+        })
+        .collect();
+    let title = match app.backend_kind {
+        Backend::Redis => " Redis db · ↑↓ Enter · Esc 关 ",
+        _ => " 数据库 · ↑↓ Enter · Esc 关 ",
+    };
+    let list = List::new(items)
+        .block(
+            Block::default()
+                .borders(Borders::ALL)
+                .title(title)
+                .border_set(border::ROUNDED)
+                .border_style(Style::default().fg(Color::Cyan)),
+        )
+        .highlight_style(
+            Style::default()
+                .bg(Color::DarkGray)
+                .add_modifier(Modifier::BOLD),
+        );
+    f.render_stateful_widget(list, box_area, &mut app.db_list);
+}
+
+fn render_cell_popup(f: &mut Frame, area: Rect, popup: &CellPopup) {
+    let w = {
+        let avail = area.width.saturating_sub(4);
+        if avail < 24 {
+            area.width
+        } else {
+            avail.min(88)
+        }
+    };
+    let inner_w = w.saturating_sub(4).max(1) as usize;
+    let body = wrap_text(&popup.content, inner_w);
+    let total = body.len();
+    let max_h = area.height.saturating_sub(4).max(3);
+    let h = ((total as u16) + 2).min(max_h);
+    let inner_h = h.saturating_sub(2) as usize;
+    let x = area.x + (area.width.saturating_sub(w)) / 2;
+    let y = area.y + (area.height.saturating_sub(h)) / 2;
+    let box_area = Rect {
+        x,
+        y,
+        width: w,
+        height: h,
+    };
+    f.render_widget(Clear, box_area);
+    let max_scroll = total.saturating_sub(inner_h).min(u16::MAX as usize) as u16;
+    let scroll = popup.scroll.min(max_scroll);
+    let lines: Vec<Line> = body.iter().map(|l| Line::from(Span::raw(l.clone()))).collect();
+    let title = format!(
+        " {} · {}/{} ",
+        popup.title,
+        (scroll as usize + inner_h).min(total),
+        total
+    );
+    f.render_widget(
+        Paragraph::new(lines).scroll((scroll, 0)).block(
+            Block::default()
+                .borders(Borders::ALL)
+                .title(title)
+                .border_set(border::THICK)
+                .border_style(Style::default().fg(Color::Cyan)),
+        ),
+        box_area,
+    );
 }
 
 fn render_confirm(f: &mut Frame, area: Rect, confirm: &Confirm) {
@@ -3285,5 +4043,76 @@ mod tests {
         assert!(value_to_val(&serde_json::Value::Null).is_null());
         assert_eq!(value_to_val(&serde_json::json!("")).text(), "");
         assert_eq!(value_to_val(&serde_json::json!(42)).text(), "42");
+    }
+
+    fn ten_col_grid() -> Grid {
+        let columns: Vec<String> = (0..10).map(|i| format!("c{i}")).collect();
+        Grid {
+            columns,
+            rows: vec![vec![Val::Text("1234567890".into()); 10]],
+            note: String::new(),
+        }
+    }
+
+    #[test]
+    fn abs_row_counts_across_pages() {
+        // page 2 (0-based), 50/page, 5th row of the page → row 106
+        assert_eq!(abs_row(2, 50, 5), 106);
+        assert_eq!(abs_row(0, 50, 0), 1);
+    }
+
+    #[test]
+    fn page_count_rounds_up_and_never_zero() {
+        assert_eq!(page_count(400, 50), 8);
+        assert_eq!(page_count(401, 50), 9);
+        assert_eq!(page_count(0, 50), 1);
+    }
+
+    #[test]
+    fn frozen_first_column_needs_room() {
+        let grid = ten_col_grid();
+        // 10-wide columns, gutter 2: 2+1+10+1+6 = 20 fits in 40, not in 15.
+        assert_eq!(effective_frozen(true, &grid, 2, 40, 44), 1);
+        assert_eq!(effective_frozen(true, &grid, 2, 15, 44), 0);
+        assert_eq!(effective_frozen(false, &grid, 2, 40, 44), 0);
+        // a two-column grid has nothing worth pinning
+        let narrow = Grid {
+            columns: vec!["a".into(), "b".into()],
+            rows: vec![vec![Val::Text("1".into()), Val::Text("2".into())]],
+            note: String::new(),
+        };
+        assert_eq!(effective_frozen(true, &narrow, 2, 40, 44), 0);
+    }
+
+    #[test]
+    fn window_follows_cursor_to_the_right() {
+        let grid = ten_col_grid();
+        // 10-wide columns, 2 fit in 21; cursor on col 5 scrolls the window to 4..6
+        assert_eq!(window_for_cursor(&grid, 0, 0, 21, 44, 0), (0, 2));
+        assert_eq!(window_for_cursor(&grid, 5, 0, 21, 44, 0), (4, 2));
+        // cursor to the left of the window pulls it back
+        assert_eq!(window_for_cursor(&grid, 1, 4, 21, 44, 0), (1, 2));
+    }
+
+    #[test]
+    fn window_never_scrolls_into_frozen_prefix() {
+        let grid = ten_col_grid();
+        // frozen=1: the scrollable window starts at index 1 even with cursor at 0
+        assert_eq!(window_for_cursor(&grid, 0, 0, 21, 44, 1), (1, 2));
+        // cursor past the frozen column scrolls the window while staying >= 1
+        let (off, vis) = window_for_cursor(&grid, 7, 1, 21, 44, 1);
+        assert!(off >= 1);
+        assert!(off <= 7 && 7 < off + vis);
+    }
+
+    #[test]
+    fn window_clamps_when_columns_are_narrow() {
+        let grid = Grid {
+            columns: vec!["a".into(), "b".into(), "c".into()],
+            rows: vec![vec![Val::Text("x".into()); 3]],
+            note: String::new(),
+        };
+        // avail 0 still shows one column
+        assert_eq!(window_for_cursor(&grid, 0, 0, 0, 44, 0), (0, 1));
     }
 }

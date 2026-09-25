@@ -10,9 +10,11 @@ Early but usable. Verified end-to-end against real MySQL 8.4, Redis and MongoDB 
 
 - ✅ Launch, connection picker, in-TUI connection creation
 - ✅ Connect to MySQL, browse databases/tables
-- ✅ **Table data browser**: `Enter` on a table runs a paginated `SELECT *` (50 rows per page, `n`/`p` to page), with a row-number gutter, content-sized columns, and the total row count
+- ✅ **Table data browser**: `Enter` on a table runs a paginated `SELECT *` (50 rows per page). `↑`/`↓` walk rows continuously — hitting the bottom of a page silently loads the next one and puts the cursor on its first row, and vice versa at the top. `n`/`p` and `Ctrl-F`/`Ctrl-B` turn pages while keeping the cursor on the same relative row. A row-number gutter, content-sized columns, the total row count and a live `page / absolute row` indicator are always shown
 - ✅ **Table structure**: `r` shows the field list (type / key / nullable / default / comment); `t` toggles the `SHOW CREATE TABLE` DDL (dialect-aware, built by the DBX kernel)
-- ✅ **Result grid**: the header stays in sync with `h`/`l` column scrolling, `NULL` (italic) and the empty string (`''`) render differently, and execution time / affected rows are shown
+- ✅ **Wide tables / horizontal scrolling**: `←`/`→` (or `h`/`l`) move a cell-level cursor and the column window follows it; the first data column can be pinned with `f` (the row-number gutter is always pinned); the current column is highlighted in the header and the focused cell is highlighted in the body; `Enter` opens the full, untruncated cell value in a popup. The status bar always shows `列 1|3-8/21`-style horizontal position
+- ✅ **Result grid**: the header stays in sync with column scrolling, `NULL` (italic) and the empty string (`''`) render differently, and execution time / affected rows are shown
+- ✅ **Database switching**: `d` opens a database list (`↑`/`↓` + `Enter` to switch, `Esc` to close) — the same gesture works for MySQL/PostgreSQL databases, MongoDB databases and Redis logical DBs. The current database is shown permanently in the sidebar (click it to open the list); `←`/`→` in the sidebar stay as a quick cycle, and `[`/`]` stay as a Redis shortcut. The current table selection is kept across a switch when the new database has a table with the same name
 - ✅ **DML**: `INSERT`/`UPDATE`/`DELETE` report affected rows; `DROP`/`TRUNCATE` and `WHERE`-less `UPDATE`/`DELETE` pop a red confirmation before running
 - ✅ **Multi-statement scripts**: `a; b; c;` runs as a batch and shows one row per statement; `Enter` drills into a statement's result set
 - ✅ **SQL editor**: multi-line, shell-style `↑`/`↓` history (seeded from DBX's shared query history), the results pane takes focus after a run
@@ -103,7 +105,8 @@ DBX_DATA_DIR=/path/to/dir dbxt
 | Connection picker | `↑` `↓` / `Enter` | select / connect |
 | Connection picker | `c` | new connection form |
 | Sidebar (connected) | `↑` `↓` | move in table list |
-| Sidebar | `←` `→` | switch database |
+| Sidebar | `←` `→` | cycle database (shortcut) |
+| Sidebar | `d` | open the database list (SQL / MongoDB / Redis) |
 | Sidebar | `Enter` | browse table data (paginated `SELECT *`) |
 | Sidebar | `r` | table structure (fields + DDL) |
 | Sidebar | `o` | back to connection picker |
@@ -113,13 +116,18 @@ DBX_DATA_DIR=/path/to/dir dbxt
 | Editor | `Esc` | back to sidebar |
 | Redis input | `[` `]` | switch Redis database (db 0/1/2…) |
 | MongoDB input | `use dbname` + `Enter` | switch database |
-| Results | `↑` `↓` `j` `k` | scroll rows |
-| Results | `PgUp` / `PgDn` | scroll a screen of rows |
-| Results | `n` / `p` | next / previous data page (table data) |
-| Results | `h` `l` | scroll columns |
+| Results | `↑` `↓` `j` `k` | move the row cursor (auto-flips the page at an edge) |
+| Results | `PgUp` / `PgDn` | scroll a screen, carrying over the page boundary |
+| Results | `n` / `p` | next / previous data page, keeping the relative row |
+| Results | `Ctrl-F` / `Ctrl-B` | next / previous data page |
+| Results | `←` `→` `h` `l` | move the cell cursor (the column window follows) |
+| Results | `Enter` | open the focused cell in a popup / open a statement's result (script view) |
+| Results | `f` | pin / unpin the first data column |
+| Results | `Home` / `End` | first / last row of the page |
 | Results | `t` | toggle fields ↔ DDL (structure view) |
-| Results | `Enter` | open a statement's result (script view) |
 | Results | `e` / `Esc` | back to editor / collapse |
+| Cell popup | `↑` `↓` / `PgUp` `PgDn` / `Esc` `Enter` | scroll / close |
+| Database list | `↑` `↓` / `Enter` / `Esc` | select / switch / close |
 | Confirmation | `Enter` `y` / `Esc` `n` | run / cancel a dangerous statement |
 
 ### Mouse / touch
@@ -127,8 +135,18 @@ DBX_DATA_DIR=/path/to/dir dbxt
 Touch taps in terminals are delivered as mouse-down events, so this works on touch devices (including Android Termux) and through tmux mouse passthrough:
 
 - Click a row to select; click the same row again to confirm (connect, browse data)
+- Click a cell to move the cell cursor there; click a statement row in a script to drill in
+- Click a table in the sidebar to select it, click again to browse its data; click the database row to open the database list
 - Click an area (editor, command input, results) to focus it
-- Wheel scrolls rows; horizontal wheel scrolls result columns
+- Wheel scrolls rows (and auto-flips the page at an edge); `Shift`+wheel scrolls columns; horizontal wheel also scrolls columns
+
+### Interaction notes
+
+**Continuous row browsing.** Table data is still fetched 50 rows at a time, but the page boundary is invisible to the keyboard: `↑`/`↓` (and the wheel) load the neighbouring page when the cursor runs off an edge, landing on the row you would have reached anyway. `n`/`p` and `Ctrl-F`/`Ctrl-B` turn a whole page while keeping the cursor on the same relative row, so paging never throws you back to the top. The status bar always shows `第 3/8 页 · 行 102/400`.
+
+**Wide tables.** Each grid has a cell cursor. `←`/`→` (or `h`/`l`) move it and the visible column window follows, with the header of the current column highlighted. `f` pins the first data column next to the always-pinned row-number gutter, so a primary key stays visible while you scroll to the right. `Enter` opens the focused cell in a popup, which is how over-wide values stay readable. The status bar always shows the horizontal position as `列 1|3-8/21` (pinned | scrolled).
+
+**Database switching.** `d` opens a list of databases and `Enter` switches — one gesture for MySQL/PostgreSQL schemas, MongoDB databases and Redis logical DBs, instead of a blind `←`/`→` cycle that is invisible on a narrow screen. The list is an overlay rather than an always-expanded sidebar tree because the sidebar collapses to a 7-line strip on narrow layouts; an overlay works the same at every size and scales to many databases. The current database is still shown permanently in the sidebar (and clicking it opens the same list), while `←`/`→` and Redis `[`/`]` remain as shortcuts.
 
 ## Roadmap
 
