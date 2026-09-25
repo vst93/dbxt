@@ -1447,10 +1447,14 @@ fn render_browse(f: &mut Frame, area: Rect, app: &mut App) {
         // wrapped rows, so this keeps recent results on screen in small terminals).
         let inner_w = res_area.width.saturating_sub(2).max(1) as usize;
         let inner_h = res_area.height.saturating_sub(2) as usize;
+        // A single console entry can carry several physical rows (MongoDB results join
+        // each row with '\n'; Redis pretty-prints JSON). ratatui's Line does not break on
+        // '\n', so split entries into real lines here — otherwise multi-row output
+        // collapses onto one line and the scroll math below is wrong.
         let lines: Vec<Line> = app
             .cmd_output
             .iter()
-            .map(|l| Line::raw(l.as_str()))
+            .flat_map(|entry| entry.lines().map(Line::raw))
             .collect();
         let rows: usize = lines
             .iter()

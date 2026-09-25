@@ -6,7 +6,7 @@ A keyboard-and-mouse friendly terminal UI for databases, built on the [DBX](http
 
 ## Status
 
-Early working prototype. Verified end-to-end against a real MySQL 8.4 server:
+Early working prototype. Verified end-to-end against real MySQL 8.4 and Redis servers:
 
 - ✅ Launch, connection picker, in-TUI connection creation
 - ✅ Connect to MySQL, browse databases/tables (78 tables listed)
@@ -14,7 +14,7 @@ Early working prototype. Verified end-to-end against a real MySQL 8.4 server:
 - ✅ MySQL server errors surfaced verbatim in the status line
 - ✅ Adaptive layout at 120×32 (desktop) and 42×22 (narrow pane / phone portrait)
 - ✅ Redis: connect, `SET`/`GET`/`KEYS`/`DBSIZE`, quoted args, and `[`/`]` db switching verified end-to-end
-- ⚠️ MongoDB command line is implemented but not yet live-tested
+- ⚠️ MongoDB: command line implemented; basic operations verified but `use <db>` switching has a known bug (commands may target the wrong database until the connection is created with the target database preselected) — fix planned
 - ⚠️ Cross-platform release builds (Windows / macOS / Android-Termux) planned, not yet verified
 
 ## Relationship to DBX
