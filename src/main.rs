@@ -2,6 +2,7 @@
 // Apache-2.0. Reuses DBX connection storage (dbx.db), native drivers, SQL safety.
 #![recursion_limit = "512"]
 
+use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
@@ -15,7 +16,8 @@ use crossterm::execute;
 use dbx_core::models::connection::ConnectionConfig;
 use dbx_core::query::QueryExecutionOptions;
 use dbx_core::sql_dialect::{
-    build_count_table_sql, build_table_data_select_sql_with_database, TableDataSelectSqlOptions,
+    build_count_table_sql, build_table_data_select_sql_with_database, normalize_where_input,
+    quote_table_identifier, TableDataSelectSqlOptions,
 };
 use dbx_core::types::{ColumnInfo, TableInfo};
 use dbx_mcp::backend::{
@@ -180,10 +182,39 @@ struct ScriptView {
 #[derive(Clone)]
 struct PageState {
     table: String,
+    table_type: Option<String>,
     page: usize,
     page_size: usize,
     total: Option<u64>,
     has_next: bool,
+    /// Active WHERE predicate (without the `WHERE` keyword); empty = no filter.
+    filter: String,
+    /// Active ORDER BY expression (without the `ORDER BY` keyword).
+    order_by: Option<String>,
+}
+
+/// Column metadata for the table currently open in the data browser. Used to
+/// build `UPDATE`/`INSERT` templates (primary-key detection, value typing).
+#[derive(Clone)]
+struct TableMeta {
+    table: String,
+    columns: Vec<ColumnInfo>,
+}
+
+/// One paginated table-data request (first load, page turn, filter or sort).
+struct TableDataReq {
+    cfg: Box<ConnectionConfig>,
+    db: String,
+    table: String,
+    table_type: Option<String>,
+    page: usize,
+    page_size: usize,
+    filter: String,
+    order_by: Option<String>,
+    /// Reuse a session-cached total instead of running COUNT(*) again.
+    known_total: Option<u64>,
+    /// Monotonic request id; a reply whose id is not the latest is discarded.
+    gen: u64,
 }
 
 #[derive(Clone)]
@@ -195,6 +226,14 @@ struct Confirm {
 /// A modal showing one cell's full, untruncated value.
 #[derive(Clone)]
 struct CellPopup {
+    title: String,
+    content: String,
+    scroll: u16,
+}
+
+/// A modal showing every column of the focused row, one per line.
+#[derive(Clone)]
+struct RowPopup {
     title: String,
     content: String,
     scroll: u16,
@@ -230,6 +269,57 @@ fn truncate_disp(s: &str, max: usize) -> String {
 
 fn one_line(s: &str) -> String {
     s.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+/// Reverse CP1252→UTF-8 double-encoding in an identifier, for display only.
+///
+/// A MySQL client that writes through the wrong connection charset
+/// (latin1/CP1252) stores each byte of the correct UTF-8 sequence as a separate
+/// CP1252 character. dbx-core already reverses this for cell values and table
+/// comments (`fix_potential_double_encoding` in `db/db/mysql.rs`) but not for
+/// table / database / column names, so dbxt applies the same reversal when
+/// *rendering* identifiers. The raw name is always what is sent to the server,
+/// and correctly stored CJK names (chars > U+00FF) pass through untouched.
+fn fix_double_encoding(s: &str) -> String {
+    let mut bytes = Vec::with_capacity(s.len());
+    for c in s.chars() {
+        let byte = match c as u32 {
+            0x20AC => 0x80,
+            0x201A => 0x82,
+            0x0192 => 0x83,
+            0x201E => 0x84,
+            0x2026 => 0x85,
+            0x2020 => 0x86,
+            0x2021 => 0x87,
+            0x02C6 => 0x88,
+            0x2030 => 0x89,
+            0x0160 => 0x8A,
+            0x2039 => 0x8B,
+            0x0152 => 0x8C,
+            0x017D => 0x8E,
+            0x2018 => 0x91,
+            0x2019 => 0x92,
+            0x201C => 0x93,
+            0x201D => 0x94,
+            0x2022 => 0x95,
+            0x2013 => 0x96,
+            0x2014 => 0x97,
+            0x02DC => 0x98,
+            0x2122 => 0x99,
+            0x0161 => 0x9A,
+            0x203A => 0x9B,
+            0x0153 => 0x9C,
+            0x017E => 0x9E,
+            0x0178 => 0x9F,
+            v if v <= 0xFF => v as u8,
+            _ => return s.to_string(),
+        };
+        bytes.push(byte);
+    }
+    match String::from_utf8(bytes) {
+        Ok(decoded) if decoded.chars().any(|c| c > '\u{00FF}') => decoded,
+        _ => s.to_string(),
+    }
 }
 
 /// Hard-wrap text to `width` display columns, returning physical lines.
@@ -358,11 +448,13 @@ enum Op {
     ListTables(Box<ConnectionConfig>, String),
     Columns(Box<ConnectionConfig>, String, String),
     Ddl(Box<ConnectionConfig>, String, String),
-    TableData(Box<ConnectionConfig>, String, String, Option<String>, usize, usize),
+    TableData(Box<TableDataReq>),
+    TableColumns(Box<ConnectionConfig>, String, String),
     Query(Box<ConnectionConfig>, String, String),
     Redis(Box<ConnectionConfig>, u32, String),
     Mongo(Box<ConnectionConfig>, String, String),
     History(Box<ConnectionConfig>),
+    DatabasesRefresh(Box<ConnectionConfig>),
     AddConn(Box<ConnectionConfig>),
 }
 
@@ -384,12 +476,21 @@ enum OpResult {
         has_next: bool,
         page: usize,
         table: String,
+        table_type: Option<String>,
+        filter: String,
+        order_by: Option<String>,
+        gen: u64,
+    },
+    TableColumns {
+        table: String,
+        columns: Vec<ColumnInfo>,
     },
     Query(Box<dbx_core::db::QueryResult>),
     Script(Vec<StmtOutcome>),
     Redis(String),
     Mongo(String),
     History(Vec<String>),
+    DatabasesRefresh(Vec<String>),
     Added(String),
     Error(String),
 }
@@ -480,13 +581,30 @@ async fn run_op(backend: &LocalBackend, op: Op) -> OpResult {
                 },
             }
         }
-        Op::TableData(cfg, db, table, table_type, page, page_size) => {
+        Op::TableData(req) => {
+            let TableDataReq {
+                cfg,
+                db,
+                table,
+                table_type,
+                page,
+                page_size,
+                filter,
+                order_by,
+                known_total,
+                gen,
+            } = *req;
+            // A user filter may be typed with a leading WHERE; strip it so it can
+            // be embedded as a predicate.
+            let filter = normalize_where_input(Some(&filter));
             let options = TableDataSelectSqlOptions {
                 database_type: Some(cfg.db_type),
                 table_name: table.clone(),
-                table_type,
+                table_type: table_type.clone(),
                 limit: Some(page_size + 1),
                 offset: Some(page * page_size),
+                where_input: (!filter.is_empty()).then(|| filter.clone()),
+                order_by: order_by.clone(),
                 ..Default::default()
             };
             let sql = build_table_data_select_sql_with_database(options, false);
@@ -501,21 +619,33 @@ async fn run_op(backend: &LocalBackend, op: Op) -> OpResult {
                     let has_next = rows.len() > page_size;
                     rows.truncate(page_size);
                     let grid = Grid::from_query(columns, &rows, format!("{ms}ms"));
-                    let count_sql = build_count_table_sql(Some(cfg.db_type), None, &table);
-                    let total = match backend
-                        .execute_query(&cfg, &db, &count_sql, Some(1), Some(15))
-                        .await
-                    {
-                        Ok(c) => c
-                            .rows
-                            .first()
-                            .and_then(|row| row.first())
-                            .and_then(|v| match v {
-                                serde_json::Value::Number(n) => n.as_u64(),
-                                serde_json::Value::String(s) => s.parse().ok(),
-                                _ => None,
-                            }),
-                        Err(_) => None,
+                    // COUNT(*) is a full scan on large tables; reuse the session
+                    // cache and only run it when the caller has no cached total.
+                    let total = match known_total {
+                        Some(t) => Some(t),
+                        None => {
+                            let base = build_count_table_sql(Some(cfg.db_type), None, &table);
+                            let count_sql = if filter.is_empty() {
+                                base
+                            } else {
+                                format!("{base} WHERE ({filter})")
+                            };
+                            match backend
+                                .execute_query(&cfg, &db, &count_sql, Some(1), Some(15))
+                                .await
+                            {
+                                Ok(c) => c
+                                    .rows
+                                    .first()
+                                    .and_then(|row| row.first())
+                                    .and_then(|v| match v {
+                                        serde_json::Value::Number(n) => n.as_u64(),
+                                        serde_json::Value::String(s) => s.parse().ok(),
+                                        _ => None,
+                                    }),
+                                Err(_) => None,
+                            }
+                        }
                     };
                     OpResult::TableData {
                         grid: Box::new(grid),
@@ -523,11 +653,19 @@ async fn run_op(backend: &LocalBackend, op: Op) -> OpResult {
                         has_next,
                         page,
                         table,
+                        table_type,
+                        filter,
+                        order_by,
+                        gen,
                     }
                 }
                 Err(e) => OpResult::Error(format!("table data: {e}")),
             }
         }
+        Op::TableColumns(cfg, db, table) => match backend.get_columns(&cfg, &db, "", &table).await {
+            Ok(columns) => OpResult::TableColumns { table, columns },
+            Err(e) => OpResult::Error(format!("table columns: {e}")),
+        },
         Op::Query(cfg, db, sql) => {
             let statements = dbx_core::sql::split_sql_statements_for_database(&sql, cfg.db_type);
             if statements.len() > 1 {
@@ -612,6 +750,10 @@ async fn run_op(backend: &LocalBackend, op: Op) -> OpResult {
                 Err(_) => OpResult::History(Vec::new()),
             }
         }
+        Op::DatabasesRefresh(cfg) => match backend.list_databases(&cfg).await {
+            Ok(dbs) => OpResult::DatabasesRefresh(dbs),
+            Err(e) => OpResult::Error(format!("databases: {e}")),
+        },
         Op::AddConn(cfg) => match backend.add_connection_for_mcp(*cfg).await {
             Ok(saved) => OpResult::Added(format!(
                 "已保存: {} ({})",
@@ -722,10 +864,27 @@ struct App {
     vis_cols: usize,   // columns currently visible (set while rendering)
     freeze_first: bool, // pin the first data column (row-number gutter is always pinned)
     cell_popup: Option<CellPopup>,
+    row_popup: Option<RowPopup>,
+
+    // WHERE filter prompt (modal text input)
+    filter_prompt: Option<TextArea<'static>>,
+
+    // help overlay
+    help_open: bool,
+    help_scroll: u16,
+
+    // column metadata for the table currently open in the data browser
+    table_meta: Option<TableMeta>,
+    // session cache of COUNT(*) totals, keyed by db/table/filter
+    count_cache: HashMap<String, u64>,
 
     // pagination hand-off between key handling and the async page load
     pending_sel: Option<usize>,
+    // focus to apply when the next page arrives (None = do not steal focus)
+    pending_focus: Option<Focus>,
     page_pending: bool,
+    // monotonically increasing id of the latest table-data request
+    page_gen: u64,
 
     // database switcher overlay
     db_picker_open: bool,
@@ -904,8 +1063,16 @@ async fn run_app(mut terminal: ratatui::DefaultTerminal, backend: Arc<LocalBacke
         vis_cols: 0,
         freeze_first: true,
         cell_popup: None,
+        row_popup: None,
+        filter_prompt: None,
+        help_open: false,
+        help_scroll: 0,
+        table_meta: None,
+        count_cache: HashMap::new(),
         pending_sel: None,
+        pending_focus: None,
         page_pending: false,
+        page_gen: 0,
         db_picker_open: false,
         db_list: ListState::default(),
         pending_table: None,
@@ -984,7 +1151,11 @@ fn apply_op_result(app: &mut App, res: OpResult, tx: &Tx) {
             app.col_offset = 0;
             app.col_cursor = 0;
             app.cell_popup = None;
+            app.row_popup = None;
+            app.filter_prompt = None;
+            app.table_meta = None;
             app.pending_sel = None;
+            app.pending_focus = None;
             app.page_pending = false;
             app.set_placeholder();
             // auto-load tables for the selected database
@@ -1013,6 +1184,8 @@ fn apply_op_result(app: &mut App, res: OpResult, tx: &Tx) {
             app.table_list.select(if n == 0 { None } else { Some(sel) });
             app.columns.clear();
             app.ddl = None;
+            // The browsed table's column metadata may belong to another database.
+            app.table_meta = None;
             app.status = format!("{n} 个表/视图 · Enter 数据 · r 结构 · Tab 编辑SQL");
         }
         OpResult::Columns { table, columns: cols } => {
@@ -1047,17 +1220,33 @@ fn apply_op_result(app: &mut App, res: OpResult, tx: &Tx) {
             has_next,
             page,
             table,
+            table_type,
+            filter,
+            order_by,
+            gen,
         } => {
+            // Discard any reply that is not for the latest request: a slow page
+            // load must not clobber a newer filter / sort / table view.
+            if gen != app.page_gen {
+                return;
+            }
             app.page_pending = false;
             let rows = grid.rows.len();
+            if let Some(t) = total {
+                app.count_cache
+                    .insert(count_cache_key(&app.current_db(), &table, &filter), t);
+            }
             app.grid = Some(*grid);
             app.grid_kind = GridKind::TableData;
             app.page_state = Some(PageState {
                 table: table.clone(),
+                table_type,
                 page,
                 page_size: PAGE_SIZE,
                 total,
                 has_next,
+                filter,
+                order_by,
             });
             app.script = None;
             app.ddl = None;
@@ -1071,23 +1260,47 @@ fn apply_op_result(app: &mut App, res: OpResult, tx: &Tx) {
                 .map(|s| s.min(rows.saturating_sub(1)))
                 .unwrap_or(0);
             app.cell_popup = None;
+            app.row_popup = None;
             // Keep the horizontal window across pages; only clamp the cell cursor.
             let ncols = app.grid.as_ref().map(|g| g.columns.len()).unwrap_or(0);
             app.col_cursor = app.col_cursor.min(ncols.saturating_sub(1));
             app.col_offset = app.col_offset.min(ncols.saturating_sub(1));
-            app.focus = Focus::Preview;
+            // Do not steal focus on a background page load: only move it when the
+            // request asked for it (opening a table from the sidebar) and the user
+            // has not already moved focus somewhere else.
+            if let Some(f) = app.pending_focus.take() {
+                if app.focus == Focus::Sidebar {
+                    app.focus = f;
+                }
+            }
             let total_txt = total
                 .map(|t| format!("共 {t} 行"))
                 .unwrap_or_else(|| "总数未知".into());
+            let ps = app.page_state.as_ref().unwrap();
+            let extra = page_state_extra(ps);
             app.status = format!(
-                "{}.{} · 第 {} 页 · {} 行 · {total_txt}",
+                "{}.{} · 第 {} 页 · {} 行 · {total_txt}{extra}",
                 app.current_db(),
                 table,
                 page + 1,
                 rows
             );
         }
+        OpResult::TableColumns { table, columns } => {
+            // Only keep metadata that belongs to the table on screen.
+            let active = app.page_state.as_ref().map(|p| p.table.as_str()) == Some(table.as_str())
+                || app.selected_table().map(|t| t.name.as_str()) == Some(table.as_str());
+            if active {
+                app.table_meta = Some(TableMeta { table, columns });
+            }
+        }
         OpResult::Query(r) => {
+            // A statement that returned no columns is a write/DDL, and one that
+            // reports affected rows (e.g. `INSERT … RETURNING`) changed data too:
+            // any cached COUNT(*) may be stale now.
+            if r.columns.is_empty() || r.affected_rows > 0 {
+                app.count_cache.clear();
+            }
             let note = note_of(&r);
             let grid = Grid::from_query(r.columns.clone(), &r.rows, note.clone());
             app.status = format!("{} · {} · {}", app.selected_name(), grid.rows.len(), note);
@@ -1104,6 +1317,7 @@ fn apply_op_result(app: &mut App, res: OpResult, tx: &Tx) {
             app.focus = Focus::Preview;
         }
         OpResult::Script(outcomes) => {
+            app.count_cache.clear();
             let n = outcomes.len();
             let errors = outcomes.iter().filter(|o| o.error.is_some()).count();
             let affected: u64 = outcomes.iter().map(|o| o.affected).sum();
@@ -1145,6 +1359,24 @@ fn apply_op_result(app: &mut App, res: OpResult, tx: &Tx) {
             }
             app.history_idx = None;
         }
+        OpResult::DatabasesRefresh(dbs) => {
+            if dbs.is_empty() {
+                app.status = "未发现数据库".into();
+                return;
+            }
+            let current = app.current_db();
+            app.databases = dbs;
+            if let Some(i) = app.databases.iter().position(|d| d == &current) {
+                app.db_index = i;
+            }
+            app.db_index = app.db_index.min(app.databases.len().saturating_sub(1));
+            if app.db_picker_open {
+                let n = db_entries(app).len();
+                let cur = db_current_index(app).min(n.saturating_sub(1));
+                app.db_list.select(if n == 0 { None } else { Some(cur) });
+            }
+            app.status = format!("已刷新 {} 个数据库", app.databases.len());
+        }
         OpResult::Added(msg) => {
             app.status = format!("✓ {msg}");
             app.page = Page::Browse;
@@ -1158,6 +1390,7 @@ fn apply_op_result(app: &mut App, res: OpResult, tx: &Tx) {
         OpResult::Error(e) => {
             app.page_pending = false;
             app.pending_sel = None;
+            app.pending_focus = None;
             app.status = format!("✗ {e}");
         }
     }
@@ -1167,6 +1400,24 @@ fn trim_output(v: &mut Vec<String>) {
     while v.len() > 400 {
         v.remove(0);
     }
+}
+
+/// Session cache key for a COUNT(*) total. Sorting does not affect the count, so
+/// it is intentionally not part of the key; the WHERE filter is.
+fn count_cache_key(db: &str, table: &str, filter: &str) -> String {
+    format!("{db}\u{1}{table}\u{1}{filter}")
+}
+
+/// Human-readable `· 过滤: … · 排序: …` suffix for the status line and grid title.
+fn page_state_extra(ps: &PageState) -> String {
+    let mut s = String::new();
+    if !ps.filter.trim().is_empty() {
+        s.push_str(&format!(" · 过滤: {}", truncate_disp(&one_line(&ps.filter), 48)));
+    }
+    if let Some(o) = ps.order_by.as_deref().filter(|o| !o.trim().is_empty()) {
+        s.push_str(&format!(" · 排序: {}", truncate_disp(o, 32)));
+    }
+    s
 }
 
 fn columns_grid(cols: &[ColumnInfo]) -> Grid {
@@ -1185,7 +1436,7 @@ fn columns_grid(cols: &[ColumnInfo]) -> Grid {
                 ""
             };
             vec![
-                Val::Text(c.name.clone()),
+                Val::Text(fix_double_encoding(&c.name)),
                 Val::Text(c.data_type.clone()),
                 Val::Text(key.to_string()),
                 Val::Text(if c.is_nullable { "Y" } else { "N" }.to_string()),
@@ -1252,6 +1503,9 @@ fn key(app: &mut App, tx: &Tx, k: KeyEvent) {
         app.col_offset = 0;
         app.col_cursor = 0;
         app.cell_popup = None;
+        app.row_popup = None;
+        app.filter_prompt = None;
+        app.help_open = false;
         app.db_picker_open = false;
         app.set_placeholder();
         return;
@@ -1280,15 +1534,35 @@ fn confirm_key(app: &mut App, tx: &Tx, k: KeyEvent) {
 }
 
 fn browse_key(app: &mut App, tx: &Tx, k: KeyEvent) {
-    // Cell detail popup swallows input while open.
+    // Overlays are modal, most-specific first. Esc always closes the current one.
+    if app.help_open {
+        help_key(app, k);
+        return;
+    }
+    if app.filter_prompt.is_some() {
+        filter_prompt_key(app, tx, k);
+        return;
+    }
+    if app.row_popup.is_some() {
+        popup_key(app, k, PopupTarget::Row);
+        return;
+    }
     if app.cell_popup.is_some() {
-        popup_key(app, k);
+        popup_key(app, k, PopupTarget::Cell);
         return;
     }
 
     // Database switcher overlay (`d`) is modal.
     if app.db_picker_open {
         db_picker_key(app, tx, k);
+        return;
+    }
+
+    // Help works from anywhere except the text inputs (where `?` is a character).
+    if k.code == KeyCode::Char('?')
+        && !matches!(app.focus, Focus::Editor | Focus::CmdInput)
+    {
+        open_help(app);
         return;
     }
 
@@ -1358,6 +1632,15 @@ fn db_picker_key(app: &mut App, tx: &Tx, k: KeyEvent) {
         }
         KeyCode::Char('d') if k.modifiers.is_empty() => {
             app.db_picker_open = false;
+        }
+        KeyCode::Char('r') if k.modifiers.is_empty() => {
+            // Refresh the list in place, keeping the overlay open.
+            if app.backend_kind == Backend::Redis {
+                app.status = "Redis 固定 16 个逻辑库".into();
+            } else if let Some(cfg) = app.selected.clone() {
+                app.status = "刷新数据库列表…".into();
+                spawn_op(&app.backend, tx, Op::DatabasesRefresh(Box::new(cfg)));
+            }
         }
         KeyCode::Up | KeyCode::Char('k') => {
             if n > 0 {
@@ -1545,29 +1828,51 @@ fn open_table_data(app: &mut App, tx: &Tx) {
     app.col_offset = 0;
     app.col_cursor = 0;
     app.cell_popup = None;
+    app.row_popup = None;
     app.sel = 0;
     app.pending_sel = Some(0);
+    app.pending_focus = Some(Focus::Preview);
     app.page_pending = true;
+    app.table_meta = None;
     app.page_state = Some(PageState {
         table: table.0.clone(),
+        table_type: Some(table.1.clone()),
         page: 0,
         page_size: PAGE_SIZE,
         total: None,
         has_next: false,
+        filter: String::new(),
+        order_by: None,
     });
     app.loading = true;
     app.status = format!("加载 {}.{} 数据…", app.current_db(), table.0);
+    // Column metadata powers the `e`/`i` templates (primary-key detection).
     spawn_op(
         &app.backend,
         tx,
-        Op::TableData(
-            Box::new(cfg),
-            app.current_db(),
-            table.0,
-            Some(table.1),
-            0,
-            PAGE_SIZE,
-        ),
+        Op::TableColumns(Box::new(cfg.clone()), app.current_db(), table.0.clone()),
+    );
+    let known = app
+        .count_cache
+        .get(&count_cache_key(&app.current_db(), &table.0, ""))
+        .copied();
+    app.page_gen += 1;
+    let gen = app.page_gen;
+    spawn_op(
+        &app.backend,
+        tx,
+        Op::TableData(Box::new(TableDataReq {
+            cfg: Box::new(cfg),
+            db: app.current_db(),
+            table: table.0,
+            table_type: Some(table.1),
+            page: 0,
+            page_size: PAGE_SIZE,
+            filter: String::new(),
+            order_by: None,
+            known_total: known,
+            gen,
+        })),
     );
 }
 
@@ -1584,28 +1889,78 @@ fn goto_page(app: &mut App, tx: &Tx, page: usize, pending_sel: Option<usize>) ->
     let Some(cfg) = app.selected.clone() else {
         return false;
     };
-    let table_type = app
-        .tables
-        .iter()
-        .find(|t| t.name == ps.table)
-        .map(|t| t.table_type.clone());
     app.page_pending = true;
     app.pending_sel = pending_sel;
     app.loading = true;
     app.status = format!("加载 {} 第 {} 页…", ps.table, page + 1);
+    let known = app
+        .count_cache
+        .get(&count_cache_key(&app.current_db(), &ps.table, &ps.filter))
+        .copied();
+    app.page_gen += 1;
+    let gen = app.page_gen;
     spawn_op(
         &app.backend,
         tx,
-        Op::TableData(
-            Box::new(cfg),
-            app.current_db(),
-            ps.table.clone(),
-            table_type,
+        Op::TableData(Box::new(TableDataReq {
+            cfg: Box::new(cfg),
+            db: app.current_db(),
+            table: ps.table.clone(),
+            table_type: ps.table_type.clone(),
             page,
-            ps.page_size,
-        ),
+            page_size: ps.page_size,
+            filter: ps.filter.clone(),
+            order_by: ps.order_by.clone(),
+            known_total: known,
+            gen,
+        })),
     );
     true
+}
+
+/// Re-run the current table view from page 0 with a new filter / sort. The
+/// focus is intentionally left where it is (background refresh).
+fn reload_table_view(app: &mut App, tx: &Tx, filter: String, order_by: Option<String>, page: usize) {
+    let Some(ps) = app.page_state.clone() else {
+        return;
+    };
+    let Some(cfg) = app.selected.clone() else {
+        return;
+    };
+    app.page_state = Some(PageState {
+        page,
+        total: None,
+        has_next: false,
+        filter: filter.clone(),
+        order_by: order_by.clone(),
+        ..ps.clone()
+    });
+    app.page_pending = true;
+    app.pending_sel = Some(0);
+    app.loading = true;
+    app.status = format!("加载 {} 第 {} 页…", ps.table, page + 1);
+    let known = app
+        .count_cache
+        .get(&count_cache_key(&app.current_db(), &ps.table, &filter))
+        .copied();
+    app.page_gen += 1;
+    let gen = app.page_gen;
+    spawn_op(
+        &app.backend,
+        tx,
+        Op::TableData(Box::new(TableDataReq {
+            cfg: Box::new(cfg),
+            db: app.current_db(),
+            table: ps.table,
+            table_type: ps.table_type,
+            page,
+            page_size: ps.page_size,
+            filter,
+            order_by,
+            known_total: known,
+            gen,
+        })),
+    );
 }
 
 /// Rows the results pane can show at once (header + borders excluded).
@@ -1755,7 +2110,11 @@ fn reload_tables(app: &mut App, tx: &Tx) {
         app.col_offset = 0;
         app.col_cursor = 0;
         app.cell_popup = None;
+        app.row_popup = None;
+        app.filter_prompt = None;
+        app.table_meta = None;
         app.pending_sel = None;
+        app.pending_focus = None;
         app.page_pending = false;
         app.loading = true;
         let db = app.current_db();
@@ -1832,8 +2191,9 @@ fn visible_cols(grid: &Grid, off: usize, avail: usize, max_cell: usize) -> usize
 
 /// Move the focused cell one column left/right. The visible window follows the
 /// cursor, which is what makes horizontal browsing feel like scrolling a table.
+/// Works for table data, query results and drilled script results alike.
 fn move_col_cursor(app: &mut App, delta: i32) {
-    let Some(grid) = app.grid.as_ref() else {
+    let Some(grid) = active_grid(app) else {
         return;
     };
     let n = grid.columns.len();
@@ -1842,6 +2202,24 @@ fn move_col_cursor(app: &mut App, delta: i32) {
     }
     let next = (app.col_cursor as i32 + delta).clamp(0, n as i32 - 1);
     app.col_cursor = next as usize;
+}
+
+/// The grid the cell cursor currently operates on: a drilled script result
+/// takes precedence over the top-level grid (which is empty while a script is
+/// shown).
+fn active_grid(app: &App) -> Option<Grid> {
+    if let Some(s) = &app.script {
+        if let Some(i) = s.drilled {
+            return s.outcomes.get(i).map(|o| o.grid.clone());
+        }
+    }
+    app.grid.clone()
+}
+
+/// True when the results pane is showing a browsable table (not a query result,
+/// structure list or script).
+fn in_table_data_view(app: &App) -> bool {
+    app.script.is_none() && app.grid_kind == GridKind::TableData && app.page_state.is_some()
 }
 
 /// Absolute row number (1-based) of the cursor across all pages.
@@ -2189,7 +2567,7 @@ fn sidebar_db_label(app: &App) -> String {
     if app.backend_kind == Backend::Redis {
         format!("redis db {} · d 切换", app.redis_db)
     } else {
-        format!("{} · d 切换", app.current_db())
+        format!("{} · d 切换", fix_double_encoding(&app.current_db()))
     }
 }
 
@@ -2280,7 +2658,10 @@ fn preview_key(app: &mut App, tx: &Tx, k: KeyEvent) {
             app.show_first_grid();
             app.focus = Focus::Sidebar;
         }
-        KeyCode::Char('e') | KeyCode::Char('E') => app.focus = Focus::Editor,
+        KeyCode::Char('e') => edit_cell(app),
+        KeyCode::Char('E') => app.focus = Focus::Editor,
+        KeyCode::Char('i') => quick_insert(app),
+        KeyCode::Char('o') => open_row_popup(app),
         KeyCode::Char('t') | KeyCode::Char('T') => {
             if app.ddl.is_some() {
                 app.struct_view = match app.struct_view {
@@ -2290,12 +2671,17 @@ fn preview_key(app: &mut App, tx: &Tx, k: KeyEvent) {
                 app.ddl_scroll = 0;
             }
         }
-        KeyCode::Char('f') if k.modifiers.is_empty() => {
+        KeyCode::Char('s') => sort_column(app, tx),
+        // `f` filters; Shift-F clears. Freeze-first-column moves to `z`.
+        KeyCode::Char('F') => clear_filter(app, tx),
+        KeyCode::Char('f') if k.modifiers.contains(KeyModifiers::SHIFT) => clear_filter(app, tx),
+        KeyCode::Char('f') => open_filter_prompt(app),
+        KeyCode::Char('z') => {
             app.freeze_first = !app.freeze_first;
             app.status = if app.freeze_first {
-                "首列已钉住 · f 取消".into()
+                "首列已钉住 · z 取消".into()
             } else {
-                "首列已取消钉住 · f 钉住".into()
+                "首列已取消钉住 · z 钉住".into()
             };
         }
         KeyCode::Up | KeyCode::Char('k') => {
@@ -2365,21 +2751,91 @@ fn preview_key(app: &mut App, tx: &Tx, k: KeyEvent) {
     }
 }
 
-fn popup_key(app: &mut App, k: KeyEvent) {
-    match k.code {
-        KeyCode::Esc | KeyCode::Char('q') | KeyCode::Enter => {
-            app.cell_popup = None;
-            return;
+#[derive(Clone, Copy)]
+enum PopupTarget {
+    Cell,
+    Row,
+}
+
+/// Shared key handling for the scrollable text popups (cell value / row detail).
+/// Esc (and q / Enter) close the current popup.
+fn popup_key(app: &mut App, k: KeyEvent, target: PopupTarget) {
+    if matches!(k.code, KeyCode::Esc | KeyCode::Char('q') | KeyCode::Enter) {
+        match target {
+            PopupTarget::Cell => app.cell_popup = None,
+            PopupTarget::Row => app.row_popup = None,
         }
+        return;
+    }
+    let delta: i32 = match k.code {
+        KeyCode::Up | KeyCode::Char('k') => -1,
+        KeyCode::Down | KeyCode::Char('j') => 1,
+        KeyCode::PageUp => -5,
+        KeyCode::PageDown => 5,
+        _ => 0,
+    };
+    if delta == 0 {
+        return;
+    }
+    match target {
+        PopupTarget::Cell => {
+            if let Some(p) = &mut app.cell_popup {
+                p.scroll = (p.scroll as i32 + delta).max(0) as u16;
+            }
+        }
+        PopupTarget::Row => {
+            if let Some(p) = &mut app.row_popup {
+                p.scroll = (p.scroll as i32 + delta).max(0) as u16;
+            }
+        }
+    }
+}
+
+fn open_help(app: &mut App) {
+    app.help_open = true;
+    app.help_scroll = 0;
+}
+
+fn help_key(app: &mut App, k: KeyEvent) {
+    match k.code {
+        KeyCode::Esc | KeyCode::Char('q') | KeyCode::Char('?') => app.help_open = false,
+        KeyCode::Up | KeyCode::Char('k') => {
+            app.help_scroll = app.help_scroll.saturating_sub(1)
+        }
+        KeyCode::Down | KeyCode::Char('j') => {
+            app.help_scroll = app.help_scroll.saturating_add(1)
+        }
+        KeyCode::PageUp => app.help_scroll = app.help_scroll.saturating_sub(8),
+        KeyCode::PageDown => app.help_scroll = app.help_scroll.saturating_add(8),
         _ => {}
     }
-    if let Some(popup) = &mut app.cell_popup {
-        match k.code {
-            KeyCode::Up | KeyCode::Char('k') => popup.scroll = popup.scroll.saturating_sub(1),
-            KeyCode::Down | KeyCode::Char('j') => popup.scroll = popup.scroll.saturating_add(1),
-            KeyCode::PageUp => popup.scroll = popup.scroll.saturating_sub(5),
-            KeyCode::PageDown => popup.scroll = popup.scroll.saturating_add(5),
-            _ => {}
+}
+
+fn filter_prompt_key(app: &mut App, tx: &Tx, k: KeyEvent) {
+    match k.code {
+        KeyCode::Enter => {
+            let filter = app
+                .filter_prompt
+                .as_ref()
+                .map(|t| t.lines().join(" ").trim().to_string())
+                .unwrap_or_default();
+            app.filter_prompt = None;
+            let order_by = app.page_state.as_ref().and_then(|p| p.order_by.clone());
+            if filter.is_empty() {
+                app.status = "过滤已清除".into();
+            } else {
+                app.status = format!("过滤: {filter}");
+            }
+            reload_table_view(app, tx, filter, order_by, 0);
+        }
+        KeyCode::Esc => {
+            app.filter_prompt = None;
+            app.status = "已取消过滤".into();
+        }
+        _ => {
+            if let Some(t) = &mut app.filter_prompt {
+                t.input(k);
+            }
         }
     }
 }
@@ -2394,7 +2850,7 @@ fn cursor_abs_row(app: &App) -> usize {
 
 /// Show the focused cell's full value in a modal (truncated cells stay readable).
 fn open_cell_popup(app: &mut App) {
-    let Some(grid) = app.grid.as_ref() else {
+    let Some(grid) = active_grid(app) else {
         return;
     };
     let Some(row) = grid.rows.get(app.sel) else {
@@ -2409,7 +2865,8 @@ fn open_cell_popup(app: &mut App) {
         Val::Text(s) => s.clone(),
     };
     let title = format!(
-        "{col} · 第 {} 行 · {} 字符",
+        "{} · 第 {} 行 · {} 字符",
+        fix_double_encoding(&col),
         cursor_abs_row(app),
         content.chars().count()
     );
@@ -2418,6 +2875,300 @@ fn open_cell_popup(app: &mut App) {
         content,
         scroll: 0,
     });
+}
+
+/// Open the focused row as a vertical `column = value` list.
+fn open_row_popup(app: &mut App) {
+    let Some(grid) = active_grid(app) else {
+        return;
+    };
+    let Some(row) = grid.rows.get(app.sel) else {
+        return;
+    };
+    let mut content = String::new();
+    for (ci, col) in grid.columns.iter().enumerate() {
+        let shown = match row.get(ci) {
+            Some(Val::Null) | None => "NULL".to_string(),
+            Some(Val::Text(s)) if s.is_empty() => "''".to_string(),
+            Some(Val::Text(s)) => s.clone(),
+        };
+        content.push_str(&fix_double_encoding(col));
+        content.push_str(" = ");
+        content.push_str(&shown);
+        content.push('\n');
+    }
+    let title = format!("第 {} 行 · {} 列", cursor_abs_row(app), grid.columns.len());
+    app.row_popup = Some(RowPopup {
+        title,
+        content,
+        scroll: 0,
+    });
+}
+
+// ── edit / insert templates ──
+
+/// Escape a value as a standard SQL string literal (quote doubled, backslash
+/// escaped). Fine for MySQL's default mode and standard SQL alike.
+fn sql_literal(s: &str) -> String {
+    format!("'{}'", s.replace('\\', "\\\\").replace('\'', "''"))
+}
+
+fn is_numeric_type(t: &str) -> bool {
+    let lower = t.trim().to_ascii_lowercase();
+    let base = lower.split(['(', ' ']).next().unwrap_or("");
+    matches!(
+        base,
+        "int" | "integer"
+            | "bigint"
+            | "smallint"
+            | "tinyint"
+            | "mediumint"
+            | "int2"
+            | "int4"
+            | "int8"
+            | "serial"
+            | "bigserial"
+            | "decimal"
+            | "numeric"
+            | "float"
+            | "float4"
+            | "float8"
+            | "double"
+            | "real"
+            | "number"
+            | "money"
+            | "unsigned"
+    )
+}
+
+/// Column type from the browsed table's metadata, when available.
+fn column_type(app: &App, table: &str, col: &str) -> Option<String> {
+    let meta = app.table_meta.as_ref()?;
+    if meta.table != table {
+        return None;
+    }
+    meta.columns
+        .iter()
+        .find(|c| c.name == col)
+        .map(|c| c.data_type.clone())
+}
+
+/// Render a cell value as a SQL literal, keeping numeric columns unquoted when
+/// the value really is a number.
+fn val_literal(v: &Val, data_type: Option<&str>) -> String {
+    match v {
+        Val::Null => "NULL".to_string(),
+        Val::Text(s) if s.is_empty() => "''".to_string(),
+        Val::Text(s) => {
+            if data_type.map(is_numeric_type).unwrap_or(false) && s.parse::<f64>().is_ok() {
+                s.clone()
+            } else if s.eq_ignore_ascii_case("true") || s.eq_ignore_ascii_case("false") {
+                s.to_ascii_uppercase()
+            } else {
+                sql_literal(s)
+            }
+        }
+    }
+}
+
+/// `e` — generate an `UPDATE` for the focused cell, prefilled into the editor.
+/// The statement is never run directly; it goes through the normal run path
+/// (including the dangerous-statement confirmation).
+fn edit_cell(app: &mut App) {
+    if !in_table_data_view(app) {
+        app.focus = Focus::Editor;
+        return;
+    }
+    let Some(grid) = active_grid(app) else {
+        return;
+    };
+    let Some(ps) = app.page_state.clone() else {
+        return;
+    };
+    let Some(cfg) = app.selected.clone() else {
+        return;
+    };
+    let Some(row) = grid.rows.get(app.sel).cloned() else {
+        return;
+    };
+    let Some(col) = grid.columns.get(app.col_cursor).cloned() else {
+        return;
+    };
+    let Some(val) = row.get(app.col_cursor).cloned() else {
+        return;
+    };
+
+    // Primary keys drive the WHERE clause; fall back to every column (with a
+    // warning) when the table has none or its metadata is not loaded yet.
+    let (keys, no_pk) = match app.table_meta.as_ref().filter(|m| m.table == ps.table) {
+        Some(meta) => {
+            let pks: Vec<String> = meta
+                .columns
+                .iter()
+                .filter(|c| c.is_primary_key)
+                .map(|c| c.name.clone())
+                .collect();
+            if pks.is_empty() {
+                (grid.columns.clone(), true)
+            } else {
+                (pks, false)
+            }
+        }
+        None => (grid.columns.clone(), true),
+    };
+
+    let q = |name: &str| quote_table_identifier(Some(cfg.db_type), name);
+    let set_val = val_literal(&val, column_type(app, &ps.table, &col).as_deref());
+    let mut conds: Vec<String> = Vec::new();
+    for k in &keys {
+        let Some(ci) = grid.columns.iter().position(|c| c == k) else {
+            continue;
+        };
+        let Some(v) = row.get(ci) else {
+            continue;
+        };
+        conds.push(format!(
+            "{} = {}",
+            q(k),
+            val_literal(v, column_type(app, &ps.table, k).as_deref())
+        ));
+    }
+    let where_clause = if conds.is_empty() {
+        "1 = 1".to_string()
+    } else {
+        conds.join(" AND ")
+    };
+    let mut sql = String::new();
+    if no_pk {
+        sql.push_str("-- ⚠ 未检测到主键：WHERE 用全部列匹配，请确认条件唯一\n");
+    }
+    sql.push_str(&format!(
+        "UPDATE {}\nSET {} = {}\nWHERE {};",
+        q(&ps.table),
+        q(&col),
+        set_val,
+        where_clause
+    ));
+    app.set_editor_text(&sql);
+    app.focus = Focus::Editor;
+    app.status = if no_pk {
+        "已生成 UPDATE（无主键 → 全部列匹配，请先核对）· Ctrl-J 执行".into()
+    } else {
+        format!("已生成 UPDATE（主键 {}）· Ctrl-J 执行", keys.join(", "))
+    };
+}
+
+/// `i` — prefill an `INSERT` template built from the table's column list.
+fn quick_insert(app: &mut App) {
+    if !in_table_data_view(app) {
+        app.status = "仅表格浏览支持快速插入".into();
+        return;
+    }
+    let Some(ps) = app.page_state.clone() else {
+        return;
+    };
+    let Some(cfg) = app.selected.clone() else {
+        return;
+    };
+    let Some(meta) = app.table_meta.as_ref().filter(|m| m.table == ps.table).cloned() else {
+        app.status = "表结构尚未加载，稍后重试".into();
+        return;
+    };
+    let cols: Vec<&ColumnInfo> = meta
+        .columns
+        .iter()
+        .filter(|c| {
+            !c.extra
+                .as_deref()
+                .map(|e| e.to_ascii_lowercase().contains("auto_increment"))
+                .unwrap_or(false)
+        })
+        .collect();
+    if cols.is_empty() {
+        app.status = "没有可插入的列".into();
+        return;
+    }
+    let q = |name: &str| quote_table_identifier(Some(cfg.db_type), name);
+    let col_list = cols.iter().map(|c| q(&c.name)).collect::<Vec<_>>().join(", ");
+    let vals = cols
+        .iter()
+        .map(|c| {
+            if is_numeric_type(&c.data_type) {
+                "0".to_string()
+            } else if c.is_nullable {
+                "NULL".to_string()
+            } else {
+                "''".to_string()
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(", ");
+    let sql = format!("INSERT INTO {} ({})\nVALUES ({});", q(&ps.table), col_list, vals);
+    app.set_editor_text(&sql);
+    app.focus = Focus::Editor;
+    app.status = "已生成 INSERT 模板 · 填写值后 Ctrl-J 执行".into();
+}
+
+// ── filter / sort ──
+
+fn open_filter_prompt(app: &mut App) {
+    if !in_table_data_view(app) {
+        app.status = "仅表格浏览支持过滤".into();
+        return;
+    }
+    let Some(ps) = app.page_state.clone() else {
+        return;
+    };
+    let mut ta = TextArea::from(ps.filter.split('\n').collect::<Vec<_>>());
+    ta.set_placeholder_text("例: city = 'Beijing'（留空回车 = 清除）");
+    ta.move_cursor(CursorMove::End);
+    app.filter_prompt = Some(ta);
+}
+
+/// Shift-F — drop the active filter and reload the first page.
+fn clear_filter(app: &mut App, tx: &Tx) {
+    let has_filter = app
+        .page_state
+        .as_ref()
+        .map(|p| !p.filter.trim().is_empty())
+        .unwrap_or(false);
+    if !has_filter {
+        app.status = "当前无过滤条件".into();
+        return;
+    }
+    let order_by = app.page_state.as_ref().and_then(|p| p.order_by.clone());
+    reload_table_view(app, tx, String::new(), order_by, 0);
+    app.status = "过滤已清除".into();
+}
+
+/// `s` — sort by the focused column, toggling ASC ↔ DESC.
+fn sort_column(app: &mut App, tx: &Tx) {
+    if !in_table_data_view(app) {
+        app.status = "仅表格浏览支持排序".into();
+        return;
+    }
+    let Some(grid) = active_grid(app) else {
+        return;
+    };
+    let Some(ps) = app.page_state.clone() else {
+        return;
+    };
+    let Some(cfg) = app.selected.clone() else {
+        return;
+    };
+    let Some(col) = grid.columns.get(app.col_cursor).cloned() else {
+        return;
+    };
+    let q = quote_table_identifier(Some(cfg.db_type), &col);
+    let asc = format!("{q} ASC");
+    let desc = format!("{q} DESC");
+    let (next, dir) = match ps.order_by.as_deref() {
+        Some(o) if o == asc => (Some(desc), "降序"),
+        Some(o) if o == desc => (Some(asc), "升序"),
+        _ => (Some(asc), "升序"),
+    };
+    reload_table_view(app, tx, ps.filter.clone(), next, 0);
+    app.status = format!("按 {col} {dir}");
 }
 
 fn drill_script(app: &mut App, idx: usize) {
@@ -2723,7 +3474,16 @@ fn ui(f: &mut Frame, app: &mut App) {
         render_confirm(f, f.area(), &confirm);
     }
     if let Some(popup) = app.cell_popup.clone() {
-        render_cell_popup(f, f.area(), &popup);
+        render_text_popup(f, f.area(), &popup.title, &popup.content, popup.scroll);
+    }
+    if let Some(popup) = app.row_popup.clone() {
+        render_text_popup(f, f.area(), &popup.title, &popup.content, popup.scroll);
+    }
+    if app.filter_prompt.is_some() {
+        render_filter_prompt(f, f.area(), app);
+    }
+    if app.help_open {
+        render_help(f, f.area(), app);
     }
 }
 
@@ -2753,7 +3513,7 @@ fn render_header(f: &mut Frame, area: Rect, app: &App) {
         .map(|c| format!("{} ({})", c.name, c.db_type.as_str()))
         .unwrap_or_else(|| "未连接".into());
     let db = if app.selected.is_some() && !app.current_db().is_empty() {
-        format!(" · db:{}", app.current_db())
+        format!(" · db:{}", fix_double_encoding(&app.current_db()))
     } else {
         String::new()
     };
@@ -2858,10 +3618,16 @@ fn render_status(f: &mut Frame, area: Rect, app: &App) {
 }
 
 fn render_footer(f: &mut Frame, area: Rect, app: &App) {
-    let text: String = if app.cell_popup.is_some() {
+    let text: String = if app.help_open {
+        "快捷键速查 · ↑↓ 滚动 · Esc 关闭".into()
+    } else if app.filter_prompt.is_some() {
+        "WHERE 过滤 · Enter 应用 · Esc 取消 · 留空回车清除".into()
+    } else if app.row_popup.is_some() {
+        "行详情 · ↑↓ 滚动 · Esc/Enter 关闭".into()
+    } else if app.cell_popup.is_some() {
         "单元格 · ↑↓ 滚动 · Esc/Enter 关闭".into()
     } else if app.db_picker_open {
-        "↑↓ 选择数据库 · Enter 切换 · Esc 关闭".into()
+        "↑↓ 选择数据库 · Enter 切换 · r 刷新 · Esc 关闭".into()
     } else if app.confirm.is_some() {
         "⚠ 危险操作 · Enter/y 执行 · Esc/n 取消".into()
     } else if app.layout_mode == LayoutMode::Narrow {
@@ -2871,10 +3637,12 @@ fn render_footer(f: &mut Frame, area: Rect, app: &App) {
                 Focus::Sidebar if app.selected.is_none() => {
                     "↑↓ 连接 · Enter 选 · c 新建 · q 隐藏".into()
                 }
-                Focus::Sidebar => "↑↓ 表 · d 切库 · Enter 数据 · r 结构".into(),
+                Focus::Sidebar => "↑↓ 表 · d 切库 · Enter 数据 · r 结构 · ? 帮助".into(),
                 Focus::Editor => "Ctrl-J 运行 · ↑ 历史 · Tab 下一区".into(),
                 Focus::CmdInput => "Enter 执行 · Ctrl-L 换模式".into(),
-                Focus::Preview => "↑↓ 滚/翻页 · ←→ 列 · Enter 单元格 · Esc 返回".into(),
+                Focus::Preview => {
+                    "↑↓ 行 · ←→ 列 · Enter 单元格 · e 编辑 · f 过滤 · ? 帮助".into()
+                }
             },
         }
     } else {
@@ -2885,14 +3653,14 @@ fn render_footer(f: &mut Frame, area: Rect, app: &App) {
                     "↑↓ 选择连接 · Enter 连接 · c 新建连接 · q 显隐列表 · Tab 直接写SQL".into()
                 }
                 Focus::Sidebar => {
-                    "↑↓ 表 · d/←→ 切库 · Enter 浏览数据 · r 表结构 · Tab SQL · o 换连接".into()
+                    "↑↓ 表 · d/←→ 切库 · Enter 浏览数据 · r 表结构 · Tab SQL · o 换连接 · ? 帮助".into()
                 }
                 Focus::Editor => "Ctrl-J/F5 运行 · Enter 换行 · ↑/↓ 历史 · Tab 下一区 · Esc 侧栏".into(),
                 Focus::CmdInput => {
                     "Enter 执行 · [ ] 切 redis db · Ctrl-L 切 sql/redis/mongo · Esc 编辑器".into()
                 }
                 Focus::Preview => {
-                    "↑↓ 行(到边自动翻页) · n/p/Ctrl-F 翻页 · ←→/hl 列 · f 钉首列 · Enter 单元格 · t 字段/DDL · Esc 收起".into()
+                    "↑↓ 行(到边翻页) · n/p 翻页 · ←→/hl 列 · Enter 单元格 · o 整行 · e 编辑 · i 插入 · f 过滤 · s 排序 · z 钉首列 · t 字段/DDL · ? 帮助 · Esc 收起".into()
                 }
             },
         }
@@ -3059,21 +3827,22 @@ fn grid_title(app: &App) -> String {
                 .unwrap_or_else(|| "总数未知".into());
             let more = if ps.has_next { " · n 下一页" } else { "" };
             format!(
-                " {}.{} · 第 {} 页 · {}–{} / {} · {}{} ",
-                app.current_db(),
-                ps.table,
+                " {}.{} · 第 {} 页 · {}–{} / {} · {}{}{} ",
+                fix_double_encoding(&app.current_db()),
+                fix_double_encoding(&ps.table),
                 ps.page + 1,
                 if rows == 0 { 0 } else { offset + 1 },
                 offset + rows,
                 total,
                 app.grid.as_ref().map(|g| g.note.clone()).unwrap_or_default(),
-                more
+                more,
+                page_state_extra(ps)
             )
         }
         GridKind::Columns => {
             let table = app
                 .selected_table()
-                .map(|t| t.name.clone())
+                .map(|t| fix_double_encoding(&t.name))
                 .unwrap_or_default();
             format!(
                 " 表结构 · {table} · {} · t 查看 DDL ",
@@ -3168,7 +3937,11 @@ fn render_grid(f: &mut Frame, area: Rect, app: &mut App, grid: &Grid, kind: Grid
     left_widths.extend(widths[..frozen].iter().copied());
     let mut lheader: Vec<Cell> = vec![gutter_header_cell()];
     for (ci, w) in widths.iter().enumerate().take(frozen) {
-        lheader.push(col_header_cell(&grid.columns[ci], *w, ci == cc));
+        lheader.push(col_header_cell(
+            &fix_double_encoding(&grid.columns[ci]),
+            *w,
+            ci == cc,
+        ));
     }
     let mut lrows: Vec<Row> = Vec::new();
     for (i, row) in grid.rows.iter().enumerate().skip(start).take(h) {
@@ -3215,7 +3988,11 @@ fn render_grid(f: &mut Frame, area: Rect, app: &mut App, grid: &Grid, kind: Grid
             };
             let mut rheader: Vec<Cell> = Vec::new();
             for (ci, w) in widths.iter().enumerate().skip(off).take(visible) {
-                rheader.push(col_header_cell(&grid.columns[ci], *w, ci == cc));
+                rheader.push(col_header_cell(
+                    &fix_double_encoding(&grid.columns[ci]),
+                    *w,
+                    ci == cc,
+                ));
             }
             let mut rrows: Vec<Row> = Vec::new();
             for (i, row) in grid.rows.iter().enumerate().skip(start).take(h) {
@@ -3267,7 +4044,8 @@ fn render_columns_grid(
     let cc = app.col_cursor;
     let mut header = vec![gutter_header_cell()];
     header.extend(grid.columns.iter().enumerate().map(|(ci, c)| {
-        col_header_cell(c, disp_width(c), ci == cc)
+        let shown = fix_double_encoding(c);
+        col_header_cell(&shown, disp_width(&shown), ci == cc)
     }));
     let rows: Vec<Row> = grid
         .rows
@@ -3587,7 +4365,7 @@ fn render_sidebar(f: &mut Frame, area: Rect, app: &mut App) {
                 Style::default()
             };
             lines.push(Line::from(Span::styled(
-                format!("{marker}{}{view}", t.name),
+                format!("{marker}{}{view}", fix_double_encoding(&t.name)),
                 style,
             )));
         }
@@ -3784,7 +4562,10 @@ fn render_db_picker(f: &mut Frame, area: Rect, app: &mut App) {
             ListItem::new(Line::from(vec![
                 Span::styled(mark, style),
                 Span::styled(
-                    truncate_disp(name, (box_area.width as usize).saturating_sub(6)),
+                    truncate_disp(
+                        &fix_double_encoding(name),
+                        (box_area.width as usize).saturating_sub(6),
+                    ),
                     style,
                 ),
             ]))
@@ -3810,7 +4591,8 @@ fn render_db_picker(f: &mut Frame, area: Rect, app: &mut App) {
     f.render_stateful_widget(list, box_area, &mut app.db_list);
 }
 
-fn render_cell_popup(f: &mut Frame, area: Rect, popup: &CellPopup) {
+/// Shared scrollable text popup used for both cell values and row details.
+fn render_text_popup(f: &mut Frame, area: Rect, title: &str, content: &str, scroll: u16) {
     let w = {
         let avail = area.width.saturating_sub(4);
         if avail < 24 {
@@ -3820,7 +4602,7 @@ fn render_cell_popup(f: &mut Frame, area: Rect, popup: &CellPopup) {
         }
     };
     let inner_w = w.saturating_sub(4).max(1) as usize;
-    let body = wrap_text(&popup.content, inner_w);
+    let body = wrap_text(content, inner_w);
     let total = body.len();
     let max_h = area.height.saturating_sub(4).max(3);
     let h = ((total as u16) + 2).min(max_h);
@@ -3835,11 +4617,146 @@ fn render_cell_popup(f: &mut Frame, area: Rect, popup: &CellPopup) {
     };
     f.render_widget(Clear, box_area);
     let max_scroll = total.saturating_sub(inner_h).min(u16::MAX as usize) as u16;
-    let scroll = popup.scroll.min(max_scroll);
+    let scroll = scroll.min(max_scroll);
     let lines: Vec<Line> = body.iter().map(|l| Line::from(Span::raw(l.clone()))).collect();
     let title = format!(
-        " {} · {}/{} ",
-        popup.title,
+        " {} · {}/{} · Esc 关闭 ",
+        title,
+        (scroll as usize + inner_h).min(total),
+        total
+    );
+    f.render_widget(
+        Paragraph::new(lines).scroll((scroll, 0)).block(
+            Block::default()
+                .borders(Borders::ALL)
+                .title(title)
+                .border_set(border::THICK)
+                .border_style(Style::default().fg(Color::Cyan)),
+        ),
+        box_area,
+    );
+}
+
+fn render_filter_prompt(f: &mut Frame, area: Rect, app: &mut App) {
+    let w = {
+        let avail = area.width.saturating_sub(4);
+        if avail < 24 {
+            area.width
+        } else {
+            avail.min(70)
+        }
+    };
+    let h = 5.min(area.height);
+    let x = area.x + (area.width.saturating_sub(w)) / 2;
+    let y = area.y + (area.height.saturating_sub(h)) / 2;
+    let box_area = Rect {
+        x,
+        y,
+        width: w,
+        height: h,
+    };
+    f.render_widget(Clear, box_area);
+    if let Some(ta) = app.filter_prompt.as_mut() {
+        let block = Block::default()
+            .borders(Borders::ALL)
+            .title(" WHERE 过滤 · Enter 应用 · Esc 取消 ")
+            .border_set(border::ROUNDED)
+            .border_style(Style::default().fg(Color::Yellow));
+        ta.set_block(block);
+        f.render_widget(&*ta, box_area);
+    }
+}
+
+/// The `?` shortcut cheat-sheet, generated from the same list the README table
+/// mirrors.
+const HELP_ROWS: &[(&str, &str)] = &[
+    ("— 全局 —", ""),
+    ("Ctrl-C", "退出"),
+    ("Ctrl-L", "切换命令模式 SQL → Redis → MongoDB"),
+    ("F5 / Ctrl-J", "执行当前 SQL"),
+    ("Tab", "切换区域 侧栏 → 编辑器 → 结果"),
+    ("?", "本帮助"),
+    ("— 侧栏 —", ""),
+    ("↑ ↓", "移动表列表"),
+    ("Enter", "浏览表数据"),
+    ("r", "表结构（字段 + DDL）"),
+    ("d", "数据库列表（浮层内 r 刷新）"),
+    ("← →", "切换数据库（快捷）"),
+    ("o", "返回连接选择"),
+    ("c", "新建连接"),
+    ("— 结果（表格浏览）—", ""),
+    ("↑ ↓ / j k", "行光标（到边自动翻页）"),
+    ("PgUp / PgDn", "整屏滚动，跨页衔接"),
+    ("n / p", "下一页 / 上一页"),
+    ("Ctrl-F / Ctrl-B", "下一页 / 上一页"),
+    ("← → / h l", "单元格光标（列窗口跟随）"),
+    ("Enter", "查看完整单元格"),
+    ("o", "整行详情（纵向）"),
+    ("e", "编辑当前单元格 → 生成 UPDATE"),
+    ("i", "快速插入 → 生成 INSERT 模板"),
+    ("f", "WHERE 过滤（留空回车清除）"),
+    ("Shift-F", "清除过滤"),
+    ("s", "按当前列升 / 降序"),
+    ("z", "钉住 / 取消首列"),
+    ("t", "字段 ↔ DDL（表结构）"),
+    ("Esc", "收起结果 / 关闭浮层"),
+    ("— 编辑器 / 命令 —", ""),
+    ("↑ ↓", "历史（首行 / 末行）"),
+    ("[ ]", "Redis 逻辑库"),
+    ("use <db>", "MongoDB 切库"),
+    ("— 危险操作确认 —", ""),
+    ("Enter / y", "执行"),
+    ("Esc / n", "取消"),
+];
+
+fn render_help(f: &mut Frame, area: Rect, app: &mut App) {
+    let w = {
+        let avail = area.width.saturating_sub(4);
+        if avail < 30 {
+            area.width
+        } else {
+            avail.min(64)
+        }
+    };
+    let max_h = area.height.saturating_sub(2).max(3);
+    let h = (HELP_ROWS.len() as u16 + 2).min(max_h);
+    let inner_h = h.saturating_sub(2) as usize;
+    let x = area.x + (area.width.saturating_sub(w)) / 2;
+    let y = area.y + (area.height.saturating_sub(h)) / 2;
+    let box_area = Rect {
+        x,
+        y,
+        width: w,
+        height: h,
+    };
+    f.render_widget(Clear, box_area);
+    let total = HELP_ROWS.len();
+    let max_scroll = total.saturating_sub(inner_h) as u16;
+    let scroll = app.help_scroll.min(max_scroll);
+    let key_w = 16usize.min(w.saturating_sub(6) as usize);
+    let lines: Vec<Line> = HELP_ROWS
+        .iter()
+        .map(|(k, d)| {
+            if d.is_empty() {
+                Line::from(Span::styled(
+                    *k,
+                    Style::default()
+                        .fg(Color::Cyan)
+                        .add_modifier(Modifier::BOLD),
+                ))
+            } else {
+                Line::from(vec![
+                    Span::styled(
+                        format!("{:<key_w$}", k),
+                        Style::default().fg(Color::Yellow),
+                    ),
+                    Span::raw(*d),
+                ])
+            }
+        })
+        .collect();
+    let title = format!(
+        " 快捷键 · {}/{} · ↑↓ 滚动 · Esc 关闭 ",
         (scroll as usize + inner_h).min(total),
         total
     );
@@ -4114,5 +5031,100 @@ mod tests {
         };
         // avail 0 still shows one column
         assert_eq!(window_for_cursor(&grid, 0, 0, 0, 44, 0), (0, 1));
+    }
+
+    #[test]
+    fn sql_literal_escapes_quotes_and_backslashes() {
+        assert_eq!(sql_literal("O'Brien"), "'O''Brien'");
+        assert_eq!(sql_literal("a\\b"), "'a\\\\b'");
+        assert_eq!(sql_literal("plain"), "'plain'");
+    }
+
+    #[test]
+    fn numeric_type_detection_ignores_length_params() {
+        assert!(is_numeric_type("int"));
+        assert!(is_numeric_type("BIGINT(20) UNSIGNED"));
+        assert!(is_numeric_type("decimal(10, 2)"));
+        assert!(is_numeric_type("double precision"));
+        assert!(!is_numeric_type("varchar(50)"));
+        assert!(!is_numeric_type("text"));
+        assert!(!is_numeric_type("date"));
+        assert!(!is_numeric_type("json"));
+    }
+
+    #[test]
+    fn value_literal_types_numbers_but_quotes_text() {
+        // NULL and empty string stay distinct
+        assert_eq!(val_literal(&Val::Null, Some("int")), "NULL");
+        assert_eq!(val_literal(&Val::Text(String::new()), Some("int")), "''");
+        // numeric column + numeric value → unquoted
+        assert_eq!(val_literal(&Val::Text("42".into()), Some("int")), "42");
+        // same value in a text column → quoted
+        assert_eq!(val_literal(&Val::Text("42".into()), Some("varchar(10)")), "'42'");
+        // a non-numeric value in a numeric column must still be quoted
+        assert_eq!(val_literal(&Val::Text("n/a".into()), Some("int")), "'n/a'");
+        assert_eq!(
+            val_literal(&Val::Text("true".into()), Some("bool")),
+            "TRUE"
+        );
+    }
+
+    #[test]
+    fn count_cache_key_depends_on_filter_not_sort() {
+        assert_eq!(count_cache_key("db", "t", ""), count_cache_key("db", "t", ""));
+        assert_ne!(
+            count_cache_key("db", "t", "a = 1"),
+            count_cache_key("db", "t", "a = 2")
+        );
+        assert_ne!(count_cache_key("db1", "t", ""), count_cache_key("db2", "t", ""));
+    }
+
+    #[test]
+    fn page_state_extra_reports_filter_and_sort() {
+        let ps = PageState {
+            table: "t".into(),
+            table_type: None,
+            page: 0,
+            page_size: 50,
+            total: None,
+            has_next: false,
+            filter: "city = 'Beijing'".into(),
+            order_by: Some("`id` DESC".into()),
+        };
+        let extra = page_state_extra(&ps);
+        assert!(extra.contains("过滤: city = 'Beijing'"));
+        assert!(extra.contains("排序: `id` DESC"));
+    }
+
+    #[test]
+    fn page_state_extra_is_empty_without_filter_or_sort() {
+        let ps = PageState {
+            table: "t".into(),
+            table_type: None,
+            page: 0,
+            page_size: 50,
+            total: None,
+            has_next: false,
+            filter: String::new(),
+            order_by: None,
+        };
+        assert!(page_state_extra(&ps).is_empty());
+    }
+
+    #[test]
+    fn double_encoding_is_reversed_for_display() {
+        // "保留表" written through a CP1252 connection: the stored string is the
+        // mojibake below (U+009D for byte 0x9D).
+        let mojibake = "\u{e4}\u{bf}\u{9d}\u{e7}\u{2022}\u{2122}\u{e8}\u{a1}\u{a8}";
+        assert_eq!(fix_double_encoding(mojibake), "保留表");
+    }
+
+    #[test]
+    fn double_encoding_leaves_clean_names_alone() {
+        // Correctly stored CJK contains chars > U+00FF and must pass through.
+        assert_eq!(fix_double_encoding("保留表"), "保留表");
+        assert_eq!(fix_double_encoding("users"), "users");
+        // A Latin-1 name whose bytes are not valid UTF-8 is left untouched.
+        assert_eq!(fix_double_encoding("café"), "café");
     }
 }
