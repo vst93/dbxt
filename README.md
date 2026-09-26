@@ -113,6 +113,7 @@ DBX_DATA_DIR=/path/to/dir dbxt
 | Global | `F5` / `Ctrl-J` | run current SQL |
 | Connection picker | `↑` `↓` / `Enter` | select / connect |
 | Connection picker | `c` | new connection form |
+| Connection picker | `p` | duplicate the highlighted connection into the form |
 | Sidebar (connected) | `↑` `↓` | move in table list |
 | Sidebar | `←` `→` | cycle database (shortcut) |
 | Sidebar | `d` | open the database list (SQL / MongoDB / Redis) |
@@ -124,6 +125,9 @@ DBX_DATA_DIR=/path/to/dir dbxt
 | Anywhere | `Alt-1` / `Alt-2` / `Alt-3` | focus sidebar / editor / results |
 | Anywhere | `Ctrl-A` | toggle auto-collapse (on = unfocused panes collapse, off = all expanded) |
 | Anywhere | `Ctrl-W` | collapse / expand the focused pane |
+| Anywhere | `Ctrl-G` | toggle pan mode — vertical wheel / up-down swipe pans columns (touch fallback) |
+| Anywhere | `Ctrl-O` | saved SQL snippets (DBX's `saved_sql_files`), insert into the editor |
+| Anywhere | `Ctrl-P` | `EXPLAIN` the editor's SQL (SQL backends) |
 | Anywhere | `Ctrl-S` / `Ctrl-X` | commit / discard the queued transactional batch |
 | Editor | `Enter` | new line |
 | Editor | `↑` / `↓` | history (on the first / last line) |
@@ -135,6 +139,12 @@ DBX_DATA_DIR=/path/to/dir dbxt
 | Results | `n` / `p` | next / previous data page, keeping the relative row |
 | Results | `Ctrl-F` / `Ctrl-B` | next / previous data page |
 | Results | `←` `→` `h` `l` | move the cell cursor (the column window follows) |
+| Results | `Shift`/`Alt`+wheel, horizontal wheel | pan columns |
+| Results | `Ctrl-G` | pan mode: the vertical wheel pans columns instead of rows |
+| Results | `◀` `▶` on the bottom bar | tap to pan one window of columns (touch-friendly) |
+| Results | `[` / `]` | previous / next result tab (successive queries) |
+| Results | `Ctrl-Y` | export the focused result to CSV under `$HOME` |
+| Results | `Ctrl-N` | load more rows when the result was truncated at the cap |
 | Results | `Ctrl-E` | focus the SQL editor |
 | Results | `Enter` | open the focused cell in a popup / open a statement's result (script view) |
 | Results | `o` | open the whole focused row as a vertical list |
@@ -156,6 +166,7 @@ DBX_DATA_DIR=/path/to/dir dbxt
 | Edit layer (UPDATE) | `Enter` / `Esc` / `Ctrl-V` / `Ctrl-T` | execute / cancel / hand to editor / queue for batch |
 | Edit layer (INSERT) | `Enter` / `Esc` / `Ctrl-V` / `Ctrl-T` | execute / cancel / hand to editor / queue for batch |
 | Database list | `↑` `↓` / `Enter` / `r` / `Esc` | select / switch / reload / close |
+| SQL snippets (`Ctrl-O`) | `↑` `↓` / `Enter` / `r` / `Esc` | select / insert into editor / reload / close |
 | Help | `↑` `↓` `PgUp` `PgDn` / `Esc` `?` | scroll / close |
 | Confirmation | `Enter` `y` / `Esc` `n` | execute / cancel (full SQL shown) |
 
@@ -166,9 +177,19 @@ Touch taps in terminals are delivered as mouse-down events, so this works on tou
 - Click a row to select; click the same row again to confirm (connect, browse data)
 - Click a cell to move the cell cursor there; click a statement row in a script to drill in
 - Click a table in the sidebar to select it, click again to browse its data; click the database row to open the database list
-- Click the bottom progress bar to jump the column window; click a collapsed pane strip to expand and focus it
+- Click the bottom progress bar to jump the column window; click the `◀` / `▶` at either end to pan one window of columns; click a collapsed pane strip to expand and focus it
 - Click an area (editor, command input, results) to focus it
-- Wheel scrolls rows (and auto-flips the page at an edge); `Shift`+wheel scrolls columns; the horizontal wheel — what a touch screen sends for a left/right swipe — scrolls columns directly too
+- Wheel scrolls rows (and auto-flips the page at an edge); `Shift`+wheel and `Alt`+wheel scroll columns; the horizontal wheel — what a touch screen sends for a left/right swipe — scrolls columns directly too
+
+**Horizontal scrolling on a phone.** Touch terminals disagree about what a left/right swipe means. dbxt accepts every encoding it has seen, and gives you two fallbacks that need no horizontal wheel at all:
+
+- a horizontal wheel (`ScrollLeft` / `ScrollRight`) pans the columns **whatever pane has focus**, so a swipe works even after you tapped the sidebar or the editor;
+- `Shift`+wheel and `Alt`+wheel pan the columns;
+- `Ctrl-G` turns on **pan mode**, after which the plain vertical wheel (the one gesture every terminal reports) pans columns instead of rows — the state shows as `横滚 开` in the status bar;
+- the `◀` / `▶` buttons on the bottom bar pan a whole window per tap (taps are the one gesture that is always delivered), and the bar itself is clickable to jump;
+- `←` / `→` (or `h` / `l`) move the cell cursor and drag the column window with it.
+
+If a swipe still does nothing, run dbxt with `DBXT_EVENT_TRACE=/tmp/dbxt-events.log` (or `=1`): every **mouse and resize** event is appended to that file and the last one is echoed in the status bar, so you can see exactly what your terminal sends. Keystrokes are never traced, so a password typed into the connection form cannot leak into the log.
 
 ### Interaction notes
 
@@ -186,6 +207,8 @@ Touch taps in terminals are delivered as mouse-down events, so this works on tou
 
 **Database switching.** `d` opens a list of databases and `Enter` switches — one gesture for MySQL/PostgreSQL schemas, MongoDB databases and Redis logical DBs, instead of a blind `←`/`→` cycle that is invisible on a narrow screen. `r` reloads the list in place (a database created elsewhere in the session shows up without reconnecting). The list is an overlay rather than an always-expanded sidebar tree because the sidebar collapses to a one-line strip on narrow layouts; an overlay works the same at every size and scales to many databases. The current database is still shown permanently in the sidebar (and clicking it opens the same list), while `←`/`→` and Redis `[`/`]` remain as shortcuts.
 
+**Result tabs, EXPLAIN, export and snippets (DBX parity).** Every SQL run keeps its result as a tab, so consecutive `SELECT`s no longer overwrite each other — `[` / `]` flip between them and the title shows `结果 2/3`. `Ctrl-P` wraps the editor's SQL in the dialect's `EXPLAIN` (`EXPLAIN QUERY PLAN` on SQLite, `EXPLAIN` on MySQL/PostgreSQL/DuckDB/…) and shows the plan as a normal grid. `Ctrl-Y` writes the focused result to a CSV file under `$HOME` (`dbxt-export-<table|query>-<epoch>.csv`, RFC 4180 quoting, NULL as an empty field) and reports the path. A result that hit the 500-row cap says `已截断`; `Ctrl-N` re-runs the same statement with a larger cap (500 → 1000 → …, up to 20 000) and replaces the tab in place. `Ctrl-O` lists the SQL snippets DBX saved for this connection (`saved_sql_files`) and inserts the highlighted one into the editor; `r` reloads the list. Connections are colour-coded by family (mysql / redis / mongo / sqlite …) in the picker and the sidebar, using the connection's own colour when it has one, and `p` copies a connection into the form (new id on save; the copy does not carry SSH transport layers).
+
 ## Known issues
 
 - **Double-encoded CJK identifiers.** If a table/database/column was originally created through a MySQL connection with the wrong charset (latin1/CP1252), MySQL stores each byte of the UTF-8 name as a separate CP1252 character. DBX's kernel already reverses this for cell values and table comments, but not for identifiers; dbxt applies the same reversal when *rendering* table, database and column names, so such a table shows as `保留表` in the sidebar. The raw (garbled) name is still what is sent to the server, which is why it appears verbatim in a generated `UPDATE`/`INSERT` statement. Names created correctly (as UTF-8) are shown and round-trip unchanged. Server-side `WHERE` filters match the *stored* bytes, so for double-encoded data you must filter on the stored value, not the repaired display.
@@ -194,8 +217,8 @@ Touch taps in terminals are delivered as mouse-down events, so this works on tou
 
 ## Roadmap
 
-- [ ] In-TUI connection editing / deletion
-- [ ] Result export (CSV / JSON)
+- [ ] In-TUI connection editing / deletion (duplication is in via `p`)
+- [ ] Result export to JSON / XLSX (CSV is in via `Ctrl-Y`)
 - [ ] Persist dbxt-run SQL back into DBX's shared query history (it is read today)
 - [ ] Schema-aware SQL editing / autocomplete
 - [ ] Release builds for Windows, macOS (Intel/Apple Silicon), Linux (glibc + musl), Android Termux (aarch64 musl, static)

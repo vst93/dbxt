@@ -3,6 +3,7 @@
 #![recursion_limit = "512"]
 
 use std::collections::HashMap;
+use std::io::Write;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
@@ -41,8 +42,12 @@ type Tx = tokio::sync::mpsc::UnboundedSender<OpResult>;
 
 /// Rows fetched per table-data page (one extra row is fetched to detect a next page).
 const PAGE_SIZE: usize = 50;
-/// Hard cap on rows returned for an arbitrary SQL statement.
+/// Rows fetched for an arbitrary SQL statement on the first run.
 const QUERY_MAX_ROWS: usize = 500;
+/// How many extra rows each `Ctrl-N` "load more" step pulls.
+const QUERY_MORE_STEP: usize = 500;
+/// Hard ceiling for `Ctrl-N`; past this the user should refine the query.
+const QUERY_MAX_ROWS_CAP: usize = 20_000;
 
 // ─── pages & focus ───────────────────────────────────────────────────────────
 
@@ -255,6 +260,20 @@ struct ScriptView {
     outcomes: Vec<StmtOutcome>,
     sel: usize,
     drilled: Option<usize>,
+}
+
+/// One saved query result the user can flip back to with `[` / `]` (DBX keeps
+/// a result tab per run; this is the TUI equivalent for query results).
+#[derive(Clone)]
+struct ResultTab {
+    /// Short label (the first line of the SQL, trimmed).
+    title: String,
+    grid: Option<Grid>,
+    script: Option<ScriptView>,
+    kind: GridKind,
+    sel: usize,
+    col_offset: usize,
+    col_cursor: usize,
 }
 
 #[derive(Clone)]
@@ -569,10 +588,11 @@ enum Op {
     Ddl(Box<ConnectionConfig>, String, String),
     TableData(Box<TableDataReq>),
     TableColumns(Box<ConnectionConfig>, String, String),
-    Query(Box<ConnectionConfig>, String, String),
+    Query(Box<ConnectionConfig>, String, String, usize),
     Redis(Box<ConnectionConfig>, u32, String),
     Mongo(Box<ConnectionConfig>, String, String),
     History(Box<ConnectionConfig>),
+    Snippets(Box<ConnectionConfig>),
     DatabasesRefresh(Box<ConnectionConfig>),
     AddConn(Box<ConnectionConfig>),
 }
@@ -604,11 +624,12 @@ enum OpResult {
         table: String,
         columns: Vec<ColumnInfo>,
     },
-    Query(Box<dbx_core::db::QueryResult>),
+    Query(Box<dbx_core::db::QueryResult>, String, usize),
     Script(Vec<StmtOutcome>),
     Redis(String),
     Mongo(String),
     History(Vec<String>),
+    Snippets(Vec<(String, String)>),
     DatabasesRefresh(Vec<String>),
     Added(String),
     Error(String),
@@ -785,11 +806,12 @@ async fn run_op(backend: &LocalBackend, op: Op) -> OpResult {
             Ok(columns) => OpResult::TableColumns { table, columns },
             Err(e) => OpResult::Error(format!("table columns: {e}")),
         },
-        Op::Query(cfg, db, sql) => {
+        Op::Query(cfg, db, sql, cap) => {
+            let cap = cap.max(1);
             let statements = dbx_core::sql::split_sql_statements_for_database(&sql, cfg.db_type);
             if statements.len() > 1 {
                 let options = QueryExecutionOptions {
-                    max_rows: Some(QUERY_MAX_ROWS),
+                    max_rows: Some(cap),
                     timeout_secs: Some(60),
                     ..Default::default()
                 };
@@ -809,10 +831,10 @@ async fn run_op(backend: &LocalBackend, op: Op) -> OpResult {
                 }
             } else {
                 match backend
-                    .execute_query(&cfg, &db, &sql, Some(QUERY_MAX_ROWS), Some(60))
+                    .execute_query(&cfg, &db, &sql, Some(cap), Some(60))
                     .await
                 {
-                    Ok(r) => OpResult::Query(Box::new(r)),
+                    Ok(r) => OpResult::Query(Box::new(r), sql, cap),
                     Err(e) => OpResult::Error(format!("query: {e}")),
                 }
             }
@@ -869,6 +891,34 @@ async fn run_op(backend: &LocalBackend, op: Op) -> OpResult {
                 Err(_) => OpResult::History(Vec::new()),
             }
         }
+        Op::Snippets(cfg) => match backend.state().storage.load_saved_sql_library().await {
+            Ok(lib) => {
+                let folder_name = |id: &Option<String>| -> Option<String> {
+                    let id = id.as_deref()?;
+                    lib.folders
+                        .iter()
+                        .find(|f| f.id == id)
+                        .map(|f| f.name.clone())
+                };
+                let mut items: Vec<(String, String)> = lib
+                    .files
+                    .into_iter()
+                    // Only this connection's snippets, plus unscoped ones, so the
+                    // overlay never mixes another database's SQL.
+                    .filter(|f| f.connection_id.is_empty() || f.connection_id == cfg.id)
+                    .map(|f| {
+                        let label = match folder_name(&f.folder_id) {
+                            Some(folder) if !folder.is_empty() => format!("{folder}/{}", f.name),
+                            _ => f.name.clone(),
+                        };
+                        (label, f.sql)
+                    })
+                    .collect();
+                items.sort_by_key(|a| a.0.to_lowercase());
+                OpResult::Snippets(items)
+            }
+            Err(e) => OpResult::Error(format!("snippets: {e}")),
+        },
         Op::DatabasesRefresh(cfg) => match backend.list_databases(&cfg).await {
             Ok(dbs) => OpResult::DatabasesRefresh(dbs),
             Err(e) => OpResult::Error(format!("databases: {e}")),
@@ -945,6 +995,9 @@ struct Rects {
     /// Clickable horizontal scrollbar track (bottom border of the result grid).
     hbar: Rect,
     hbar_visible: bool,
+    /// Tap targets for the `◀` / `▶` pan buttons drawn at either end of the bar.
+    hbar_prev: Rect,
+    hbar_next: Rect,
 }
 
 /// Panes that can be collapsed in the responsive layout.
@@ -1013,6 +1066,27 @@ struct App {
     // help overlay
     help_open: bool,
     help_scroll: u16,
+
+    // touch / terminal fallbacks
+    //   pan_mode: vertical wheel pans columns instead of rows (for phone terminals
+    //   that never emit a horizontal wheel for a left/right swipe).
+    pan_mode: bool,
+    //   When `DBXT_EVENT_TRACE` is set, mouse/resize events are appended here so a
+    //   user can report exactly what their terminal sends. Keystrokes are never
+    //   traced (a password field would leak).
+    trace_path: Option<PathBuf>,
+    last_event: Option<String>,
+
+    // successive query results, switchable with `[` / `]`
+    result_tabs: Vec<ResultTab>,
+    result_tab: usize,
+    // the last query that hit the row cap, for `Ctrl-N` "load more"
+    query_more: Option<(String, usize)>,
+
+    // saved-SQL snippet overlay (DBX's `saved_sql_files`)
+    snippet_open: bool,
+    snippet_list: ListState,
+    snippets: Vec<(String, String)>,
 
     // column metadata for the table currently open in the data browser
     table_meta: Option<TableMeta>,
@@ -1173,6 +1247,19 @@ async fn run_app(mut terminal: ratatui::DefaultTerminal, backend: Arc<LocalBacke
     let mut ticker = tokio::time::interval(Duration::from_millis(180));
     ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
 
+    // `DBXT_EVENT_TRACE=<path>` (or `=1` for the default path) records mouse and
+    // resize events so a user can tell us exactly what their phone terminal sends.
+    let trace_path = std::env::var_os("DBXT_EVENT_TRACE")
+        .filter(|v| !v.is_empty())
+        .map(|v| {
+            let s = v.to_string_lossy().to_string();
+            if s == "1" {
+                PathBuf::from("/tmp/dbxt-events.log")
+            } else {
+                PathBuf::from(s)
+            }
+        });
+
     let mut app = App {
         backend: backend.clone(),
         page: Page::Browse,
@@ -1214,6 +1301,15 @@ async fn run_app(mut terminal: ratatui::DefaultTerminal, backend: Arc<LocalBacke
         auto_collapse: false,
         help_open: false,
         help_scroll: 0,
+        pan_mode: false,
+        trace_path,
+        last_event: None,
+        result_tabs: Vec::new(),
+        result_tab: 0,
+        query_more: None,
+        snippet_open: false,
+        snippet_list: ListState::default(),
+        snippets: Vec::new(),
         table_meta: None,
         count_cache: HashMap::new(),
         pending_sel: None,
@@ -1444,7 +1540,7 @@ fn apply_op_result(app: &mut App, res: OpResult, tx: &Tx) {
                 app.table_meta = Some(TableMeta { table, columns });
             }
         }
-        OpResult::Query(r) => {
+        OpResult::Query(r, sql, cap) => {
             // A statement that returned no columns is a write/DDL, and one that
             // reports affected rows (e.g. `INSERT … RETURNING`) changed data too:
             // any cached COUNT(*) may be stale now.
@@ -1473,19 +1569,24 @@ fn apply_op_result(app: &mut App, res: OpResult, tx: &Tx) {
             }
             app.pending_write = false;
             let note = note_of(&r);
+            let truncated = r.truncated;
             let grid = Grid::from_query(r.columns.clone(), &r.rows, note.clone());
             app.status = format!("{} · {} · {}", app.selected_name(), grid.rows.len(), note);
-            app.grid = Some(grid);
-            app.grid_kind = GridKind::Query;
-            app.page_state = None;
-            app.script = None;
+            // Keep every query result as a tab so consecutive SELECTs can be flipped
+            // with `[` / `]` instead of overwriting each other. A `Ctrl-N` "load more"
+            // (a cap above the default) replaces the active tab instead of spawning
+            // one per step.
+            let title = query_tab_title(&sql);
+            if cap > QUERY_MAX_ROWS {
+                replace_result_tab(app, title, Some(grid), None, GridKind::Query);
+            } else {
+                push_result_tab(app, title, Some(grid), None, GridKind::Query);
+            }
             app.ddl = None;
             app.struct_view = StructView::Fields;
-            app.sel = 0;
-            app.col_offset = 0;
-            app.col_cursor = 0;
-            app.cell_popup = None;
             app.focus = Focus::Preview;
+            // A truncated result can be extended with Ctrl-N.
+            app.query_more = if truncated { Some((sql, cap)) } else { None };
         }
         OpResult::Script(outcomes) => {
             app.count_cache.clear();
@@ -1494,19 +1595,15 @@ fn apply_op_result(app: &mut App, res: OpResult, tx: &Tx) {
             let affected: u64 = outcomes.iter().map(|o| o.affected).sum();
             let was_batch = app.pending_write;
             app.pending_write = false;
-            app.script = Some(ScriptView {
+            app.query_more = None;
+            let script = ScriptView {
                 outcomes,
                 sel: 0,
                 drilled: None,
-            });
-            app.grid = None;
-            app.page_state = None;
+            };
+            push_result_tab(app, format!("脚本 {n} 条"), None, Some(script), GridKind::Query);
             app.ddl = None;
             app.struct_view = StructView::Fields;
-            app.sel = 0;
-            app.col_offset = 0;
-            app.col_cursor = 0;
-            app.cell_popup = None;
             app.focus = Focus::Preview;
             if was_batch {
                 app.status = if errors == 0 {
@@ -1540,6 +1637,18 @@ fn apply_op_result(app: &mut App, res: OpResult, tx: &Tx) {
                 app.history = merged;
             }
             app.history_idx = None;
+        }
+        OpResult::Snippets(items) => {
+            let n = items.len();
+            app.snippets = items;
+            app.snippet_open = true;
+            app.snippet_list
+                .select(if n == 0 { None } else { Some(0) });
+            app.status = if n == 0 {
+                "没有保存的 SQL 片段（可在 DBX 桌面端保存后复用）".into()
+            } else {
+                format!("{n} 个 SQL 片段 · Enter 插入编辑器 · r 刷新 · Esc 关闭")
+            };
         }
         OpResult::DatabasesRefresh(dbs) => {
             if dbs.is_empty() {
@@ -1642,6 +1751,7 @@ fn columns_grid(cols: &[ColumnInfo]) -> Grid {
 // ─── input handling ──────────────────────────────────────────────────────────
 
 fn handle_event(app: &mut App, tx: &Tx, ev: Event) {
+    trace_event(app, &ev);
     match ev {
         Event::Key(k) if k.kind == KeyEventKind::Press => key(app, tx, k),
         Event::Paste(s) => match app.focus {
@@ -1750,6 +1860,12 @@ fn browse_key(app: &mut App, tx: &Tx, k: KeyEvent) {
         return;
     }
 
+    // Saved-SQL snippet overlay (Ctrl-O) is modal.
+    if app.snippet_open {
+        snippet_key(app, tx, k);
+        return;
+    }
+
     // Database switcher overlay (`d`) is modal.
     if app.db_picker_open {
         db_picker_key(app, tx, k);
@@ -1769,6 +1885,28 @@ fn browse_key(app: &mut App, tx: &Tx, k: KeyEvent) {
         || k.code == KeyCode::F(5)
     {
         run_current(app, tx);
+        return;
+    }
+
+    // Ctrl-O: DBX's saved SQL snippets, insertable into the editor. Allowed from
+    // the editor too (that is where the snippet lands).
+    if k.modifiers.contains(KeyModifiers::CONTROL)
+        && !k.modifiers.contains(KeyModifiers::ALT)
+        && k.code == KeyCode::Char('o')
+        && app.selected.is_some()
+    {
+        open_snippets(app, tx);
+        return;
+    }
+
+    // Ctrl-P: run the editor's SQL through the dialect's EXPLAIN.
+    if k.modifiers.contains(KeyModifiers::CONTROL)
+        && !k.modifiers.contains(KeyModifiers::ALT)
+        && k.code == KeyCode::Char('p')
+        && app.selected.is_some()
+        && app.backend_kind == Backend::Sql
+    {
+        explain_current(app, tx);
         return;
     }
 
@@ -1846,6 +1984,18 @@ fn browse_key(app: &mut App, tx: &Tx, k: KeyEvent) {
             }
             KeyCode::Char('w') => {
                 toggle_pane_collapse(app);
+                return;
+            }
+            // Ctrl-G: fallback for phone terminals that never send a horizontal
+            // wheel — the vertical wheel (the one gesture every terminal has)
+            // pans columns instead of rows.
+            KeyCode::Char('g') => {
+                app.pan_mode = !app.pan_mode;
+                app.status = if app.pan_mode {
+                    "横滚 开 · 滚轮横滚列".into()
+                } else {
+                    "横滚 关 · 滚轮纵向".into()
+                };
                 return;
             }
             _ => {}
@@ -1973,6 +2123,8 @@ fn sidebar_key(app: &mut App, tx: &Tx, k: KeyEvent) {
                 app.page = Page::NewConn;
                 app.form = ConnForm::default();
             }
+            // Duplicate the highlighted connection into the form.
+            KeyCode::Char('p') => duplicate_connection(app),
             KeyCode::Char('q') => {
                 app.picker_open = !app.picker_open;
             }
@@ -2016,6 +2168,8 @@ fn sidebar_key(app: &mut App, tx: &Tx, k: KeyEvent) {
             app.page = Page::NewConn;
             app.form = ConnForm::default();
         }
+        // Duplicate the current connection into the form (new id on save).
+        KeyCode::Char('p') => duplicate_connection(app),
         KeyCode::Char('o') => {
             // back to connection picker
             app.selected = None;
@@ -2643,9 +2797,61 @@ fn scroll(app: &mut App, tx: &Tx, delta: i32) {
 
 fn mouse(app: &mut App, tx: &Tx, m: MouseEvent) {
     let r = app.rects;
+    // Overlays own the wheel while they are open; scrolling the grid underneath a
+    // modal would be invisible and confusing.
+    match m.kind {
+        MouseEventKind::ScrollUp | MouseEventKind::ScrollDown => {
+            let up = m.kind == MouseEventKind::ScrollUp;
+            if let Some(p) = app.cell_popup.as_mut() {
+                p.scroll = if up {
+                    p.scroll.saturating_sub(1)
+                } else {
+                    p.scroll.saturating_add(1)
+                };
+                return;
+            }
+            if let Some(p) = app.row_popup.as_mut() {
+                p.scroll = if up {
+                    p.scroll.saturating_sub(1)
+                } else {
+                    p.scroll.saturating_add(1)
+                };
+                return;
+            }
+            if app.help_open {
+                app.help_scroll = if up {
+                    app.help_scroll.saturating_sub(1)
+                } else {
+                    app.help_scroll.saturating_add(1)
+                };
+                return;
+            }
+            if app.confirm.is_some()
+                || app.edit_dialog.is_some()
+                || app.filter_prompt.is_some()
+                || app.db_picker_open
+                || app.snippet_open
+            {
+                return;
+            }
+        }
+        MouseEventKind::ScrollLeft | MouseEventKind::ScrollRight
+            if app.confirm.is_some()
+                || app.edit_dialog.is_some()
+                || app.cell_popup.is_some()
+                || app.row_popup.is_some()
+                || app.filter_prompt.is_some()
+                || app.db_picker_open
+                || app.snippet_open
+                || app.help_open =>
+        {
+            return;
+        }
+        _ => {}
+    }
     match m.kind {
         MouseEventKind::Down(MouseButton::Left) => {
-            if app.confirm.is_some() || app.edit_dialog.is_some() {
+            if app.confirm.is_some() || app.edit_dialog.is_some() || app.snippet_open {
                 return;
             }
             if app.cell_popup.is_some() {
@@ -2714,21 +2920,29 @@ fn mouse(app: &mut App, tx: &Tx, m: MouseEvent) {
             }
         }
         MouseEventKind::ScrollUp => {
-            if m.modifiers.contains(KeyModifiers::SHIFT) && app.focus == Focus::Preview {
+            if wheel_pans_columns(app, &m) {
                 move_col_cursor(app, -1);
             } else {
                 scroll(app, tx, -1);
             }
         }
         MouseEventKind::ScrollDown => {
-            if m.modifiers.contains(KeyModifiers::SHIFT) && app.focus == Focus::Preview {
+            if wheel_pans_columns(app, &m) {
                 move_col_cursor(app, 1);
             } else {
                 scroll(app, tx, 1);
             }
         }
-        MouseEventKind::ScrollLeft if app.focus == Focus::Preview => move_col_cursor(app, -1),
-        MouseEventKind::ScrollRight if app.focus == Focus::Preview => move_col_cursor(app, 1),
+        // A touch screen's left/right swipe arrives as a horizontal wheel. Pan the
+        // columns regardless of which pane has focus, so a swipe works even after
+        // tapping the sidebar or the editor; when every column already fits the
+        // event is simply ignored.
+        MouseEventKind::ScrollLeft => {
+            pan_columns(app, -1);
+        }
+        MouseEventKind::ScrollRight => {
+            pan_columns(app, 1);
+        }
         _ => {}
     }
 }
@@ -2807,13 +3021,23 @@ fn result_click(app: &mut App, x: u16, y: u16) {
 /// Clicking the horizontal progress bar jumps the column window to the clicked
 /// position. Returns true when the click was on the bar (and handled).
 fn hbar_click(app: &mut App, x: u16, y: u16) -> bool {
+    if !app.rects.hbar_visible {
+        return false;
+    }
+    // The `◀` / `▶` end buttons pan one window — the touch-friendly control for
+    // phones whose terminal never sends a horizontal wheel.
+    if rect_contains(app.rects.hbar_prev, x, y) {
+        let step = app.vis_cols.max(1) as i32;
+        pan_columns(app, -step);
+        return true;
+    }
+    if rect_contains(app.rects.hbar_next, x, y) {
+        let step = app.vis_cols.max(1) as i32;
+        pan_columns(app, step);
+        return true;
+    }
     let r = app.rects.hbar;
-    if !app.rects.hbar_visible
-        || r.width == 0
-        || y != r.y
-        || x < r.x
-        || x >= r.x + r.width
-    {
+    if r.width == 0 || y != r.y || x < r.x || x >= r.x + r.width {
         return false;
     }
     let Some(grid) = active_grid(app) else {
@@ -2951,6 +3175,10 @@ fn preview_key(app: &mut App, tx: &Tx, k: KeyEvent) {
             KeyCode::Char('k') => sort_column(app, tx, true),
             KeyCode::Char('r') => clear_filter(app, tx),
             KeyCode::Char('d') => delete_row(app),
+            // Ctrl-Y: export the focused grid to CSV; Ctrl-N: load more rows when
+            // the previous query hit the row cap.
+            KeyCode::Char('y') => export_csv(app),
+            KeyCode::Char('n') => load_more_rows(app, tx),
             _ => {}
         }
         return;
@@ -2978,6 +3206,9 @@ fn preview_key(app: &mut App, tx: &Tx, k: KeyEvent) {
         KeyCode::Char('e') => edit_cell(app),
         KeyCode::Char('i') => quick_insert(app),
         KeyCode::Char('o') => open_row_popup(app),
+        // Result tabs: flip between successive query results.
+        KeyCode::Char('[') => switch_result_tab(app, -1),
+        KeyCode::Char(']') => switch_result_tab(app, 1),
         KeyCode::Char('t') => {
             if app.ddl.is_some() {
                 app.struct_view = match app.struct_view {
@@ -3849,7 +4080,32 @@ fn execute_sql(app: &mut App, tx: &Tx, sql: String) {
     app.loading = true;
     app.status = "执行中…".into();
     let db = app.current_db();
-    spawn_op(&app.backend, tx, Op::Query(Box::new(cfg), db, sql));
+    spawn_op(
+        &app.backend,
+        tx,
+        Op::Query(Box::new(cfg), db, sql, QUERY_MAX_ROWS),
+    );
+}
+
+/// `Ctrl-N`: re-run the last query with a larger row cap when it was truncated.
+fn load_more_rows(app: &mut App, tx: &Tx) {
+    let Some((sql, cap)) = app.query_more.clone() else {
+        app.status = "没有可加载的更多结果（结果未截断）".into();
+        return;
+    };
+    if cap >= QUERY_MAX_ROWS_CAP {
+        app.status = format!("已达上限 {QUERY_MAX_ROWS_CAP} 行，请用 WHERE / LIMIT 缩小查询");
+        return;
+    }
+    let Some(cfg) = app.selected.clone() else {
+        app.status = "✗ 未选择连接".into();
+        return;
+    };
+    let next = (cap + QUERY_MORE_STEP).min(QUERY_MAX_ROWS_CAP);
+    app.loading = true;
+    app.status = format!("加载更多… (上限 {next} 行)");
+    let db = app.current_db();
+    spawn_op(&app.backend, tx, Op::Query(Box::new(cfg), db, sql, next));
 }
 
 fn run_cmd_line(app: &mut App, tx: &Tx) {
@@ -4054,6 +4310,435 @@ impl App {
     }
 }
 
+// ─── DBX-parity feature helpers ──────────────────────────────────────────────
+
+/// Parse a `#rrggbb` / `rrggbb` connection colour into a terminal colour.
+fn parse_hex_color(s: &str) -> Option<Color> {
+    let h = s.trim().trim_start_matches('#');
+    if h.len() != 6 || !h.chars().all(|c| c.is_ascii_hexdigit()) {
+        return None;
+    }
+    let r = u8::from_str_radix(&h[0..2], 16).ok()?;
+    let g = u8::from_str_radix(&h[2..4], 16).ok()?;
+    let b = u8::from_str_radix(&h[4..6], 16).ok()?;
+    Some(Color::Rgb(r, g, b))
+}
+
+/// Default colour for a database family, used when a connection has no colour.
+fn db_type_color(db_type: &str) -> Color {
+    match db_type.to_ascii_lowercase().as_str() {
+        "mysql" | "mariadb" | "tidb" | "doris" | "selectdb" | "starrocks" => Color::LightBlue,
+        "postgres" | "postgresql" | "opengauss" | "gaussdb" | "kingbase" | "highgo"
+        | "cockroachdb" | "redshift" | "dm" | "kwdb" => Color::LightCyan,
+        "sqlite" | "libsql" | "turso" => Color::LightYellow,
+        "redis" | "keydb" | "valkey" => Color::LightRed,
+        "mongodb" | "mongo" => Color::LightGreen,
+        "elasticsearch" | "meilisearch" | "opensearch" => Color::LightMagenta,
+        "clickhouse" | "duckdb" | "sqlserver" | "oracle" => Color::Yellow,
+        _ => Color::Gray,
+    }
+}
+
+/// The colour to badge a connection with: its own colour when set, else a family
+/// default so mysql / redis / mongo are visually distinct at a glance.
+fn connection_color(cfg: &ConnectionConfig) -> Color {
+    cfg.color
+        .as_deref()
+        .and_then(parse_hex_color)
+        .unwrap_or_else(|| db_type_color(cfg.db_type.as_str()))
+}
+
+/// Build the EXPLAIN statement for the current dialect. `None` when the engine
+/// has no single-statement EXPLAIN (SQL Server / Oracle need a session toggle).
+fn explain_sql_for(db_type: &str, sql: &str) -> Option<String> {
+    let sql = sql.trim().trim_end_matches(';').trim();
+    if sql.is_empty() {
+        return None;
+    }
+    let prefix = match db_type.to_ascii_lowercase().as_str() {
+        "sqlite" | "libsql" | "turso" => "EXPLAIN QUERY PLAN ",
+        "mysql" | "mariadb" | "tidb" | "doris" | "selectdb" | "starrocks" | "oceanbase"
+        | "tdengine" | "clickhouse" | "duckdb" | "postgres" | "postgresql" | "opengauss"
+        | "gaussdb" | "kingbase" | "highgo" | "cockroachdb" | "redshift" | "dm" | "kwdb" => {
+            "EXPLAIN "
+        }
+        _ => return None,
+    };
+    Some(format!("{prefix}{sql}"))
+}
+
+/// RFC 4180 CSV field: quote when the value contains a comma, quote, CR or LF.
+fn csv_field(s: &str) -> String {
+    if s.contains([',', '"', '\n', '\r']) {
+        format!("\"{}\"", s.replace('"', "\"\""))
+    } else {
+        s.to_string()
+    }
+}
+
+/// Serialise a grid to CSV. NULL becomes an empty field (the same convention
+/// DBX's own CSV export uses).
+fn grid_to_csv(grid: &Grid) -> String {
+    let mut out = String::new();
+    out.push_str(
+        &grid
+            .columns
+            .iter()
+            .map(|c| csv_field(c))
+            .collect::<Vec<_>>()
+            .join(","),
+    );
+    out.push('\n');
+    for row in &grid.rows {
+        let fields: Vec<String> = (0..grid.columns.len())
+            .map(|ci| csv_field(row.get(ci).map(Val::text).unwrap_or("")))
+            .collect();
+        out.push_str(&fields.join(","));
+        out.push('\n');
+    }
+    out
+}
+
+/// True when the active grid has columns hidden to the right, i.e. horizontal
+/// panning would actually change what is on screen.
+fn has_h_scroll(app: &App) -> bool {
+    if app.grid_kind == GridKind::Columns {
+        return false;
+    }
+    let n = active_grid(app).map(|g| g.columns.len()).unwrap_or(0);
+    n > app.grid_frozen + app.vis_cols.max(1)
+}
+
+/// Move the column window by `delta` columns. Returns true when a grid with a
+/// horizontal overflow handled it (so the caller can suppress row scrolling).
+fn pan_columns(app: &mut App, delta: i32) -> bool {
+    if !has_h_scroll(app) {
+        return false;
+    }
+    move_col_cursor(app, delta);
+    true
+}
+
+/// Does this wheel event mean "pan columns" rather than "scroll rows"?
+fn wheel_pans_columns(app: &App, m: &MouseEvent) -> bool {
+    if app.focus != Focus::Preview {
+        return false;
+    }
+    let wants_pan = m.modifiers.contains(KeyModifiers::SHIFT)
+        || m.modifiers.contains(KeyModifiers::ALT)
+        || app.pan_mode;
+    wants_pan && has_h_scroll(app)
+}
+
+/// Human-readable description of the mouse/resize events we trace.
+fn describe_event(ev: &Event) -> Option<String> {
+    match ev {
+        Event::Mouse(m) => {
+            let mods = if m.modifiers.is_empty() {
+                String::new()
+            } else {
+                format!(" mods={:?}", m.modifiers)
+            };
+            Some(format!("Mouse {:?} @({},{}){}", m.kind, m.column, m.row, mods))
+        }
+        Event::Resize(w, h) => Some(format!("Resize {w}x{h}")),
+        _ => None,
+    }
+}
+
+/// Append a mouse/resize event to the trace file and remember it for the status
+/// bar. Only mouse and resize events are traced: never keystrokes, so a password
+/// typed into the connection form can never be written to disk.
+fn trace_event(app: &mut App, ev: &Event) {
+    let Some(desc) = describe_event(ev) else {
+        return;
+    };
+    if let Some(path) = &app.trace_path {
+        if let Ok(mut f) = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(path)
+        {
+            let _ = writeln!(f, "{desc}");
+        }
+    }
+    app.last_event = Some(desc);
+}
+
+/// Short tab label for a query: its first non-empty line.
+fn query_tab_title(sql: &str) -> String {
+    let first = sql.lines().find(|l| !l.trim().is_empty()).unwrap_or("").trim();
+    truncate_disp(first, 40)
+}
+
+impl App {
+    /// Copy the on-screen query result back into its tab before leaving it.
+    fn save_result_tab(&mut self) {
+        let idx = self.result_tab;
+        if self.grid_kind == GridKind::TableData || idx >= self.result_tabs.len() {
+            return;
+        }
+        if let Some(tab) = self.result_tabs.get_mut(idx) {
+            tab.grid = self.grid.clone();
+            tab.script = self.script.clone();
+            tab.kind = self.grid_kind;
+            tab.sel = self.sel;
+            tab.col_offset = self.col_offset;
+            tab.col_cursor = self.col_cursor;
+        }
+    }
+
+    /// Show the active tab's stored view.
+    fn restore_result_tab(&mut self) {
+        let Some(tab) = self.result_tabs.get(self.result_tab).cloned() else {
+            return;
+        };
+        self.grid = tab.grid;
+        self.script = tab.script;
+        self.grid_kind = tab.kind;
+        self.sel = tab.sel;
+        self.col_offset = tab.col_offset;
+        self.col_cursor = tab.col_cursor;
+        self.page_state = None;
+        self.cell_popup = None;
+        self.row_popup = None;
+    }
+}
+
+/// Record a fresh query result as a new tab and show it.
+fn push_result_tab(
+    app: &mut App,
+    title: String,
+    grid: Option<Grid>,
+    script: Option<ScriptView>,
+    kind: GridKind,
+) {
+    app.save_result_tab();
+    app.result_tabs.push(ResultTab {
+        title,
+        grid: grid.clone(),
+        script: script.clone(),
+        kind,
+        sel: 0,
+        col_offset: 0,
+        col_cursor: 0,
+    });
+    app.result_tab = app.result_tabs.len() - 1;
+    // Cap the history so a long session cannot grow without bound.
+    if app.result_tabs.len() > 20 {
+        app.result_tabs.remove(0);
+        app.result_tab = app.result_tab.saturating_sub(1);
+    }
+    app.grid = grid;
+    app.script = script;
+    app.grid_kind = kind;
+    app.sel = 0;
+    app.col_offset = 0;
+    app.col_cursor = 0;
+    app.page_state = None;
+    app.cell_popup = None;
+    app.row_popup = None;
+}
+
+/// Show a result in place of the active tab (used by Ctrl-N "load more").
+fn replace_result_tab(
+    app: &mut App,
+    title: String,
+    grid: Option<Grid>,
+    script: Option<ScriptView>,
+    kind: GridKind,
+) {
+    if app.result_tabs.is_empty() {
+        push_result_tab(app, title, grid, script, kind);
+        return;
+    }
+    let idx = app.result_tab.min(app.result_tabs.len() - 1);
+    app.result_tabs[idx] = ResultTab {
+        title,
+        grid: grid.clone(),
+        script: script.clone(),
+        kind,
+        sel: 0,
+        col_offset: 0,
+        col_cursor: 0,
+    };
+    app.result_tab = idx;
+    app.grid = grid;
+    app.script = script;
+    app.grid_kind = kind;
+    app.sel = 0;
+    app.col_offset = 0;
+    app.col_cursor = 0;
+    app.page_state = None;
+    app.cell_popup = None;
+    app.row_popup = None;
+}
+
+/// `[` / `]`: flip between the query results kept in this session.
+fn switch_result_tab(app: &mut App, delta: i32) {
+    if app.result_tabs.len() < 2 {
+        app.status = "仅 1 个结果标签".into();
+        return;
+    }
+    app.save_result_tab();
+    let n = app.result_tabs.len() as i32;
+    app.result_tab = (app.result_tab as i32 + delta).rem_euclid(n) as usize;
+    app.restore_result_tab();
+    app.status = format!("结果 {}/{}", app.result_tab + 1, app.result_tabs.len());
+}
+
+/// `Ctrl-P`: run the editor's SQL through the dialect's EXPLAIN.
+fn explain_current(app: &mut App, tx: &Tx) {
+    let Some(cfg) = app.selected.clone() else {
+        app.status = "✗ 未选择连接".into();
+        return;
+    };
+    let sql = app.editor_sql();
+    match explain_sql_for(cfg.db_type.as_str(), &sql) {
+        Some(explain) => {
+            app.loading = true;
+            app.status = format!("{} EXPLAIN…", cfg.db_type.as_str());
+            let db = app.current_db();
+            spawn_op(
+                &app.backend,
+                tx,
+                Op::Query(Box::new(cfg), db, explain, QUERY_MAX_ROWS),
+            );
+        }
+        None => {
+            app.status = format!(
+                "{} 不支持单语句 EXPLAIN（请手动执行）",
+                cfg.db_type.as_str()
+            );
+        }
+    }
+}
+
+/// `Ctrl-Y`: export the focused result grid to a CSV file under `$HOME`.
+fn export_csv(app: &mut App) {
+    let Some(grid) = active_grid(app) else {
+        app.status = "没有可导出的结果".into();
+        return;
+    };
+    if grid.columns.is_empty() {
+        app.status = "没有可导出的列".into();
+        return;
+    }
+    let csv = grid_to_csv(&grid);
+    let dir = std::env::var_os("HOME")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from("."));
+    let ts = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    let raw_label = match app.grid_kind {
+        GridKind::TableData => app
+            .page_state
+            .as_ref()
+            .map(|p| p.table.clone())
+            .unwrap_or_else(|| "table".into()),
+        _ => "query".into(),
+    };
+    let label: String = raw_label
+        .chars()
+        .map(|c| if c == '/' || c == '\\' || c == ' ' { '_' } else { c })
+        .collect();
+    let path = dir.join(format!("dbxt-export-{label}-{ts}.csv"));
+    match std::fs::write(&path, csv.as_bytes()) {
+        Ok(_) => {
+            let rows = grid.rows.len();
+            app.status = format!("✓ 已导出 {rows} 行 → {}", path.display());
+        }
+        Err(e) => app.status = format!("✗ 导出失败: {e}"),
+    }
+}
+
+/// `Ctrl-O`: open the saved-SQL snippet overlay for the current connection.
+fn open_snippets(app: &mut App, tx: &Tx) {
+    let Some(cfg) = app.selected.clone() else {
+        app.status = "先选择连接".into();
+        return;
+    };
+    app.loading = true;
+    app.status = "加载 SQL 片段…".into();
+    spawn_op(&app.backend, tx, Op::Snippets(Box::new(cfg)));
+}
+
+fn snippet_key(app: &mut App, tx: &Tx, k: KeyEvent) {
+    let n = app.snippets.len();
+    match k.code {
+        KeyCode::Esc | KeyCode::Char('q') => app.snippet_open = false,
+        KeyCode::Up => {
+            let i = app
+                .snippet_list
+                .selected()
+                .map(|i| i.saturating_sub(1))
+                .unwrap_or(0);
+            if n > 0 {
+                app.snippet_list.select(Some(i));
+            }
+        }
+        KeyCode::Down => {
+            let i = app
+                .snippet_list
+                .selected()
+                .map(|i| (i + 1).min(n.saturating_sub(1)))
+                .unwrap_or(0);
+            if n > 0 {
+                app.snippet_list.select(Some(i));
+            }
+        }
+        KeyCode::Char('r') if k.modifiers.is_empty() => open_snippets(app, tx),
+        KeyCode::Enter => {
+            if let Some(i) = app.snippet_list.selected() {
+                if let Some((name, sql)) = app.snippets.get(i).cloned() {
+                    let existing = app.editor_sql();
+                    let merged = if existing.trim().is_empty() {
+                        sql
+                    } else {
+                        format!("{}\n{sql}", existing.trim_end())
+                    };
+                    app.set_editor_text(&merged);
+                    app.snippet_open = false;
+                    app.focus = Focus::Editor;
+                    app.status = format!("✓ 已插入 {name}");
+                }
+            }
+        }
+        _ => {}
+    }
+}
+
+/// `p` in the connection picker: pre-fill the form with a copy of a connection.
+fn duplicate_connection(app: &mut App) {
+    let Some(idx) = app.conn_list.selected() else {
+        return;
+    };
+    let Some(cfg) = app.connections.get(idx).cloned() else {
+        return;
+    };
+    app.form = ConnForm {
+        name: format!("{} (副本)", cfg.name),
+        db_type: cfg.db_type.as_str().to_string(),
+        host: cfg.host.clone(),
+        port: if cfg.port == 0 {
+            String::new()
+        } else {
+            cfg.port.to_string()
+        },
+        username: cfg.username.clone(),
+        password: cfg.password.clone(),
+        database: cfg.database.clone().unwrap_or_default(),
+        ssl: cfg.ssl,
+        field: 0,
+        editing: false,
+        err: String::new(),
+    };
+    app.page = Page::NewConn;
+    app.status = format!("复制连接 {} · 改参数后 Enter 保存", cfg.name);
+}
+
 // ─── rendering ───────────────────────────────────────────────────────────────
 
 fn ui(f: &mut Frame, app: &mut App) {
@@ -4093,6 +4778,9 @@ fn ui(f: &mut Frame, app: &mut App) {
     }
     if app.db_picker_open {
         render_db_picker(f, f.area(), app);
+    }
+    if app.snippet_open {
+        render_snippets(f, f.area(), app);
     }
     if let Some(confirm) = app.confirm.clone() {
         render_confirm(f, f.area(), &confirm);
@@ -4179,6 +4867,11 @@ fn spinner_frame(i: usize) -> char {
 /// Right-hand section of the status bar: context about the current result set.
 fn context_info(app: &App) -> String {
     let mut parts: Vec<String> = Vec::new();
+    // Touch fallback: vertical wheel pans columns (Ctrl-G). Shown first so it
+    // survives the status-bar truncation on a narrow phone screen.
+    if app.pan_mode {
+        parts.push("横滚 开".into());
+    }
     match app.focus {
         Focus::Sidebar => parts.push("焦点 侧栏".into()),
         Focus::Editor => parts.push("焦点 SQL".into()),
@@ -4191,6 +4884,17 @@ fn context_info(app: &App) -> String {
     } else {
         "自动折叠 关".into()
     });
+    // Result tabs (queries only).
+    if app.result_tabs.len() > 1 && app.grid_kind != GridKind::TableData {
+        parts.push(format!("结果 {}/{}", app.result_tab + 1, app.result_tabs.len()));
+    }
+    // Live event readout while `DBXT_EVENT_TRACE` is set, so a user can report
+    // exactly which events their terminal sends for a swipe.
+    if app.trace_path.is_some() {
+        if let Some(ev) = &app.last_event {
+            parts.push(format!("事件 {ev}"));
+        }
+    }
     if let Some(ps) = &app.page_state {
         let pages = ps
             .total
@@ -4279,7 +4983,7 @@ fn render_footer(f: &mut Frame, area: Rect, app: &App) {
                 Focus::Editor => "Ctrl-J 运行 · ↑ 历史 · Tab 下一区".into(),
                 Focus::CmdInput => "Enter 执行 · Ctrl-L 换模式".into(),
                 Focus::Preview => {
-                    "↑↓ 行 · ←→ 列 · Enter 单元格 · e 编辑 · Del 删行 · f 过滤 · Ctrl-A 折叠 · ? 帮助".into()
+                    "↑↓ 行 · ←→ 列 · Enter 单元格 · e 编辑 · Del 删行 · f 过滤 · Ctrl-G 横滚 · ? 帮助".into()
                 }
             },
         }
@@ -4288,7 +4992,7 @@ fn render_footer(f: &mut Frame, area: Rect, app: &App) {
             Page::NewConn => "↑↓/h,l 字段 · Enter 编辑/保存 · Esc 返回 · ssl 回车切换".into(),
             _ => match app.focus {
                 Focus::Sidebar if app.selected.is_none() => {
-                    "↑↓ 选择连接 · Enter 连接 · c 新建连接 · q 显隐列表 · Tab 直接写SQL".into()
+                    "↑↓ 选择连接 · Enter 连接 · c 新建 · p 复制 · q 显隐列表 · Tab 直接写SQL".into()
                 }
                 Focus::Sidebar => {
                     "↑↓ 表 · d/←→ 切库 · Enter 浏览数据 · r 表结构 · Tab SQL · o 换连接 · ? 帮助".into()
@@ -4298,7 +5002,7 @@ fn render_footer(f: &mut Frame, area: Rect, app: &App) {
                     "Enter 执行 · [ ] 切 redis db · Ctrl-L 切 sql/redis/mongo · Esc 编辑器".into()
                 }
                 Focus::Preview => {
-                    "↑↓ 行(到边翻页) · ←→/hl 列 · Enter 单元格 · o 整行 · e 编辑 · i 插入 · Del 删行 · f 过滤 · s 排序 · Ctrl-R 清过滤 · Ctrl-A 自动折叠 · ? 帮助".into()
+                    "↑↓ 行(到边翻页) · ←→/hl 列 · Enter 单元格 · o 整行 · e 编辑 · i 插入 · Del 删行 · f 过滤 · s 排序 · Ctrl-G 横滚 · Ctrl-Y 导出 · Ctrl-A 自动折叠 · ? 帮助".into()
                 }
             },
         }
@@ -4596,13 +5300,24 @@ fn grid_title(app: &App) -> String {
                 app.grid.as_ref().map(|g| g.note.clone()).unwrap_or_default()
             )
         }
-        GridKind::Query => format!(
-            " 结果 · {} ",
-            app.grid
-                .as_ref()
-                .map(|g| g.note.clone())
-                .unwrap_or_default()
-        ),
+        GridKind::Query => {
+            let note = app.grid.as_ref().map(|g| g.note.clone()).unwrap_or_default();
+            if app.result_tabs.len() > 1 {
+                let title = app
+                    .result_tabs
+                    .get(app.result_tab)
+                    .map(|t| t.title.clone())
+                    .unwrap_or_default();
+                format!(
+                    " 结果 {}/{} · {note} · {} · [ ] 切换 ",
+                    app.result_tab + 1,
+                    app.result_tabs.len(),
+                    truncate_disp(&title, 20)
+                )
+            } else {
+                format!(" 结果 · {note} ")
+            }
+        }
     }
 }
 
@@ -4793,8 +5508,10 @@ fn render_grid(f: &mut Frame, area: Rect, app: &mut App, grid: &Grid, kind: Grid
 
     // ── horizontal scroll progress bar (drawn on the bottom border) ──
     app.rects.hbar_visible = false;
+    app.rects.hbar_prev = Rect::default();
+    app.rects.hbar_next = Rect::default();
     let scrollable_total = ncols.saturating_sub(frozen);
-    if visible > 0 && scrollable_total > visible && inner_w >= 14 {
+    if visible > 0 && scrollable_total > visible && inner_w >= 16 {
         let win_start = off.saturating_sub(frozen);
         let pin = match frozen {
             0 => String::new(),
@@ -4802,7 +5519,9 @@ fn render_grid(f: &mut Frame, area: Rect, app: &mut App, grid: &Grid, kind: Grid
             f => format!("1-{f}|"),
         };
         let label = format!("列 {pin}{}-{}/{}", off + 1, off + visible, ncols);
-        let track = inner_w;
+        // One cell at each end is a tap target for panning a whole window — the
+        // touch-friendly control for phones whose terminal sends no h-wheel.
+        let track = inner_w - 2;
         let label_w = disp_width(&label);
         let bar_len = if track > label_w + 6 {
             track - label_w - 1
@@ -4812,6 +5531,10 @@ fn render_grid(f: &mut Frame, area: Rect, app: &mut App, grid: &Grid, kind: Grid
         let (ts, tl) = scrollbar_geom(scrollable_total, win_start, visible, bar_len);
         let tl = tl.max(1).min(bar_len);
         let mut spans: Vec<Span> = Vec::new();
+        spans.push(Span::styled(
+            "◀",
+            Style::default().fg(Color::LightGreen),
+        ));
         // A half-height bar (lower block) instead of a full `█` keeps the
         // indicator visually thin on the bottom border.
         if ts > 0 {
@@ -4838,6 +5561,10 @@ fn render_grid(f: &mut Frame, area: Rect, app: &mut App, grid: &Grid, kind: Grid
             }
             spans.push(Span::styled(label, Style::default().fg(Color::Gray)));
         }
+        spans.push(Span::styled(
+            "▶",
+            Style::default().fg(Color::LightGreen),
+        ));
         let bar_area = Rect {
             x: inner.x,
             y: area.y + area.height - 1,
@@ -4845,8 +5572,20 @@ fn render_grid(f: &mut Frame, area: Rect, app: &mut App, grid: &Grid, kind: Grid
             height: 1,
         };
         f.render_widget(Paragraph::new(Line::from(spans)), bar_area);
-        app.rects.hbar = Rect {
+        app.rects.hbar_prev = Rect {
             x: inner.x,
+            y: bar_area.y,
+            width: 1,
+            height: 1,
+        };
+        app.rects.hbar_next = Rect {
+            x: inner.x + inner_w as u16 - 1,
+            y: bar_area.y,
+            width: 1,
+            height: 1,
+        };
+        app.rects.hbar = Rect {
+            x: inner.x + 1,
             y: bar_area.y,
             width: bar_len as u16,
             height: 1,
@@ -5274,11 +6013,14 @@ fn render_sidebar(f: &mut Frame, area: Rect, app: &mut App) {
     let mut lines: Vec<Line> = Vec::new();
 
     if let Some(c) = &app.selected {
+        let conn_color = connection_color(c);
         lines.push(Line::from(vec![
-            Span::styled("● ", Style::default().fg(Color::Green)),
+            Span::styled("● ", Style::default().fg(conn_color)),
             Span::styled(
                 c.name.clone(),
-                Style::default().add_modifier(Modifier::BOLD),
+                Style::default()
+                    .fg(conn_color)
+                    .add_modifier(Modifier::BOLD),
             ),
         ]));
         // database row: always visible when known, opens the `d` switcher on click
@@ -5454,15 +6196,16 @@ fn render_conn_picker(f: &mut Frame, area: Rect, app: &mut App) {
         .iter()
         .map(|c| {
             let w = (box_area.width as usize).saturating_sub(16);
+            let color = connection_color(c);
             ListItem::new(Line::from(vec![
                 Span::styled(
                     format!("{:11}", truncate_disp(c.db_type.as_str(), 11)),
-                    Style::default().fg(Color::Magenta),
+                    Style::default().fg(color),
                 ),
                 Span::raw(" "),
                 Span::styled(
                     truncate_disp(&c.name, w),
-                    Style::default().add_modifier(Modifier::BOLD),
+                    Style::default().fg(color).add_modifier(Modifier::BOLD),
                 ),
             ]))
         })
@@ -5471,7 +6214,7 @@ fn render_conn_picker(f: &mut Frame, area: Rect, app: &mut App) {
         .block(
             Block::default()
                 .borders(Borders::ALL)
-                .title(" 连接 · ↑↓ Enter · c 新建 · q 隐藏 ")
+                .title(" 连接 · ↑↓ Enter · c 新建 · p 复制 · q 隐藏 ")
                 .border_set(border::ROUNDED),
         )
         .highlight_style(
@@ -5545,6 +6288,67 @@ fn render_db_picker(f: &mut Frame, area: Rect, app: &mut App) {
                 .add_modifier(Modifier::BOLD),
         );
     f.render_stateful_widget(list, box_area, &mut app.db_list);
+}
+
+/// Saved-SQL snippet overlay (DBX's `saved_sql_files`). Enter inserts into the
+/// editor; `r` reloads from the shared DBX store.
+fn render_snippets(f: &mut Frame, area: Rect, app: &mut App) {
+    let w = area.width.min(if app.layout_mode == LayoutMode::Narrow {
+        area.width
+    } else {
+        60
+    });
+    let h = (app.snippets.len() as u16 + 2).clamp(3, area.height.saturating_sub(2));
+    let x = area.x + (area.width.saturating_sub(w)) / 2;
+    let y = area.y + (area.height.saturating_sub(h)) / 2;
+    let box_area = Rect {
+        x,
+        y,
+        width: w,
+        height: h,
+    };
+    f.render_widget(Clear, box_area);
+    let items: Vec<ListItem> = app
+        .snippets
+        .iter()
+        .map(|(name, sql)| {
+            let head = sql
+                .lines()
+                .find(|l| !l.trim().is_empty())
+                .unwrap_or("")
+                .trim();
+            ListItem::new(Line::from(vec![
+                Span::styled(
+                    format!("{:20}", truncate_disp(name, 20)),
+                    Style::default()
+                        .fg(Color::Cyan)
+                        .add_modifier(Modifier::BOLD),
+                ),
+                Span::raw(" "),
+                Span::styled(
+                    truncate_disp(head, (box_area.width as usize).saturating_sub(24)),
+                    Style::default().fg(Color::DarkGray),
+                ),
+            ]))
+        })
+        .collect();
+    let list = List::new(items)
+        .block(
+            Block::default()
+                .borders(Borders::ALL)
+                .title(format!(
+                    " SQL 片段 · {} 个 · Enter 插入 · r 刷新 · Esc 关 ",
+                    app.snippets.len()
+                ))
+                .border_set(border::ROUNDED)
+                .border_style(Style::default().fg(Color::Cyan)),
+        )
+        .highlight_style(
+            Style::default()
+                .bg(Color::DarkGray)
+                .add_modifier(Modifier::BOLD),
+        );
+    f.render_stateful_widget(list, box_area, &mut app.snippet_list);
 }
 
 /// Shared scrollable text popup used for both cell values and row details.
@@ -5874,6 +6678,9 @@ const HELP_ROWS: &[(&str, &str)] = &[
     ("Alt-1 / 2 / 3", "直接聚焦 侧栏 / 编辑器 / 结果"),
     ("Ctrl-A", "自动折叠 开 / 关（开=非焦点栏收起）"),
     ("Ctrl-W", "收起 / 展开当前焦点区域"),
+    ("Ctrl-G", "横滚模式（触屏兜底：滚轮/上下滑 = 横滚列）"),
+    ("Ctrl-O", "SQL 片段收藏（DBX saved_sql_files）"),
+    ("Ctrl-P", "EXPLAIN 当前 SQL（SQL 后端）"),
     ("?", "本帮助"),
     ("— 侧栏 —", ""),
     ("↑ ↓", "移动表列表"),
@@ -5883,14 +6690,20 @@ const HELP_ROWS: &[(&str, &str)] = &[
     ("← →", "切换数据库（快捷）"),
     ("o", "返回连接选择"),
     ("c", "新建连接"),
+    ("p", "复制连接（预填表单）"),
     ("— 结果（表格浏览）—", ""),
     ("↑ ↓ / j k", "行光标（到边自动翻页）"),
     ("PgUp / PgDn", "整屏滚动，跨页衔接"),
     ("n / p", "下一页 / 上一页"),
     ("Ctrl-F / Ctrl-B", "下一页 / 上一页"),
     ("← → / h l", "单元格光标（列窗口跟随）"),
-    ("Shift+滚轮 / 横滚", "横向滚动列（触屏左右滑动）"),
+    ("Shift/Alt+滚轮 · 横滚", "横向滚动列（触屏左右滑动）"),
+    ("Ctrl-G", "横滚模式：纵向滚轮/上下滑改为横滚列"),
+    ("◀ ▶（底部）", "点击向左/右翻一屏列（触屏可用）"),
     ("底部进度条", "当前列窗口位置 · 点击可跳转"),
+    ("[ ]", "切换本次会话的结果标签"),
+    ("Ctrl-Y", "导出当前结果为 CSV（$HOME）"),
+    ("Ctrl-N", "结果被截断时加载更多行"),
     ("Enter", "查看完整单元格"),
     ("o", "整行详情（纵向）"),
     ("e", "编辑单元格 → diff 确认后执行"),
@@ -5916,6 +6729,9 @@ const HELP_ROWS: &[(&str, &str)] = &[
     ("— 危险操作 / 删除确认 —", ""),
     ("Enter / y", "执行（SQL 全文可见）"),
     ("Esc / n", "取消"),
+    ("— SQL 片段（Ctrl-O）—", ""),
+    ("↑ ↓ / Enter", "选择 / 插入到编辑器"),
+    ("r / Esc", "刷新 / 关闭"),
 ];
 
 fn render_help(f: &mut Frame, area: Rect, app: &mut App) {
@@ -6448,5 +7264,63 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn explain_uses_dialect_prefix() {
+        assert_eq!(
+            explain_sql_for("mysql", "SELECT 1;").as_deref(),
+            Some("EXPLAIN SELECT 1")
+        );
+        assert_eq!(
+            explain_sql_for("postgres", "select * from t").as_deref(),
+            Some("EXPLAIN select * from t")
+        );
+        assert_eq!(
+            explain_sql_for("sqlite", "SELECT 1").as_deref(),
+            Some("EXPLAIN QUERY PLAN SELECT 1")
+        );
+        // Unknown / unsupported engines return None instead of a broken statement.
+        assert!(explain_sql_for("sqlserver", "SELECT 1").is_none());
+        assert!(explain_sql_for("oracle", "SELECT 1").is_none());
+        assert!(explain_sql_for("mysql", "   ;").is_none());
+    }
+
+    #[test]
+    fn csv_quoting_follows_rfc4180() {
+        assert_eq!(csv_field("plain"), "plain");
+        assert_eq!(csv_field("a,b"), "\"a,b\"");
+        assert_eq!(csv_field("a\"b"), "\"a\"\"b\"");
+        assert_eq!(csv_field("a\nb"), "\"a\nb\"");
+    }
+
+    #[test]
+    fn grid_to_csv_keeps_null_empty() {
+        let grid = Grid {
+            columns: vec!["id".into(), "name".into()],
+            rows: vec![
+                vec![Val::Text("1".into()), Val::Null],
+                vec![Val::Text("2".into()), Val::Text("a,b".into())],
+            ],
+            note: String::new(),
+        };
+        assert_eq!(grid_to_csv(&grid), "id,name\n1,\n2,\"a,b\"\n");
+    }
+
+    #[test]
+    fn connection_colour_prefers_explicit_hex() {
+        assert_eq!(parse_hex_color("#ff0000"), Some(Color::Rgb(255, 0, 0)));
+        assert_eq!(parse_hex_color("00ff00"), Some(Color::Rgb(0, 255, 0)));
+        assert_eq!(parse_hex_color("not-a-colour"), None);
+        assert_eq!(parse_hex_color("#fff"), None);
+        // Families are distinct so a picker row is identifiable at a glance.
+        assert_ne!(db_type_color("mysql"), db_type_color("redis"));
+        assert_ne!(db_type_color("mongodb"), db_type_color("redis"));
+    }
+
+    #[test]
+    fn query_tab_title_is_first_line() {
+        assert_eq!(query_tab_title("\n\nSELECT 1\nFROM t"), "SELECT 1");
+        assert_eq!(query_tab_title("   "), "");
     }
 }
