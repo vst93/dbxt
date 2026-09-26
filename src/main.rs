@@ -2,6 +2,10 @@
 // Apache-2.0. Reuses DBX connection storage (dbx.db), native drivers, SQL safety.
 #![recursion_limit = "512"]
 
+mod ui_text;
+
+use ui_text::{t, tf};
+
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::io::Write;
 use std::path::PathBuf;
@@ -133,17 +137,17 @@ fn toggle_auto_collapse(app: &mut App) {
     app.auto_collapse = !app.auto_collapse;
     app.pane_override = [None; 3];
     app.status = if app.auto_collapse {
-        "自动折叠：开 · 非焦点栏收起（Ctrl-A 关闭）".into()
+        t("自动折叠：开 · 非焦点栏收起（Ctrl-A 关闭）").into()
     } else {
-        "自动折叠：关 · 所有栏展开（Ctrl-A 开启）".into()
+        t("自动折叠：关 · 所有栏展开（Ctrl-A 开启）").into()
     };
 }
 
 fn pane_name(pane: usize) -> &'static str {
     match pane {
-        PANE_SIDEBAR => "侧栏",
-        PANE_EDITOR => "编辑器",
-        _ => "结果区",
+        PANE_SIDEBAR => t("侧栏"),
+        PANE_EDITOR => t("编辑器"),
+        _ => t("结果区"),
     }
 }
 
@@ -156,9 +160,9 @@ fn toggle_pane_collapse(app: &mut App) {
     let cur = pane_eff_collapsed(app, pane);
     app.pane_override[pane] = Some(!cur);
     app.status = if cur {
-        format!("已展开{}", pane_name(pane))
+        tf("已展开{}", &[&(pane_name(pane))])
     } else {
-        format!("已收起{}", pane_name(pane))
+        tf("已收起{}", &[&(pane_name(pane))])
     };
 }
 
@@ -576,7 +580,7 @@ impl TuiConfig {
         // Atomic-ish: write a sibling temp file then rename so a crash never
         // leaves a half-written config behind. The pid keeps two concurrent
         // dbxt processes from fighting over the same temp path.
-        let tmp = path.with_extension(format!("{}.tmp", std::process::id()));
+        let tmp = path.with_extension(format!("{}.tmp",  std::process::id()));
         if std::fs::write(&tmp, text).is_ok() {
             let _ = std::fs::rename(&tmp, path);
         }
@@ -809,14 +813,11 @@ fn detect_danger(statement: &str) -> Option<String> {
         .find(|w| !w.is_empty())
         .unwrap_or("");
     match first {
-        "drop" => Some("DROP 会永久删除对象".to_string()),
-        "truncate" => Some("TRUNCATE 会清空整张表且不可回滚".to_string()),
+        "drop" => Some(t("DROP 会永久删除对象").to_string()),
+        "truncate" => Some(t("TRUNCATE 会清空整张表且不可回滚").to_string()),
         "update" | "delete" => {
             if !has_keyword(&lower, "where") {
-                Some(format!(
-                    "{} 没有 WHERE 子句，会作用于整张表",
-                    first.to_ascii_uppercase()
-                ))
+                Some(tf("{} 没有 WHERE 子句，会作用于整张表", &[&(first.to_ascii_uppercase())]))
             } else {
                 None
             }
@@ -824,7 +825,7 @@ fn detect_danger(statement: &str) -> Option<String> {
         // A common-table-expression statement can hide a destructive DELETE
         // (`WITH x AS (...) DELETE FROM t`), which has no leading DELETE keyword.
         "with" if has_keyword(&lower, "delete") && !has_keyword(&lower, "where") => {
-            Some("DELETE 没有 WHERE 子句，会作用于整张表".to_string())
+            Some(t("DELETE 没有 WHERE 子句，会作用于整张表").to_string())
         }
         _ => None,
     }
@@ -912,15 +913,15 @@ enum OpResult {
 fn note_of(r: &dbx_core::db::QueryResult) -> String {
     let mut parts: Vec<String> = Vec::new();
     if !r.columns.is_empty() {
-        parts.push(format!("{} 行", r.rows.len()));
+        parts.push(tf("{} 行", &[&(r.rows.len())]));
     } else {
         // DML / DDL: report the affected-row count even when it is zero.
-        parts.push(format!("影响 {} 行", r.affected_rows));
+        parts.push(tf("影响 {} 行", &[&(r.affected_rows)]));
     }
     if r.truncated {
-        parts.push("已截断".into());
+        parts.push(t("已截断").into());
     }
-    parts.push(format!("{}ms", r.execution_time_ms));
+    parts.push(format!("{}ms",  r.execution_time_ms));
     parts.join(" · ")
 }
 
@@ -1007,9 +1008,9 @@ async fn run_op(backend: &LocalBackend, op: Op) -> OpResult {
                 databases: vec![cfg.database.clone().unwrap_or_default()],
                 warning: Some(match cfg.database.as_deref() {
                     Some(db) if !db.is_empty() => {
-                        format!("无法列举数据库（{e}），仅使用配置库 {db}")
+                        tf("无法列举数据库（{}），仅使用配置库 {}", &[&(e), &(db)])
                     }
-                    _ => format!("无法列举数据库（{e}），将使用连接默认库"),
+                    _ => tf("无法列举数据库（{}），将使用连接默认库", &[&(e)]),
                 }),
             },
         },
@@ -1028,7 +1029,7 @@ async fn run_op(backend: &LocalBackend, op: Op) -> OpResult {
                 Ok(ddl) => OpResult::Ddl { table, text: ddl },
                 Err(e) => OpResult::Ddl {
                     table,
-                    text: format!("-- 无法获取 DDL: {e}"),
+                    text: tf("-- 无法获取 DDL: {}", &[&(e)]),
                 },
             }
         }
@@ -1133,7 +1134,7 @@ async fn run_op(backend: &LocalBackend, op: Op) -> OpResult {
                             let text = statements
                                 .get(idx)
                                 .cloned()
-                                .unwrap_or_else(|| format!("-- statement {}", idx + 1));
+                                .unwrap_or_else(|| format!("-- statement {}",  idx + 1));
                             outcomes.push(stmt_outcome(text, r));
                         }
                         OpResult::Script(outcomes)
@@ -1157,7 +1158,7 @@ async fn run_op(backend: &LocalBackend, op: Op) -> OpResult {
                 // Without it, dbx-core's allowlist blocks ordinary commands such as KEYS.
                 Ok(r) => OpResult::Redis(match serde_json::to_string_pretty(&r.value) {
                     Ok(s) => s,
-                    Err(_) => format!("{:?}", r.value),
+                    Err(_) => format!("{:?}",  r.value),
                 }),
                 Err(e) => OpResult::Error(format!("redis: {e}")),
             }
@@ -1175,7 +1176,7 @@ async fn run_op(backend: &LocalBackend, op: Op) -> OpResult {
                 }
                 Err(e) => OpResult::Error(format!("mongo: {e}")),
             },
-            Err(e) => OpResult::Error(format!("mongo parse: {e} (例: db.col.find({{}}))")),
+            Err(e) => OpResult::Error(tf("mongo parse: {} (例: db.col.find({{}}))", &[&(e)])),
         },
         Op::History(cfg) => {
             match backend
@@ -1219,7 +1220,7 @@ async fn run_op(backend: &LocalBackend, op: Op) -> OpResult {
                     .filter(|f| f.connection_id.is_empty() || f.connection_id == cfg.id)
                     .map(|f| {
                         let label = match folder_name(&f.folder_id) {
-                            Some(folder) if !folder.is_empty() => format!("{folder}/{}", f.name),
+                            Some(folder) if !folder.is_empty() => format!("{folder}/{}",  f.name),
                             _ => f.name.clone(),
                         };
                         (label, f.sql)
@@ -1258,11 +1259,7 @@ async fn run_op(backend: &LocalBackend, op: Op) -> OpResult {
             Err(e) => OpResult::Error(format!("databases: {e}")),
         },
         Op::AddConn(cfg) => match backend.add_connection_for_mcp(*cfg).await {
-            Ok(saved) => OpResult::Added(format!(
-                "已保存: {} ({})",
-                saved.name,
-                saved.db_type.as_str()
-            )),
+            Ok(saved) => OpResult::Added(tf("已保存: {} ({})", &[&(saved.name), &(saved.db_type.as_str())])),
             Err(e) => OpResult::Error(format!("save: {e}")),
         },
     }
@@ -1277,10 +1274,7 @@ fn spawn_op(backend: &Arc<LocalBackend>, tx: &Tx, op: Op) {
         // never answers must surface an error, not a spinner that never stops.
         let res = match tokio::time::timeout(limit, run_op(&backend, op)).await {
             Ok(r) => r,
-            Err(_) => OpResult::Error(format!(
-                "操作超时（{}s）· 服务器无响应或网络中断，请检查连接后用 d 重连",
-                limit.as_secs()
-            )),
+            Err(_) => OpResult::Error(tf("操作超时（{}s）· 服务器无响应或网络中断，请检查连接后用 d 重连", &[&(limit.as_secs())])),
         };
         let _ = tx.send(res);
     });
@@ -1321,9 +1315,11 @@ impl Default for ConnForm {
     }
 }
 
-const FORM_FIELDS: [&str; 9] = [
-    "name", "db_type", "host", "port", "username", "password", "database", "ssl", "保存",
-];
+fn form_fields() -> [&'static str; 9] {
+    [
+        "name", "db_type", "host", "port", "username", "password", "database", "ssl", t("保存"),
+    ]
+}
 
 #[derive(Default, Clone, Copy)]
 struct Rects {
@@ -1715,15 +1711,15 @@ impl App {
     }
     fn set_placeholder(&mut self) {
         let t = match self.backend_kind {
-            Backend::Redis => format!("redis 命令… (db={}) · Ctrl-L 切换", self.redis_db),
-            Backend::Mongo => format!("mongo shell… (db={}) · Ctrl-L 切换", self.current_db()),
+            Backend::Redis => tf("redis 命令… (db={}) · Ctrl-L 切换", &[&(self.redis_db)]),
+            Backend::Mongo => tf("mongo shell… (db={}) · Ctrl-L 切换", &[&(self.current_db())]),
             Backend::Sql => String::new(),
         };
         self.cmd_input.set_placeholder_text(t);
     }
     fn set_editor_text(&mut self, text: &str) {
         let mut ta = TextArea::from(text.split('\n'));
-        ta.set_placeholder_text("SQL … (Ctrl-J / F5 执行 · ↑ 历史)");
+        ta.set_placeholder_text(t("SQL … (Ctrl-J / F5 执行 · ↑ 历史)"));
         ta.move_cursor(CursorMove::Bottom);
         ta.move_cursor(CursorMove::End);
         self.editor = ta;
@@ -1799,6 +1795,8 @@ fn env_log_path(var: &str, default_name: &str) -> Option<PathBuf> {
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    // Resolve the UI language once, before any text is drawn.
+    ui_text::set_lang(ui_text::detect_lang());
     // The positional argument is the `dbx.db` file itself. A directory is also
     // accepted (and joined with `dbx.db`) so the historical documented usage
     // keeps working.
@@ -1815,9 +1813,7 @@ async fn main() -> Result<()> {
         }
     }
     let backend = Arc::new(LocalBackend::open(&db_path).await.map_err(|e| {
-        anyhow::anyhow!(
-            "打开 DBX 存储文件失败 ({db_path:?}): {e}\n(可用 DBX_DATA_DIR 指定目录，或把 dbx.db 文件路径作为第一个位置参数传入)"
-        )
+        anyhow::anyhow!("{}", tf("打开 DBX 存储文件失败 ({}): {}\n(可用 DBX_DATA_DIR 指定目录，或把 dbx.db 文件路径作为第一个位置参数传入)", &[&format!("{:?}", db_path), &(e)]))
     })?);
 
     let terminal = ratatui::init();
@@ -1951,7 +1947,7 @@ async fn run_app(mut terminal: ratatui::DefaultTerminal, backend: Arc<LocalBacke
         pending_ops: 1,
         loading_since: Some(Instant::now()),
         spinner: 0,
-        status: "加载连接…".into(),
+        status: t("加载连接…").into(),
         backend_kind: Backend::Sql,
         cmd_input: TextArea::default(),
         cmd_output: Vec::new(),
@@ -1961,7 +1957,7 @@ async fn run_app(mut terminal: ratatui::DefaultTerminal, backend: Arc<LocalBacke
         term_h: 0,
         rects: Rects::default(),
     };
-    app.editor.set_placeholder_text("SQL … (Ctrl-J / F5 执行 · ↑ 历史)");
+    app.editor.set_placeholder_text(t("SQL … (Ctrl-J / F5 执行 · ↑ 历史)"));
     app.set_placeholder();
 
     // Pre-counted by `pending_ops: 1` in the initializer above.
@@ -2010,7 +2006,7 @@ fn apply_op_result(app: &mut App, res: OpResult, tx: &Tx) {
                 app.conn_list.select(Some(0));
             }
             app.picker_open = app.selected.is_none();
-            app.status = format!("{n} 个连接 · ↑↓+Enter 选择 · c 新建");
+            app.status = tf("{} 个连接 · ↑↓+Enter 选择 · c 新建", &[&(n)]);
         }
         OpResult::Databases { databases: dbs, warning } => {
             let configured = app.selected.as_ref().and_then(|c| c.database.clone());
@@ -2037,9 +2033,9 @@ fn apply_op_result(app: &mut App, res: OpResult, tx: &Tx) {
             if let Some(cfg) = app.selected.clone() {
                 let db = app.current_db();
                 app.status = if db.is_empty() {
-                    format!("加载 {} 表…", cfg.name)
+                    tf("加载 {} 表…", &[&(cfg.name)])
                 } else {
-                    format!("加载 {db} 表…")
+                    tf("加载 {} 表…", &[&(db)])
                 };
                 app.spawn(tx, Op::ListTables(Box::new(cfg.clone()), db));
                 app.spawn(tx, Op::History(Box::new(cfg)));
@@ -2074,18 +2070,13 @@ fn apply_op_result(app: &mut App, res: OpResult, tx: &Tx) {
                     open_table_data(app, tx);
                     return;
                 }
-                app.status = format!("✗ 未找到表 {name}");
+                app.status = tf("✗ 未找到表 {}", &[&(name)]);
                 return;
             }
             app.status = if app.table_filter.is_empty() {
-                format!("{n} 个表/视图 · Enter 数据 · r 结构 · / 过滤 · Tab 编辑SQL")
+                tf("{} 个表/视图 · Enter 数据 · r 结构 · / 过滤 · Tab 编辑SQL", &[&(n)])
             } else {
-                format!(
-                    "过滤「{}」· {}/{} 个表 · Esc 清除",
-                    app.table_filter,
-                    app.tables.len(),
-                    n
-                )
+                tf("过滤「{}」· {}/{} 个表 · Esc 清除", &[&(app.table_filter), &(app.tables.len()), &(n)])
             };
         }
         OpResult::Columns { table, columns: cols } => {
@@ -2106,7 +2097,7 @@ fn apply_op_result(app: &mut App, res: OpResult, tx: &Tx) {
             app.col_cursor = 0;
             app.cell_popup = None;
             app.focus = Focus::Preview;
-            app.status = format!("{table} 结构 · {n} 字段 · t 切换 DDL · Esc 返回");
+            app.status = tf("{} 结构 · {} 字段 · t 切换 DDL · Esc 返回", &[&(table), &(n)]);
         }
         OpResult::Ddl { table, text } => {
             if app.selected_table().map(|t| t.name.clone()).as_deref() == Some(table.as_str()) {
@@ -2174,19 +2165,13 @@ fn apply_op_result(app: &mut App, res: OpResult, tx: &Tx) {
                 }
             }
             let total_txt = total
-                .map(|t| format!("共 {t} 行"))
-                .unwrap_or_else(|| "总数未知".into());
+                .map(|t| tf("共 {} 行", &[&(t)]))
+                .unwrap_or_else(|| t("总数未知").into());
             let ps = app.page_state.as_ref().unwrap();
             let extra = page_state_extra(ps);
-            app.status = format!(
-                "{}.{} · 第 {} 页 · {} 行 · {total_txt}{extra}",
-                app.current_db(),
-                table,
-                page + 1,
-                rows
-            );
+            app.status = tf("{}.{} · 第 {} 页 · {} 行 · {}{}", &[&(app.current_db()), &(table), &(page + 1), &(rows), &(total_txt), &(extra)]);
             if let Some(msg) = app.pending_write_msg.take() {
-                app.status = format!("{msg} · 已刷新（第 {} 页）", page + 1);
+                app.status = tf("{} · 已刷新（第 {} 页）", &[&(msg), &(page + 1)]);
             }
         }
         OpResult::TableColumns { table, columns } => {
@@ -2218,17 +2203,17 @@ fn apply_op_result(app: &mut App, res: OpResult, tx: &Tx) {
             if app.pending_write && is_write {
                 app.pending_write = false;
                 let affected = r.affected_rows;
-                let note = format!("{}ms", r.execution_time_ms);
+                let note = format!("{}ms",  r.execution_time_ms);
                 if app.page_state.is_some() && app.grid_kind == GridKind::TableData {
                     let sel = app.sel;
                     let ps = app.page_state.clone().unwrap();
-                    let msg = format!("✓ 影响 {affected} 行 · {note}");
+                    let msg = tf("✓ 影响 {} 行 · {}", &[&(affected), &(note)]);
                     app.pending_write_msg = Some(msg.clone());
                     reload_table_view(app, tx, ps.filter.clone(), ps.order_by.clone(), ps.page);
                     app.pending_sel = Some(sel);
-                    app.status = format!("{msg} · 已刷新当前页");
+                    app.status = tf("{} · 已刷新当前页", &[&(msg)]);
                 } else {
-                    app.status = format!("✓ 影响 {affected} 行 · {note}");
+                    app.status = tf("✓ 影响 {} 行 · {}", &[&(affected), &(note)]);
                 }
                 return;
             }
@@ -2236,7 +2221,7 @@ fn apply_op_result(app: &mut App, res: OpResult, tx: &Tx) {
             let note = note_of(&r);
             let truncated = r.truncated;
             let grid = Grid::from_query(r.columns.clone(), &r.rows, note.clone());
-            app.status = format!("{} · {} · {}", app.selected_name(), grid.rows.len(), note);
+            app.status = format!("{} · {} · {}",  app.selected_name(),  grid.rows.len(),  note);
             // Keep every query result as a tab so consecutive SELECTs can be flipped
             // with `[` / `]` instead of overwriting each other. A `Ctrl-N` "load more"
             // (a cap above the default) replaces the active tab instead of spawning
@@ -2270,19 +2255,19 @@ fn apply_op_result(app: &mut App, res: OpResult, tx: &Tx) {
                 sel: 0,
                 drilled: None,
             };
-            push_result_tab(app, format!("脚本 {n} 条"), None, Some(script), GridKind::Query);
+            push_result_tab(app, tf("脚本 {} 条", &[&(n)]), None, Some(script), GridKind::Query);
             app.ddl = None;
             app.struct_view = StructView::Fields;
             app.focus = Focus::Preview;
             if was_batch {
                 app.status = if errors == 0 {
-                    format!("✓ 批量提交成功 · {n} 条语句 · 影响 {affected} 行")
+                    tf("✓ 批量提交成功 · {} 条语句 · 影响 {} 行", &[&(n), &(affected)])
                 } else {
-                    format!("✗ 批量提交失败 · {errors} 错误 · 影响 {affected} 行（事务可能已回滚）· Enter 看详情")
+                    tf("✗ 批量提交失败 · {} 错误 · 影响 {} 行（事务可能已回滚）· Enter 看详情", &[&(errors), &(affected)])
                 };
             } else {
                 app.status =
-                    format!("脚本 · {n} 条语句 · 影响 {affected} 行 · {errors} 错误 · Enter 看结果");
+                    tf("脚本 · {} 条语句 · 影响 {} 行 · {} 错误 · Enter 看结果", &[&(n), &(affected), &(errors)]);
             }
         }
         OpResult::Redis(s) => {
@@ -2316,16 +2301,14 @@ fn apply_op_result(app: &mut App, res: OpResult, tx: &Tx) {
             // A just-saved confirmation must survive the refresh that follows it.
             if !app.status.starts_with('✓') {
                 app.status = if n == 0 {
-                    "没有保存的 SQL 片段（可在 DBX 桌面端保存后复用）".into()
+                    t("没有保存的 SQL 片段（可在 DBX 桌面端保存后复用）").into()
                 } else {
-                    format!(
-                        "{n} 个 SQL 片段 · Enter 插入编辑器 · s 收藏当前 SQL · r 刷新 · Esc 关闭"
-                    )
+                    tf("{} 个 SQL 片段 · Enter 插入编辑器 · s 收藏当前 SQL · r 刷新 · Esc 关闭", &[&(n)])
                 };
             }
         }
         OpResult::SnippetSaved(name) => {
-            app.status = format!("✓ 已收藏 SQL 片段「{name}」（DBX saved_sql_files）");
+            app.status = tf("✓ 已收藏 SQL 片段「{}」（DBX saved_sql_files）", &[&(name)]);
             // Refresh the list so the new favourite is visible immediately.
             if let Some(cfg) = app.selected.clone() {
                 app.spawn(tx, Op::Snippets(Box::new(cfg)));
@@ -2333,7 +2316,7 @@ fn apply_op_result(app: &mut App, res: OpResult, tx: &Tx) {
         }
         OpResult::DatabasesRefresh(dbs) => {
             if dbs.is_empty() {
-                app.status = "未发现数据库".into();
+                app.status = t("未发现数据库").into();
                 return;
             }
             let current = app.current_db();
@@ -2347,7 +2330,7 @@ fn apply_op_result(app: &mut App, res: OpResult, tx: &Tx) {
                 let cur = db_current_index(app).min(n.saturating_sub(1));
                 app.db_list.select(if n == 0 { None } else { Some(cur) });
             }
-            app.status = format!("已刷新 {} 个数据库", app.databases.len());
+            app.status = tf("已刷新 {} 个数据库", &[&(app.databases.len())]);
         }
         OpResult::Added(msg) => {
             app.status = format!("✓ {msg}");
@@ -2386,16 +2369,16 @@ fn count_cache_key(db: &str, table: &str, filter: &str) -> String {
 fn page_state_extra(ps: &PageState) -> String {
     let mut s = String::new();
     if !ps.filter.trim().is_empty() {
-        s.push_str(&format!(" · 过滤: {}", truncate_disp(&one_line(&ps.filter), 48)));
+        s.push_str(&tf(" · 过滤: {}", &[&(truncate_disp(&one_line(&ps.filter), 48))]));
     }
     if let Some(o) = ps.order_by.as_deref().filter(|o| !o.trim().is_empty()) {
-        s.push_str(&format!(" · 排序: {}", truncate_disp(o, 32)));
+        s.push_str(&tf(" · 排序: {}", &[&(truncate_disp(o, 32))]));
     }
     s
 }
 
 fn columns_grid(cols: &[ColumnInfo]) -> Grid {
-    let columns = ["字段", "类型", "键", "可空", "默认值", "注释"]
+    let columns = [t("字段"), t("类型"), t("键"), t("可空"), t("默认值"), t("注释")]
         .iter()
         .map(|s| s.to_string())
         .collect();
@@ -2425,7 +2408,7 @@ fn columns_grid(cols: &[ColumnInfo]) -> Grid {
     Grid {
         columns,
         rows,
-        note: format!("{} 字段", cols.len()),
+        note: tf("{} 字段", &[&(cols.len())]),
     }
 }
 
@@ -2522,7 +2505,7 @@ fn confirm_key(app: &mut App, tx: &Tx, k: KeyEvent) {
         KeyCode::Esc | KeyCode::Char('n') | KeyCode::Char('N') => {
             app.confirm = None;
             app.pending_write = false;
-            app.status = "已取消".into();
+            app.status = t("已取消").into();
         }
         _ => {}
     }
@@ -2670,11 +2653,11 @@ fn browse_key(app: &mut App, tx: &Tx, k: KeyEvent) {
     }
     if k.modifiers.contains(KeyModifiers::CONTROL) && k.code == KeyCode::Char('x') {
         if app.batch.is_empty() {
-            app.status = "批量队列为空（编辑时按 Ctrl-T 加入）".into();
+            app.status = t("批量队列为空（编辑时按 Ctrl-T 加入）").into();
         } else {
             let n = app.batch.len();
             app.batch.clear();
-            app.status = format!("已清空批量队列（{n} 条）");
+            app.status = tf("已清空批量队列（{} 条）", &[&(n)]);
         }
         return;
     }
@@ -2762,9 +2745,9 @@ fn browse_key(app: &mut App, tx: &Tx, k: KeyEvent) {
             KeyCode::Char('g') => {
                 app.pan_mode = !app.pan_mode;
                 app.status = if app.pan_mode {
-                    "横滚 开 · 滚轮横滚列".into()
+                    t("横滚 开 · 滚轮横滚列").into()
                 } else {
-                    "横滚 关 · 滚轮纵向".into()
+                    t("横滚 关 · 滚轮纵向").into()
                 };
                 return;
             }
@@ -2803,7 +2786,7 @@ fn db_current_index(app: &App) -> usize {
 fn open_db_picker(app: &mut App) {
     let n = db_entries(app).len();
     if n == 0 {
-        app.status = "没有可切换的数据库".into();
+        app.status = t("没有可切换的数据库").into();
         return;
     }
     app.db_picker_open = true;
@@ -2823,9 +2806,9 @@ fn db_picker_key(app: &mut App, tx: &Tx, k: KeyEvent) {
         KeyCode::Char('r') if k.modifiers.is_empty() => {
             // Refresh the list in place, keeping the overlay open.
             if app.backend_kind == Backend::Redis {
-                app.status = "Redis 固定 16 个逻辑库".into();
+                app.status = t("Redis 固定 16 个逻辑库").into();
             } else if let Some(cfg) = app.selected.clone() {
-                app.status = "刷新数据库列表…".into();
+                app.status = t("刷新数据库列表…").into();
                 app.spawn(tx, Op::DatabasesRefresh(Box::new(cfg)));
             }
         }
@@ -2876,7 +2859,7 @@ fn db_picker_apply(app: &mut App, tx: &Tx, idx: usize) {
             if idx < app.databases.len() {
                 app.db_index = idx;
                 let db = app.current_db();
-                app.status = format!("切换数据库 → {db}");
+                app.status = tf("切换数据库 → {}", &[&(db)]);
                 reload_tables(app, tx);
             }
         }
@@ -2995,14 +2978,14 @@ fn sidebar_key(app: &mut App, tx: &Tx, k: KeyEvent) {
 
 fn load_structure(app: &mut App, tx: &Tx) {
     let Some(table) = app.selected_table().map(|t| t.name.clone()) else {
-        app.status = "先选中一张表".into();
+        app.status = t("先选中一张表").into();
         return;
     };
     let Some(cfg) = app.selected.clone() else {
         return;
     };
     app.loading = true;
-    app.status = format!("加载 {table} 结构…");
+    app.status = tf("加载 {} 结构…", &[&(table)]);
     let db = app.current_db();
     app.spawn(
         tx,
@@ -3053,7 +3036,7 @@ fn open_table_data(app: &mut App, tx: &Tx) {
         order_by: order_by.clone(),
     });
     app.loading = true;
-    app.status = format!("加载 {}.{} 数据…", app.current_db(), table.0);
+    app.status = tf("加载 {}.{} 数据…", &[&(app.current_db()), &(table.0)]);
     // Column metadata powers the `e`/`i` templates (primary-key detection).
     app.spawn(
         tx,
@@ -3098,7 +3081,7 @@ fn goto_page(app: &mut App, tx: &Tx, page: usize, pending_sel: Option<usize>) ->
     app.page_pending = true;
     app.pending_sel = pending_sel;
     app.loading = true;
-    app.status = format!("加载 {} 第 {} 页…", ps.table, page + 1);
+    app.status = tf("加载 {} 第 {} 页…", &[&(ps.table), &(page + 1)]);
     let known = app
         .count_cache
         .get(&count_cache_key(&app.current_db(), &ps.table, &ps.filter))
@@ -3143,7 +3126,7 @@ fn reload_table_view(app: &mut App, tx: &Tx, filter: String, order_by: Option<St
     app.page_pending = true;
     app.pending_sel = Some(0);
     app.loading = true;
-    app.status = format!("加载 {} 第 {} 页…", ps.table, page + 1);
+    app.status = tf("加载 {} 第 {} 页…", &[&(ps.table), &(page + 1)]);
     let known = app
         .count_cache
         .get(&count_cache_key(&app.current_db(), &ps.table, &filter))
@@ -3289,11 +3272,11 @@ fn page_turn(app: &mut App, tx: &Tx, forward: bool) {
         return;
     };
     if forward && !ps.has_next {
-        app.status = "已经是最后一页".into();
+        app.status = t("已经是最后一页").into();
         return;
     }
     if !forward && ps.page == 0 {
-        app.status = "已经是第一页".into();
+        app.status = t("已经是第一页").into();
         return;
     }
     let target = if forward { ps.page + 1 } else { ps.page - 1 };
@@ -3323,7 +3306,7 @@ fn reload_tables(app: &mut App, tx: &Tx) {
         app.page_pending = false;
         app.loading = true;
         let db = app.current_db();
-        app.status = format!("切换到 {db} …");
+        app.status = tf("切换到 {} …", &[&(db)]);
         app.set_placeholder();
         app.spawn(tx, Op::ListTables(Box::new(cfg), db));
     }
@@ -3402,8 +3385,8 @@ fn grid_max_cell(app: &App, ncols: usize, inner_w: usize, gutter: u16) -> usize 
 /// Human label for the compact mode, used in the status bar and messages.
 fn compact_label(app: &App) -> String {
     let on = compact_active(app.compact, app.layout_mode);
-    let auto = if app.compact.is_none() { "自动" } else { "手动" };
-    format!("紧凑列 {}{}", if on { "开" } else { "关" }, auto)
+    let auto = if app.compact.is_none() { t("自动") } else { t("手动") };
+    tf("紧凑列 {}{}", &[&(if on { t("开") } else { t("关") }), &(auto)])
 }
 
 /// Drop every column the user hid with Ctrl-Shift-H. At least one column always
@@ -3650,7 +3633,7 @@ fn connect_selected(app: &mut App, tx: &Tx) {
             app.cmd_output.clear();
             app.set_placeholder();
             app.loading = true;
-            app.status = format!("连接 {} ({})…", cfg.name, cfg.db_type.as_str());
+            app.status = tf("连接 {} ({})…", &[&(cfg.name), &(cfg.db_type.as_str())]);
             app.spawn(tx, Op::Databases(Box::new(cfg)));
         }
     }
@@ -4078,9 +4061,9 @@ fn sidebar_db_row(app: &App) -> bool {
 
 fn sidebar_db_label(app: &App) -> String {
     if app.backend_kind == Backend::Redis {
-        format!("redis db {} · d 切换", app.redis_db)
+        tf("redis db {} · d 切换", &[&(app.redis_db)])
     } else {
-        format!("{} · d 切换", fix_double_encoding(&app.current_db()))
+        tf("{} · d 切换", &[&(fix_double_encoding(&app.current_db()))])
     }
 }
 
@@ -4182,7 +4165,7 @@ fn preview_key(app: &mut App, tx: &Tx, k: KeyEvent) {
         app.result_needle.clear();
         app.rebuild_view();
         app.sel = 0;
-        app.status = "已清除结果搜索".into();
+        app.status = t("已清除结果搜索").into();
         return;
     }
     match k.code {
@@ -4236,9 +4219,9 @@ fn preview_key(app: &mut App, tx: &Tx, k: KeyEvent) {
         KeyCode::Char('z') => {
             app.freeze_first = !app.freeze_first;
             app.status = if app.freeze_first {
-                "首列已钉住 · z 取消".into()
+                t("首列已钉住 · z 取消").into()
             } else {
-                "首列已取消钉住 · z 钉住".into()
+                t("首列已取消钉住 · z 钉住").into()
             };
         }
         KeyCode::Up | KeyCode::Char('k') => {
@@ -4301,7 +4284,7 @@ fn preview_key(app: &mut App, tx: &Tx, k: KeyEvent) {
         }
         KeyCode::Char('N') => {
             if app.result_needle.trim().is_empty() {
-                app.status = "先按 / 搜索结果，再用 n/N 跳转命中".into();
+                app.status = t("先按 / 搜索结果，再用 n/N 跳转命中").into();
             } else {
                 search_move(app, -1);
             }
@@ -4402,15 +4385,15 @@ fn filter_prompt_key(app: &mut App, tx: &Tx, k: KeyEvent) {
             app.filter_prompt = None;
             let order_by = app.page_state.as_ref().and_then(|p| p.order_by.clone());
             if filter.is_empty() {
-                app.status = "过滤已清除".into();
+                app.status = t("过滤已清除").into();
             } else {
-                app.status = format!("过滤: {filter}");
+                app.status = tf("过滤: {}", &[&(filter)]);
             }
             reload_table_view(app, tx, filter, order_by, 0);
         }
         KeyCode::Esc => {
             app.filter_prompt = None;
-            app.status = "已取消过滤".into();
+            app.status = t("已取消过滤").into();
         }
         _ => {
             if let Some(t) = &mut app.filter_prompt {
@@ -4426,21 +4409,21 @@ fn filter_prompt_key(app: &mut App, tx: &Tx, k: KeyEvent) {
 /// is loaded for editing, so `/` again refines an existing search.
 fn open_result_filter(app: &mut App) {
     if app.grid_kind == GridKind::Columns {
-        app.status = "表结构视图不支持搜索".into();
+        app.status = t("表结构视图不支持搜索").into();
         return;
     }
     // The script *list* has no data grid to search; once a statement is drilled
     // into, its result is a normal grid and search applies.
     if app.script.as_ref().is_some_and(|s| s.drilled.is_none()) {
-        app.status = "脚本列表不支持搜索（先 Enter 进入某条语句的结果）".into();
+        app.status = t("脚本列表不支持搜索（先 Enter 进入某条语句的结果）").into();
         return;
     }
     if active_grid(app).is_none() {
-        app.status = "没有可搜索的结果".into();
+        app.status = t("没有可搜索的结果").into();
         return;
     }
     let mut ta = TextArea::from([app.result_needle.clone()]);
-    ta.set_placeholder_text("搜索本页结果行…");
+    ta.set_placeholder_text(t("搜索本页结果行…"));
     ta.move_cursor(CursorMove::End);
     app.result_filter = Some(ta);
 }
@@ -4452,12 +4435,9 @@ fn result_filter_key(app: &mut App, k: KeyEvent) {
             app.result_filter = None;
             let n = result_row_count(app);
             app.status = if app.result_needle.trim().is_empty() {
-                "结果搜索已清除".into()
+                t("结果搜索已清除").into()
             } else {
-                format!(
-                    "搜索「{}」· {n} 行命中 · n/N 跳转 · Esc 清除",
-                    app.result_needle
-                )
+                tf("搜索「{}」· {} 行命中 · n/N 跳转 · Esc 清除", &[&(app.result_needle), &(n)])
             };
         }
         KeyCode::Esc => {
@@ -4465,7 +4445,7 @@ fn result_filter_key(app: &mut App, k: KeyEvent) {
             app.result_needle.clear();
             app.rebuild_view();
             app.sel = 0;
-            app.status = "已清除结果搜索".into();
+            app.status = t("已清除结果搜索").into();
         }
         _ => {
             if let Some(t) = &mut app.result_filter {
@@ -4480,9 +4460,9 @@ fn result_filter_key(app: &mut App, k: KeyEvent) {
             app.sel = 0;
             let n = result_row_count(app);
             app.status = if app.result_needle.trim().is_empty() {
-                "输入以搜索结果行…".into()
+                t("输入以搜索结果行…").into()
             } else {
-                format!("搜索「{}」· {n} 行命中", app.result_needle)
+                tf("搜索「{}」· {} 行命中", &[&(app.result_needle), &(n)])
             };
         }
     }
@@ -4493,7 +4473,7 @@ fn result_filter_key(app: &mut App, k: KeyEvent) {
 fn search_move(app: &mut App, dir: i32) {
     let n = result_row_count(app);
     if n == 0 {
-        app.status = format!("搜索「{}」· 0 行命中", app.result_needle);
+        app.status = tf("搜索「{}」· 0 行命中", &[&(app.result_needle)]);
         return;
     }
     if dir > 0 {
@@ -4501,7 +4481,7 @@ fn search_move(app: &mut App, dir: i32) {
     } else {
         app.sel = (app.sel + n - 1) % n;
     }
-    app.status = format!("搜索「{}」· 命中 {}/{n}", app.result_needle, app.sel + 1);
+    app.status = tf("搜索「{}」· 命中 {}/{}", &[&(app.result_needle), &(app.sel + 1), &(n)]);
 }
 
 // ── mobile efficiency: compact columns / column visibility / recents / filter ──
@@ -4514,13 +4494,9 @@ fn toggle_compact(app: &mut App) {
     app.compact = Some(!now);
     let on = compact_active(app.compact, app.layout_mode);
     app.status = if on {
-        format!(
-            "{} · 列宽≤{} 自适应，尽量一屏放下（Alt-C / w 关闭）",
-            compact_label(app),
-            COMPACT_MAX_CELL
-        )
+        tf("{} · 列宽≤{} 自适应，尽量一屏放下（Alt-C / w 关闭）", &[&(compact_label(app)), &(COMPACT_MAX_CELL)])
     } else {
-        format!("{} · 列宽按内容（Alt-C / w 开启）", compact_label(app))
+        tf("{} · 列宽按内容（Alt-C / w 开启）", &[&(compact_label(app))])
     };
     // Persist the choice: as the global default and, when a table is open, for
     // that exact `database.table` so reopening it restores the mode.
@@ -4535,11 +4511,11 @@ fn toggle_compact(app: &mut App) {
 /// Ctrl-Shift-H — open the column-visibility picker for the grid on screen.
 fn open_col_picker(app: &mut App) {
     let Some(grid) = app.grid_full.clone() else {
-        app.status = "没有可选择的列（先打开一张表或执行查询）".into();
+        app.status = t("没有可选择的列（先打开一张表或执行查询）").into();
         return;
     };
     if grid.columns.is_empty() || app.grid_kind == GridKind::Columns {
-        app.status = "当前视图不支持列选择".into();
+        app.status = t("当前视图不支持列选择").into();
         return;
     }
     app.col_picker_open = true;
@@ -4582,14 +4558,14 @@ fn col_picker_key(app: &mut App, k: KeyEvent) {
             app.col_hidden.clear();
             app.reapply_col_filter();
             app.persist_cols();
-            app.status = "已显示全部列（已记住）".into();
+            app.status = t("已显示全部列（已记住）").into();
         }
         KeyCode::Char('x') => {
             if let Some(grid) = app.grid_full.clone() {
                 app.col_hidden = grid.columns.iter().skip(1).cloned().collect();
                 app.reapply_col_filter();
                 app.persist_cols();
-                app.status = "仅保留第一列（已记住）".into();
+                app.status = t("仅保留第一列（已记住）").into();
             }
         }
         _ => {}
@@ -4611,7 +4587,7 @@ fn toggle_col_visible(app: &mut App) {
     if app.col_hidden.remove(&name) {
         app.reapply_col_filter();
         app.persist_cols();
-        app.status = format!("显示列 {name} · 已记住");
+        app.status = tf("显示列 {} · 已记住", &[&(name)]);
     } else {
         let visible = grid
             .columns
@@ -4619,20 +4595,20 @@ fn toggle_col_visible(app: &mut App) {
             .filter(|c| !app.col_hidden.contains(c.as_str()))
             .count();
         if visible <= 1 {
-            app.status = "至少保留一列".into();
+            app.status = t("至少保留一列").into();
             return;
         }
         app.col_hidden.insert(name.clone());
         app.reapply_col_filter();
         app.persist_cols();
-        app.status = format!("隐藏列 {name} · 已记住");
+        app.status = tf("隐藏列 {} · 已记住", &[&(name)]);
     }
 }
 
 /// Ctrl-Shift-R — jump straight to one of the last five browsed tables.
 fn open_recent_tables(app: &mut App) {
     if app.recent_tables.is_empty() {
-        app.status = "还没有浏览过表".into();
+        app.status = t("还没有浏览过表").into();
         return;
     }
     app.recent_open = true;
@@ -4688,13 +4664,13 @@ fn open_recent(app: &mut App, tx: &Tx, idx: usize) {
     // Another database: switch first and let the table-list reply open the table.
     if db != app.current_db() {
         let Some(pos) = app.databases.iter().position(|d| *d == db) else {
-            app.status = format!("✗ 数据库 {db} 不在当前连接中");
+            app.status = tf("✗ 数据库 {} 不在当前连接中", &[&(db)]);
             return;
         };
         app.db_index = pos;
         app.pending_open_table = Some(table.clone());
         app.pending_table = None;
-        app.status = format!("切换到 {db} 并打开 {table} …");
+        app.status = tf("切换到 {} 并打开 {} …", &[&(db), &(table)]);
         reload_tables(app, tx);
         return;
     }
@@ -4702,7 +4678,7 @@ fn open_recent(app: &mut App, tx: &Tx, idx: usize) {
         app.table_list.select(Some(pos));
         open_table_data(app, tx);
     } else {
-        app.status = format!("✗ 未找到表 {table}（可能被过滤或已删除）");
+        app.status = tf("✗ 未找到表 {}（可能被过滤或已删除）", &[&(table)]);
     }
 }
 
@@ -4736,7 +4712,7 @@ fn apply_table_filter(app: &mut App) {
 
 fn open_table_filter(app: &mut App) {
     if app.tables_all.is_empty() {
-        app.status = "还没有表可过滤".into();
+        app.status = t("还没有表可过滤").into();
         return;
     }
     let mut ta = TextArea::from([app.table_filter.clone()]);
@@ -4756,16 +4732,16 @@ fn table_filter_key(app: &mut App, k: KeyEvent) {
             apply_table_filter(app);
             let (n, total) = (app.tables.len(), app.tables_all.len());
             app.status = if app.table_filter.is_empty() {
-                format!("{total} 个表/视图")
+                tf("{} 个表/视图", &[&(total)])
             } else {
-                format!("过滤「{}」· {n}/{total} 个表 · Esc 清除", app.table_filter)
+                tf("过滤「{}」· {}/{} 个表 · Esc 清除", &[&(app.table_filter), &(n), &(total)])
             };
         }
         KeyCode::Esc => {
             app.table_prompt = None;
             app.table_filter.clear();
             apply_table_filter(app);
-            app.status = format!("已清除表过滤 · {} 个表/视图", app.tables.len());
+            app.status = tf("已清除表过滤 · {} 个表/视图", &[&(app.tables.len())]);
         }
         _ => {
             if let Some(t) = app.table_prompt.as_mut() {
@@ -5015,7 +4991,7 @@ fn open_completion(app: &mut App) {
     let (ctx, partial) = completion_context(&app.editor);
     let items = completion_candidates(app, &ctx, &partial);
     if items.is_empty() {
-        app.status = format!("无可补全项（前缀「{partial}」）");
+        app.status = tf("无可补全项（前缀「{}」）", &[&(partial)]);
         return;
     }
     app.completion = Some(Completion {
@@ -5112,12 +5088,7 @@ fn open_cell_popup(app: &mut App) {
     };
     let col = grid.columns.get(app.col_cursor).cloned().unwrap_or_default();
     let (text, style) = value_display(v);
-    let title = format!(
-        "{} · 第 {} 行 · {} 字符",
-        fix_double_encoding(&col),
-        cursor_abs_row(app),
-        text.chars().count()
-    );
+    let title = tf("{} · 第 {} 行 · {} 字符", &[&(fix_double_encoding(&col)), &(cursor_abs_row(app)), &(text.chars().count())]);
     app.cell_popup = Some(CellPopup {
         title,
         lines: vec![PopupLine { text, style }],
@@ -5143,11 +5114,11 @@ fn open_row_popup(app: &mut App) {
             Some(Val::Text(s)) => (s.clone(), Style::default()),
         };
         lines.push(PopupLine {
-            text: format!("{} = {}", fix_double_encoding(col), shown),
+            text: format!("{} = {}",  fix_double_encoding(col),  shown),
             style,
         });
     }
-    let title = format!("第 {} 行 · {} 列", cursor_abs_row(app), grid.columns.len());
+    let title = tf("第 {} 行 · {} 列", &[&(cursor_abs_row(app)), &(grid.columns.len())]);
     app.row_popup = Some(RowPopup {
         title,
         lines,
@@ -5160,7 +5131,7 @@ fn open_row_popup(app: &mut App) {
 /// Escape a value as a standard SQL string literal (quote doubled, backslash
 /// escaped). Fine for MySQL's default mode and standard SQL alike.
 fn sql_literal(s: &str) -> String {
-    format!("'{}'", s.replace('\\', "\\\\").replace('\'', "''"))
+    format!("'{}'",  s.replace('\\', "\\\\").replace('\'', "''"))
 }
 
 fn is_numeric_type(t: &str) -> bool {
@@ -5288,7 +5259,7 @@ fn build_insert_sql(
         })
         .collect::<Vec<_>>()
         .join(", ");
-    format!("INSERT INTO {} ({})\nVALUES ({});", q(table), cols, vals)
+    format!("INSERT INTO {} ({})\nVALUES ({});",  q(table),  cols,  vals)
 }
 
 fn is_ident_byte(b: u8) -> bool {
@@ -5452,27 +5423,27 @@ fn clipboard_copy(text: &str) -> Option<PathBuf> {
 /// `y` in the results pane: copy the focused row as an `INSERT` statement.
 fn copy_row_sql(app: &mut App) {
     if app.grid_kind == GridKind::Columns {
-        app.status = "表结构视图没有可复制的数据行".into();
+        app.status = t("表结构视图没有可复制的数据行").into();
         return;
     }
     if app.script.as_ref().is_some_and(|s| s.drilled.is_none()) {
-        app.status = "脚本列表没有可复制的行（先 Enter 进入某条语句的结果）".into();
+        app.status = t("脚本列表没有可复制的行（先 Enter 进入某条语句的结果）").into();
         return;
     }
     let Some(cfg) = app.selected.clone() else {
-        app.status = "✗ 未选择连接".into();
+        app.status = t("✗ 未选择连接").into();
         return;
     };
     let Some(full) = full_grid(app) else {
-        app.status = "没有可复制的行".into();
+        app.status = t("没有可复制的行").into();
         return;
     };
     let Some(orig) = app.full_row_index() else {
-        app.status = "没有可复制的行".into();
+        app.status = t("没有可复制的行").into();
         return;
     };
     let Some(row) = full.rows.get(orig).cloned() else {
-        app.status = "没有可复制的行".into();
+        app.status = t("没有可复制的行").into();
         return;
     };
     let table = if let Some(ps) = &app.page_state {
@@ -5485,19 +5456,16 @@ fn copy_row_sql(app: &mut App) {
         app.last_sql.as_deref().and_then(guess_table_from_sql)
     };
     let Some(table) = table else {
-        app.status = "无法从当前结果确定表名（仅表格浏览与含 FROM 的查询支持 y）".into();
+        app.status = t("无法从当前结果确定表名（仅表格浏览与含 FROM 的查询支持 y）").into();
         return;
     };
     let sql = build_insert_sql(&cfg, &table, &full, &row, app);
     let n = sql.chars().count();
     match clipboard_copy(&sql) {
         Some(p) => {
-            app.status = format!(
-                "✓ 已复制 INSERT（{n} 字符）· OSC52 剪贴板 · 兜底 {}",
-                p.display()
-            )
+            app.status = tf("✓ 已复制 INSERT（{} 字符）· OSC52 剪贴板 · 兜底 {}", &[&(n), &(p.display())])
         }
-        None => app.status = format!("✓ 已复制 INSERT（{n} 字符）· OSC52 剪贴板"),
+        None => app.status = tf("✓ 已复制 INSERT（{} 字符）· OSC52 剪贴板", &[&(n)]),
     }
 }
 
@@ -5539,7 +5507,7 @@ fn edit_prefill(v: &Val) -> String {
             if new_value_literal(s, None) == sql_literal(s) {
                 s.clone()
             } else {
-                format!("'{}'", s.replace('\'', "''"))
+                format!("'{}'",  s.replace('\'', "''"))
             }
         }
     }
@@ -5555,10 +5523,10 @@ fn build_update_sql(
 ) -> String {
     let q = |name: &str| quote_table_identifier(Some(cfg.db_type), name);
     format!(
-        "UPDATE {}\nSET {} = {}\nWHERE {};",
-        q(table),
-        q(column),
-        new_value_literal(input, data_type),
+        "UPDATE {}\nSET {} = {}\nWHERE {};", 
+        q(table), 
+        q(column), 
+        new_value_literal(input, data_type), 
         where_clause
     )
 }
@@ -5619,8 +5587,8 @@ fn row_where_clause(
             continue;
         };
         conds.push(format!(
-            "{} = {}",
-            q(k),
+            "{} = {}", 
+            q(k), 
             val_literal(v, column_type(app, table, k).as_deref())
         ));
     }
@@ -5637,7 +5605,7 @@ fn row_where_clause(
 /// through the red confirmation layer; nothing is deleted until Enter.
 fn delete_row(app: &mut App) {
     if !in_table_data_view(app) {
-        app.status = "仅表格浏览支持删除行".into();
+        app.status = t("仅表格浏览支持删除行").into();
         return;
     }
     let Some(grid) = active_grid(app) else {
@@ -5650,19 +5618,19 @@ fn delete_row(app: &mut App) {
         return;
     };
     let Some(row) = grid.rows.get(app.sel).cloned() else {
-        app.status = "没有可删除的行".into();
+        app.status = t("没有可删除的行").into();
         return;
     };
     let (where_clause, keys, no_pk) = row_where_clause(app, &grid, &row, &ps.table);
     let q = |name: &str| quote_table_identifier(Some(cfg.db_type), name);
-    let sql = format!("DELETE FROM {}\nWHERE {};", q(&ps.table), where_clause);
+    let sql = format!("DELETE FROM {}\nWHERE {};",  q(&ps.table),  where_clause);
     let mut reasons: Vec<String> = Vec::new();
     if no_pk {
-        reasons.push("⚠ 未检测到主键：将按全部列匹配删除，请确认只命中这一行".into());
+        reasons.push(t("⚠ 未检测到主键：将按全部列匹配删除，请确认只命中这一行").into());
     } else {
-        reasons.push(format!("将删除 1 行（主键 {}）", keys.join(", ")));
+        reasons.push(tf("将删除 1 行（主键 {}）", &[&(keys.join(", "))]));
     }
-    reasons.push("DELETE 不可撤销，Enter 后立即执行".into());
+    reasons.push(t("DELETE 不可撤销，Enter 后立即执行").into());
     reasons.push(format!("WHERE {where_clause}"));
     app.confirm = Some(Confirm {
         sql,
@@ -5670,7 +5638,7 @@ fn delete_row(app: &mut App) {
         refresh: true,
         clear_batch: false,
     });
-    app.status = "删除确认 · Enter 执行 · Esc 取消".into();
+    app.status = t("删除确认 · Enter 执行 · Esc 取消").into();
 }
 
 /// `e` — open a diff-style confirmation layer for the focused cell. The user
@@ -5710,7 +5678,7 @@ fn edit_cell(app: &mut App) {
     // there is no chance of the literal text "NULL" sneaking into the input.
     let initial = edit_prefill(&val);
     let mut ta = TextArea::from(initial.split('\n').collect::<Vec<_>>());
-    ta.set_placeholder_text("留空 = NULL · '文本' = 字符串");
+    ta.set_placeholder_text(t("留空 = NULL · '文本' = 字符串"));
     ta.move_cursor(CursorMove::End);
     app.edit_dialog = Some(EditDialog {
         kind: EditKind::Update,
@@ -5727,16 +5695,14 @@ fn edit_cell(app: &mut App) {
         insert_sql: String::new(),
         insert_preview: Vec::new(),
     });
-    app.status = format!(
-        "编辑 {col} → Enter 确认执行 · Esc 取消 · Ctrl-V 转编辑器 · Ctrl-T 加入批量"
-    );
+    app.status = tf("编辑 {} → Enter 确认执行 · Esc 取消 · Ctrl-V 转编辑器 · Ctrl-T 加入批量", &[&(col)]);
 }
 
 /// `i` — open the diff layer with an `INSERT` template built from the table's
 /// column list. Enter submits, `v` hands the SQL to the editor.
 fn quick_insert(app: &mut App) {
     if !in_table_data_view(app) {
-        app.status = "仅表格浏览支持快速插入".into();
+        app.status = t("仅表格浏览支持快速插入").into();
         return;
     }
     let Some(ps) = app.page_state.clone() else {
@@ -5746,7 +5712,7 @@ fn quick_insert(app: &mut App) {
         return;
     };
     let Some(meta) = app.table_meta.as_ref().filter(|m| m.table == ps.table).cloned() else {
-        app.status = "表结构尚未加载，稍后重试".into();
+        app.status = t("表结构尚未加载，稍后重试").into();
         return;
     };
     let cols: Vec<&ColumnInfo> = meta
@@ -5760,7 +5726,7 @@ fn quick_insert(app: &mut App) {
         })
         .collect();
     if cols.is_empty() {
-        app.status = "没有可插入的列".into();
+        app.status = t("没有可插入的列").into();
         return;
     }
     let q = |name: &str| quote_table_identifier(Some(cfg.db_type), name);
@@ -5779,9 +5745,9 @@ fn quick_insert(app: &mut App) {
         preview.push((fix_double_encoding(&c.name), v));
     }
     let sql = format!(
-        "INSERT INTO {} ({})\nVALUES ({});",
-        q(&ps.table),
-        col_list,
+        "INSERT INTO {} ({})\nVALUES ({});", 
+        q(&ps.table), 
+        col_list, 
         vals.join(", ")
     );
     app.edit_dialog = Some(EditDialog {
@@ -5799,10 +5765,7 @@ fn quick_insert(app: &mut App) {
         insert_sql: sql,
         insert_preview: preview,
     });
-    app.status = format!(
-        "插入 {} → Enter 确认执行 · Esc 取消 · Ctrl-V 转编辑器 · Ctrl-T 加入批量",
-        ps.table
-    );
+    app.status = tf("插入 {} → Enter 确认执行 · Esc 取消 · Ctrl-V 转编辑器 · Ctrl-T 加入批量", &[&(ps.table)]);
 }
 
 /// Keys for the diff-style edit confirmation layer. UPDATE has a live text
@@ -5817,21 +5780,18 @@ fn edit_dialog_key(app: &mut App, tx: &Tx, k: KeyEvent) {
     let to_editor = ctrl && k.code == KeyCode::Char('v') || (insert && plain && k.code == KeyCode::Char('v'));
     let to_batch = ctrl && k.code == KeyCode::Char('t') || (insert && plain && k.code == KeyCode::Char('b'));
     if k.code == KeyCode::Esc {
-        app.status = "已取消编辑".into();
+        app.status = t("已取消编辑").into();
     } else if k.code == KeyCode::Enter {
         submit_edit_sql(app, tx, d.sql());
     } else if to_editor {
         let sql = d.sql();
         app.set_editor_text(&sql);
         app.focus = Focus::Editor;
-        app.status = "已转入编辑器微调 · Ctrl-J 执行".into();
+        app.status = t("已转入编辑器微调 · Ctrl-J 执行").into();
     } else if to_batch {
         let sql = d.sql();
         app.batch.push(sql);
-        app.status = format!(
-            "已加入批量队列（{} 条）· Ctrl-S 打包提交 · Ctrl-X 清空",
-            app.batch.len()
-        );
+        app.status = tf("已加入批量队列（{} 条）· Ctrl-S 打包提交 · Ctrl-X 清空", &[&(app.batch.len())]);
     } else {
         if d.kind == EditKind::Update {
             d.new_input.input(k);
@@ -5845,7 +5805,7 @@ fn edit_dialog_key(app: &mut App, tx: &Tx, k: KeyEvent) {
 fn submit_edit_sql(app: &mut App, tx: &Tx, sql: String) {
     let mut reason = detect_danger(&sql);
     if reason.is_none() && one_line(&sql).to_ascii_lowercase().contains("where 1 = 1") {
-        reason = Some("WHERE 恒真（1 = 1），会作用于整张表".into());
+        reason = Some(t("WHERE 恒真（1 = 1），会作用于整张表").into());
     }
     if let Some(reason) = reason {
         app.confirm = Some(Confirm {
@@ -5866,7 +5826,7 @@ fn submit_edit_sql(app: &mut App, tx: &Tx, sql: String) {
 /// nothing runs until Enter (Esc keeps the queue intact).
 fn commit_batch(app: &mut App) {
     if app.batch.is_empty() {
-        app.status = "批量队列为空（编辑时按 Ctrl-T 加入）".into();
+        app.status = t("批量队列为空（编辑时按 Ctrl-T 加入）").into();
         return;
     }
     let n = app.batch.len();
@@ -5880,13 +5840,13 @@ fn commit_batch(app: &mut App) {
     app.confirm = Some(Confirm {
         sql: script,
         reasons: vec![
-            format!("批量事务：{n} 条修改将在同一个 BEGIN … COMMIT 中执行"),
-            "任一语句失败则整体回滚；Enter 后立即执行".into(),
+            tf("批量事务：{} 条修改将在同一个 BEGIN … COMMIT 中执行", &[&(n)]),
+            t("任一语句失败则整体回滚；Enter 后立即执行").into(),
         ],
         refresh: true,
         clear_batch: true,
     });
-    app.status = format!("批量提交确认（{n} 条）· Enter 执行 · Esc 取消");
+    app.status = tf("批量提交确认（{} 条）· Enter 执行 · Esc 取消", &[&(n)]);
 }
 
 
@@ -5894,7 +5854,7 @@ fn commit_batch(app: &mut App) {
 
 fn open_filter_prompt(app: &mut App) {
     if !in_table_data_view(app) {
-        app.status = "仅表格浏览支持过滤".into();
+        app.status = t("仅表格浏览支持过滤").into();
         return;
     }
     let Some(ps) = app.page_state.clone() else {
@@ -5905,7 +5865,7 @@ fn open_filter_prompt(app: &mut App) {
     let initial = if ps.filter.trim().is_empty() {
         match (active_grid(app), app.selected.as_ref()) {
             (Some(grid), Some(cfg)) => match grid.columns.get(app.col_cursor) {
-                Some(col) => format!("{} = ", quote_table_identifier(Some(cfg.db_type), col)),
+                Some(col) => format!("{} = ",  quote_table_identifier(Some(cfg.db_type), col)),
                 None => String::new(),
             },
             _ => String::new(),
@@ -5914,7 +5874,7 @@ fn open_filter_prompt(app: &mut App) {
         ps.filter.clone()
     };
     let mut ta = TextArea::from(initial.split('\n').collect::<Vec<_>>());
-    ta.set_placeholder_text("例: city = 'Beijing'（留空回车 = 清除）");
+    ta.set_placeholder_text(t("例: city = 'Beijing'（留空回车 = 清除）"));
     ta.move_cursor(CursorMove::End);
     app.filter_prompt = Some(ta);
 }
@@ -5927,12 +5887,12 @@ fn clear_filter(app: &mut App, tx: &Tx) {
         .map(|p| !p.filter.trim().is_empty())
         .unwrap_or(false);
     if !has_filter {
-        app.status = "当前无过滤条件".into();
+        app.status = t("当前无过滤条件").into();
         return;
     }
     let order_by = app.page_state.as_ref().and_then(|p| p.order_by.clone());
     reload_table_view(app, tx, String::new(), order_by, 0);
-    app.status = "过滤已清除".into();
+    app.status = t("过滤已清除").into();
 }
 
 /// `s` — sort by the focused column, toggling ASC ↔ DESC.
@@ -5985,7 +5945,7 @@ fn build_order_by(cfg: &ConnectionConfig, keys: &[(String, bool)]) -> Option<Str
     let q = |n: &str| quote_table_identifier(Some(cfg.db_type), n);
     Some(
         keys.iter()
-            .map(|(c, d)| format!("{} {}", q(c), if *d { "DESC" } else { "ASC" }))
+            .map(|(c, d)| format!("{} {}",  q(c),  if *d { "DESC" } else { "ASC" }))
             .collect::<Vec<_>>()
             .join(", "),
     )
@@ -5993,7 +5953,7 @@ fn build_order_by(cfg: &ConnectionConfig, keys: &[(String, bool)]) -> Option<Str
 
 fn sort_column(app: &mut App, tx: &Tx, append: bool) {
     if !in_table_data_view(app) {
-        app.status = "仅表格浏览支持排序".into();
+        app.status = t("仅表格浏览支持排序").into();
         return;
     }
     let Some(grid) = active_grid(app) else {
@@ -6026,19 +5986,16 @@ fn sort_column(app: &mut App, tx: &Tx, append: bool) {
     }
     let next = build_order_by(&cfg, &keys);
     let dir = if keys.first().map(|(_, d)| *d).unwrap_or(false) {
-        "降序"
+        t("降序")
     } else {
-        "升序"
+        t("升序")
     };
     // Persist the sort for this table so reopening it restores the order.
     let db = app.current_db();
     app.config.entry(&db, &ps.table).order_by = next.clone();
     app.persist();
     reload_table_view(app, tx, ps.filter.clone(), next, 0);
-    app.status = format!(
-        "按 {col} {dir}{}",
-        if append { "（附加排序键）" } else { "" }
-    );
+    app.status = tf("按 {} {}{}", &[&(col), &(dir), &(if append { t("（附加排序键）") } else { "" })]);
 }
 
 fn drill_script(app: &mut App, idx: usize) {
@@ -6066,7 +6023,7 @@ fn run_sql(app: &mut App, tx: &Tx) {
         return;
     }
     let Some(cfg) = app.selected.clone() else {
-        app.status = "✗ 未选择连接".into();
+        app.status = t("✗ 未选择连接").into();
         return;
     };
     // Danger check runs per statement so `UPDATE a; DELETE FROM b;` is caught too.
@@ -6094,11 +6051,11 @@ fn run_sql(app: &mut App, tx: &Tx) {
 
 fn execute_sql(app: &mut App, tx: &Tx, sql: String) {
     let Some(cfg) = app.selected.clone() else {
-        app.status = "✗ 未选择连接".into();
+        app.status = t("✗ 未选择连接").into();
         return;
     };
     app.loading = true;
-    app.status = "执行中…".into();
+    app.status = t("执行中…").into();
     let db = app.current_db();
     app.spawn(
         tx,
@@ -6109,20 +6066,20 @@ fn execute_sql(app: &mut App, tx: &Tx, sql: String) {
 /// `Ctrl-N`: re-run the last query with a larger row cap when it was truncated.
 fn load_more_rows(app: &mut App, tx: &Tx) {
     let Some((sql, cap)) = app.query_more.clone() else {
-        app.status = "没有可加载的更多结果（结果未截断）".into();
+        app.status = t("没有可加载的更多结果（结果未截断）").into();
         return;
     };
     if cap >= QUERY_MAX_ROWS_CAP {
-        app.status = format!("已达上限 {QUERY_MAX_ROWS_CAP} 行，请用 WHERE / LIMIT 缩小查询");
+        app.status = tf("已达上限 {} 行，请用 WHERE / LIMIT 缩小查询", &[&(QUERY_MAX_ROWS_CAP)]);
         return;
     }
     let Some(cfg) = app.selected.clone() else {
-        app.status = "✗ 未选择连接".into();
+        app.status = t("✗ 未选择连接").into();
         return;
     };
     let next = (cap + QUERY_MORE_STEP).min(QUERY_MAX_ROWS_CAP);
     app.loading = true;
-    app.status = format!("加载更多… (上限 {next} 行)");
+    app.status = tf("加载更多… (上限 {} 行)", &[&(next)]);
     let db = app.current_db();
     app.spawn(tx, Op::Query(Box::new(cfg), db, sql, next));
 }
@@ -6133,7 +6090,7 @@ fn run_cmd_line(app: &mut App, tx: &Tx) {
         return;
     }
     let Some(cfg) = app.selected.clone() else {
-        app.status = "✗ 未选择连接".into();
+        app.status = t("✗ 未选择连接").into();
         return;
     };
     app.cmd_input = TextArea::default();
@@ -6142,7 +6099,7 @@ fn run_cmd_line(app: &mut App, tx: &Tx) {
     match app.backend_kind {
         Backend::Redis => {
             app.cmd_output
-                .push(format!("redis[{}]> {cmd}", app.redis_db));
+                .push(format!("redis[{}]> {cmd}",  app.redis_db));
             app.spawn(
                 tx,
                 Op::Redis(Box::new(cfg), app.redis_db, cmd),
@@ -6155,7 +6112,7 @@ fn run_cmd_line(app: &mut App, tx: &Tx) {
             if let Some(db) = cmd.strip_prefix("use ") {
                 let db = db.trim().trim_end_matches(';').trim().to_string();
                 if db.is_empty() {
-                    app.status = "✗ use 需要数据库名".into();
+                    app.status = t("✗ use 需要数据库名").into();
                     app.loading = false;
                     return;
                 }
@@ -6167,7 +6124,7 @@ fn run_cmd_line(app: &mut App, tx: &Tx) {
                 return;
             }
             app.cmd_output
-                .push(format!("mongo({})> {cmd}", app.current_db()));
+                .push(format!("mongo({})> {cmd}",  app.current_db()));
             app.spawn(
                 tx,
                 Op::Mongo(Box::new(cfg), app.current_db(), cmd),
@@ -6242,8 +6199,8 @@ fn form_key(app: &mut App, tx: &Tx, k: KeyEvent) {
             app.page = Page::Browse;
             app.focus = Focus::Sidebar;
         }
-        KeyCode::Up => f.field = (f.field + FORM_FIELDS.len() - 1) % FORM_FIELDS.len(),
-        KeyCode::Down | KeyCode::Tab => f.field = (f.field + 1) % FORM_FIELDS.len(),
+        KeyCode::Up => f.field = (f.field + form_fields().len() - 1) % form_fields().len(),
+        KeyCode::Down | KeyCode::Tab => f.field = (f.field + 1) % form_fields().len(),
         KeyCode::Enter => {
             if f.field == 7 {
                 f.ssl = !f.ssl;
@@ -6254,9 +6211,9 @@ fn form_key(app: &mut App, tx: &Tx, k: KeyEvent) {
             }
         }
         KeyCode::Left | KeyCode::Char('h') => {
-            f.field = (f.field + FORM_FIELDS.len() - 1) % FORM_FIELDS.len()
+            f.field = (f.field + form_fields().len() - 1) % form_fields().len()
         }
-        KeyCode::Right | KeyCode::Char('l') => f.field = (f.field + 1) % FORM_FIELDS.len(),
+        KeyCode::Right | KeyCode::Char('l') => f.field = (f.field + 1) % form_fields().len(),
         _ => {}
     }
 }
@@ -6264,14 +6221,11 @@ fn form_key(app: &mut App, tx: &Tx, k: KeyEvent) {
 fn save_form(app: &mut App, tx: &Tx) {
     let f = app.form.clone();
     if f.name.trim().is_empty() || f.host.trim().is_empty() {
-        app.form.err = "name / host 必填".into();
+        app.form.err = t("name / host 必填").into();
         return;
     }
     let Ok(db_type) = parse_database_type(&f.db_type) else {
-        app.form.err = format!(
-            "未知类型: {} (mysql / postgres / redis / mongodb …)",
-            f.db_type
-        );
+        app.form.err = tf("未知类型: {} (mysql / postgres / redis / mongodb …)", &[&(f.db_type)]);
         return;
     };
     let port = f
@@ -6305,7 +6259,7 @@ fn save_form(app: &mut App, tx: &Tx) {
     };
     app.form.err.clear();
     app.loading = true;
-    app.status = "保存连接…".into();
+    app.status = t("保存连接…").into();
     app.spawn(tx, Op::AddConn(Box::new(cfg)));
 }
 
@@ -6387,7 +6341,7 @@ fn explain_sql_for(db_type: &str, sql: &str) -> Option<String> {
 /// RFC 4180 CSV field: quote when the value contains a comma, quote, CR or LF.
 fn csv_field(s: &str) -> String {
     if s.contains([',', '"', '\n', '\r']) {
-        format!("\"{}\"", s.replace('"', "\"\""))
+        format!("\"{}\"",  s.replace('"', "\"\""))
     } else {
         s.to_string()
     }
@@ -6503,14 +6457,27 @@ fn pan_columns(app: &mut App, delta: i32) -> bool {
 }
 
 /// Does this wheel event mean "pan columns" rather than "scroll rows"?
+///
+/// A terminal is only required to put a modifier into a wheel event's SGR button
+/// byte if it chooses to; many PC terminals and tmux never set the SHIFT bit for
+/// Shift+wheel (and some swallow Shift+wheel for their own horizontal scroll), so
+/// the app cannot rely on SHIFT alone. ALT and CONTROL are reported far more
+/// reliably, and `Ctrl-G` pan mode works regardless of what the terminal sends.
+fn wheel_wants_pan(
+    focus: Focus,
+    mods: KeyModifiers,
+    pan_mode: bool,
+    has_h_scroll: bool,
+) -> bool {
+    let modifier_pan = mods.intersects(
+        KeyModifiers::SHIFT | KeyModifiers::ALT | KeyModifiers::CONTROL,
+    );
+    focus == Focus::Preview && (pan_mode || modifier_pan) && has_h_scroll
+}
+
+/// Does this wheel event mean "pan columns" rather than "scroll rows"?
 fn wheel_pans_columns(app: &App, m: &MouseEvent) -> bool {
-    if app.focus != Focus::Preview {
-        return false;
-    }
-    let wants_pan = m.modifiers.contains(KeyModifiers::SHIFT)
-        || m.modifiers.contains(KeyModifiers::ALT)
-        || app.pan_mode;
-    wants_pan && has_h_scroll(app)
+    wheel_wants_pan(app.focus, m.modifiers, app.pan_mode, has_h_scroll(app))
 }
 
 /// How many recent mouse events the `DBXT_MOUSE_DEBUG` overlay keeps.
@@ -6555,8 +6522,8 @@ fn mouse_wire_hint(m: &MouseEvent) -> String {
     // Legacy X10 encoding: three bytes after `ESC [ M`, each offset by 32.
     if x <= 223 && y <= 223 && cb + 32 <= 255 {
         out.push_str(&format!(
-            " | X10 \\x1b[M {}+32 {}+32 {}+32",
-            cb, m.column, m.row
+            " | X10 \\x1b[M {}+32 {}+32 {}+32", 
+            cb,  m.column,  m.row
         ));
     }
     out
@@ -6567,14 +6534,14 @@ fn describe_mouse(m: &MouseEvent) -> String {
     let mods = if m.modifiers.is_empty() {
         String::new()
     } else {
-        format!(" mods={:?}", m.modifiers)
+        format!(" mods={:?}",  m.modifiers)
     };
     format!(
-        "{:?} @({},{}){} · {}",
-        m.kind,
-        m.column,
-        m.row,
-        mods,
+        "{:?} @({},{}){} · {}", 
+        m.kind, 
+        m.column, 
+        m.row, 
+        mods, 
         mouse_wire_hint(m)
     )
 }
@@ -6582,7 +6549,7 @@ fn describe_mouse(m: &MouseEvent) -> String {
 /// Human-readable description of the mouse/resize events we trace.
 fn describe_event(ev: &Event) -> Option<String> {
     match ev {
-        Event::Mouse(m) => Some(format!("Mouse {}", describe_mouse(m))),
+        Event::Mouse(m) => Some(format!("Mouse {}",  describe_mouse(m))),
         Event::Resize(w, h) => Some(format!("Resize {w}x{h}")),
         _ => None,
     }
@@ -6596,9 +6563,9 @@ fn describe_event_short(ev: &Event) -> Option<String> {
             let mods = if m.modifiers.is_empty() {
                 String::new()
             } else {
-                format!(" mods={:?}", m.modifiers)
+                format!(" mods={:?}",  m.modifiers)
             };
-            Some(format!("Mouse {:?} @({},{}){}", m.kind, m.column, m.row, mods))
+            Some(format!("Mouse {:?} @({},{}){}",  m.kind,  m.column,  m.row,  mods))
         }
         Event::Resize(w, h) => Some(format!("Resize {w}x{h}")),
         _ => None,
@@ -6860,27 +6827,27 @@ fn replace_result_tab(
 /// `[` / `]`: flip between the query results kept in this session.
 fn switch_result_tab(app: &mut App, delta: i32) {
     if app.result_tabs.len() < 2 {
-        app.status = "仅 1 个结果标签".into();
+        app.status = t("仅 1 个结果标签").into();
         return;
     }
     app.save_result_tab();
     let n = app.result_tabs.len() as i32;
     app.result_tab = (app.result_tab as i32 + delta).rem_euclid(n) as usize;
     app.restore_result_tab();
-    app.status = format!("结果 {}/{}", app.result_tab + 1, app.result_tabs.len());
+    app.status = tf("结果 {}/{}", &[&(app.result_tab + 1), &(app.result_tabs.len())]);
 }
 
 /// `Ctrl-P`: run the editor's SQL through the dialect's EXPLAIN.
 fn explain_current(app: &mut App, tx: &Tx) {
     let Some(cfg) = app.selected.clone() else {
-        app.status = "✗ 未选择连接".into();
+        app.status = t("✗ 未选择连接").into();
         return;
     };
     let sql = app.editor_sql();
     match explain_sql_for(cfg.db_type.as_str(), &sql) {
         Some(explain) => {
             app.loading = true;
-            app.status = format!("{} EXPLAIN…", cfg.db_type.as_str());
+            app.status = format!("{} EXPLAIN…",  cfg.db_type.as_str());
             let db = app.current_db();
             app.spawn(
                 tx,
@@ -6888,10 +6855,7 @@ fn explain_current(app: &mut App, tx: &Tx) {
             );
         }
         None => {
-            app.status = format!(
-                "{} 不支持单语句 EXPLAIN（请手动执行）",
-                cfg.db_type.as_str()
-            );
+            app.status = tf("{} 不支持单语句 EXPLAIN（请手动执行）", &[&(cfg.db_type.as_str())]);
         }
     }
 }
@@ -6899,11 +6863,11 @@ fn explain_current(app: &mut App, tx: &Tx) {
 /// `Ctrl-Y`: export the focused result grid to a CSV file under `$HOME`.
 fn export_csv(app: &mut App) {
     let Some(grid) = active_grid(app) else {
-        app.status = "没有可导出的结果".into();
+        app.status = t("没有可导出的结果").into();
         return;
     };
     if grid.columns.is_empty() {
-        app.status = "没有可导出的列".into();
+        app.status = t("没有可导出的列").into();
         return;
     }
     let csv = grid_to_csv(&grid);
@@ -6930,20 +6894,20 @@ fn export_csv(app: &mut App) {
     match std::fs::write(&path, csv.as_bytes()) {
         Ok(_) => {
             let rows = grid.rows.len();
-            app.status = format!("✓ 已导出 {rows} 行 → {}", path.display());
+            app.status = tf("✓ 已导出 {} 行 → {}", &[&(rows), &(path.display())]);
         }
-        Err(e) => app.status = format!("✗ 导出失败: {e}"),
+        Err(e) => app.status = tf("✗ 导出失败: {}", &[&(e)]),
     }
 }
 
 /// `Ctrl-O`: open the saved-SQL snippet overlay for the current connection.
 fn open_snippets(app: &mut App, tx: &Tx) {
     let Some(cfg) = app.selected.clone() else {
-        app.status = "先选择连接".into();
+        app.status = t("先选择连接").into();
         return;
     };
     app.loading = true;
-    app.status = "加载 SQL 片段…".into();
+    app.status = t("加载 SQL 片段…").into();
     app.spawn(tx, Op::Snippets(Box::new(cfg)));
 }
 
@@ -6981,12 +6945,12 @@ fn snippet_key(app: &mut App, tx: &Tx, k: KeyEvent) {
                     let merged = if existing.trim().is_empty() {
                         sql
                     } else {
-                        format!("{}\n{sql}", existing.trim_end())
+                        format!("{}\n{sql}",  existing.trim_end())
                     };
                     app.set_editor_text(&merged);
                     app.snippet_open = false;
                     app.focus = Focus::Editor;
-                    app.status = format!("✓ 已插入 {name}");
+                    app.status = tf("✓ 已插入 {}", &[&(name)]);
                 }
             }
         }
@@ -6998,7 +6962,7 @@ fn snippet_key(app: &mut App, tx: &Tx, k: KeyEvent) {
 fn open_snippet_name(app: &mut App) {
     let sql = app.editor_sql();
     if sql.trim().is_empty() {
-        app.status = "编辑器为空：先写 SQL 再收藏".into();
+        app.status = t("编辑器为空：先写 SQL 再收藏").into();
         return;
     }
     let mut ta = TextArea::from([query_tab_title(&sql)]);
@@ -7017,7 +6981,7 @@ fn snippet_name_key(app: &mut App, tx: &Tx, k: KeyEvent) {
                 .unwrap_or_default();
             app.snippet_name = None;
             if name.is_empty() {
-                app.status = "片段名称不能为空".into();
+                app.status = t("片段名称不能为空").into();
                 return;
             }
             // DBX stores snippet names with a `.sql` suffix.
@@ -7028,7 +6992,7 @@ fn snippet_name_key(app: &mut App, tx: &Tx, k: KeyEvent) {
                 return;
             };
             let sql = app.editor_sql();
-            app.status = format!("保存片段 {name} …");
+            app.status = tf("保存片段 {} …", &[&(name)]);
             app.spawn(
                 tx,
                 Op::SaveSnippet(Box::new(cfg), name, sql),
@@ -7036,7 +7000,7 @@ fn snippet_name_key(app: &mut App, tx: &Tx, k: KeyEvent) {
         }
         KeyCode::Esc => {
             app.snippet_name = None;
-            app.status = "已取消收藏".into();
+            app.status = t("已取消收藏").into();
         }
         _ => {
             if let Some(t) = app.snippet_name.as_mut() {
@@ -7055,7 +7019,7 @@ fn duplicate_connection(app: &mut App) {
         return;
     };
     app.form = ConnForm {
-        name: format!("{} (副本)", cfg.name),
+        name: tf("{} (副本)", &[&(cfg.name)]),
         db_type: cfg.db_type.as_str().to_string(),
         host: cfg.host.clone(),
         port: if cfg.port == 0 {
@@ -7072,7 +7036,7 @@ fn duplicate_connection(app: &mut App) {
         err: String::new(),
     };
     app.page = Page::NewConn;
-    app.status = format!("复制连接 {} · 改参数后 Enter 保存", cfg.name);
+    app.status = tf("复制连接 {} · 改参数后 Enter 保存", &[&(cfg.name)]);
 }
 
 // ─── rendering ───────────────────────────────────────────────────────────────
@@ -7181,7 +7145,7 @@ fn render_mouse_debug(f: &mut Frame, area: Rect, app: &App) {
         width: w,
         height: h,
     };
-    let title = format!(" 鼠标事件 DBXT_MOUSE_DEBUG · 横滑={:?} ", app.drag_pan);
+    let title = tf(" 鼠标事件 DBXT_MOUSE_DEBUG · 横滑={} ", &[&format!("{:?}", app.drag_pan)]);
     f.render_widget(Clear, rect);
     f.render_widget(
         Paragraph::new(lines).block(
@@ -7228,10 +7192,10 @@ fn render_header(f: &mut Frame, area: Rect, app: &App) {
     let conn = app
         .selected
         .as_ref()
-        .map(|c| format!("{} ({})", c.name, c.db_type.as_str()))
-        .unwrap_or_else(|| "未连接".into());
+        .map(|c| format!("{} ({})",  c.name,  c.db_type.as_str()))
+        .unwrap_or_else(|| t("未连接").into());
     let db = if app.selected.is_some() && !app.current_db().is_empty() {
-        format!(" · db:{}", fix_double_encoding(&app.current_db()))
+        format!(" · db:{}",  fix_double_encoding(&app.current_db()))
     } else {
         String::new()
     };
@@ -7248,9 +7212,9 @@ fn render_header(f: &mut Frame, area: Rect, app: &App) {
             .map(|t| t.elapsed().as_secs())
             .unwrap_or(0);
         if secs >= 3 {
-            format!(" {} {}s", spinner_frame(app.spinner), secs)
+            format!(" {} {}s",  spinner_frame(app.spinner),  secs)
         } else {
-            format!(" {}", spinner_frame(app.spinner))
+            format!(" {}",  spinner_frame(app.spinner))
         }
     } else {
         String::new()
@@ -7292,37 +7256,37 @@ fn context_info(app: &App) -> String {
         }
     }
     if let Some(ncols) = fits {
-        parts.push(format!("全部 {ncols} 列已适配"));
+        parts.push(tf("全部 {} 列已适配", &[&(ncols)]));
     }
     if compact_active(app.compact, app.layout_mode) {
         parts.push(if app.compact.is_none() {
-            "紧凑列".into()
+            t("紧凑列").into()
         } else {
-            "紧凑列 手动".into()
+            t("紧凑列 手动").into()
         });
     }
     if !app.col_hidden.is_empty() {
-        parts.push(format!("隐藏列 {}", app.col_hidden.len()));
+        parts.push(tf("隐藏列 {}", &[&(app.col_hidden.len())]));
     }
     // Touch fallback: vertical wheel pans columns (Ctrl-G).
     if app.pan_mode {
-        parts.push("横滚 开".into());
+        parts.push(t("横滚 开").into());
     }
     match app.focus {
-        Focus::Sidebar => parts.push("焦点 侧栏".into()),
-        Focus::Editor => parts.push("焦点 SQL".into()),
-        Focus::CmdInput => parts.push("焦点 命令".into()),
-        Focus::Preview => parts.push("焦点 结果".into()),
+        Focus::Sidebar => parts.push(t("焦点 侧栏").into()),
+        Focus::Editor => parts.push(t("焦点 SQL").into()),
+        Focus::CmdInput => parts.push(t("焦点 命令").into()),
+        Focus::Preview => parts.push(t("焦点 结果").into()),
     }
     // Small marker for the responsive-collapse master switch (Ctrl-A).
     parts.push(if app.auto_collapse {
-        "自动折叠 开".into()
+        t("自动折叠 开").into()
     } else {
-        "自动折叠 关".into()
+        t("自动折叠 关").into()
     });
     // Result tabs (queries only).
     if app.result_tabs.len() > 1 && app.grid_kind != GridKind::TableData {
-        parts.push(format!("结果 {}/{}", app.result_tab + 1, app.result_tabs.len()));
+        parts.push(tf("结果 {}/{}", &[&(app.result_tab + 1), &(app.result_tabs.len())]));
     }
     // Live event readout while `DBXT_EVENT_TRACE` is set, so a user can report
     // exactly which events their terminal sends for a swipe. Pushed last so the
@@ -7330,7 +7294,7 @@ fn context_info(app: &App) -> String {
     // text is the first thing that can go); with the `DBXT_MOUSE_DEBUG` panel on
     // screen the status bar keeps its width instead.
     let event_part = if app.trace_path.is_some() && !app.mouse_debug {
-        app.last_event.as_ref().map(|ev| format!("事件 {ev}"))
+        app.last_event.as_ref().map(|ev| tf("事件 {}", &[&(ev)]))
     } else {
         None
     };
@@ -7339,7 +7303,7 @@ fn context_info(app: &App) -> String {
             .total
             .map(|t| page_count(t, ps.page_size).to_string())
             .unwrap_or_else(|| "?".into());
-        parts.push(format!("第 {}/{} 页", ps.page + 1, pages));
+        parts.push(tf("第 {}/{} 页", &[&(ps.page + 1), &(pages)]));
     }
     let n = result_row_count(app);
     if n > 0 {
@@ -7350,7 +7314,7 @@ fn context_info(app: &App) -> String {
             .and_then(|ps| ps.total)
             .map(|t| t as usize)
             .unwrap_or(n);
-        parts.push(format!("行 {cur}/{total_abs}"));
+        parts.push(tf("行 {}/{}", &[&(cur), &(total_abs)]));
     }
     // Horizontal position is always visible for data grids so the user can tell
     // at a glance that more columns exist off-screen. With a pinned prefix the
@@ -7369,12 +7333,12 @@ fn context_info(app: &App) -> String {
             // nothing left to scroll to — the whole point of compact mode. That
             // marker was already pushed at the front of the list.
             if app.grid_frozen + vis < ncols {
-                parts.push(format!("列 {pin}{}-{}/{}", off + 1, off + vis, ncols));
+                parts.push(tf("列 {}{}-{}/{}", &[&(pin), &(off + 1), &(off + vis), &(ncols)]));
             }
         }
     }
     if !app.batch.is_empty() {
-        parts.push(format!("批量 {} 待提交", app.batch.len()));
+        parts.push(tf("批量 {} 待提交", &[&(app.batch.len())]));
     }
     if let Some(ev) = event_part {
         parts.push(ev);
@@ -7412,77 +7376,267 @@ fn render_status(f: &mut Frame, area: Rect, app: &App) {
     );
 }
 
-fn render_footer(f: &mut Frame, area: Rect, app: &App) {
-    let text: String = if app.help_open {
-        "快捷键速查 · ↑↓ 滚动 · Esc 关闭".into()
+/// One footer hint: the keycap plus what it does.
+type Hint = (&'static str, &'static str);
+
+/// Which surface currently owns the keyboard, from the footer's point of view.
+/// Overlays take precedence over the page, exactly like the key router.
+#[derive(Clone, Copy, PartialEq, Debug)]
+enum FooterView {
+    Help,
+    TablePrompt,
+    ResultFilter,
+    Recent,
+    ColPicker,
+    Completion,
+    SnippetName,
+    Snippets,
+    FilterPrompt,
+    Popup,
+    EditDialog,
+    DbPicker,
+    Confirm,
+    ConnPicker,
+    NewConn,
+    Browse,
+}
+
+/// Everything the footer needs to know, so the group choice can be unit-tested
+/// without building a whole `App`.
+#[derive(Clone, Copy)]
+struct FooterCtx {
+    view: FooterView,
+    focus: Focus,
+    has_connection: bool,
+}
+
+fn footer_ctx(app: &App) -> FooterCtx {
+    let view = if app.help_open {
+        FooterView::Help
     } else if app.table_prompt.is_some() {
-        "过滤表名 · 输入即筛选 · Enter 保留 · Esc 清除".into()
+        FooterView::TablePrompt
     } else if app.result_filter.is_some() {
-        "搜索结果 · 输入即筛选 · Enter 保留 · Esc 清除".into()
+        FooterView::ResultFilter
     } else if app.recent_open {
-        "最近表 · ↑↓ 选择 · Enter 直达 · Esc 关闭".into()
+        FooterView::Recent
     } else if app.col_picker_open {
-        "列显示 · 空格勾选 · a 全选 · x 仅首列 · Esc 关闭".into()
+        FooterView::ColPicker
     } else if app.completion.is_some() {
-        "SQL 补全 · ↑↓ 选择 · Tab/Enter 上屏 · Esc 取消".into()
+        FooterView::Completion
     } else if app.snippet_name.is_some() {
-        "收藏为 SQL 片段 · 输入名称 · Enter 保存 · Esc 取消".into()
+        FooterView::SnippetName
     } else if app.snippet_open {
-        "↑↓ 选择 · Enter 插入编辑器 · s 收藏当前 SQL · r 刷新 · Esc 关闭".into()
+        FooterView::Snippets
     } else if app.filter_prompt.is_some() {
-        "WHERE 过滤 · Enter 应用 · Esc 取消 · 留空回车清除".into()
-    } else if app.row_popup.is_some() {
-        "行详情 · ↑↓ 滚动 · Esc/Enter 关闭".into()
-    } else if app.cell_popup.is_some() {
-        "单元格 · ↑↓ 滚动 · Esc/Enter 关闭".into()
+        FooterView::FilterPrompt
+    } else if app.row_popup.is_some() || app.cell_popup.is_some() {
+        FooterView::Popup
     } else if app.edit_dialog.is_some() {
-        "✎ 编辑确认 · Enter 执行 · Esc 取消 · Ctrl-V 转编辑器 · Ctrl-T 加入批量".into()
+        FooterView::EditDialog
     } else if app.db_picker_open {
-        "↑↓ 选择数据库 · Enter 切换 · r 刷新 · Esc 关闭".into()
+        FooterView::DbPicker
     } else if app.confirm.is_some() {
-        "⚠ 危险操作 · Enter/y 执行 · Esc/n 取消".into()
-    } else if app.layout_mode == LayoutMode::Narrow {
-        match app.page {
-            Page::NewConn => "↑↓ 字段 · Enter 编辑/保存 · Esc 返回".into(),
-            _ => match app.focus {
-                Focus::Sidebar if app.selected.is_none() => {
-                    "↑↓ 连接 · Enter 选 · c 新建 · q 隐藏".into()
-                }
-                Focus::Sidebar => "↑↓ 表 · / 过滤 · t 最近表 · d 切库 · Enter 数据 · r 结构 · ? 帮助".into(),
-                Focus::Editor => "Ctrl-J 运行 · Ctrl-Space 补全 · ↑ 历史 · Tab 下一区".into(),
-                Focus::CmdInput => "Enter 执行 · Ctrl-L 换模式".into(),
-                Focus::Preview => {
-                    "↑↓ 行 · ←→ 列 · Enter 整行 · e 编辑 · Del 删行 · f 过滤 · / 搜索 · y 复制INSERT · Ctrl-G 横滚 · ? 帮助".into()
-                }
-            },
-        }
+        FooterView::Confirm
+    } else if app.page == Page::NewConn {
+        FooterView::NewConn
+    } else if app.picker_open && app.selected.is_none() {
+        FooterView::ConnPicker
     } else {
-        match app.page {
-            Page::NewConn => "↑↓/h,l 字段 · Enter 编辑/保存 · Esc 返回 · ssl 回车切换".into(),
-            _ => match app.focus {
-                Focus::Sidebar if app.selected.is_none() => {
-                    "↑↓ 选择连接 · Enter 连接 · c 新建 · p 复制 · q 显隐列表 · Tab 直接写SQL".into()
-                }
-                Focus::Sidebar => {
-                    "↑↓ 表 · / 过滤 · t 最近表 · d/←→ 切库 · Enter 浏览 · r 结构 · Tab SQL · ? 帮助".into()
-                }
-                Focus::Editor => {
-                    "Ctrl-J/F5 运行 · Ctrl-Space 补全 · Enter 换行 · ↑/↓ 历史 · Tab 下一区 · Esc 侧栏".into()
-                }
-                Focus::CmdInput => {
-                    "Enter 执行 · [ ] 切 redis db · Ctrl-L 切 sql/redis/mongo · Esc 编辑器".into()
-                }
-                Focus::Preview => {
-                    "↑↓ 行(到边翻页) · ←→/hl 列 · Enter 整行/单元格 · e 编辑 · i 插入 · Del 删行 · y 复制INSERT · f 过滤 · / 搜索 · s 排序 · w 紧凑 · c 列显隐 · ? 帮助".into()
-                }
-            },
-        }
+        FooterView::Browse
     };
-    f.render_widget(
-        Paragraph::new(truncate_disp(&text, area.width as usize))
-            .style(Style::default().fg(Color::DarkGray)),
-        area,
-    );
+    FooterCtx {
+        view,
+        focus: app.focus,
+        has_connection: app.selected.is_some(),
+    }
+}
+
+/// Build the footer hint list for a context, most relevant first. The last entry
+/// is always the pinned `?` help key, so the escape hatch can never be dropped;
+/// rendering trims lower-priority hints when the line is narrow.
+fn footer_hints_ctx(ctx: FooterCtx) -> Vec<Hint> {
+    let mut v: Vec<Hint> = match ctx.view {
+        FooterView::Help => vec![("↑↓", t("滚动")), ("Esc", t("关闭"))],
+        FooterView::TablePrompt | FooterView::ResultFilter => {
+            vec![("Enter", t("保留")), ("Esc", t("清除"))]
+        }
+        FooterView::Recent => vec![
+            ("↑↓", t("选择")),
+            ("Enter", t("直达")),
+            ("Esc", t("关闭")),
+        ],
+        FooterView::ColPicker => vec![
+            ("Space", t("勾选")),
+            ("a", t("全选")),
+            ("x", t("仅首列")),
+            ("Esc", t("关闭")),
+        ],
+        FooterView::Completion => vec![
+            ("↑↓", t("选择")),
+            ("Tab/Enter", t("上屏")),
+            ("Esc", t("取消")),
+        ],
+        FooterView::SnippetName => vec![("Enter", t("保存")), ("Esc", t("取消"))],
+        FooterView::Snippets => vec![
+            ("↑↓", t("选择")),
+            ("Enter", t("插入编辑器")),
+            ("s", t("收藏")),
+            ("r", t("刷新")),
+            ("Esc", t("关闭")),
+        ],
+        FooterView::FilterPrompt => {
+            vec![("Enter", t("应用")), ("Esc", t("取消")), ("⏎", t("清除"))]
+        }
+        FooterView::Popup => vec![("↑↓", t("滚动")), ("Esc/Enter", t("关闭"))],
+        FooterView::EditDialog => vec![
+            ("Enter", t("执行")),
+            ("Esc", t("取消")),
+            ("Ctrl-V", t("转编辑器")),
+            ("Ctrl-T", t("加入批量")),
+        ],
+        FooterView::DbPicker => vec![
+            ("↑↓", t("选择")),
+            ("Enter", t("切换")),
+            ("r", t("刷新")),
+            ("Esc", t("关闭")),
+        ],
+        FooterView::Confirm => vec![("Enter/y", t("执行")), ("Esc/n", t("取消"))],
+        FooterView::ConnPicker => vec![
+            ("↑↓", t("选择连接")),
+            ("Enter", t("连接")),
+            ("c", t("新建")),
+            ("p", t("复制")),
+            ("q", t("显隐")),
+        ],
+        FooterView::NewConn => vec![
+            ("↑↓", t("字段")),
+            ("Enter", t("编辑/保存")),
+            ("Esc", t("返回")),
+            ("ssl", t("切换")),
+        ],
+        FooterView::Browse => match ctx.focus {
+            Focus::Sidebar if !ctx.has_connection => vec![
+                ("↑↓", t("选择连接")),
+                ("Enter", t("连接")),
+                ("c", t("新建")),
+                ("p", t("复制")),
+                ("q", t("显隐")),
+            ],
+            Focus::Sidebar => vec![
+                ("↑↓", t("表")),
+                ("/", t("过滤")),
+                ("Enter", t("浏览")),
+                ("r", t("结构")),
+                ("d", t("切库")),
+                ("Tab", t("SQL")),
+            ],
+            Focus::Editor => vec![
+                ("Ctrl-J", t("运行")),
+                ("Ctrl-Space", t("补全")),
+                ("Enter", t("换行")),
+                ("↑↓", t("历史")),
+                ("Tab", t("下一区")),
+                ("Esc", t("侧栏")),
+            ],
+            Focus::CmdInput => vec![
+                ("Enter", t("执行")),
+                ("[ ]", t("切库")),
+                ("Ctrl-L", t("换模式")),
+                ("Esc", t("编辑器")),
+            ],
+            Focus::Preview => vec![
+                ("↑↓", t("行")),
+                ("←→", t("列")),
+                ("Enter", t("详情")),
+                ("e", t("编辑")),
+                ("i", t("插入")),
+                ("Del", t("删行")),
+                ("y", t("复制INSERT")),
+                ("f", t("过滤")),
+                ("/", t("搜索")),
+            ],
+        },
+    };
+    // The help key is the one hint that is never dropped.
+    v.push(("?", t("帮助")));
+    v
+}
+
+/// Build the footer hint list for the current app state.
+fn footer_hints(app: &App) -> Vec<Hint> {
+    footer_hints_ctx(footer_ctx(app))
+}
+
+fn hint_width(h: &Hint) -> usize {
+    disp_width(h.0) + 1 + disp_width(h.1)
+}
+
+/// Choose which leading hints fit in `width` while always keeping the pinned
+/// final hint (`?` help). Returns the chosen leading hints and whether anything
+/// was dropped (so the caller can draw the `…` marker).
+fn footer_select<'a>(hints: &'a [Hint], width: usize) -> (Vec<&'a Hint>, bool) {
+    let (help, lead) = hints.split_last().expect("footer always has a hint");
+    // Reserve the help hint plus two " · " separators and the `…` marker.
+    let mut budget = width.saturating_sub(hint_width(help) + 5);
+    let mut chosen: Vec<&'a Hint> = Vec::new();
+    let mut dropped = false;
+    for h in lead {
+        let w = hint_width(h);
+        if w + 3 <= budget {
+            budget -= w + 3;
+            chosen.push(h);
+        } else {
+            dropped = true;
+            break;
+        }
+    }
+    (chosen, dropped)
+}
+
+#[cfg(test)]
+/// Display width of the rendered footer line for a chosen set, used by tests.
+/// Mirrors exactly what [`render_footer`] draws: the chosen hints, an optional
+/// `…` marker, the pinned help hint, and one `" · "` separator per gap.
+fn footer_line_width(chosen: &[&Hint], help: &Hint, dropped: bool) -> usize {
+    let mut w: usize = chosen.iter().map(|h| hint_width(h)).sum();
+    w += hint_width(help);
+    let mut tokens = chosen.len() + 1; // chosen hints + help
+    if dropped {
+        tokens += 1;
+        w += 1; // the "…" glyph
+    }
+    w + tokens.saturating_sub(1) * 3
+}
+
+fn render_footer(f: &mut Frame, area: Rect, app: &App) {
+    let hints = footer_hints(app);
+    let (chosen, dropped) = footer_select(&hints, area.width as usize);
+    let help = hints.last().expect("footer always has a hint");
+    let mut spans: Vec<Span> = Vec::new();
+    let sep = Span::styled(" · ", Style::default().fg(Color::DarkGray));
+    let key_style = Style::default()
+        .fg(Color::Cyan)
+        .add_modifier(Modifier::BOLD);
+    let desc_style = Style::default().fg(Color::DarkGray);
+    for h in &chosen {
+        if !spans.is_empty() {
+            spans.push(sep.clone());
+        }
+        spans.push(Span::styled(h.0, key_style));
+        spans.push(Span::styled(format!(" {}", h.1), desc_style));
+    }
+    if dropped {
+        if !spans.is_empty() {
+            spans.push(sep.clone());
+        }
+        spans.push(Span::styled("…", desc_style));
+    }
+    if !spans.is_empty() {
+        spans.push(sep);
+    }
+    spans.push(Span::styled(help.0, key_style));
+    spans.push(Span::styled(format!(" {}", help.1), desc_style));
+    f.render_widget(Paragraph::new(Line::from(spans)), area);
 }
 
 fn render_browse(f: &mut Frame, area: Rect, app: &mut App) {
@@ -7574,8 +7728,8 @@ fn render_main_area(
 
     if has_cmd {
         let title = match app.backend_kind {
-            Backend::Redis => format!(" redis[{}] ", app.redis_db),
-            Backend::Mongo => format!(" mongo({}) ", app.current_db()),
+            Backend::Redis => format!(" redis[{}] ",  app.redis_db),
+            Backend::Mongo => format!(" mongo({}) ",  app.current_db()),
             Backend::Sql => " cmd ".into(),
         };
         let cfocused = app.focus == Focus::CmdInput;
@@ -7602,18 +7756,18 @@ fn render_sidebar_strip(f: &mut Frame, area: Rect, app: &mut App) {
     let focused = app.focus == Focus::Sidebar;
     let mut text = String::new();
     if let Some(c) = &app.selected {
-        text.push_str(&format!("▸ {} · {} 表", truncate_disp(&c.name, 16), app.tables.len()));
+        text.push_str(&tf("▸ {} · {} 表", &[&(truncate_disp(&c.name, 16)), &(app.tables.len())]));
         let db = app.current_db();
         if !db.is_empty() {
-            text.push_str(&format!(" · {}", fix_double_encoding(&db)));
+            text.push_str(&format!(" · {}",  fix_double_encoding(&db)));
         }
         if let Some(t) = app.selected_table() {
-            text.push_str(&format!(" · {}", fix_double_encoding(&t.name)));
+            text.push_str(&format!(" · {}",  fix_double_encoding(&t.name)));
         }
     } else {
-        text.push_str("▸ 未连接");
+        text.push_str(t("▸ 未连接"));
     }
-    text.push_str(" · 点击/Ctrl-W 展开");
+    text.push_str(t(" · 点击/Ctrl-W 展开"));
     let style = if focused {
         Style::default()
             .fg(Color::Black)
@@ -7636,9 +7790,9 @@ fn render_editor_strip(f: &mut Frame, area: Rect, app: &mut App) {
     let sql = app.editor_sql();
     let first = sql.lines().find(|l| !l.trim().is_empty()).unwrap_or("");
     let text = if first.is_empty() {
-        "SQL ▸ 空 · 点击/Tab 展开".to_string()
+        t("SQL ▸ 空 · 点击/Tab 展开").to_string()
     } else {
-        format!("SQL ▸ {} · 点击/Tab 展开", one_line(first))
+        tf("SQL ▸ {} · 点击/Tab 展开", &[&(one_line(first))])
     };
     let style = if focused {
         Style::default()
@@ -7657,7 +7811,7 @@ fn render_editor_strip(f: &mut Frame, area: Rect, app: &mut App) {
 /// One-line summary shown in place of the results pane when it is collapsed.
 fn render_results_strip(f: &mut Frame, area: Rect, app: &mut App) {
     let n = result_row_count(app);
-    let text = format!("结果 ▸ {n} 行 · 点击/Ctrl-W 展开");
+    let text = tf("结果 ▸ {} 行 · 点击/Ctrl-W 展开", &[&(n)]);
     f.render_widget(
         Paragraph::new(truncate_disp(&text, area.width as usize))
             .style(Style::default().fg(Color::Gray)),
@@ -7677,16 +7831,11 @@ fn render_results_pane(f: &mut Frame, area: Rect, app: &mut App) {
     if let Some(s) = app.script.clone() {
         if let Some(i) = s.drilled {
             let o = &s.outcomes[i];
-            let title = format!(
-                " {}语句 {} 结果 · {} · Esc 返回脚本 ",
-                search_marker(app),
-                i + 1,
-                if o.grid.note.is_empty() {
+            let title = tf(" {}语句 {} 结果 · {} · Esc 返回脚本 ", &[&(search_marker(app)), &(i + 1), &(if o.grid.note.is_empty() {
                     "".to_string()
                 } else {
                     o.grid.note.clone()
-                }
-            );
+                })]);
             if let Some(grid) = active_grid(app) {
                 render_grid(f, area, app, &grid, GridKind::Query, &title);
             }
@@ -7716,12 +7865,12 @@ fn render_results_pane(f: &mut Frame, area: Rect, app: &mut App) {
         if app.picker_open {
             ""
         } else {
-            "q 显示连接列表"
+            t("q 显示连接列表")
         }
     } else if app.tables.is_empty() {
-        "无表 · Tab 到 SQL 编辑器 · Ctrl-L 切 redis/mongo 命令行"
+        t("无表 · Tab 到 SQL 编辑器 · Ctrl-L 切 redis/mongo 命令行")
     } else {
-        "↑↓ 选表 · Enter 浏览数据 · r 表结构\nTab 到 SQL 编辑器 · Ctrl-L 切 redis/mongo 命令行"
+        t("↑↓ 选表 · Enter 浏览数据 · r 表结构\nTab 到 SQL 编辑器 · Ctrl-L 切 redis/mongo 命令行")
     };
     f.render_widget(
         Paragraph::new(hint)
@@ -7729,7 +7878,7 @@ fn render_results_pane(f: &mut Frame, area: Rect, app: &mut App) {
             .block(
                 Block::default()
                     .borders(Borders::ALL)
-                    .title(" 结果 ")
+                    .title(t(" 结果 "))
                     .border_set(border::ROUNDED)
                     .border_style(border_style(app.focus == Focus::Preview)),
             ),
@@ -7743,11 +7892,7 @@ fn search_marker(app: &App) -> String {
     if app.result_needle.trim().is_empty() {
         String::new()
     } else {
-        format!(
-            "🔍「{}」{} 命中 · ",
-            app.result_needle,
-            result_row_count(app)
-        )
+        tf("🔍「{}」{} 命中 · ", &[&(app.result_needle), &(result_row_count(app))])
     }
 }
 
@@ -7755,38 +7900,23 @@ fn grid_title(app: &App) -> String {
     match app.grid_kind {
         GridKind::TableData => {
             let Some(ps) = &app.page_state else {
-                return " 结果 ".into();
+                return t(" 结果 ").into();
             };
             let rows = app.grid.as_ref().map(|g| g.rows.len()).unwrap_or(0);
             let offset = ps.page * ps.page_size;
             let total = ps
                 .total
-                .map(|t| format!("共 {t} 行"))
-                .unwrap_or_else(|| "总数未知".into());
-            let more = if ps.has_next { " · n 下一页" } else { "" };
-            format!(
-                " {}{}.{} · 第 {} 页 · {}–{} / {} · {}{}{} ",
-                search_marker(app),
-                fix_double_encoding(&app.current_db()),
-                fix_double_encoding(&ps.table),
-                ps.page + 1,
-                if rows == 0 { 0 } else { offset + 1 },
-                offset + rows,
-                total,
-                app.grid.as_ref().map(|g| g.note.clone()).unwrap_or_default(),
-                more,
-                page_state_extra(ps)
-            )
+                .map(|t| tf("共 {} 行", &[&(t)]))
+                .unwrap_or_else(|| t("总数未知").into());
+            let more = if ps.has_next { t(" · n 下一页") } else { "" };
+            tf(" {}{}.{} · 第 {} 页 · {}–{} / {} · {}{}{} ", &[&(search_marker(app)), &(fix_double_encoding(&app.current_db())), &(fix_double_encoding(&ps.table)), &(ps.page + 1), &(if rows == 0 { 0 } else { offset + 1 }), &(offset + rows), &(total), &(app.grid.as_ref().map(|g| g.note.clone()).unwrap_or_default()), &(more), &(page_state_extra(ps))])
         }
         GridKind::Columns => {
             let table = app
                 .selected_table()
                 .map(|t| fix_double_encoding(&t.name))
                 .unwrap_or_default();
-            format!(
-                " 表结构 · {table} · {} · t 查看 DDL ",
-                app.grid.as_ref().map(|g| g.note.clone()).unwrap_or_default()
-            )
+            tf(" 表结构 · {} · {} · t 查看 DDL ", &[&(table), &(app.grid.as_ref().map(|g| g.note.clone()).unwrap_or_default())])
         }
         GridKind::Query => {
             let note = app.grid.as_ref().map(|g| g.note.clone()).unwrap_or_default();
@@ -7796,15 +7926,9 @@ fn grid_title(app: &App) -> String {
                     .get(app.result_tab)
                     .map(|t| t.title.clone())
                     .unwrap_or_default();
-                format!(
-                    " {}结果 {}/{} · {note} · {} · [ ] 切换 ",
-                    search_marker(app),
-                    app.result_tab + 1,
-                    app.result_tabs.len(),
-                    truncate_disp(&title, 20)
-                )
+                tf(" {}结果 {}/{} · {} · {} · [ ] 切换 ", &[&(search_marker(app)), &(app.result_tab + 1), &(app.result_tabs.len()), &(note), &(truncate_disp(&title, 20))])
             } else {
-                format!(" {}结果 · {note} ", search_marker(app))
+                tf(" {}结果 · {} ", &[&(search_marker(app)), &(note)])
             }
         }
     }
@@ -8019,7 +8143,7 @@ fn render_grid(f: &mut Frame, area: Rect, app: &mut App, grid: &Grid, kind: Grid
             1 => "1|".to_string(),
             f => format!("1-{f}|"),
         };
-        let label = format!("列 {pin}{}-{}/{}", off + 1, off + visible, ncols);
+        let label = tf("列 {}{}-{}/{}", &[&(pin), &(off + 1), &(off + visible), &(ncols)]);
         // One cell at each end is a tap target for panning a whole window — the
         // touch-friendly control for phones whose terminal sends no h-wheel.
         let track = inner_w - 2;
@@ -8251,7 +8375,7 @@ fn gutter_cell(i: usize, selected: bool) -> Cell<'static> {
     } else {
         Style::default().fg(Color::DarkGray)
     };
-    Cell::from(Span::styled(format!("{}", i + 1), style))
+    Cell::from(Span::styled(format!("{}",  i + 1), style))
 }
 
 fn col_header_cell(
@@ -8274,7 +8398,7 @@ fn col_header_cell(
     }
     let sw = disp_width(&suffix);
     let text = if w > sw {
-        format!("{}{}", truncate_disp(name, w - sw), suffix)
+        format!("{}{}",  truncate_disp(name, w - sw),  suffix)
     } else {
         truncate_disp(suffix.trim_start(), w)
     };
@@ -8392,12 +8516,7 @@ fn render_script_list(f: &mut Frame, area: Rect, app: &mut App, script: &ScriptV
     let focused = app.focus == Focus::Preview;
     let errors = script.outcomes.iter().filter(|o| o.error.is_some()).count();
     let affected: u64 = script.outcomes.iter().map(|o| o.affected).sum();
-    let title = format!(
-        " 脚本 · {} 条语句 · 影响 {} 行 · {} 错误 · Enter 查看结果 ",
-        script.outcomes.len(),
-        affected,
-        errors
-    );
+    let title = tf(" 脚本 · {} 条语句 · 影响 {} 行 · {} 错误 · Enter 查看结果 ", &[&(script.outcomes.len()), &(affected), &(errors)]);
     let widths = [
         Constraint::Length(4),
         Constraint::Min(20),
@@ -8410,9 +8529,9 @@ fn render_script_list(f: &mut Frame, area: Rect, app: &mut App, script: &ScriptV
         .enumerate()
         .map(|(i, o)| {
             let status = match &o.error {
-                Some(e) => format!("✗ {}", truncate_disp(&one_line(e), 16)),
-                None if !o.grid.columns.is_empty() => format!("{} 行", o.grid.rows.len()),
-                None => format!("影响 {} 行", o.affected),
+                Some(e) => format!("✗ {}",  truncate_disp(&one_line(e), 16)),
+                None if !o.grid.columns.is_empty() => tf("{} 行", &[&(o.grid.rows.len())]),
+                None => tf("影响 {} 行", &[&(o.affected)]),
             };
             let style = if o.error.is_some() {
                 Style::default().fg(Color::Red)
@@ -8421,13 +8540,13 @@ fn render_script_list(f: &mut Frame, area: Rect, app: &mut App, script: &ScriptV
             };
             let mut r = Row::new(vec![
                 Cell::from(Span::styled(
-                    format!("{}", i + 1),
+                    format!("{}",  i + 1),
                     Style::default().fg(Color::DarkGray),
                 )),
                 Cell::from(Span::raw(truncate_disp(&one_line(&o.sql), 80))),
                 Cell::from(Span::styled(status, style)),
                 Cell::from(Span::styled(
-                    format!("{}ms", o.ms),
+                    format!("{}ms",  o.ms),
                     Style::default().fg(Color::DarkGray),
                 )),
             ]);
@@ -8439,7 +8558,7 @@ fn render_script_list(f: &mut Frame, area: Rect, app: &mut App, script: &ScriptV
         .collect();
     let table = Table::new(rows, widths)
         .header(
-            Row::new(vec!["#", "语句", "结果", "耗时"]).style(
+            Row::new(vec!["#", t("语句"), t("结果"), t("耗时")]).style(
                 Style::default()
                     .fg(Color::Cyan)
                     .add_modifier(Modifier::BOLD),
@@ -8485,11 +8604,7 @@ fn render_ddl(f: &mut Frame, area: Rect, app: &mut App, ddl: &str) {
             Line::from(vec![Span::raw(" ".repeat(indent)), Span::styled(trimmed.to_string(), style)])
         })
         .collect();
-    let title = format!(
-        " 表结构 (DDL) · {table} · {}/{} 行 · t 返回字段 ",
-        (app.ddl_scroll as usize + inner_h).min(total),
-        total
-    );
+    let title = tf(" 表结构 (DDL) · {} · {}/{} 行 · t 返回字段 ", &[&(table), &((app.ddl_scroll as usize + inner_h).min(total)), &(total)]);
     f.render_widget(
         Paragraph::new(body)
             .scroll((app.ddl_scroll, 0))
@@ -8545,7 +8660,7 @@ fn render_console(f: &mut Frame, area: Rect, app: &App) {
             .block(
                 Block::default()
                     .borders(Borders::ALL)
-                    .title(" 输出 ")
+                    .title(t(" 输出 "))
                     .border_set(border::ROUNDED)
                     .border_style(border_style(app.focus == Focus::Preview)),
             ),
@@ -8594,13 +8709,13 @@ fn render_sidebar(f: &mut Frame, area: Rect, app: &mut App) {
             let (mark, text, style) = if app.table_filter.is_empty() {
                 (
                     "/ ",
-                    "/ 过滤表名".to_string(),
+                    t("/ 过滤表名").to_string(),
                     Style::default().fg(Color::DarkGray),
                 )
             } else {
                 (
                     "▸ ",
-                    format!("/{} · {}/{}", app.table_filter, app.tables.len(), app.tables_all.len()),
+                    format!("/{} · {}/{}",  app.table_filter,  app.tables.len(),  app.tables_all.len()),
                     Style::default().fg(Color::Yellow),
                 )
             };
@@ -8635,15 +8750,15 @@ fn render_sidebar(f: &mut Frame, area: Rect, app: &mut App) {
                 Style::default()
             };
             lines.push(Line::from(Span::styled(
-                format!("{marker}{}{view}", fix_double_encoding(&t.name)),
+                format!("{marker}{}{view}",  fix_double_encoding(&t.name)),
                 style,
             )));
         }
 
         let title = if app.table_filter.is_empty() {
-            format!(" {} ({}) ", c.name, app.tables_all.len())
+            format!(" {} ({}) ",  c.name,  app.tables_all.len())
         } else {
-            format!(" {} 表 {}/{} ", c.name, app.tables.len(), app.tables_all.len())
+            tf(" {} 表 {}/{} ", &[&(c.name), &(app.tables.len()), &(app.tables_all.len())])
         };
         f.render_widget(
             Paragraph::new(lines).block(
@@ -8660,7 +8775,7 @@ fn render_sidebar(f: &mut Frame, area: Rect, app: &mut App) {
         let hint = if app.picker_open {
             ""
         } else {
-            "q 显示\n连接列表"
+            t("q 显示\n连接列表")
         };
         f.render_widget(
             Paragraph::new(hint)
@@ -8668,7 +8783,7 @@ fn render_sidebar(f: &mut Frame, area: Rect, app: &mut App) {
                 .block(
                     Block::default()
                         .borders(Borders::ALL)
-                        .title(" 连接 ")
+                        .title(t(" 连接 "))
                         .border_set(border::ROUNDED)
                         .border_style(border_style(focused)),
                 ),
@@ -8684,7 +8799,7 @@ fn render_form(f: &mut Frame, area: Rect, app: &mut App) {
     } else {
         52.min(area.width.saturating_sub(4))
     };
-    let box_h = (FORM_FIELDS.len() as u16 + 6).min(area.height.saturating_sub(2));
+    let box_h = (form_fields().len() as u16 + 6).min(area.height.saturating_sub(2));
     let x = area.x + (area.width.saturating_sub(box_w)) / 2;
     let y = area.y + (area.height.saturating_sub(box_h)) / 2;
     let box_area = Rect {
@@ -8706,12 +8821,12 @@ fn render_form(f: &mut Frame, area: Rect, app: &mut App) {
         if form.ssl { "y".into() } else { "n".into() },
         String::new(),
     ];
-    for (i, label) in FORM_FIELDS.iter().enumerate() {
+    for (i, label) in form_fields().iter().enumerate() {
         let active = i == form.field;
         let value = if i == 8 {
-            "↵ 保存连接".to_string()
+            t("↵ 保存连接").to_string()
         } else if form.editing && active {
-            format!("{}▏", vals[i])
+            format!("{}▏",  vals[i])
         } else {
             vals[i].clone()
         };
@@ -8730,7 +8845,7 @@ fn render_form(f: &mut Frame, area: Rect, app: &mut App) {
     }
     if !form.err.is_empty() {
         lines.push(Line::from(Span::styled(
-            format!("✗ {}", form.err),
+            format!("✗ {}",  form.err),
             Style::default().fg(Color::Red),
         )));
     }
@@ -8741,7 +8856,7 @@ fn render_form(f: &mut Frame, area: Rect, app: &mut App) {
 
     let block = Block::default()
         .borders(Borders::ALL)
-        .title(" 新建连接 ")
+        .title(t(" 新建连接 "))
         .border_set(border::ROUNDED)
         .border_style(Style::default().fg(Color::Green));
     f.render_widget(Clear, box_area);
@@ -8775,7 +8890,7 @@ fn render_conn_picker(f: &mut Frame, area: Rect, app: &mut App) {
             let color = connection_color(c);
             ListItem::new(Line::from(vec![
                 Span::styled(
-                    format!("{:11}", truncate_disp(c.db_type.as_str(), 11)),
+                    format!("{:11}",  truncate_disp(c.db_type.as_str(), 11)),
                     Style::default().fg(color),
                 ),
                 Span::raw(" "),
@@ -8790,7 +8905,7 @@ fn render_conn_picker(f: &mut Frame, area: Rect, app: &mut App) {
         .block(
             Block::default()
                 .borders(Borders::ALL)
-                .title(" 连接 · ↑↓ Enter · c 新建 · p 复制 · q 隐藏 ")
+                .title(t(" 连接 · ↑↓ Enter · c 新建 · p 复制 · q 隐藏 "))
                 .border_set(border::ROUNDED),
         )
         .highlight_style(
@@ -8847,8 +8962,8 @@ fn render_db_picker(f: &mut Frame, area: Rect, app: &mut App) {
         })
         .collect();
     let title = match app.backend_kind {
-        Backend::Redis => " Redis db · ↑↓ Enter · Esc 关 ",
-        _ => " 数据库 · ↑↓ Enter · Esc 关 ",
+        Backend::Redis => t(" Redis db · ↑↓ Enter · Esc 关 "),
+        _ => t(" 数据库 · ↑↓ Enter · Esc 关 "),
     };
     let list = List::new(items)
         .block(
@@ -8895,7 +9010,7 @@ fn render_snippets(f: &mut Frame, area: Rect, app: &mut App) {
                 .trim();
             ListItem::new(Line::from(vec![
                 Span::styled(
-                    format!("{:20}", truncate_disp(name, 20)),
+                    format!("{:20}",  truncate_disp(name, 20)),
                     Style::default()
                         .fg(Color::Cyan)
                         .add_modifier(Modifier::BOLD),
@@ -8912,10 +9027,7 @@ fn render_snippets(f: &mut Frame, area: Rect, app: &mut App) {
         .block(
             Block::default()
                 .borders(Borders::ALL)
-                .title(format!(
-                    " SQL 片段 · {} 个 · Enter 插入 · r 刷新 · Esc 关 ",
-                    app.snippets.len()
-                ))
+                .title(tf(" SQL 片段 · {} 个 · Enter 插入 · r 刷新 · Esc 关 ", &[&(app.snippets.len())]))
                 .border_set(border::ROUNDED)
                 .border_style(Style::default().fg(Color::Cyan)),
         )
@@ -8970,7 +9082,7 @@ fn render_col_picker(f: &mut Frame, area: Rect, app: &mut App) {
                     style,
                 ),
                 Span::styled(
-                    format!("  {}", i + 1),
+                    format!("  {}",  i + 1),
                     Style::default().fg(Color::DarkGray),
                 ),
             ]))
@@ -8985,10 +9097,7 @@ fn render_col_picker(f: &mut Frame, area: Rect, app: &mut App) {
         .block(
             Block::default()
                 .borders(Borders::ALL)
-                .title(format!(
-                    " 列显示 {visible}/{} · 空格勾选 · a 全选 · x 仅首列 · Esc 关 ",
-                    grid.columns.len()
-                ))
+                .title(tf(" 列显示 {}/{} · 空格勾选 · a 全选 · x 仅首列 · Esc 关 ", &[&(visible), &(grid.columns.len())]))
                 .border_set(border::ROUNDED)
                 .border_style(Style::default().fg(Color::Cyan)),
         )
@@ -9033,7 +9142,7 @@ fn render_recent_tables(f: &mut Frame, area: Rect, app: &mut App) {
                     Style::default().add_modifier(Modifier::BOLD),
                 ),
                 Span::styled(
-                    format!("  {}", fix_double_encoding(db)),
+                    format!("  {}",  fix_double_encoding(db)),
                     Style::default().fg(Color::Cyan),
                 ),
             ]))
@@ -9043,7 +9152,7 @@ fn render_recent_tables(f: &mut Frame, area: Rect, app: &mut App) {
         .block(
             Block::default()
                 .borders(Borders::ALL)
-                .title(" 最近表 · ↑↓ Enter 直达 · Esc 关 ")
+                .title(t(" 最近表 · ↑↓ Enter 直达 · Esc 关 "))
                 .border_set(border::ROUNDED)
                 .border_style(Style::default().fg(Color::Cyan)),
         )
@@ -9071,11 +9180,7 @@ fn render_table_filter(f: &mut Frame, area: Rect, app: &mut App) {
     f.render_widget(Clear, box_area);
     let block = Block::default()
         .borders(Borders::ALL)
-        .title(format!(
-            " 过滤表名 {}/{} · Enter 保留 · Esc 清除 ",
-            app.tables.len(),
-            app.tables_all.len()
-        ))
+        .title(tf(" 过滤表名 {}/{} · Enter 保留 · Esc 清除 ", &[&(app.tables.len()), &(app.tables_all.len())]))
         .border_set(border::ROUNDED)
         .border_style(Style::default().fg(Color::Yellow));
     let inner = block.inner(box_area);
@@ -9103,9 +9208,7 @@ fn render_result_filter(f: &mut Frame, area: Rect, app: &mut App) {
     let hits = result_row_count(app);
     let block = Block::default()
         .borders(Borders::ALL)
-        .title(format!(
-            " 搜索结果 {hits} 行命中 · Enter 保留 · Esc 清除 "
-        ))
+        .title(tf(" 搜索结果 {} 行命中 · Enter 保留 · Esc 清除 ", &[&(hits)]))
         .border_set(border::ROUNDED)
         .border_style(Style::default().fg(Color::Yellow));
     let inner = block.inner(box_area);
@@ -9153,7 +9256,7 @@ fn render_completion(f: &mut Frame, app: &App) {
             let tag = item.kind.to_string();
             let room = (w as usize).saturating_sub(6);
             Line::from(vec![
-                Span::styled(format!("{:<room$}", truncate_disp(&item.text, room)), style),
+                Span::styled(format!("{:<room$}",  truncate_disp(&item.text, room)), style),
                 Span::styled(format!("[{tag}]"), style.fg(Color::DarkGray)),
             ])
         })
@@ -9162,7 +9265,7 @@ fn render_completion(f: &mut Frame, app: &App) {
         Paragraph::new(lines).block(
             Block::default()
                 .borders(Borders::ALL)
-                .title(" 补全 · T表 C列 K关键字 · Tab 上屏 · ↑↓ · Esc ")
+                .title(t(" 补全 · T表 C列 K关键字 · Tab 上屏 · ↑↓ · Esc "))
                 .border_set(border::ROUNDED)
                 .border_style(Style::default().fg(Color::Cyan)),
         ),
@@ -9185,7 +9288,7 @@ fn render_snippet_name(f: &mut Frame, area: Rect, app: &mut App) {
     f.render_widget(Clear, box_area);
     let block = Block::default()
         .borders(Borders::ALL)
-        .title(" 收藏为 SQL 片段（DBX saved_sql_files）· Enter 保存 · Esc 取消 ")
+        .title(t(" 收藏为 SQL 片段（DBX saved_sql_files）· Enter 保存 · Esc 取消 "))
         .border_set(border::ROUNDED)
         .border_style(Style::default().fg(Color::Green));
     let inner = block.inner(box_area);
@@ -9233,12 +9336,7 @@ fn render_text_popup(f: &mut Frame, area: Rect, title: &str, lines: &[PopupLine]
     f.render_widget(Clear, box_area);
     let max_scroll = total.saturating_sub(inner_h).min(u16::MAX as usize) as u16;
     let scroll = scroll.min(max_scroll);
-    let title = format!(
-        " {} · {}/{} · Esc 关闭 ",
-        title,
-        (scroll as usize + inner_h).min(total),
-        total
-    );
+    let title = tf(" {} · {}/{} · Esc 关闭 ", &[&(title), &((scroll as usize + inner_h).min(total)), &(total)]);
     f.render_widget(
         Paragraph::new(body).scroll((scroll, 0)).block(
             Block::default()
@@ -9274,7 +9372,7 @@ fn render_edit_dialog(f: &mut Frame, area: Rect, app: &mut App) {
             };
             let mut header_lines: Vec<Line> = Vec::new();
             header_lines.push(Line::from(vec![
-                Span::styled("列   ", Style::default().fg(Color::DarkGray)),
+                Span::styled(t("列   "), Style::default().fg(Color::DarkGray)),
                 Span::styled(
                     d.column.clone(),
                     Style::default()
@@ -9283,14 +9381,14 @@ fn render_edit_dialog(f: &mut Frame, area: Rect, app: &mut App) {
                 ),
                 Span::styled(
                     format!(
-                        "  {}",
+                        "  {}", 
                         d.data_type.clone().unwrap_or_else(|| "?".into())
                     ),
                     Style::default().fg(Color::DarkGray),
                 ),
             ]));
             header_lines.push(Line::from(vec![
-                Span::styled("旧值 ", Style::default().fg(Color::DarkGray)),
+                Span::styled(t("旧值 "), Style::default().fg(Color::DarkGray)),
                 Span::styled(
                     truncate_disp(&one_line(&old), inner_w.saturating_sub(6)),
                     old_style,
@@ -9305,12 +9403,12 @@ fn render_edit_dialog(f: &mut Frame, area: Rect, app: &mut App) {
             ]));
             if d.no_pk {
                 header_lines.push(Line::from(Span::styled(
-                    "⚠ 未检测到主键：WHERE 用全部列匹配，请确认条件唯一",
+                    t("⚠ 未检测到主键：WHERE 用全部列匹配，请确认条件唯一"),
                     Style::default().fg(Color::Yellow),
                 )));
             } else {
                 header_lines.push(Line::from(vec![
-                    Span::styled("主键 ", Style::default().fg(Color::DarkGray)),
+                    Span::styled(t("主键 "), Style::default().fg(Color::DarkGray)),
                     Span::styled(
                         truncate_disp(&d.keys.join(", "), inner_w.saturating_sub(6)),
                         Style::default().fg(Color::Cyan),
@@ -9322,7 +9420,7 @@ fn render_edit_dialog(f: &mut Frame, area: Rect, app: &mut App) {
             let sql_lines = wrap_sql_lines(&d.sql(), inner_w.saturating_sub(2));
             header_lines.push(Line::from(""));
             header_lines.push(Line::from(Span::styled(
-                "生成的 SQL（Enter 执行）",
+                t("生成的 SQL（Enter 执行）"),
                 Style::default().fg(Color::DarkGray),
             )));
             for l in &sql_lines {
@@ -9345,7 +9443,7 @@ fn render_edit_dialog(f: &mut Frame, area: Rect, app: &mut App) {
             let block = Block::default()
                 .borders(Borders::ALL)
                 .title(Span::styled(
-                    format!(" ✎ 编辑 {}.{} ", d.db, d.table),
+                    tf(" ✎ 编辑 {}.{} ", &[&(d.db), &(d.table)]),
                     Style::default()
                         .fg(Color::Yellow)
                         .add_modifier(Modifier::BOLD),
@@ -9381,7 +9479,7 @@ fn render_edit_dialog(f: &mut Frame, area: Rect, app: &mut App) {
                 if let Some(dd) = app.edit_dialog.as_mut() {
                     let b = Block::default()
                         .borders(Borders::ALL)
-                        .title(" 新值 · Enter 执行 ")
+                        .title(t(" 新值 · Enter 执行 "))
                         .border_set(border::ROUNDED)
                         .border_style(Style::default().fg(Color::Green));
                     dd.new_input.set_block(b);
@@ -9398,7 +9496,7 @@ fn render_edit_dialog(f: &mut Frame, area: Rect, app: &mut App) {
                 };
                 f.render_widget(
                     Paragraph::new(truncate_disp(
-                        "Enter 执行 · Esc 取消 · Ctrl-V 转编辑器 · Ctrl-T 加入批量",
+                        t("Enter 执行 · Esc 取消 · Ctrl-V 转编辑器 · Ctrl-T 加入批量"),
                         inner_w,
                     ))
                     .style(Style::default().fg(Color::DarkGray)),
@@ -9409,7 +9507,7 @@ fn render_edit_dialog(f: &mut Frame, area: Rect, app: &mut App) {
         EditKind::Insert => {
             let mut lines: Vec<Line> = Vec::new();
             lines.push(Line::from(Span::styled(
-                format!("新增一行到 {}.{}", d.db, d.table),
+                tf("新增一行到 {}.{}", &[&(d.db), &(d.table)]),
                 Style::default().fg(Color::Cyan),
             )));
             for (col, val) in d.insert_preview.iter().take(10) {
@@ -9433,14 +9531,14 @@ fn render_edit_dialog(f: &mut Frame, area: Rect, app: &mut App) {
             }
             lines.push(Line::from(""));
             lines.push(Line::from(Span::styled(
-                "生成的 SQL（Enter 执行）",
+                t("生成的 SQL（Enter 执行）"),
                 Style::default().fg(Color::DarkGray),
             )));
             for l in wrap_sql_lines(&d.sql(), inner_w.saturating_sub(2)) {
                 lines.push(Line::from(Span::styled(l, Style::default().fg(Color::White))));
             }
             lines.push(Line::from(Span::styled(
-                "Enter 执行 · Esc 取消 · Ctrl-V 转编辑器 · Ctrl-T 加入批量",
+                t("Enter 执行 · Esc 取消 · Ctrl-V 转编辑器 · Ctrl-T 加入批量"),
                 Style::default().fg(Color::DarkGray),
             )));
             let h = (lines.len() as u16 + 2).min(area.height);
@@ -9456,7 +9554,7 @@ fn render_edit_dialog(f: &mut Frame, area: Rect, app: &mut App) {
             let block = Block::default()
                 .borders(Borders::ALL)
                 .title(Span::styled(
-                    format!(" ➕ 插入 {}.{} ", d.db, d.table),
+                    tf(" ➕ 插入 {}.{} ", &[&(d.db), &(d.table)]),
                     Style::default()
                         .fg(Color::Green)
                         .add_modifier(Modifier::BOLD),
@@ -9489,7 +9587,7 @@ fn render_filter_prompt(f: &mut Frame, area: Rect, app: &mut App) {
     f.render_widget(Clear, box_area);
     let block = Block::default()
         .borders(Borders::ALL)
-        .title(" WHERE 过滤 · Enter 应用 · Esc 取消 · 留空清除 ")
+        .title(t(" WHERE 过滤 · Enter 应用 · Esc 取消 · 留空清除 "))
         .border_set(border::ROUNDED)
         .border_style(Style::default().fg(Color::Yellow));
     let inner = block.inner(box_area);
@@ -9516,11 +9614,11 @@ fn render_filter_prompt(f: &mut Frame, area: Rect, app: &mut App) {
     if hint_h > 0 {
         let hints = vec![
             Line::from(Span::styled(
-                "语法: = != <> > < >= <= LIKE IN BETWEEN IS NULL · AND/OR · 字符串单引号",
+                t("语法: = != <> > < >= <= LIKE IN BETWEEN IS NULL · AND/OR · 字符串单引号"),
                 Style::default().fg(Color::DarkGray),
             )),
             Line::from(Span::styled(
-                "MySQL 反引号 `col` · PG 双引号 \"col\"（区分大小写）",
+                t("MySQL 反引号 `col` · PG 双引号 \"col\"（区分大小写）"),
                 Style::default().fg(Color::DarkGray),
             )),
         ];
@@ -9576,7 +9674,10 @@ const HELP_ROWS: &[(&str, &str)] = &[
     ("← → / h l", "单元格光标（列窗口跟随）"),
     ("Home / End", "首行 / 末行"),
     ("Ctrl-E", "聚焦 SQL 编辑器"),
-    ("Shift/Alt+滚轮 · 横滑", "横向滚动列（触屏左右滑动 / 拖动）"),
+    (
+        "Shift/Alt/Ctrl+滚轮 · 横滑",
+        "横向滚动列（触屏左右滑动 / 拖动）；PC 终端若 Shift+滚轮 无效，用 Ctrl+滚轮 或 Ctrl-G",
+    ),
     ("Shift+← →", "横滚列一列（任意区域，按住连滚）"),
     ("Ctrl-G", "横滚模式：纵向滚轮/上下滑改为横滚列"),
     ("◀ ▶（底部）", "点击向左/右翻一屏列（触屏可用）"),
@@ -9656,7 +9757,7 @@ fn render_help(f: &mut Frame, area: Rect, app: &mut App) {
         .map(|(k, d)| {
             if d.is_empty() {
                 Line::from(Span::styled(
-                    *k,
+                    t(k),
                     Style::default()
                         .fg(Color::Cyan)
                         .add_modifier(Modifier::BOLD),
@@ -9667,16 +9768,12 @@ fn render_help(f: &mut Frame, area: Rect, app: &mut App) {
                         format!("{:<key_w$}", k),
                         Style::default().fg(Color::Yellow),
                     ),
-                    Span::raw(*d),
+                    Span::raw(t(d)),
                 ])
             }
         })
         .collect();
-    let title = format!(
-        " 快捷键 · {}/{} · ↑↓ 滚动 · Esc 关闭 ",
-        (scroll as usize + inner_h).min(total),
-        total
-    );
+    let title = tf(" 快捷键 · {}/{} · ↑↓ 滚动 · Esc 关闭 ", &[&((scroll as usize + inner_h).min(total)), &(total)]);
     f.render_widget(
         Paragraph::new(lines).scroll((scroll, 0)).block(
             Block::default()
@@ -9741,20 +9838,20 @@ fn render_confirm(f: &mut Frame, area: Rect, confirm: &Confirm) {
     }
     if truncated {
         lines.push(Line::from(Span::styled(
-            "…（语句过长，已截断显示）",
+            t("…（语句过长，已截断显示）"),
             Style::default().fg(Color::DarkGray),
         )));
     }
     lines.push(Line::from(""));
     lines.push(Line::from(Span::styled(
-        "Enter/y 执行   Esc/n 取消",
+        t("Enter/y 执行   Esc/n 取消"),
         Style::default().fg(Color::Yellow),
     )));
 
     let block = Block::default()
         .borders(Borders::ALL)
         .title(Span::styled(
-            " ⚠ 危险操作确认 ",
+            t(" ⚠ 危险操作确认 "),
             Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
         ))
         .border_set(border::THICK)
@@ -11004,5 +11101,209 @@ mod tests {
             completion_context(&end("select * from [users].")).0,
             CompCtx::Qualified("users".into())
         );
+    }
+
+    // ── R15: wheel modifier encodings, footer layout, bilingual UI ──
+
+    #[test]
+    fn every_wheel_modifier_encoding_pans_columns() {
+        // The SGR button codes a terminal may send for a wheel event: 64/65 carry
+        // no modifier bit; +4 shift, +8 alt, +16 ctrl. SHIFT is the one terminals
+        // most often omit, so ALT and CTRL must pan as well.
+        for (mods, pans) in [
+            (KeyModifiers::NONE, false),
+            (KeyModifiers::SHIFT, true),
+            (KeyModifiers::ALT, true),
+            (KeyModifiers::CONTROL, true),
+        ] {
+            assert_eq!(
+                wheel_wants_pan(Focus::Preview, mods, false, true),
+                pans,
+                "modifiers {mods:?}"
+            );
+            // No horizontal overflow → never pan, modifier or not.
+            assert!(!wheel_wants_pan(Focus::Preview, mods, false, false));
+        }
+        // Ctrl-G pan mode pans with an unmodified wheel; other panes never pan.
+        assert!(wheel_wants_pan(Focus::Preview, KeyModifiers::NONE, true, true));
+        assert!(!wheel_wants_pan(
+            Focus::Editor,
+            KeyModifiers::CONTROL,
+            false,
+            true
+        ));
+    }
+
+    #[test]
+    fn wire_hint_covers_all_wheel_encodings() {
+        let mk = |code: u8| {
+            let mut m = KeyModifiers::NONE;
+            if code & 4 != 0 {
+                m |= KeyModifiers::SHIFT;
+            }
+            if code & 8 != 0 {
+                m |= KeyModifiers::ALT;
+            }
+            if code & 16 != 0 {
+                m |= KeyModifiers::CONTROL;
+            }
+            MouseEvent {
+                kind: if code & 1 == 0 {
+                    MouseEventKind::ScrollUp
+                } else {
+                    MouseEventKind::ScrollDown
+                },
+                column: 0,
+                row: 0,
+                modifiers: m,
+            }
+        };
+        for code in [64u8, 65, 68, 69, 72, 73, 80, 81] {
+            let hint = mouse_wire_hint(&mk(code));
+            assert!(hint.contains(&format!("<{code};1;1M")), "code {code}: {hint}");
+        }
+    }
+
+    #[test]
+    fn footer_keeps_help_visible_and_fits() {
+        let hints: Vec<Hint> = vec![
+            ("↑↓", "row"),
+            ("←→", "column"),
+            ("Enter", "details"),
+            ("e", "edit"),
+            ("i", "insert"),
+            ("Del", "delete row"),
+            ("y", "copy INSERT"),
+            ("f", "filter"),
+            ("/", "search"),
+            ("?", "help"),
+        ];
+        let help = *hints.last().unwrap();
+        for width in [42usize, 60, 80, 110] {
+            let (chosen, dropped) = footer_select(&hints, width);
+            // `? 帮助` is pinned: always present and always last.
+            assert_eq!(*hints.last().unwrap(), ("?", "help"));
+            let line_w = footer_line_width(&chosen, &help, dropped);
+            assert!(
+                line_w <= width,
+                "width {width}: line {line_w} chosen {chosen:?}"
+            );
+            if dropped {
+                assert!(chosen.len() < hints.len() - 1);
+            }
+        }
+        // Very narrow: only the help hint and the `…` marker survive.
+        let (chosen, dropped) = footer_select(&hints, 10);
+        assert!(chosen.is_empty());
+        assert!(dropped);
+        assert!(footer_line_width(&chosen, &help, dropped) <= 10);
+    }
+
+    #[test]
+    fn footer_groups_follow_focus_and_overlays() {
+        let keys = |view, focus, has_conn| -> Vec<&'static str> {
+            footer_hints_ctx(FooterCtx {
+                view,
+                focus,
+                has_connection: has_conn,
+            })
+            .iter()
+            .map(|h| h.0)
+            .collect()
+        };
+        // Overlays get their own group instead of the page's.
+        assert_eq!(
+            keys(FooterView::Confirm, Focus::Preview, true),
+            vec!["Enter/y", "Esc/n", "?"]
+        );
+        assert_eq!(
+            keys(FooterView::EditDialog, Focus::Preview, true),
+            vec!["Enter", "Esc", "Ctrl-V", "Ctrl-T", "?"]
+        );
+        assert_eq!(
+            keys(FooterView::Help, Focus::Preview, true),
+            vec!["↑↓", "Esc", "?"]
+        );
+        // Each browse pane gets its own, most-relevant keys.
+        let sidebar = keys(FooterView::Browse, Focus::Sidebar, true);
+        assert!(sidebar.contains(&"/") && sidebar.contains(&"r") && sidebar.contains(&"Tab"));
+        let editor = keys(FooterView::Browse, Focus::Editor, true);
+        assert!(editor.contains(&"Ctrl-J") && editor.contains(&"Ctrl-Space"));
+        let preview = keys(FooterView::Browse, Focus::Preview, true);
+        assert!(preview.contains(&"↑↓") && preview.contains(&"e") && preview.contains(&"y"));
+        // No connection yet → the picker group, never the table group.
+        let no_conn = keys(FooterView::Browse, Focus::Sidebar, false);
+        assert!(no_conn.contains(&"c") && !no_conn.contains(&"/"));
+        // Every group ends with the pinned help key.
+        for view in [
+            FooterView::Help,
+            FooterView::Confirm,
+            FooterView::EditDialog,
+            FooterView::Browse,
+            FooterView::NewConn,
+            FooterView::ColPicker,
+            FooterView::Snippets,
+        ] {
+            let h = footer_hints_ctx(FooterCtx {
+                view,
+                focus: Focus::Preview,
+                has_connection: true,
+            });
+            assert_eq!(h.last().unwrap().0, "?", "{view:?}");
+        }
+    }
+
+    #[test]
+    fn ui_switches_between_chinese_and_english() {
+        use ui_text::{t_lang, tf_lang, Lang};
+        // Confirm dialog, footer help, and a templated status message.
+        assert_eq!(t_lang(" ⚠ 危险操作确认 ", Lang::Zh), " ⚠ 危险操作确认 ");
+        assert_eq!(
+            t_lang(" ⚠ 危险操作确认 ", Lang::En),
+            " ⚠ Confirm dangerous operation "
+        );
+        assert_eq!(t_lang("帮助", Lang::Zh), "帮助");
+        assert_eq!(t_lang("帮助", Lang::En), "Help");
+        assert_eq!(t_lang("执行", Lang::En), "execute");
+        assert_eq!(t_lang("取消", Lang::En), "cancel");
+        assert_eq!(
+            tf_lang("搜索「{}」· {} 行命中", &[&"x", &3], Lang::En),
+            "Search \"x\" · 3 rows matched"
+        );
+        assert_eq!(
+            tf_lang("搜索「{}」· {} 行命中", &[&"x", &3], Lang::Zh),
+            "搜索「x」· 3 行命中"
+        );
+        // Escaped braces survive template substitution.
+        assert_eq!(
+            tf_lang("mongo parse: {} (例: db.col.find({{}}))", &[&"boom"], Lang::En),
+            "mongo parse: boom (e.g. db.col.find({}))"
+        );
+    }
+
+    #[test]
+    fn language_detection_reads_the_environment() {
+        use ui_text::{detect_lang_from, Lang};
+        assert_eq!(detect_lang_from(None, Some("zh_CN.UTF-8")), Lang::Zh);
+        assert_eq!(detect_lang_from(None, Some("en_US.UTF-8")), Lang::En);
+        // DBXT_LANG wins over the locale.
+        assert_eq!(detect_lang_from(Some("en"), Some("zh_CN.UTF-8")), Lang::En);
+        assert_eq!(detect_lang_from(Some("zh"), Some("en_US.UTF-8")), Lang::Zh);
+        // Nothing set → built-in default is Chinese.
+        assert_eq!(detect_lang_from(None, None), Lang::Zh);
+    }
+
+    #[test]
+    fn text_table_covers_every_key() {
+        for k in ui_text::ALL_KEYS {
+            let en = ui_text::t_lang(k, ui_text::Lang::En);
+            assert_ne!(en, *k, "missing English translation for {k:?}");
+            assert!(!en.is_empty(), "empty English for {k:?}");
+            assert!(
+                k.chars().any(|c| ('\u{4e00}'..='\u{9fff}').contains(&c)),
+                "key without CJK: {k:?}"
+            );
+        }
+        assert!(ui_text::ALL_KEYS.len() > 300);
     }
 }
