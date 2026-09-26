@@ -6,7 +6,7 @@ use std::collections::{HashMap, HashSet, VecDeque};
 use std::io::Write;
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use anyhow::Result;
 use crossterm::event::{
@@ -48,6 +48,15 @@ const QUERY_MAX_ROWS: usize = 500;
 const QUERY_MORE_STEP: usize = 500;
 /// Hard ceiling for `Ctrl-N`; past this the user should refine the query.
 const QUERY_MAX_ROWS_CAP: usize = 20_000;
+/// Last-resort watchdog for a single backend call. The SQL path already asks the
+/// driver for a 60 s statement timeout, but Redis / MongoDB / metadata calls
+/// carry no timeout of their own: without this a dead server would leave the
+/// spinner turning forever instead of surfacing an error. The per-op ceiling is
+/// in [`Op::watchdog`].
+const OP_WATCHDOG_FALLBACK: Duration = Duration::from_secs(60);
+/// SQL may be a multi-statement script, so it gets a wider ceiling (each
+/// statement is still bounded by the driver's own 60 s timeout).
+const OP_WATCHDOG_SQL: Duration = Duration::from_secs(180);
 
 // ─── pages & focus ───────────────────────────────────────────────────────────
 
@@ -430,6 +439,14 @@ struct TuiConfig {
     /// Global compact-column default, used when a table has no stored choice.
     compact: Option<bool>,
     tables: HashMap<(String, String), TablePrefs>,
+    /// Whether this session changed the global compact default. Untouched
+    /// globals are left to whatever another session last wrote.
+    dirty_global: bool,
+    /// `(database, table)` entries this session actually changed. Saving merges
+    /// only these into the on-disk file, so two dbxt sessions (or a hand-edit)
+    /// no longer clobber each other's tables; an entry reset to defaults is
+    /// removed instead of silently surviving.
+    dirty: HashSet<(String, String)>,
 }
 
 impl TuiConfig {
@@ -441,8 +458,10 @@ impl TuiConfig {
         let Ok(v) = serde_json::from_str::<serde_json::Value>(&text) else {
             return Self::default();
         };
-        let mut cfg = Self::default();
-        cfg.compact = v.get("compact").and_then(|b| b.as_bool());
+        let mut cfg = Self {
+            compact: v.get("compact").and_then(|b| b.as_bool()),
+            ..Self::default()
+        };
         if let Some(tables) = v.get("tables").and_then(|t| t.as_object()) {
             for (db, by_table) in tables {
                 let Some(by_table) = by_table.as_object() else {
@@ -481,9 +500,36 @@ impl TuiConfig {
         cfg
     }
 
-    /// Write the config back, creating the parent directory. Best-effort: a
-    /// read-only config dir must never interrupt the TUI.
+    /// Write the config back, merging with whatever is on disk so two dbxt
+    /// sessions (or an external editor) do not clobber each other: only the
+    /// `(database, table)` entries this session actually changed are applied,
+    /// and a cleared entry is removed. Best-effort: a read-only config dir must
+    /// never interrupt the TUI.
     fn save(&self, path: &std::path::Path) {
+        // Start from the current on-disk state so another session's tables are
+        // preserved; a missing / corrupt file simply means we start from scratch.
+        let mut merged = TuiConfig::load(path);
+        if self.dirty_global {
+            merged.compact = self.compact;
+        }
+        for key in &self.dirty {
+            let all_default = self
+                .tables
+                .get(key)
+                .map(|p| p.hidden.is_empty() && p.compact.is_none() && p.order_by.is_none())
+                .unwrap_or(true);
+            if all_default {
+                merged.tables.remove(key);
+            } else if let Some(prefs) = self.tables.get(key) {
+                merged.tables.insert(key.clone(), prefs.clone());
+            }
+        }
+        merged.write(path);
+    }
+
+    /// Serialize `self` (the already-merged state) to `path`, creating the parent
+    /// directory. Best-effort and silent on failure.
+    fn write(&self, path: &std::path::Path) {
         let mut tables = serde_json::Map::new();
         let mut keys: Vec<&(String, String)> = self.tables.keys().collect();
         keys.sort();
@@ -528,8 +574,9 @@ impl TuiConfig {
         }
         let text = serde_json::Value::Object(root).to_string();
         // Atomic-ish: write a sibling temp file then rename so a crash never
-        // leaves a half-written config behind.
-        let tmp = path.with_extension("json.tmp");
+        // leaves a half-written config behind. The pid keeps two concurrent
+        // dbxt processes from fighting over the same temp path.
+        let tmp = path.with_extension(format!("{}.tmp", std::process::id()));
         if std::fs::write(&tmp, text).is_ok() {
             let _ = std::fs::rename(&tmp, path);
         }
@@ -539,10 +586,17 @@ impl TuiConfig {
         self.tables.get(&(db.to_string(), table.to_string()))
     }
 
+    /// Mutable access that records the entry as changed by this session.
     fn entry(&mut self, db: &str, table: &str) -> &mut TablePrefs {
-        self.tables
-            .entry((db.to_string(), table.to_string()))
-            .or_default()
+        let key = (db.to_string(), table.to_string());
+        self.dirty.insert(key.clone());
+        self.tables.entry(key).or_default()
+    }
+
+    /// Set the global compact default and mark it changed by this session.
+    fn set_compact(&mut self, value: Option<bool>) {
+        self.compact = value;
+        self.dirty_global = true;
     }
 }
 
@@ -797,9 +851,28 @@ enum Op {
     AddConn(Box<ConnectionConfig>),
 }
 
+impl Op {
+    /// Watchdog for this call. SQL statements already carry a 60 s driver
+    /// statement timeout; the ceiling here is only the last resort against a
+    /// server that never answers, so it is generous for a (possibly
+    /// multi-statement) script and tighter for calls that should be instant.
+    fn watchdog(&self) -> Duration {
+        match self {
+            Op::Query(..) => OP_WATCHDOG_SQL,
+            _ => OP_WATCHDOG_FALLBACK,
+        }
+    }
+}
+
 enum OpResult {
     Connections(Vec<ConnectionConfig>),
-    Databases(Vec<String>),
+    Databases {
+        databases: Vec<String>,
+        /// Set when the driver could not enumerate databases but the
+        /// connection's configured database is still usable — surfaced so the
+        /// failure is never silent.
+        warning: Option<String>,
+    },
     Tables(Vec<TableInfo>),
     Columns {
         table: String,
@@ -920,14 +993,25 @@ async fn run_op(backend: &LocalBackend, op: Op) -> OpResult {
             Err(e) => OpResult::Error(format!("load connections: {e}")),
         },
         Op::Databases(cfg) => match backend.list_databases(&cfg).await {
-            Ok(dbs) if !dbs.is_empty() => OpResult::Databases(dbs),
-            Ok(_) | Err(_) => {
-                if let Some(db) = &cfg.database {
-                    OpResult::Databases(vec![db.clone()])
-                } else {
-                    OpResult::Databases(vec![String::new()])
-                }
-            }
+            Ok(dbs) if !dbs.is_empty() => OpResult::Databases {
+                databases: dbs,
+                warning: None,
+            },
+            // A backend that legitimately exposes no database list (e.g. SQLite)
+            // still connects using the configured database.
+            Ok(_) => OpResult::Databases {
+                databases: vec![cfg.database.clone().unwrap_or_default()],
+                warning: None,
+            },
+            Err(e) => OpResult::Databases {
+                databases: vec![cfg.database.clone().unwrap_or_default()],
+                warning: Some(match cfg.database.as_deref() {
+                    Some(db) if !db.is_empty() => {
+                        format!("无法列举数据库（{e}），仅使用配置库 {db}")
+                    }
+                    _ => format!("无法列举数据库（{e}），将使用连接默认库"),
+                }),
+            },
         },
         Op::ListTables(cfg, db) => match backend.list_tables(&cfg, &db, "").await {
             Ok(t) => OpResult::Tables(t),
@@ -1187,8 +1271,17 @@ async fn run_op(backend: &LocalBackend, op: Op) -> OpResult {
 fn spawn_op(backend: &Arc<LocalBackend>, tx: &Tx, op: Op) {
     let backend = backend.clone();
     let tx = tx.clone();
+    let limit = op.watchdog();
     tokio::spawn(async move {
-        let res = run_op(&backend, op).await;
+        // The watchdog is the last resort: a server that accepts the socket but
+        // never answers must surface an error, not a spinner that never stops.
+        let res = match tokio::time::timeout(limit, run_op(&backend, op)).await {
+            Ok(r) => r,
+            Err(_) => OpResult::Error(format!(
+                "操作超时（{}s）· 服务器无响应或网络中断，请检查连接后用 d 重连",
+                limit.as_secs()
+            )),
+        };
         let _ = tx.send(res);
     });
 }
@@ -1575,6 +1668,13 @@ struct App {
     confirm: Option<Confirm>,
 
     loading: bool,
+    /// Backend calls currently in flight. The spinner only stops when this hits
+    /// zero, so a fast secondary result (e.g. the history fetch) cannot make a
+    /// slow primary one (the table list) look finished.
+    pending_ops: usize,
+    /// When the oldest in-flight call started, shown as elapsed seconds so a slow
+    /// query is visibly progressing rather than apparently hung.
+    loading_since: Option<Instant>,
     spinner: usize,
     status: String,
 
@@ -1596,6 +1696,16 @@ impl App {
             .as_ref()
             .map(|c| c.name.clone())
             .unwrap_or_default()
+    }
+    /// Queue a backend call, keeping the spinner up until *every* in-flight call
+    /// has answered.
+    fn spawn(&mut self, tx: &Tx, op: Op) {
+        self.pending_ops = self.pending_ops.saturating_add(1);
+        if self.pending_ops == 1 {
+            self.loading_since = Some(Instant::now());
+        }
+        self.loading = true;
+        spawn_op(&self.backend, tx, op);
     }
     fn current_db(&self) -> String {
         self.databases
@@ -1835,7 +1945,11 @@ async fn run_app(mut terminal: ratatui::DefaultTerminal, backend: Arc<LocalBacke
         grid_widths: Vec::new(),
         grid_avail: 0,
         confirm: None,
-        loading: false,
+        loading: true,
+        // The initial `ListConnections` below is the one call not spawned through
+        // `App::spawn`, so it is pre-counted here.
+        pending_ops: 1,
+        loading_since: Some(Instant::now()),
         spinner: 0,
         status: "加载连接…".into(),
         backend_kind: Backend::Sql,
@@ -1850,6 +1964,7 @@ async fn run_app(mut terminal: ratatui::DefaultTerminal, backend: Arc<LocalBacke
     app.editor.set_placeholder_text("SQL … (Ctrl-J / F5 执行 · ↑ 历史)");
     app.set_placeholder();
 
+    // Pre-counted by `pending_ops: 1` in the initializer above.
     spawn_op(&backend, &tx, Op::ListConnections);
 
     while !app.quit {
@@ -1881,7 +1996,12 @@ async fn run_app(mut terminal: ratatui::DefaultTerminal, backend: Arc<LocalBacke
 }
 
 fn apply_op_result(app: &mut App, res: OpResult, tx: &Tx) {
-    app.loading = false;
+    // Only stop the spinner once every in-flight call has answered.
+    app.pending_ops = app.pending_ops.saturating_sub(1);
+    if app.pending_ops == 0 {
+        app.loading = false;
+        app.loading_since = None;
+    }
     match res {
         OpResult::Connections(cs) => {
             let n = cs.len();
@@ -1892,7 +2012,7 @@ fn apply_op_result(app: &mut App, res: OpResult, tx: &Tx) {
             app.picker_open = app.selected.is_none();
             app.status = format!("{n} 个连接 · ↑↓+Enter 选择 · c 新建");
         }
-        OpResult::Databases(dbs) => {
+        OpResult::Databases { databases: dbs, warning } => {
             let configured = app.selected.as_ref().and_then(|c| c.database.clone());
             app.databases = dbs;
             app.db_index = configured
@@ -1916,14 +2036,18 @@ fn apply_op_result(app: &mut App, res: OpResult, tx: &Tx) {
             // auto-load tables for the selected database
             if let Some(cfg) = app.selected.clone() {
                 let db = app.current_db();
-                app.loading = true;
                 app.status = if db.is_empty() {
                     format!("加载 {} 表…", cfg.name)
                 } else {
                     format!("加载 {db} 表…")
                 };
-                spawn_op(&app.backend, tx, Op::ListTables(Box::new(cfg.clone()), db));
-                spawn_op(&app.backend, tx, Op::History(Box::new(cfg)));
+                app.spawn(tx, Op::ListTables(Box::new(cfg.clone()), db));
+                app.spawn(tx, Op::History(Box::new(cfg)));
+            }
+            // A failed `list_databases` is not fatal (the configured database is
+            // still used) but it must not be swallowed either.
+            if let Some(w) = warning {
+                app.status = format!("⚠ {w}");
             }
         }
         OpResult::Tables(ts) => {
@@ -2204,7 +2328,7 @@ fn apply_op_result(app: &mut App, res: OpResult, tx: &Tx) {
             app.status = format!("✓ 已收藏 SQL 片段「{name}」（DBX saved_sql_files）");
             // Refresh the list so the new favourite is visible immediately.
             if let Some(cfg) = app.selected.clone() {
-                spawn_op(&app.backend, tx, Op::Snippets(Box::new(cfg)));
+                app.spawn(tx, Op::Snippets(Box::new(cfg)));
             }
         }
         OpResult::DatabasesRefresh(dbs) => {
@@ -2233,7 +2357,7 @@ fn apply_op_result(app: &mut App, res: OpResult, tx: &Tx) {
             app.selected = None;
             app.picker_open = true;
             app.loading = true;
-            spawn_op(&app.backend, tx, Op::ListConnections);
+            app.spawn(tx, Op::ListConnections);
         }
         OpResult::Error(e) => {
             app.page_pending = false;
@@ -2702,7 +2826,7 @@ fn db_picker_key(app: &mut App, tx: &Tx, k: KeyEvent) {
                 app.status = "Redis 固定 16 个逻辑库".into();
             } else if let Some(cfg) = app.selected.clone() {
                 app.status = "刷新数据库列表…".into();
-                spawn_op(&app.backend, tx, Op::DatabasesRefresh(Box::new(cfg)));
+                app.spawn(tx, Op::DatabasesRefresh(Box::new(cfg)));
             }
         }
         KeyCode::Up | KeyCode::Char('k') => {
@@ -2880,12 +3004,11 @@ fn load_structure(app: &mut App, tx: &Tx) {
     app.loading = true;
     app.status = format!("加载 {table} 结构…");
     let db = app.current_db();
-    spawn_op(
-        &app.backend,
+    app.spawn(
         tx,
         Op::Columns(Box::new(cfg.clone()), db.clone(), table.clone()),
     );
-    spawn_op(&app.backend, tx, Op::Ddl(Box::new(cfg), db, table));
+    app.spawn(tx, Op::Ddl(Box::new(cfg), db, table));
 }
 
 fn open_table_data(app: &mut App, tx: &Tx) {
@@ -2915,7 +3038,9 @@ fn open_table_data(app: &mut App, tx: &Tx) {
     let db = app.current_db();
     let prefs = app.config.table(&db, &table.0).cloned().unwrap_or_default();
     app.col_hidden = prefs.hidden;
-    app.compact = prefs.compact.or(app.compact);
+    // Fall back to the *global* default (not whatever the previously opened table
+    // happened to use), so a table with no stored choice is not contaminated.
+    app.compact = prefs.compact.or(app.config.compact);
     let order_by = prefs.order_by;
     app.page_state = Some(PageState {
         table: table.0.clone(),
@@ -2930,8 +3055,7 @@ fn open_table_data(app: &mut App, tx: &Tx) {
     app.loading = true;
     app.status = format!("加载 {}.{} 数据…", app.current_db(), table.0);
     // Column metadata powers the `e`/`i` templates (primary-key detection).
-    spawn_op(
-        &app.backend,
+    app.spawn(
         tx,
         Op::TableColumns(Box::new(cfg.clone()), app.current_db(), table.0.clone()),
     );
@@ -2941,8 +3065,7 @@ fn open_table_data(app: &mut App, tx: &Tx) {
         .copied();
     app.page_gen += 1;
     let gen = app.page_gen;
-    spawn_op(
-        &app.backend,
+    app.spawn(
         tx,
         Op::TableData(Box::new(TableDataReq {
             cfg: Box::new(cfg),
@@ -2982,8 +3105,7 @@ fn goto_page(app: &mut App, tx: &Tx, page: usize, pending_sel: Option<usize>) ->
         .copied();
     app.page_gen += 1;
     let gen = app.page_gen;
-    spawn_op(
-        &app.backend,
+    app.spawn(
         tx,
         Op::TableData(Box::new(TableDataReq {
             cfg: Box::new(cfg),
@@ -3028,8 +3150,7 @@ fn reload_table_view(app: &mut App, tx: &Tx, filter: String, order_by: Option<St
         .copied();
     app.page_gen += 1;
     let gen = app.page_gen;
-    spawn_op(
-        &app.backend,
+    app.spawn(
         tx,
         Op::TableData(Box::new(TableDataReq {
             cfg: Box::new(cfg),
@@ -3204,7 +3325,7 @@ fn reload_tables(app: &mut App, tx: &Tx) {
         let db = app.current_db();
         app.status = format!("切换到 {db} …");
         app.set_placeholder();
-        spawn_op(&app.backend, tx, Op::ListTables(Box::new(cfg), db));
+        app.spawn(tx, Op::ListTables(Box::new(cfg), db));
     }
 }
 
@@ -3530,7 +3651,7 @@ fn connect_selected(app: &mut App, tx: &Tx) {
             app.set_placeholder();
             app.loading = true;
             app.status = format!("连接 {} ({})…", cfg.name, cfg.db_type.as_str());
-            spawn_op(&app.backend, tx, Op::Databases(Box::new(cfg)));
+            app.spawn(tx, Op::Databases(Box::new(cfg)));
         }
     }
 }
@@ -4056,7 +4177,7 @@ fn preview_key(app: &mut App, tx: &Tx, k: KeyEvent) {
     if k.code == KeyCode::Esc
         && !app.result_needle.is_empty()
         && !ddl
-        && app.script.as_ref().map_or(true, |s| s.drilled.is_some())
+        && app.script.as_ref().is_none_or(|s| s.drilled.is_some())
     {
         app.result_needle.clear();
         app.rebuild_view();
@@ -4403,7 +4524,7 @@ fn toggle_compact(app: &mut App) {
     };
     // Persist the choice: as the global default and, when a table is open, for
     // that exact `database.table` so reopening it restores the mode.
-    app.config.compact = app.compact;
+    app.config.set_compact(app.compact);
     if let Some(ps) = app.page_state.clone() {
         let db = app.current_db();
         app.config.entry(&db, &ps.table).compact = app.compact;
@@ -4774,8 +4895,7 @@ fn completion_context(ta: &TextArea) -> (CompCtx, String) {
     let head = before.trim_end();
     let last = head
         .split(|c: char| c.is_whitespace() || c == '(' || c == ',' || c == ';')
-        .filter(|s| !s.is_empty())
-        .last()
+        .rfind(|s| !s.is_empty())
         .unwrap_or("")
         .to_ascii_uppercase();
     let ctx = match last.as_str() {
@@ -5980,8 +6100,7 @@ fn execute_sql(app: &mut App, tx: &Tx, sql: String) {
     app.loading = true;
     app.status = "执行中…".into();
     let db = app.current_db();
-    spawn_op(
-        &app.backend,
+    app.spawn(
         tx,
         Op::Query(Box::new(cfg), db, sql, QUERY_MAX_ROWS),
     );
@@ -6005,7 +6124,7 @@ fn load_more_rows(app: &mut App, tx: &Tx) {
     app.loading = true;
     app.status = format!("加载更多… (上限 {next} 行)");
     let db = app.current_db();
-    spawn_op(&app.backend, tx, Op::Query(Box::new(cfg), db, sql, next));
+    app.spawn(tx, Op::Query(Box::new(cfg), db, sql, next));
 }
 
 fn run_cmd_line(app: &mut App, tx: &Tx) {
@@ -6024,8 +6143,7 @@ fn run_cmd_line(app: &mut App, tx: &Tx) {
         Backend::Redis => {
             app.cmd_output
                 .push(format!("redis[{}]> {cmd}", app.redis_db));
-            spawn_op(
-                &app.backend,
+            app.spawn(
                 tx,
                 Op::Redis(Box::new(cfg), app.redis_db, cmd),
             );
@@ -6050,8 +6168,7 @@ fn run_cmd_line(app: &mut App, tx: &Tx) {
             }
             app.cmd_output
                 .push(format!("mongo({})> {cmd}", app.current_db()));
-            spawn_op(
-                &app.backend,
+            app.spawn(
                 tx,
                 Op::Mongo(Box::new(cfg), app.current_db(), cmd),
             );
@@ -6189,7 +6306,7 @@ fn save_form(app: &mut App, tx: &Tx) {
     app.form.err.clear();
     app.loading = true;
     app.status = "保存连接…".into();
-    spawn_op(&app.backend, tx, Op::AddConn(Box::new(cfg)));
+    app.spawn(tx, Op::AddConn(Box::new(cfg)));
 }
 
 impl App {
@@ -6765,8 +6882,7 @@ fn explain_current(app: &mut App, tx: &Tx) {
             app.loading = true;
             app.status = format!("{} EXPLAIN…", cfg.db_type.as_str());
             let db = app.current_db();
-            spawn_op(
-                &app.backend,
+            app.spawn(
                 tx,
                 Op::Query(Box::new(cfg), db, explain, QUERY_MAX_ROWS),
             );
@@ -6828,7 +6944,7 @@ fn open_snippets(app: &mut App, tx: &Tx) {
     };
     app.loading = true;
     app.status = "加载 SQL 片段…".into();
-    spawn_op(&app.backend, tx, Op::Snippets(Box::new(cfg)));
+    app.spawn(tx, Op::Snippets(Box::new(cfg)));
 }
 
 fn snippet_key(app: &mut App, tx: &Tx, k: KeyEvent) {
@@ -6913,8 +7029,7 @@ fn snippet_name_key(app: &mut App, tx: &Tx, k: KeyEvent) {
             };
             let sql = app.editor_sql();
             app.status = format!("保存片段 {name} …");
-            spawn_op(
-                &app.backend,
+            app.spawn(
                 tx,
                 Op::SaveSnippet(Box::new(cfg), name, sql),
             );
@@ -7126,7 +7241,17 @@ fn render_header(f: &mut Frame, area: Rect, app: &App) {
         Backend::Mongo => " · mongo",
     };
     let spinner = if app.loading {
-        format!(" {}", spinner_frame(app.spinner))
+        // Show elapsed seconds once a call is slow enough to be worth noticing,
+        // so a long query reads as "working" rather than "hung".
+        let secs = app
+            .loading_since
+            .map(|t| t.elapsed().as_secs())
+            .unwrap_or(0);
+        if secs >= 3 {
+            format!(" {} {}s", spinner_frame(app.spinner), secs)
+        } else {
+            format!(" {}", spinner_frame(app.spinner))
+        }
     } else {
         String::new()
     };
@@ -7273,7 +7398,7 @@ fn render_status(f: &mut Frame, area: Rect, app: &App) {
         Style::default().fg(Color::Red)
     } else if app.status.starts_with('✓') {
         Style::default().fg(Color::Green)
-    } else if app.loading {
+    } else if app.status.starts_with('⚠') || app.loading {
         Style::default().fg(Color::Yellow)
     } else {
         Style::default().fg(Color::Gray)
@@ -9427,6 +9552,11 @@ const HELP_ROWS: &[(&str, &str)] = &[
     ("NULL", "真正的 SQL NULL：灰色斜体（终端不支持斜体时仅灰色）"),
     ("''", "空字符串：灰色，带引号的空串，不会与 NULL 混淆"),
     ("DBXT_NO_ITALIC=1", "强制 NULL 仅用灰色，不依赖终端斜体"),
+    ("— 连接选择 —", ""),
+    ("↑ ↓ / Enter", "选择 / 连接"),
+    ("c", "新建连接"),
+    ("p", "复制连接（预填表单）"),
+    ("q", "折叠 / 展开连接列表"),
     ("— 侧栏 —", ""),
     ("↑ ↓", "移动表列表"),
     ("/", "过滤表名（输入即筛选，Enter 保留，Esc 清除）"),
@@ -9444,6 +9574,8 @@ const HELP_ROWS: &[(&str, &str)] = &[
     ("n / p", "下一页 / 上一页"),
     ("Ctrl-F / Ctrl-B", "下一页 / 上一页"),
     ("← → / h l", "单元格光标（列窗口跟随）"),
+    ("Home / End", "首行 / 末行"),
+    ("Ctrl-E", "聚焦 SQL 编辑器"),
     ("Shift/Alt+滚轮 · 横滑", "横向滚动列（触屏左右滑动 / 拖动）"),
     ("Shift+← →", "横滚列一列（任意区域，按住连滚）"),
     ("Ctrl-G", "横滚模式：纵向滚轮/上下滑改为横滚列"),
@@ -9476,11 +9608,13 @@ const HELP_ROWS: &[(&str, &str)] = &[
     ("Esc", "取消编辑"),
     ("Ctrl-V", "将生成的 SQL 转入编辑器微调"),
     ("Ctrl-T", "加入批量队列（Ctrl-S 打包事务提交）"),
+    ("插入层 v / b", "转编辑器 / 加入批量（等价 Ctrl-V / Ctrl-T）"),
     ("Ctrl-S / Ctrl-X", "提交 / 清空批量队列"),
     ("— 编辑器 / 命令 —", ""),
     ("Ctrl-Space", "SQL 前缀补全（表名 T / 列名 C / 关键字 K，Tab 上屏）"),
     ("补全上下文", "表名. 后只补该表列名；FROM/JOIN 后优先表名；WHERE/ON 后优先列名"),
     ("↑ ↓", "历史（首行 / 末行）"),
+    ("Esc", "回到侧栏"),
     ("[ ]", "Redis 逻辑库"),
     ("use <db>", "MongoDB 切库"),
     ("— 危险操作 / 删除确认 —", ""),
@@ -10401,6 +10535,63 @@ mod tests {
     }
 
     #[test]
+    fn watchdog_tiers_are_bounded() {
+        // Metadata / Redis / Mongo calls must never spin forever...
+        assert_eq!(Op::ListConnections.watchdog(), OP_WATCHDOG_FALLBACK);
+        // ...but a (possibly multi-statement) SQL script gets a wider ceiling.
+        let cfg = new_connection_config(
+            "t".into(),
+            "t".into(),
+            parse_database_type("sqlite").unwrap(),
+            String::new(),
+            0,
+            String::new(),
+            String::new(),
+            None,
+            false,
+            None,
+        )
+        .unwrap();
+        let q = Op::Query(
+            Box::new(cfg),
+            "db".into(),
+            "SELECT 1".into(),
+            QUERY_MAX_ROWS,
+        );
+        assert_eq!(q.watchdog(), OP_WATCHDOG_SQL);
+        assert!(OP_WATCHDOG_FALLBACK < OP_WATCHDOG_SQL);
+    }
+
+    #[test]
+    fn help_documents_core_bindings() {
+        // Guard against the overlay drifting away from the real keymap: every
+        // binding a user is likely to reach for must stay documented.
+        let keys: Vec<&str> = HELP_ROWS.iter().map(|(k, _)| *k).collect();
+        for needle in [
+            "Home / End",
+            "Ctrl-E",
+            "Ctrl-O",
+            "Ctrl-P",
+            "Ctrl-N",
+            "Ctrl-Y",
+            "Ctrl-R",
+            "Ctrl-K",
+            "Ctrl-D",
+            "Ctrl-V",
+            "Ctrl-T",
+            "Ctrl-Space",
+        ] {
+            assert!(
+                keys.iter().any(|k| k.contains(needle)),
+                "help is missing {needle}"
+            );
+        }
+        // The connection-picker and editor Esc sections are documented too.
+        assert!(keys.contains(&"— 连接选择 —"));
+        assert!(HELP_ROWS.iter().any(|(_, d)| *d == "回到侧栏"));
+    }
+
+    #[test]
     fn help_has_no_bare_uppercase_shortcuts() {
         // Regression guard for the R8 keymap: every shortcut must be lowercase,
         // a named key, or a Ctrl/Alt/Shift/F-key combination — never a lone
@@ -10709,7 +10900,7 @@ mod tests {
     fn config_round_trips_and_tolerates_corruption() {
         let path = std::env::temp_dir().join(format!("dbxt-test-{}.json", Uuid::new_v4()));
         let mut cfg = TuiConfig::default();
-        cfg.compact = Some(true);
+        cfg.set_compact(Some(true));
         let e = cfg.entry("shop", "orders");
         e.hidden = ["secret".to_string()].into_iter().collect();
         e.compact = Some(false);
@@ -10731,6 +10922,51 @@ mod tests {
         // A missing file is fine too.
         let _ = std::fs::remove_file(&path);
         assert!(TuiConfig::load(&path).tables.is_empty());
+    }
+
+    #[test]
+    fn config_tolerates_wrong_shapes() {
+        let path = std::env::temp_dir().join(format!("dbxt-shape-{}.json", Uuid::new_v4()));
+        // Valid JSON but every field has the wrong type: no panic, defaults only.
+        std::fs::write(
+            &path,
+            r#"{"version":1,"compact":"yes","tables":{"db":"nope","db2":{"t":42},"db3":{"t":{"hidden":"x","compact":7,"order_by":false}}}}"#,
+        )
+        .unwrap();
+        let cfg = TuiConfig::load(&path);
+        assert_eq!(cfg.compact, None);
+        // A wrong-shaped table map / entry is skipped, not fatal.
+        assert!(cfg.table("db", "t").is_none());
+        // A nested entry with every field the wrong type degrades to defaults.
+        let p = cfg.table("db3", "t").expect("entry kept as defaults");
+        assert!(p.hidden.is_empty() && p.compact.is_none() && p.order_by.is_none());
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn config_save_merges_concurrent_sessions_and_clears_entries() {
+        let path = std::env::temp_dir().join(format!("dbxt-merge-{}.json", Uuid::new_v4()));
+        // Session A stores a sort for one table.
+        let mut a = TuiConfig::default();
+        a.entry("db", "a").order_by = Some("\"id\" ASC".into());
+        a.save(&path);
+        // Session B knows nothing about table `a` (older snapshot) and writes `b`.
+        // Its save must not wipe A's entry.
+        let mut b = TuiConfig::default();
+        b.entry("db", "b").hidden = ["x".to_string()].into_iter().collect();
+        b.save(&path);
+        let after = TuiConfig::load(&path);
+        assert!(after.table("db", "a").is_some(), "B must not clobber A");
+        assert!(after.table("db", "b").is_some());
+        // Resetting a table to defaults removes its stored entry instead of
+        // silently keeping the stale one.
+        let mut c = TuiConfig::default();
+        c.entry("db", "a");
+        c.save(&path);
+        let cleared = TuiConfig::load(&path);
+        assert!(cleared.table("db", "a").is_none());
+        assert!(cleared.table("db", "b").is_some(), "unrelated entry survives");
+        let _ = std::fs::remove_file(&path);
     }
 
     // ── R13: context-aware completion ──
