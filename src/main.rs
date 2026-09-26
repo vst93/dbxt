@@ -354,11 +354,19 @@ struct EditDialog {
     insert_preview: Vec<(String, String)>,
 }
 
+/// One logical line of a modal text popup together with the style its value
+/// deserves (NULL → grey italic, empty string → grey, ordinary text → plain).
+#[derive(Clone)]
+struct PopupLine {
+    text: String,
+    style: Style,
+}
+
 /// A modal showing one cell's full, untruncated value.
 #[derive(Clone)]
 struct CellPopup {
     title: String,
-    content: String,
+    lines: Vec<PopupLine>,
     scroll: u16,
 }
 
@@ -366,7 +374,7 @@ struct CellPopup {
 #[derive(Clone)]
 struct RowPopup {
     title: String,
-    content: String,
+    lines: Vec<PopupLine>,
     scroll: u16,
 }
 
@@ -4402,19 +4410,16 @@ fn open_cell_popup(app: &mut App) {
         return;
     };
     let col = grid.columns.get(app.col_cursor).cloned().unwrap_or_default();
-    let content = match v {
-        Val::Null => "NULL".to_string(),
-        Val::Text(s) => s.clone(),
-    };
+    let (text, style) = value_display(v);
     let title = format!(
         "{} · 第 {} 行 · {} 字符",
         fix_double_encoding(&col),
         cursor_abs_row(app),
-        content.chars().count()
+        text.chars().count()
     );
     app.cell_popup = Some(CellPopup {
         title,
-        content,
+        lines: vec![PopupLine { text, style }],
         scroll: 0,
     });
 }
@@ -4428,22 +4433,22 @@ fn open_row_popup(app: &mut App) {
     let Some(row) = grid.rows.get(app.sel) else {
         return;
     };
-    let mut content = String::new();
+    let mut lines: Vec<PopupLine> = Vec::new();
     for (ci, col) in grid.columns.iter().enumerate() {
-        let shown = match row.get(ci) {
-            Some(Val::Null) | None => "NULL".to_string(),
-            Some(Val::Text(s)) if s.is_empty() => "''".to_string(),
-            Some(Val::Text(s)) => s.clone(),
+        let (shown, style) = match row.get(ci) {
+            Some(Val::Null) | None => ("NULL".to_string(), null_style()),
+            Some(Val::Text(s)) if s.is_empty() => ("''".to_string(), empty_string_style()),
+            Some(Val::Text(s)) => (s.clone(), Style::default()),
         };
-        content.push_str(&fix_double_encoding(col));
-        content.push_str(" = ");
-        content.push_str(&shown);
-        content.push('\n');
+        lines.push(PopupLine {
+            text: format!("{} = {}", fix_double_encoding(col), shown),
+            style,
+        });
     }
     let title = format!("第 {} 行 · {} 列", cursor_abs_row(app), grid.columns.len());
     app.row_popup = Some(RowPopup {
         title,
-        content,
+        lines,
         scroll: 0,
     });
 }
@@ -4514,14 +4519,48 @@ fn val_literal(v: &Val, data_type: Option<&str>) -> String {
     }
 }
 
-/// New value typed in the edit dialog → SQL literal. An empty box means the
-/// empty string; `NULL` (any case) means SQL NULL.
+/// New value typed in the edit dialog → SQL literal. A blank box (or `NULL`,
+/// any case) means SQL NULL; `''` means the empty string; `'text'` is taken as
+/// a literal string; anything else is coerced like a cell value (numbers stay
+/// bare for numeric columns, text gets quoted).
 fn new_value_literal(input: &str, data_type: Option<&str>) -> String {
     let t = input.trim();
-    if t.eq_ignore_ascii_case("null") {
+    if t.is_empty() || t.eq_ignore_ascii_case("null") {
         return "NULL".to_string();
     }
+    if let Some(inner) = strip_string_literal(t) {
+        return sql_literal(&inner);
+    }
     val_literal(&Val::Text(t.to_string()), data_type)
+}
+
+/// If `s` is a single-quoted SQL string literal (`'…'`, `''` escaping a quote),
+/// decode its contents. Used only by the edit dialog, so a user can type `''`
+/// for the empty string (now that a blank box means NULL) and `'text'` for text
+/// that would otherwise be read as a number.
+fn strip_string_literal(s: &str) -> Option<String> {
+    let bytes = s.as_bytes();
+    if bytes.len() >= 2 && bytes[0] == b'\'' && bytes[bytes.len() - 1] == b'\'' {
+        Some(s[1..s.len() - 1].replace("''", "'"))
+    } else {
+        None
+    }
+}
+
+/// Seed text for the edit box so that submitting it unchanged round-trips: a
+/// NULL opens blank, and text the plain-input rules would misread (the empty
+/// string, `NULL`, `true`/`false`, a literal `''`) opens quoted.
+fn edit_prefill(v: &Val) -> String {
+    match v {
+        Val::Null => String::new(),
+        Val::Text(s) => {
+            if new_value_literal(s, None) == sql_literal(s) {
+                s.clone()
+            } else {
+                format!("'{}'", s.replace('\'', "''"))
+            }
+        }
+    }
 }
 
 fn build_update_sql(
@@ -4685,12 +4724,11 @@ fn edit_cell(app: &mut App) {
     let (where_clause, keys, no_pk) = row_where_clause(app, &grid, &row, &ps.table);
 
     let dt = column_type(app, &ps.table, &col);
-    let initial = match &val {
-        Val::Null => "NULL".to_string(),
-        Val::Text(s) => s.clone(),
-    };
+    // A NULL cell opens with an empty box (the old value is shown above), so
+    // there is no chance of the literal text "NULL" sneaking into the input.
+    let initial = edit_prefill(&val);
     let mut ta = TextArea::from(initial.split('\n').collect::<Vec<_>>());
-    ta.set_placeholder_text("新值：NULL / 数字 / 文本");
+    ta.set_placeholder_text("留空 = NULL · '文本' = 字符串");
     ta.move_cursor(CursorMove::End);
     app.edit_dialog = Some(EditDialog {
         kind: EditKind::Update,
@@ -6037,10 +6075,10 @@ fn ui(f: &mut Frame, app: &mut App) {
         render_confirm(f, f.area(), &confirm);
     }
     if let Some(popup) = app.cell_popup.clone() {
-        render_text_popup(f, f.area(), &popup.title, &popup.content, popup.scroll);
+        render_text_popup(f, f.area(), &popup.title, &popup.lines, popup.scroll);
     }
     if let Some(popup) = app.row_popup.clone() {
-        render_text_popup(f, f.area(), &popup.title, &popup.content, popup.scroll);
+        render_text_popup(f, f.area(), &popup.title, &popup.lines, popup.scroll);
     }
     if app.filter_prompt.is_some() {
         render_filter_prompt(f, f.area(), app);
@@ -7164,35 +7202,59 @@ fn focused_cell_style() -> Style {
         .add_modifier(Modifier::BOLD)
 }
 
+/// Italic is a nicety, not a requirement: some terminals ignore it, some render
+/// it as reverse video. The grey foreground alone still separates a real NULL
+/// from ordinary text, so an unsupported italic degrades to grey-only. Set
+/// `DBXT_NO_ITALIC=1` to force that fallback (or when the font's italic is hard
+/// to read on a light theme).
+fn italic_supported() -> bool {
+    match std::env::var("DBXT_NO_ITALIC") {
+        Ok(v) => {
+            let v = v.trim();
+            !(v == "1" || v.eq_ignore_ascii_case("true") || v.eq_ignore_ascii_case("yes"))
+        }
+        Err(_) => true,
+    }
+}
+
+/// The style that marks a real SQL NULL: grey, italic when the terminal can.
+fn null_style() -> Style {
+    let mut style = Style::default().fg(Color::DarkGray);
+    if italic_supported() {
+        style = style.add_modifier(Modifier::ITALIC);
+    }
+    style
+}
+
+/// The style for an empty string — grey, never italic, and always drawn as
+/// `''` so it can never be mistaken for NULL.
+fn empty_string_style() -> Style {
+    Style::default().fg(Color::DarkGray)
+}
+
+/// Text and style a value should be drawn with, shared by the grid, the cell /
+/// row modals and the edit dialog so every surface tells the same story:
+/// `NULL` = grey italic, `''` = grey, anything else = plain. A literal string
+/// `"NULL"` stays plain, which is exactly how it stays distinct from the real
+/// thing.
+fn value_display(v: &Val) -> (String, Style) {
+    match v {
+        Val::Null => ("NULL".to_string(), null_style()),
+        Val::Text(s) if s.is_empty() => ("''".to_string(), empty_string_style()),
+        Val::Text(s) => (s.clone(), Style::default()),
+    }
+}
+
 /// Render one cell, optionally marking it as the focused cell.
 fn cell_widget_hl(v: &Val, w: usize, focused: bool) -> Cell<'static> {
+    if focused {
+        let (text, _) = value_display(v);
+        return Cell::from(Span::styled(truncate_disp(&text, w), focused_cell_style()));
+    }
     match v {
-        Val::Null => Cell::from(Span::styled(
-            "NULL",
-            if focused {
-                focused_cell_style()
-            } else {
-                Style::default()
-                    .fg(Color::DarkGray)
-                    .add_modifier(Modifier::ITALIC)
-            },
-        )),
-        Val::Text(s) if s.is_empty() => Cell::from(Span::styled(
-            "''",
-            if focused {
-                focused_cell_style()
-            } else {
-                Style::default().fg(Color::DarkGray)
-            },
-        )),
-        Val::Text(s) => {
-            let text = truncate_disp(s, w);
-            if focused {
-                Cell::from(Span::styled(text, focused_cell_style()))
-            } else {
-                Cell::from(Span::raw(text))
-            }
-        }
+        Val::Null => Cell::from(Span::styled("NULL", null_style())),
+        Val::Text(s) if s.is_empty() => Cell::from(Span::styled("''", empty_string_style())),
+        Val::Text(s) => Cell::from(Span::raw(truncate_disp(s, w))),
     }
 }
 
@@ -7973,7 +8035,7 @@ fn render_snippet_name(f: &mut Frame, area: Rect, app: &mut App) {
 }
 
 /// Shared scrollable text popup used for both cell values and row details.
-fn render_text_popup(f: &mut Frame, area: Rect, title: &str, content: &str, scroll: u16) {
+fn render_text_popup(f: &mut Frame, area: Rect, title: &str, lines: &[PopupLine], scroll: u16) {
     let w = {
         let avail = area.width.saturating_sub(4);
         if avail < 24 {
@@ -7983,7 +8045,17 @@ fn render_text_popup(f: &mut Frame, area: Rect, title: &str, content: &str, scro
         }
     };
     let inner_w = w.saturating_sub(4).max(1) as usize;
-    let body = wrap_text(content, inner_w);
+    // Wrap each logical line on its own so the style that marks NULL / ''
+    // survives across physical rows.
+    let body: Vec<Line> = lines
+        .iter()
+        .flat_map(|pl| {
+            let style = pl.style;
+            wrap_text(&pl.text, inner_w)
+                .into_iter()
+                .map(move |t| Line::from(Span::styled(t, style)))
+        })
+        .collect();
     let total = body.len();
     let max_h = area.height.saturating_sub(4).max(3);
     let h = ((total as u16) + 2).min(max_h);
@@ -7999,7 +8071,6 @@ fn render_text_popup(f: &mut Frame, area: Rect, title: &str, content: &str, scro
     f.render_widget(Clear, box_area);
     let max_scroll = total.saturating_sub(inner_h).min(u16::MAX as usize) as u16;
     let scroll = scroll.min(max_scroll);
-    let lines: Vec<Line> = body.iter().map(|l| Line::from(Span::raw(l.clone()))).collect();
     let title = format!(
         " {} · {}/{} · Esc 关闭 ",
         title,
@@ -8007,7 +8078,7 @@ fn render_text_popup(f: &mut Frame, area: Rect, title: &str, content: &str, scro
         total
     );
     f.render_widget(
-        Paragraph::new(lines).scroll((scroll, 0)).block(
+        Paragraph::new(body).scroll((scroll, 0)).block(
             Block::default()
                 .borders(Borders::ALL)
                 .title(title)
@@ -8034,9 +8105,10 @@ fn render_edit_dialog(f: &mut Frame, area: Rect, app: &mut App) {
 
     match d.kind {
         EditKind::Update => {
-            let old = match &d.old {
-                Val::Null => "NULL".to_string(),
-                Val::Text(s) => s.clone(),
+            let (old, old_style) = match &d.old {
+                Val::Null => ("NULL".to_string(), null_style()),
+                Val::Text(s) if s.is_empty() => ("''".to_string(), empty_string_style()),
+                Val::Text(s) => (s.clone(), Style::default().fg(Color::Red)),
             };
             let mut header_lines: Vec<Line> = Vec::new();
             header_lines.push(Line::from(vec![
@@ -8059,7 +8131,7 @@ fn render_edit_dialog(f: &mut Frame, area: Rect, app: &mut App) {
                 Span::styled("旧值 ", Style::default().fg(Color::DarkGray)),
                 Span::styled(
                     truncate_disp(&one_line(&old), inner_w.saturating_sub(6)),
-                    Style::default().fg(Color::Red),
+                    old_style,
                 ),
             ]));
             header_lines.push(Line::from(vec![
@@ -8187,7 +8259,13 @@ fn render_edit_dialog(f: &mut Frame, area: Rect, app: &mut App) {
                     Span::raw(" = "),
                     Span::styled(
                         truncate_disp(val, 12),
-                        Style::default().fg(Color::Green),
+                        if val == "NULL" {
+                            null_style()
+                        } else if val == "''" {
+                            empty_string_style()
+                        } else {
+                            Style::default().fg(Color::Green)
+                        },
                     ),
                 ]));
             }
@@ -8308,6 +8386,10 @@ const HELP_ROWS: &[(&str, &str)] = &[
     ("Ctrl-P", "EXPLAIN 当前 SQL（SQL 后端）"),
     ("?", "本帮助"),
     ("DBXT_MOUSE_DEBUG=1", "启动时显示鼠标事件浮层（滑动无效时排查终端编码）"),
+    ("— 显示约定 —", ""),
+    ("NULL", "真正的 SQL NULL：灰色斜体（终端不支持斜体时仅灰色）"),
+    ("''", "空字符串：灰色，带引号的空串，不会与 NULL 混淆"),
+    ("DBXT_NO_ITALIC=1", "强制 NULL 仅用灰色，不依赖终端斜体"),
     ("— 侧栏 —", ""),
     ("↑ ↓", "移动表列表"),
     ("/", "过滤表名（输入即筛选，Enter 保留，Esc 清除）"),
@@ -8866,6 +8948,134 @@ mod tests {
         assert_eq!(value_to_val(&serde_json::json!(42)).text(), "42");
     }
 
+    #[test]
+    fn null_and_empty_string_render_distinctly() {
+        let (null_text, null) = value_display(&Val::Null);
+        assert_eq!(null_text, "NULL");
+        assert_eq!(null.fg, Some(Color::DarkGray));
+        assert_eq!(
+            null.add_modifier.contains(Modifier::ITALIC),
+            italic_supported(),
+            "NULL is italic only when the terminal supports it"
+        );
+
+        let (empty_text, empty) = value_display(&Val::Text(String::new()));
+        assert_eq!(empty_text, "''");
+        assert_eq!(empty.fg, Some(Color::DarkGray));
+        assert!(!empty.add_modifier.contains(Modifier::ITALIC));
+
+        // A literal string "NULL" stays plain — that is what tells it apart
+        // from the real thing, which is grey (and italic when possible).
+        let (literal_text, literal) = value_display(&Val::Text("NULL".into()));
+        assert_eq!(literal_text, "NULL");
+        assert_eq!(literal.fg, None);
+        assert_ne!(literal, null);
+    }
+
+    /// Render one row of grid cells exactly like the results pane does, into a
+    /// headless buffer, so the NULL / `''` contract can be checked without a
+    /// real terminal.
+    fn capture_grid_cells(rows: &[Vec<Val>], width: u16, height: u16) -> ratatui::buffer::Buffer {
+        use ratatui::backend::TestBackend;
+        use ratatui::Terminal;
+        let mut term = Terminal::new(TestBackend::new(width, height)).unwrap();
+        let ncols = rows.first().map(Vec::len).unwrap_or(0);
+        let rendered: Vec<Row> = rows
+            .iter()
+            .map(|row| {
+                Row::new(
+                    row.iter()
+                        .map(|v| cell_widget_hl(v, 8, false))
+                        .collect::<Vec<_>>(),
+                )
+            })
+            .collect();
+        let table = Table::new(
+            rendered,
+            (0..ncols).map(|_| Constraint::Length(8)).collect::<Vec<_>>(),
+        )
+        .column_spacing(1);
+        term.draw(|f| f.render_widget(table, f.area())).unwrap();
+        term.backend().buffer().clone()
+    }
+
+    #[test]
+    fn null_empty_and_literal_null_stay_apart_at_both_capture_sizes() {
+        // Three columns, each a different case: a NULL-only column, an
+        // empty-string-only column, and a mixed column that holds both a real
+        // NULL and the literal text "NULL".
+        let rows = vec![
+            vec![
+                Val::Null,
+                Val::Text(String::new()),
+                Val::Text("NULL".into()),
+            ],
+            vec![Val::Null, Val::Text(String::new()), Val::Null],
+            vec![Val::Null, Val::Text(String::new()), Val::Text("x".into())],
+        ];
+        // The two capture sizes the R12 acceptance pass uses: a phone-ish 42×22
+        // and a desktop 110×30.
+        for (w, h) in [(42u16, 22u16), (110, 30)] {
+            let buf = capture_grid_cells(&rows, w, h);
+            let text_at = |x: u16, y: u16, n: u16| -> String {
+                (0..n)
+                    .map(|i| buf.cell((x + i, y)).unwrap().symbol())
+                    .collect()
+            };
+            // 8-wide cells with a 1-column gutter: x = 0, 9, 18.
+            for (r, row) in rows.iter().enumerate() {
+                let y = r as u16;
+                let null_cell = buf.cell((0u16, y)).unwrap();
+                assert_eq!(text_at(0, y, 4), "NULL", "{w}x{h} r{r}");
+                assert_eq!(null_cell.fg, Color::DarkGray, "{w}x{h} r{r}");
+                assert_eq!(
+                    null_cell.modifier.contains(Modifier::ITALIC),
+                    italic_supported(),
+                    "{w}x{h} r{r}"
+                );
+
+                let empty_cell = buf.cell((9u16, y)).unwrap();
+                assert_eq!(text_at(9, y, 2), "''", "{w}x{h} r{r}");
+                assert_eq!(empty_cell.fg, Color::DarkGray, "{w}x{h} r{r}");
+                assert!(!empty_cell.modifier.contains(Modifier::ITALIC), "{w}x{h} r{r}");
+
+                // The mixed column: the literal "NULL" is plain, the real
+                // NULL is grey (and italic when supported).
+                let expected = match &row[2] {
+                    Val::Text(s) => s.clone(),
+                    Val::Null => "NULL".to_string(),
+                };
+                let mixed = buf.cell((18u16, y)).unwrap();
+                assert_eq!(text_at(18, y, expected.len() as u16), expected, "{w}x{h} r{r}");
+                if row[2] == Val::Null {
+                    assert_eq!(mixed.fg, Color::DarkGray, "{w}x{h} r{r}");
+                    assert_eq!(
+                        mixed.modifier.contains(Modifier::ITALIC),
+                        italic_supported(),
+                        "{w}x{h} r{r}"
+                    );
+                } else {
+                    assert_ne!(mixed.fg, Color::DarkGray, "{w}x{h} r{r}");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn csv_export_keeps_null_and_empty_as_empty_fields() {
+        let grid = Grid {
+            columns: vec!["a".into(), "b".into(), "c".into()],
+            rows: vec![vec![
+                Val::Null,
+                Val::Text(String::new()),
+                Val::Text("NULL".into()),
+            ]],
+            note: String::new(),
+        };
+        // NULL and '' are both empty fields (RFC 4180), a literal "NULL" is not.
+        assert_eq!(grid_to_csv(&grid), "a,b,c\n,,NULL\n");
+    }
+
     fn ten_col_grid() -> Grid {
         let columns: Vec<String> = (0..10).map(|i| format!("c{i}")).collect();
         Grid {
@@ -9077,12 +9287,38 @@ mod tests {
 
     #[test]
     fn new_value_literal_handles_null_empty_and_typing() {
+        // A blank box (and an explicit NULL) both mean SQL NULL now.
+        assert_eq!(new_value_literal("", Some("varchar(10)")), "NULL");
+        assert_eq!(new_value_literal("   ", Some("varchar(10)")), "NULL");
         assert_eq!(new_value_literal("NULL", Some("int")), "NULL");
         assert_eq!(new_value_literal("null", Some("varchar(10)")), "NULL");
-        assert_eq!(new_value_literal("", Some("varchar(10)")), "''");
+        // `''` is the empty string; quoted text is taken verbatim.
+        assert_eq!(new_value_literal("''", Some("varchar(10)")), "''");
+        assert_eq!(new_value_literal("'text'", Some("varchar(10)")), "'text'");
+        assert_eq!(new_value_literal("'O''Brien'", Some("text")), "'O''Brien'");
+        // Unquoted values are coerced by column type, as before.
         assert_eq!(new_value_literal("42", Some("int")), "42");
         assert_eq!(new_value_literal("42", Some("varchar(10)")), "'42'");
         assert_eq!(new_value_literal("O'Brien", Some("text")), "'O''Brien'");
+    }
+
+    #[test]
+    fn edit_prefill_round_trips_through_new_value_literal() {
+        let round = |v: Val, t: Option<&str>| new_value_literal(&edit_prefill(&v), t);
+        // NULL opens blank and submits back as NULL.
+        assert_eq!(edit_prefill(&Val::Null), "");
+        assert_eq!(round(Val::Null, Some("varchar(10)")), "NULL");
+        // The empty string opens as `''` and stays an empty string.
+        assert_eq!(edit_prefill(&Val::Text(String::new())), "''");
+        assert_eq!(round(Val::Text(String::new()), Some("varchar(10)")), "''");
+        // A literal "NULL" is quoted so an unchanged submit cannot turn it into NULL.
+        assert_eq!(edit_prefill(&Val::Text("NULL".into())), "'NULL'");
+        assert_eq!(round(Val::Text("NULL".into()), Some("varchar(10)")), "'NULL'");
+        // Ordinary values open verbatim.
+        assert_eq!(edit_prefill(&Val::Text("42".into())), "42");
+        assert_eq!(round(Val::Text("42".into()), Some("int")), "42");
+        assert_eq!(round(Val::Text("42".into()), Some("varchar(10)")), "'42'");
+        assert_eq!(round(Val::Text("O'Brien".into()), Some("text")), "'O''Brien'");
     }
 
     #[test]

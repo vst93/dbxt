@@ -20,7 +20,7 @@ Early but usable. Verified end-to-end against real MySQL 8.4, Redis and MongoDB 
 - ✅ **Horizontal scroll progress bar**: a **half-height** track + thumb is drawn along the bottom border of the result grid, showing which slice of the columns is on screen next to a `列 1|3-8/21` label; it hides automatically when every column fits, and clicking the track jumps the column window there. A matching half-width vertical position indicator is drawn on the right border
 - ✅ **Table structure**: `r` shows the field list (type / key / nullable / default / comment); `t` toggles the `SHOW CREATE TABLE` DDL (dialect-aware, built by the DBX kernel)
 - ✅ **Wide tables / horizontal scrolling**: `←`/`→` (or `h`/`l`) move a cell-level cursor and the column window follows it; `Shift`+wheel, the horizontal wheel, a left/right **swipe** (a touch drag) and `Shift`+`←`/`→` pan the window directly, the first data column can be pinned with `z` (the row-number gutter is always pinned); the current column is highlighted in the header and the focused cell is highlighted in the body; `Enter` opens the full, untruncated cell value in a popup. The status bar always shows `列 1|3-8/21`-style horizontal position, and the bottom progress bar makes it obvious at a glance. The same cell cursor and column scrolling work inside a drilled-down script result
-- ✅ **Result grid**: the header stays in sync with column scrolling, `NULL` (italic) and the empty string (`''`) render differently, and execution time / affected rows are shown
+- ✅ **Result grid**: the header stays in sync with column scrolling, `NULL` (grey italic) and the empty string (`''`, grey) render differently, and execution time / affected rows are shown
 - ✅ **Database switching**: `d` opens a database list (`↑`/`↓` + `Enter` to switch, `Esc` to close, `r` to reload the list in place) — the same gesture works for MySQL/PostgreSQL databases, MongoDB databases and Redis logical DBs. The current database is shown permanently in the sidebar (click it to open the list); `←`/`→` in the sidebar stay as a quick cycle, and `[`/`]` stay as a Redis shortcut. The current table selection is kept across a switch when the new database has a table with the same name
 - ✅ **DML**: `INSERT`/`UPDATE`/`DELETE` report affected rows; every generated write (`e` / `i` / `Delete`) and the transactional batch go through a confirmation layer that shows the full SQL, and `DROP`/`TRUNCATE` and `WHERE`-less `UPDATE`/`DELETE` additionally pop the red dangerous-statement confirmation before running
 - ✅ **Multi-statement scripts**: `a; b; c;` runs as a batch and shows one row per statement; `Enter` drills into a statement's result set (with the full cell cursor / column scrolling of the main grid)
@@ -115,6 +115,7 @@ DBX_DATA_DIR=/path/to/dir dbxt
 | `DBXT_EVENT_TRACE=<path>` (or `=1`) | append every mouse/resize event, with the exact sequence it arrived in, to that file, and echo the last one in the status bar |
 | `DBXT_MOUSE_DEBUG=1` (or `=<path>`) | the same log (`$TMPDIR/dbxt-mouse.log` by default) plus a live floating event panel — how to report what a phone swipe actually sends |
 | `DBXT_DRAG_PAN=button\|any\|off` | how a swipe is recognised: a held-button drag (default), also bare motion, or nothing |
+| `DBXT_NO_ITALIC=1` | render `NULL` in grey only — never rely on the terminal's italic face |
 
 ### Keys
 
@@ -194,6 +195,20 @@ DBX_DATA_DIR=/path/to/dir dbxt
 | SQL completion (`Ctrl-Space`) | `↑` `↓` / `Tab` `Enter` / `Esc` | select / accept / cancel (typing keeps refining) |
 | Help | `↑` `↓` `PgUp` `PgDn` / `Esc` `?` | scroll / close |
 | Confirmation | `Enter` `y` / `Esc` `n` | execute / cancel (full SQL shown) |
+
+### Display conventions
+
+Real SQL `NULL` and the empty string are different values, so dbxt never draws them the same way:
+
+| Value | How it is drawn |
+| --- | --- |
+| SQL `NULL` | `NULL`, grey (dark grey) and italic |
+| Empty string `''` | `''`, grey, upright |
+| The literal text `NULL` | `NULL`, in the normal foreground |
+
+The grey is a foreground colour only, so your terminal theme (light or dark) stays in charge of the background. If the terminal or font does not do italics, the italic is simply dropped and `NULL` stays grey — the distinction still holds. Set `DBXT_NO_ITALIC=1` to force the grey-only rendering (e.g. when the italic face is hard to read). The same convention applies everywhere a value is shown: the result grid, the cell popup (`v` / `Enter`), the row detail (`o`), the edit layer's old value and the `INSERT` preview. The empty-string marker is always `''`, so it can never be confused with NULL.
+
+CSV export (`Ctrl-Y`) follows RFC 4180 and DBX: both `NULL` and the empty string become an empty field; only the literal text `NULL` is written as `NULL`.
 
 ### Mobile efficiency (recommended phone workflow)
 
