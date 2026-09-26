@@ -25,6 +25,9 @@ Early but usable. Verified end-to-end against real MySQL 8.4, Redis and MongoDB 
 - ✅ **DML**: `INSERT`/`UPDATE`/`DELETE` report affected rows; every generated write (`e` / `i` / `Delete`) and the transactional batch go through a confirmation layer that shows the full SQL, and `DROP`/`TRUNCATE` and `WHERE`-less `UPDATE`/`DELETE` additionally pop the red dangerous-statement confirmation before running
 - ✅ **Multi-statement scripts**: `a; b; c;` runs as a batch and shows one row per statement; `Enter` drills into a statement's result set (with the full cell cursor / column scrolling of the main grid)
 - ✅ **Help overlay**: `?` opens a keyboard cheat-sheet; every overlay (database list, cell value, row detail, filter prompt, help, confirmation) closes with `Esc`
+- ✅ **Mobile efficiency**: compact column widths (`Alt-C` / `w`) share the pane so a wide table fits on a phone screen and the status bar reads `全部 N 列已适配`; `Enter` expands the focused row as a vertical `column = value` list; `Alt-H` (`c`) hides columns for the session (DBX's column-visibility picker, by name); `/` filters table names as you type; `Alt-R` (`t`) jumps to one of the last five browsed tables. See *Mobile efficiency* below for the recommended phone workflow
+- ✅ **SQL completion**: `Ctrl-Space` in the editor completes the identifier at the cursor from the current table's columns, the connection's tables and a keyword list — `Tab` accepts, typing refines
+- ✅ **Query favourites, both ways**: `Ctrl-O` inserts a DBX `saved_sql_files` snippet; `s` saves the editor's SQL back into that shared store (name prompt, `.sql` suffix, RFC3339 timestamp) so DBX Desktop sees it too
 - ✅ **No focus stealing**: a background page load updates the results in place and only moves focus to the grid when a table is first opened from the sidebar
 - ✅ **SQL editor**: multi-line, shell-style `↑`/`↓` history (seeded from DBX's shared query history), the results pane takes focus after a run
 - ✅ MySQL server errors surfaced verbatim in the status line
@@ -124,6 +127,8 @@ DBX_DATA_DIR=/path/to/dir dbxt
 | Connection picker | `c` | new connection form |
 | Connection picker | `p` | duplicate the highlighted connection into the form |
 | Sidebar (connected) | `↑` `↓` | move in table list |
+| Sidebar | `/` | filter table names as you type (`Enter` keeps it, `Esc` clears) |
+| Sidebar | `t` | recent tables overlay (`↑` `↓` + `Enter` to jump straight there) |
 | Sidebar | `←` `→` | cycle database (shortcut) |
 | Sidebar | `d` | open the database list (SQL / MongoDB / Redis) |
 | Sidebar | `Enter` | browse table data (paginated `SELECT *`) |
@@ -135,11 +140,15 @@ DBX_DATA_DIR=/path/to/dir dbxt
 | Anywhere | `Ctrl-A` | toggle auto-collapse (on = unfocused panes collapse, off = all expanded) |
 | Anywhere | `Ctrl-W` | collapse / expand the focused pane |
 | Anywhere | `Ctrl-G` | toggle pan mode — vertical wheel / up-down swipe pans columns (touch fallback) |
+| Anywhere | `Alt-C` (or `w` in the results) | toggle **compact column widths** — share the pane so a wide table fits with no horizontal scroll |
+| Anywhere | `Alt-H` (or `c` in the results) | **column visibility** picker (`Space` toggles, `a` all, `x` first only; remembered for the session) |
+| Anywhere | `Alt-R` (or `t` in the sidebar) | **recent tables** overlay — the last five browsed tables, `Enter` jumps there |
 | Anywhere | `Shift`+`←` / `Shift`+`→` | pan the column window one column (hold to repeat; the text inputs keep `Shift`+arrow for selection) |
 | Anywhere | `Ctrl-O` | saved SQL snippets (DBX's `saved_sql_files`), insert into the editor |
 | Anywhere | `Ctrl-P` | `EXPLAIN` the editor's SQL (SQL backends) |
 | Anywhere | `Ctrl-S` / `Ctrl-X` | commit / discard the queued transactional batch |
 | Editor | `Enter` | new line |
+| Editor | `Ctrl-Space` | SQL prefix completion (tables / columns / keywords, `Tab` accepts) |
 | Editor | `↑` / `↓` | history (on the first / last line) |
 | Editor | `Esc` | back to sidebar |
 | Redis input | `[` `]` | switch Redis database (db 0/1/2…) |
@@ -156,8 +165,10 @@ DBX_DATA_DIR=/path/to/dir dbxt
 | Results | `Ctrl-Y` | export the focused result to CSV under `$HOME` |
 | Results | `Ctrl-N` | load more rows when the result was truncated at the cap |
 | Results | `Ctrl-E` | focus the SQL editor |
-| Results | `Enter` | open the focused cell in a popup / open a statement's result (script view) |
-| Results | `o` | open the whole focused row as a vertical list |
+| Results | `Enter` | open the focused cell in a popup — or, in compact column mode, **expand the whole row** (script view: drill into a statement's result) |
+| Results | `v` | open the focused cell in a popup (any mode) |
+| Results | `w` / `c` | compact column widths / column visibility picker |
+| Results | `o` | open the whole focused row as a vertical list (hidden columns included) |
 | Results | `e` | edit the focused cell → diff confirmation layer (full SQL shown) |
 | Results | `i` | insert a row → diff confirmation layer (full SQL shown) |
 | Results | `Delete` / `Ctrl-D` | delete the focused row → red confirmation layer |
@@ -176,9 +187,33 @@ DBX_DATA_DIR=/path/to/dir dbxt
 | Edit layer (UPDATE) | `Enter` / `Esc` / `Ctrl-V` / `Ctrl-T` | execute / cancel / hand to editor / queue for batch |
 | Edit layer (INSERT) | `Enter` / `Esc` / `Ctrl-V` / `Ctrl-T` | execute / cancel / hand to editor / queue for batch |
 | Database list | `↑` `↓` / `Enter` / `r` / `Esc` | select / switch / reload / close |
-| SQL snippets (`Ctrl-O`) | `↑` `↓` / `Enter` / `r` / `Esc` | select / insert into editor / reload / close |
+| SQL snippets (`Ctrl-O`) | `↑` `↓` / `Enter` / `s` / `r` / `Esc` | select / insert into editor / save the editor's SQL as a new favourite / reload / close |
+| Table filter (`/`) | typing / `Enter` / `Esc` | filter live / keep the filter / clear it |
+| Column picker (`Alt-H`) | `Space` / `a` / `x` / `↑` `↓` / `Esc` | toggle one column / show all / keep only the first / move / close |
+| Recent tables (`Alt-R`) | `↑` `↓` / `Enter` / `Esc` | select / jump to the table / close |
+| SQL completion (`Ctrl-Space`) | `↑` `↓` / `Tab` `Enter` / `Esc` | select / accept / cancel (typing keeps refining) |
 | Help | `↑` `↓` `PgUp` `PgDn` / `Esc` `?` | scroll / close |
 | Confirmation | `Enter` `y` / `Esc` `n` | execute / cancel (full SQL shown) |
+
+### Mobile efficiency (recommended phone workflow)
+
+A phone terminal is narrow, and no gesture is reliably delivered. So instead of betting on a swipe, dbxt makes a wide table *fit*: on a narrow terminal the columns are compressed automatically, a row expands to a vertical list on `Enter`, and columns you do not care about can be hidden for the session. Together these remove the need to scroll sideways at all — horizontal swiping is still there as a bonus for terminals that report it.
+
+**1. Compact column widths (on by default below 50 columns).** Every column shares the pane equally (6–8 cells each, longer values get an ellipsis) so as many columns as possible land on screen at once. On a 42-column terminal a 20-column table goes from 3 visible columns to 5; on a 110-column terminal it goes from 7 to 11. When *every* column fits, the status bar says `全部 N 列已适配` and the bottom scroll bar disappears — you are done scrolling. `Alt-C` toggles it from anywhere, `w` in the results pane.
+
+**2. Row expand (`Enter`).** In compact mode `Enter` opens the focused row as a scrollable `column = value` list — every column, at full width, one per line — which is how a truncated cell is read on a small screen. `o` does the same in any mode, and `v` (or `Enter` outside compact mode) still opens just the focused cell.
+
+**3. Column visibility (`Alt-H`, or `c` in the results).** `Space` ticks a column off, `a` shows them all again, `x` keeps only the first. The choice is remembered for the browsing session (keyed by column name, so it follows you between tables) and applied to every later page and query result, so a table collapses to just the columns you care about — usually enough to make the horizontal scroll bar disappear entirely.
+
+**4. `/` to filter tables.** With a long sidebar, type a few letters of the table name and only the matches remain (`Enter` keeps the filter, `Esc` clears it). Faster than scrolling on any screen size.
+
+**5. `Alt-R` (or `t`) for recent tables.** The last five browsed `database.table` pairs, newest first — `Enter` jumps straight there, switching database first when needed. Replaces hunting through the sidebar.
+
+**6. `Ctrl-Space` for SQL completion.** Completes the identifier at the cursor from the current table's columns, the connection's tables, and a keyword list; `Tab` accepts, `↑`/`↓` choose, and typing keeps refining the list.
+
+#### A note on `Ctrl-Shift` keys
+
+`Ctrl-Shift-C` / `Ctrl-Shift-H` / `Ctrl-Shift-R` are accepted when the terminal reports the Shift modifier (kitty keyboard protocol, `modifyOtherKeys`, iTerm2). On a legacy terminal — including tmux — `Ctrl-Shift-C` is byte-for-byte `Ctrl-C` (0x03), `Ctrl-Shift-H` is `Ctrl-H` (0x08) and `Ctrl-Shift-R` is `Ctrl-R` (0x12); the Shift is simply not on the wire, so no application can tell them apart. dbxt therefore binds the three view commands to `Alt-C` / `Alt-H` / `Alt-R` (an `Alt` combination *is* delivered distinctly) plus the bare results-pane keys `w` / `c` and the sidebar key `t`.
 
 ### Mouse / touch
 
@@ -191,7 +226,7 @@ Touch taps in terminals are delivered as mouse-down events (confirmed on release
 - Click an area (editor, command input, results) to focus it
 - Wheel scrolls rows (and auto-flips the page at an edge); `Shift`+wheel and `Alt`+wheel scroll columns; the horizontal wheel and a left/right **swipe** — whatever a touch screen sends for it — scroll columns directly too
 
-**Horizontal scrolling on a phone.** Touch terminals disagree about what a left/right swipe means, so dbxt accepts every encoding it has seen and also offers fallbacks that need no horizontal wheel at all:
+**Horizontal scrolling on a phone — optional extra.** The mobile workflow above (compact columns + row expand + column visibility) is designed so that you usually do not need to scroll sideways at all. When a table is still wider than the screen and the terminal does report a swipe, dbxt accepts every encoding it has seen — and also offers fallbacks that need no horizontal wheel:
 
 - a **horizontal wheel** (`ScrollLeft` / `ScrollRight`, SGR buttons 66/67) pans the columns **whatever pane has focus**, so a swipe works even after you tapped the sidebar or the editor;
 - a **drag** — a held left button that moves (`Drag(Left)`, SGR button 32) — is read as a swipe and pans by finger travel (two columns of travel per column panned, capped per event). This is what many phone terminals actually send for a left/right swipe, and before R10 it was invisible to dbxt. A mostly-vertical drag is left alone (rows keep moving through the wheel), and a swipe no longer also counts as a tap: inside the results pane the click is confirmed on release and dropped once the finger moves;
@@ -218,7 +253,7 @@ Keystrokes are never traced, so a password typed into the connection form cannot
 
 **Continuous row browsing.** Table data is still fetched 50 rows at a time, but the page boundary is invisible to the keyboard: `↑`/`↓` (and the wheel) load the neighbouring page when the cursor runs off an edge, landing on the row you would have reached anyway. `n`/`p` and `Ctrl-F`/`Ctrl-B` turn a whole page while keeping the cursor on the same relative row, so paging never throws you back to the top. The status bar always shows `第 3/8 页 · 行 102/400`.
 
-**Wide tables.** Each grid has a cell cursor. `←`/`→` (or `h`/`l`) move it and the visible column window follows, with the header of the current column highlighted. `z` pins the first data column next to the always-pinned row-number gutter, so a primary key stays visible while you scroll to the right. `Enter` opens the focused cell in a popup, which is how over-wide values stay readable. The status bar always shows the horizontal position as `列 1|3-8/21` (pinned | scrolled). `Shift`+wheel, the horizontal wheel and a left/right swipe (a drag) move the **window** itself, one column per notch, so the table responds immediately. The same cursor and scrolling work in a drilled-down script result.
+**Wide tables.** Each grid has a cell cursor. `←`/`→` (or `h`/`l`) move it and the visible column window follows, with the header of the current column highlighted. `z` pins the first data column next to the always-pinned row-number gutter, so a primary key stays visible while you scroll to the right. `Enter` opens the focused cell in a popup, which is how over-wide values stay readable. The status bar always shows the horizontal position as `列 1|3-8/21` (pinned | scrolled), or `全部 N 列已适配` when nothing is off-screen. `Shift`+wheel, the horizontal wheel and a left/right swipe (a drag) move the **window** itself, one column per notch, so the table responds immediately. The same cursor and scrolling work in a drilled-down script result. On a narrow terminal the compact column mode (see *Mobile efficiency*) usually removes the need to scroll at all, and the `Alt-H` column picker removes the columns you do not need.
 
 **Editing without surprises.** `e` opens a diff-style confirmation layer: it shows the column, the old value, the `WHERE` clause, the detected primary key and the **full generated `UPDATE`**, and lets you type the new value inline. `Enter` executes, `Esc` cancels, `Ctrl-V` moves the generated `UPDATE` into the SQL editor for hand-editing, and `Ctrl-T` queues it instead of running it. `i` shows the whole `INSERT` statement the same way, and `Delete` / `Ctrl-D` shows the bound `DELETE … WHERE …` in a red confirmation. The `WHERE` is built from the table's primary key; a keyless table matches every column instead and warns in the layer. A generated write that somehow lacks a bound `WHERE` (or uses `WHERE 1 = 1`) still trips the ordinary dangerous-statement confirmation. After a successful write the affected-row count is reported and the current page is reloaded in place; a failure echoes the server error verbatim.
 
@@ -230,7 +265,7 @@ Keystrokes are never traced, so a password typed into the connection form cannot
 
 **Database switching.** `d` opens a list of databases and `Enter` switches — one gesture for MySQL/PostgreSQL schemas, MongoDB databases and Redis logical DBs, instead of a blind `←`/`→` cycle that is invisible on a narrow screen. `r` reloads the list in place (a database created elsewhere in the session shows up without reconnecting). The list is an overlay rather than an always-expanded sidebar tree because the sidebar collapses to a one-line strip on narrow layouts; an overlay works the same at every size and scales to many databases. The current database is still shown permanently in the sidebar (and clicking it opens the same list), while `←`/`→` and Redis `[`/`]` remain as shortcuts.
 
-**Result tabs, EXPLAIN, export and snippets (DBX parity).** Every SQL run keeps its result as a tab, so consecutive `SELECT`s no longer overwrite each other — `[` / `]` flip between them and the title shows `结果 2/3`. `Ctrl-P` wraps the editor's SQL in the dialect's `EXPLAIN` (`EXPLAIN QUERY PLAN` on SQLite, `EXPLAIN` on MySQL/PostgreSQL/DuckDB/…) and shows the plan as a normal grid. `Ctrl-Y` writes the focused result to a CSV file under `$HOME` (`dbxt-export-<table|query>-<epoch>.csv`, RFC 4180 quoting, NULL as an empty field) and reports the path. A result that hit the 500-row cap says `已截断`; `Ctrl-N` re-runs the same statement with a larger cap (500 → 1000 → …, up to 20 000) and replaces the tab in place. `Ctrl-O` lists the SQL snippets DBX saved for this connection (`saved_sql_files`) and inserts the highlighted one into the editor; `r` reloads the list. Connections are colour-coded by family (mysql / redis / mongo / sqlite …) in the picker and the sidebar, using the connection's own colour when it has one, and `p` copies a connection into the form (new id on save; the copy does not carry SSH transport layers).
+**Result tabs, EXPLAIN, export and snippets (DBX parity).** Every SQL run keeps its result as a tab, so consecutive `SELECT`s no longer overwrite each other — `[` / `]` flip between them and the title shows `结果 2/3`. `Ctrl-P` wraps the editor's SQL in the dialect's `EXPLAIN` (`EXPLAIN QUERY PLAN` on SQLite, `EXPLAIN` on MySQL/PostgreSQL/DuckDB/…) and shows the plan as a normal grid. `Ctrl-Y` writes the focused result to a CSV file under `$HOME` (`dbxt-export-<table|query>-<epoch>.csv`, RFC 4180 quoting, NULL as an empty field) and reports the path. A result that hit the 500-row cap says `已截断`; `Ctrl-N` re-runs the same statement with a larger cap (500 → 1000 → …, up to 20 000) and replaces the tab in place. `Ctrl-O` lists the SQL snippets DBX saved for this connection (`saved_sql_files`) and inserts the highlighted one into the editor; `s` saves the editor's SQL back as a new favourite (name prompt, written straight into the shared store so DBX Desktop sees it), and `r` reloads the list. Connections are colour-coded by family (mysql / redis / mongo / sqlite …) in the picker and the sidebar, using the connection's own colour when it has one, and `p` copies a connection into the form (new id on save; the copy does not carry SSH transport layers).
 
 ## Known issues
 
@@ -243,7 +278,8 @@ Keystrokes are never traced, so a password typed into the connection form cannot
 - [ ] In-TUI connection editing / deletion (duplication is in via `p`)
 - [ ] Result export to JSON / XLSX (CSV is in via `Ctrl-Y`)
 - [ ] Persist dbxt-run SQL back into DBX's shared query history (it is read today)
-- [ ] Schema-aware SQL editing / autocomplete
+- [x] Schema-aware SQL completion — prefix completion of tables / columns / keywords is in via `Ctrl-Space`; full semantic (JOIN-aware) completion is still open
+- [ ] Persist the compact-column and column-visibility choices across sessions (they are per-session today, like DBX's column picker)
 - [ ] Release builds for Windows, macOS (Intel/Apple Silicon), Linux (glibc + musl), Android Termux (aarch64 musl, static)
 
 ## License

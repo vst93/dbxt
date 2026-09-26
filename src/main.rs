@@ -2,7 +2,7 @@
 // Apache-2.0. Reuses DBX connection storage (dbx.db), native drivers, SQL safety.
 #![recursion_limit = "512"]
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::io::Write;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -269,6 +269,8 @@ struct ResultTab {
     /// Short label (the first line of the SQL, trimmed).
     title: String,
     grid: Option<Grid>,
+    /// Unfiltered grid, so the column-visibility filter can be re-applied.
+    grid_full: Option<Grid>,
     script: Option<ScriptView>,
     kind: GridKind,
     sel: usize,
@@ -366,6 +368,17 @@ struct RowPopup {
     title: String,
     content: String,
     scroll: u16,
+}
+
+/// SQL prefix-completion popup in the editor (Ctrl-Space). Tab / Enter accept,
+/// Esc cancels; typing keeps refining the candidate list.
+#[derive(Clone)]
+struct Completion {
+    items: Vec<String>,
+    sel: usize,
+    /// The identifier fragment immediately before the cursor that is replaced
+    /// when a candidate is accepted.
+    prefix: String,
 }
 
 // ─── text helpers ────────────────────────────────────────────────────────────
@@ -593,6 +606,8 @@ enum Op {
     Mongo(Box<ConnectionConfig>, String, String),
     History(Box<ConnectionConfig>),
     Snippets(Box<ConnectionConfig>),
+    /// Save the editor's SQL into DBX's `saved_sql_files` (query favourites).
+    SaveSnippet(Box<ConnectionConfig>, String, String),
     DatabasesRefresh(Box<ConnectionConfig>),
     AddConn(Box<ConnectionConfig>),
 }
@@ -630,6 +645,7 @@ enum OpResult {
     Mongo(String),
     History(Vec<String>),
     Snippets(Vec<(String, String)>),
+    SnippetSaved(String),
     DatabasesRefresh(Vec<String>),
     Added(String),
     Error(String),
@@ -648,6 +664,32 @@ fn note_of(r: &dbx_core::db::QueryResult) -> String {
     }
     parts.push(format!("{}ms", r.execution_time_ms));
     parts.join(" · ")
+}
+
+/// UTC timestamp in the RFC3339 shape DBX writes into `saved_sql_files`
+/// (`2026-06-27T00:00:00Z`). Avoids pulling in a date crate for one string.
+fn now_iso8601() -> String {
+    let secs = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    let days = (secs / 86_400) as i64;
+    let rem = secs % 86_400;
+    let (h, mi, s) = (rem / 3600, (rem % 3600) / 60, rem % 60);
+    // Howard Hinnant's civil-from-days algorithm (days since 1970-01-01).
+    let z = days + 719_468;
+    let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
+    let doe = (z - era * 146_097) as u64;
+    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
+    let mut y = yoe as i64 + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = doy - (153 * mp + 2) / 5 + 1;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 };
+    if m <= 2 {
+        y += 1;
+    }
+    format!("{y:04}-{m:02}-{d:02}T{h:02}:{mi:02}:{s:02}Z")
 }
 
 fn stmt_outcome(sql: String, b: BatchStatementResult) -> StmtOutcome {
@@ -919,6 +961,29 @@ async fn run_op(backend: &LocalBackend, op: Op) -> OpResult {
             }
             Err(e) => OpResult::Error(format!("snippets: {e}")),
         },
+        Op::SaveSnippet(cfg, name, sql) => {
+            let now = now_iso8601();
+            let file = dbx_core::saved_sql::SavedSqlFile {
+                id: Uuid::new_v4().to_string(),
+                connection_id: cfg.id.clone(),
+                folder_id: None,
+                name: name.clone(),
+                database: cfg.database.clone().unwrap_or_default(),
+                catalog: None,
+                schema: None,
+                sql,
+                sql_loaded: true,
+                order_index: 0,
+                open_count: 0,
+                opened_at: None,
+                created_at: now.clone(),
+                updated_at: now,
+            };
+            match backend.state().storage.save_saved_sql_file(&file).await {
+                Ok(()) => OpResult::SnippetSaved(name),
+                Err(e) => OpResult::Error(format!("save snippet: {e}")),
+            }
+        }
         Op::DatabasesRefresh(cfg) => match backend.list_databases(&cfg).await {
             Ok(dbs) => OpResult::DatabasesRefresh(dbs),
             Err(e) => OpResult::Error(format!("databases: {e}")),
@@ -1173,6 +1238,11 @@ struct App {
 
     tables: Vec<TableInfo>,
     table_list: ListState,
+    /// Unfiltered table list; `tables` is this list with the `/` filter applied.
+    tables_all: Vec<TableInfo>,
+    /// Active sidebar table-name filter (`/`, filter-as-you-type).
+    table_filter: String,
+    table_prompt: Option<TextArea<'static>>,
 
     // table structure
     columns: Vec<ColumnInfo>,
@@ -1194,9 +1264,30 @@ struct App {
     col_offset: usize, // leftmost column of the scrollable window
     col_cursor: usize, // focused column (cell cursor)
     vis_cols: usize,   // columns currently visible (set while rendering)
+    /// Width cap actually used for the last render (compact mode aware).
+    grid_max_cell: usize,
     freeze_first: bool, // pin the first data column (row-number gutter is always pinned)
     cell_popup: Option<CellPopup>,
     row_popup: Option<RowPopup>,
+
+    // ── mobile efficiency ──
+    /// Compact column-width mode (`None` = automatic for a narrow terminal).
+    compact: Option<bool>,
+    /// Column names hidden for this browsing session (Ctrl-Shift-H).
+    col_hidden: HashSet<String>,
+    col_picker_open: bool,
+    col_picker_list: ListState,
+    /// The unfiltered grid backing the filtered `grid` (needed to re-show a
+    /// hidden column without re-querying).
+    grid_full: Option<Grid>,
+    /// The five most recently browsed `(database, table)` pairs.
+    recent_tables: Vec<(String, String)>,
+    recent_open: bool,
+    recent_list: ListState,
+    /// A table to open as soon as the (new) table list arrives.
+    pending_open_table: Option<String>,
+    /// SQL prefix-completion popup in the editor (Ctrl-Space).
+    completion: Option<Completion>,
 
     // WHERE filter prompt (modal text input)
     filter_prompt: Option<TextArea<'static>>,
@@ -1250,6 +1341,8 @@ struct App {
     snippet_open: bool,
     snippet_list: ListState,
     snippets: Vec<(String, String)>,
+    /// Name prompt shown when saving the editor's SQL as a DBX favourite.
+    snippet_name: Option<TextArea<'static>>,
 
     // column metadata for the table currently open in the data browser
     table_meta: Option<TableMeta>,
@@ -1452,6 +1545,9 @@ async fn run_app(mut terminal: ratatui::DefaultTerminal, backend: Arc<LocalBacke
         db_index: 0,
         tables: Vec::new(),
         table_list: ListState::default(),
+        tables_all: Vec::new(),
+        table_filter: String::new(),
+        table_prompt: None,
         columns: Vec::new(),
         ddl: None,
         struct_view: StructView::Fields,
@@ -1468,9 +1564,20 @@ async fn run_app(mut terminal: ratatui::DefaultTerminal, backend: Arc<LocalBacke
         col_offset: 0,
         col_cursor: 0,
         vis_cols: 0,
+        grid_max_cell: 44,
         freeze_first: true,
         cell_popup: None,
         row_popup: None,
+        compact: None,
+        col_hidden: HashSet::new(),
+        col_picker_open: false,
+        col_picker_list: ListState::default(),
+        grid_full: None,
+        recent_tables: Vec::new(),
+        recent_open: false,
+        recent_list: ListState::default(),
+        pending_open_table: None,
+        completion: None,
         filter_prompt: None,
         edit_dialog: None,
         pending_write: false,
@@ -1494,6 +1601,7 @@ async fn run_app(mut terminal: ratatui::DefaultTerminal, backend: Arc<LocalBacke
         snippet_open: false,
         snippet_list: ListState::default(),
         snippets: Vec::new(),
+        snippet_name: None,
         table_meta: None,
         count_cache: HashMap::new(),
         pending_sel: None,
@@ -1572,7 +1680,7 @@ fn apply_op_result(app: &mut App, res: OpResult, tx: &Tx) {
                 .as_deref()
                 .and_then(|db| app.databases.iter().position(|d| d == db))
                 .unwrap_or(0);
-            app.grid = None;
+            app.clear_grid();
             app.script = None;
             app.ddl = None;
             app.page_state = None;
@@ -1600,21 +1708,42 @@ fn apply_op_result(app: &mut App, res: OpResult, tx: &Tx) {
             }
         }
         OpResult::Tables(ts) => {
-            let n = ts.len();
-            app.tables = ts;
+            app.tables_all = ts;
+            apply_table_filter(app);
+            let n = app.tables_all.len();
             // Keep the previously selected table across a database switch when the
             // new database also has a table with the same name; otherwise go to top.
             let wanted = app.pending_table.take();
-            let sel = wanted
-                .as_deref()
-                .and_then(|name| app.tables.iter().position(|t| t.name == name))
-                .unwrap_or(0);
-            app.table_list.select(if n == 0 { None } else { Some(sel) });
+            if let Some(name) = wanted.as_deref() {
+                if let Some(pos) = app.tables.iter().position(|t| t.name == name) {
+                    app.table_list.select(Some(pos));
+                }
+            }
             app.columns.clear();
             app.ddl = None;
             // The browsed table's column metadata may belong to another database.
             app.table_meta = None;
-            app.status = format!("{n} 个表/视图 · Enter 数据 · r 结构 · Tab 编辑SQL");
+            // A recent-table jump that had to switch database first: open the
+            // requested table now that the list has arrived.
+            if let Some(name) = app.pending_open_table.take() {
+                if let Some(pos) = app.tables.iter().position(|t| t.name == name) {
+                    app.table_list.select(Some(pos));
+                    open_table_data(app, tx);
+                    return;
+                }
+                app.status = format!("✗ 未找到表 {name}");
+                return;
+            }
+            app.status = if app.table_filter.is_empty() {
+                format!("{n} 个表/视图 · Enter 数据 · r 结构 · / 过滤 · Tab 编辑SQL")
+            } else {
+                format!(
+                    "过滤「{}」· {}/{} 个表 · Esc 清除",
+                    app.table_filter,
+                    app.tables.len(),
+                    n
+                )
+            };
         }
         OpResult::Columns { table, columns: cols } => {
             // Ignore a late result for a table the user has already navigated away from.
@@ -1624,8 +1753,8 @@ fn apply_op_result(app: &mut App, res: OpResult, tx: &Tx) {
             let n = cols.len();
             let grid = columns_grid(&cols);
             app.columns = cols;
-            app.grid = Some(grid);
             app.grid_kind = GridKind::Columns;
+            app.set_grid(grid);
             app.struct_view = StructView::Fields;
             app.page_state = None;
             app.script = None;
@@ -1664,8 +1793,8 @@ fn apply_op_result(app: &mut App, res: OpResult, tx: &Tx) {
                 app.count_cache
                     .insert(count_cache_key(&app.current_db(), &table, &filter), t);
             }
-            app.grid = Some(*grid);
             app.grid_kind = GridKind::TableData;
+            app.set_grid(*grid);
             app.page_state = Some(PageState {
                 table: table.clone(),
                 table_type,
@@ -1829,11 +1958,23 @@ fn apply_op_result(app: &mut App, res: OpResult, tx: &Tx) {
             app.snippet_open = true;
             app.snippet_list
                 .select(if n == 0 { None } else { Some(0) });
-            app.status = if n == 0 {
-                "没有保存的 SQL 片段（可在 DBX 桌面端保存后复用）".into()
-            } else {
-                format!("{n} 个 SQL 片段 · Enter 插入编辑器 · r 刷新 · Esc 关闭")
-            };
+            // A just-saved confirmation must survive the refresh that follows it.
+            if !app.status.starts_with('✓') {
+                app.status = if n == 0 {
+                    "没有保存的 SQL 片段（可在 DBX 桌面端保存后复用）".into()
+                } else {
+                    format!(
+                        "{n} 个 SQL 片段 · Enter 插入编辑器 · s 收藏当前 SQL · r 刷新 · Esc 关闭"
+                    )
+                };
+            }
+        }
+        OpResult::SnippetSaved(name) => {
+            app.status = format!("✓ 已收藏 SQL 片段「{name}」（DBX saved_sql_files）");
+            // Refresh the list so the new favourite is visible immediately.
+            if let Some(cfg) = app.selected.clone() {
+                spawn_op(&app.backend, tx, Op::Snippets(Box::new(cfg)));
+            }
         }
         OpResult::DatabasesRefresh(dbs) => {
             if dbs.is_empty() {
@@ -1956,8 +2097,12 @@ fn handle_event(app: &mut App, tx: &Tx, ev: Event) {
 }
 
 fn key(app: &mut App, tx: &Tx, k: KeyEvent) {
-    // global: quit
-    if k.modifiers.contains(KeyModifiers::CONTROL) && k.code == KeyCode::Char('c') {
+    // global: quit. Ctrl-Shift-C is a *view* toggle (compact columns), so the
+    // quit must not swallow it on terminals that report Shift as a modifier.
+    if k.modifiers.contains(KeyModifiers::CONTROL)
+        && !k.modifiers.contains(KeyModifiers::SHIFT)
+        && k.code == KeyCode::Char('c')
+    {
         app.quit = true;
         return;
     }
@@ -1982,7 +2127,7 @@ fn key(app: &mut App, tx: &Tx, k: KeyEvent) {
             Backend::Mongo => Backend::Sql,
         };
         app.cmd_input = TextArea::default();
-        app.grid = None;
+        app.clear_grid();
         app.script = None;
         app.ddl = None;
         app.page_state = None;
@@ -2047,7 +2192,18 @@ fn browse_key(app: &mut App, tx: &Tx, k: KeyEvent) {
         return;
     }
 
-    // Saved-SQL snippet overlay (Ctrl-O) is modal.
+    // SQL completion popup (editor): must be handled before the global Tab
+    // handler, otherwise Tab would switch panes instead of accepting.
+    if app.completion.is_some() {
+        completion_key(app, k);
+        return;
+    }
+
+    // Saved-SQL snippet overlay (Ctrl-O) is modal; the name prompt is on top.
+    if app.snippet_name.is_some() {
+        snippet_name_key(app, tx, k);
+        return;
+    }
     if app.snippet_open {
         snippet_key(app, tx, k);
         return;
@@ -2057,6 +2213,44 @@ fn browse_key(app: &mut App, tx: &Tx, k: KeyEvent) {
     if app.db_picker_open {
         db_picker_key(app, tx, k);
         return;
+    }
+
+    // Sidebar table filter (`/`) is modal while it is being typed.
+    if app.table_prompt.is_some() {
+        table_filter_key(app, k);
+        return;
+    }
+
+    // Recent-table overlay (Ctrl-Shift-R) is modal.
+    if app.recent_open {
+        recent_key(app, tx, k);
+        return;
+    }
+
+    // Column-visibility overlay (Ctrl-Shift-H) is modal.
+    if app.col_picker_open {
+        col_picker_key(app, k);
+        return;
+    }
+
+    // Ctrl-Shift view controls (mobile efficiency). Handled before the pane
+    // handlers so a Shift is never dropped by the Ctrl-letter blocks below.
+    if k.modifiers.contains(KeyModifiers::CONTROL) && k.modifiers.contains(KeyModifiers::SHIFT) {
+        match k.code {
+            KeyCode::Char('c') | KeyCode::Char('C') => {
+                toggle_compact(app);
+                return;
+            }
+            KeyCode::Char('h') | KeyCode::Char('H') => {
+                open_col_picker(app);
+                return;
+            }
+            KeyCode::Char('r') | KeyCode::Char('R') => {
+                open_recent_tables(app);
+                return;
+            }
+            _ => {}
+        }
     }
 
     // Help works from anywhere except the text inputs (where `?` is a character).
@@ -2124,7 +2318,11 @@ fn browse_key(app: &mut App, tx: &Tx, k: KeyEvent) {
         return;
     }
 
-    // responsive layout: Alt-1/2/3 focus a pane and reset the collapse overrides
+    // responsive layout: Alt-1/2/3 focus a pane and reset the collapse overrides.
+    // Alt-C / Alt-H / Alt-R are the mobile-efficiency view commands (compact
+    // columns / column visibility / recent tables): an Alt combo is reported
+    // distinctly by every terminal, unlike Ctrl-Shift-X which tmux and legacy
+    // terminals fold back into Ctrl-X.
     if k.modifiers.contains(KeyModifiers::ALT) {
         match k.code {
             KeyCode::Char('1') => {
@@ -2140,6 +2338,18 @@ fn browse_key(app: &mut App, tx: &Tx, k: KeyEvent) {
             KeyCode::Char('3') => {
                 app.focus = Focus::Preview;
                 app.pane_override = [None; 3];
+                return;
+            }
+            KeyCode::Char('c') | KeyCode::Char('C') => {
+                toggle_compact(app);
+                return;
+            }
+            KeyCode::Char('h') | KeyCode::Char('H') => {
+                open_col_picker(app);
+                return;
+            }
+            KeyCode::Char('r') | KeyCode::Char('R') => {
+                open_recent_tables(app);
                 return;
             }
             _ => {}
@@ -2373,9 +2583,11 @@ fn sidebar_key(app: &mut App, tx: &Tx, k: KeyEvent) {
             // back to connection picker
             app.selected = None;
             app.tables.clear();
+            app.tables_all.clear();
+            app.table_filter.clear();
             app.columns.clear();
             app.databases.clear();
-            app.grid = None;
+            app.clear_grid();
             app.script = None;
             app.ddl = None;
             app.page_state = None;
@@ -2385,6 +2597,11 @@ fn sidebar_key(app: &mut App, tx: &Tx, k: KeyEvent) {
             app.picker_open = true;
         }
         KeyCode::Char('r') => load_structure(app, tx),
+        // `/` — filter-as-you-type over the table list (vim-style), the fast way
+        // to reach a table when the sidebar is long.
+        KeyCode::Char('/') => open_table_filter(app),
+        // `t` — jump straight to one of the last five browsed tables.
+        KeyCode::Char('t') => open_recent_tables(app),
         KeyCode::Up => {
             let n = app.tables.len();
             if n > 0 {
@@ -2441,7 +2658,7 @@ fn open_table_data(app: &mut App, tx: &Tx) {
     let Some(cfg) = app.selected.clone() else {
         return;
     };
-    app.grid = None;
+    app.clear_grid();
     app.script = None;
     app.ddl = None;
     app.struct_view = StructView::Fields;
@@ -2454,6 +2671,7 @@ fn open_table_data(app: &mut App, tx: &Tx) {
     app.pending_focus = Some(Focus::Preview);
     app.page_pending = true;
     app.table_meta = None;
+    remember_recent_table(app, &app.current_db(), &table.0);
     app.page_state = Some(PageState {
         table: table.0.clone(),
         table_type: Some(table.1.clone()),
@@ -2722,9 +2940,10 @@ fn reload_tables(app: &mut App, tx: &Tx) {
         // the new database.
         app.pending_table = app.selected_table().map(|t| t.name.clone());
         app.tables.clear();
+        app.tables_all.clear();
         app.columns.clear();
         app.ddl = None;
-        app.grid = None;
+        app.clear_grid();
         app.script = None;
         app.page_state = None;
         app.col_offset = 0;
@@ -2768,6 +2987,88 @@ fn max_cell_width(mode: LayoutMode) -> usize {
 }
 
 const MIN_CELL_WIDTH: usize = 6;
+
+/// Narrowest a column may get in the compact (mobile) column-width mode. Below
+/// this a value is no longer identifiable at a glance.
+const COMPACT_MIN_CELL: usize = 6;
+/// Widest a column gets in compact mode when the pane is too small for every
+/// column to share the space equally. Keeps a phone table from showing two
+/// half-screen columns.
+const COMPACT_MAX_CELL: usize = 8;
+
+/// Is the compact column-width mode active? `None` means "auto": on for a
+/// narrow (phone) terminal, off otherwise. The toggle stores an explicit
+/// on/off so a user can override the automatic choice in either direction.
+fn compact_active(compact: Option<bool>, mode: LayoutMode) -> bool {
+    compact.unwrap_or(mode == LayoutMode::Narrow)
+}
+
+/// Width cap for one grid column in compact mode.
+///
+/// The pane is shared equally among all columns, so a table whose columns are
+/// not too numerous fits completely and needs no horizontal scrolling at all.
+/// When even `COMPACT_MIN_CELL` per column does not fit, the cap stays at the
+/// minimum and the grid scrolls as before.
+fn compact_max_cell(inner_w: usize, gutter: usize, ncols: usize, base: usize) -> usize {
+    if ncols == 0 {
+        return COMPACT_MAX_CELL.min(base);
+    }
+    let avail = inner_w.saturating_sub(gutter);
+    let per = avail.saturating_sub(ncols.saturating_sub(1)) / ncols;
+    if per >= COMPACT_MAX_CELL {
+        // Room to spare: let a wide terminal use its normal content width.
+        base.min(per.max(COMPACT_MIN_CELL))
+    } else {
+        per.clamp(COMPACT_MIN_CELL, COMPACT_MAX_CELL).min(base)
+    }
+}
+
+/// Effective per-column width cap for the current frame.
+fn grid_max_cell(app: &App, ncols: usize, inner_w: usize, gutter: u16) -> usize {
+    let base = max_cell_width(app.layout_mode);
+    if compact_active(app.compact, app.layout_mode) {
+        compact_max_cell(inner_w, gutter as usize, ncols, base)
+    } else {
+        base
+    }
+}
+
+/// Human label for the compact mode, used in the status bar and messages.
+fn compact_label(app: &App) -> String {
+    let on = compact_active(app.compact, app.layout_mode);
+    let auto = if app.compact.is_none() { "自动" } else { "手动" };
+    format!("紧凑列 {}{}", if on { "开" } else { "关" }, auto)
+}
+
+/// Drop every column the user hid with Ctrl-Shift-H. At least one column always
+/// survives so a grid can never render as nothing (DBX does the same).
+fn filter_grid(grid: &Grid, hidden: &HashSet<String>) -> Grid {
+    if hidden.is_empty() {
+        return grid.clone();
+    }
+    let mut keep: Vec<usize> = (0..grid.columns.len())
+        .filter(|&i| !hidden.contains(grid.columns[i].as_str()))
+        .collect();
+    if keep.is_empty() {
+        keep.push(0);
+    }
+    if keep.len() == grid.columns.len() {
+        return grid.clone();
+    }
+    Grid {
+        columns: keep.iter().map(|&i| grid.columns[i].clone()).collect(),
+        rows: grid
+            .rows
+            .iter()
+            .map(|r| {
+                keep.iter()
+                    .map(|&i| r.get(i).cloned().unwrap_or(Val::Null))
+                    .collect()
+            })
+            .collect(),
+        note: grid.note.clone(),
+    }
+}
 
 /// Natural width of one grid column: the widest of its header and cells,
 /// clamped to `[MIN_CELL_WIDTH, max_cell]`.
@@ -2830,10 +3131,24 @@ fn move_col_cursor(app: &mut App, delta: i32) {
 fn active_grid(app: &App) -> Option<Grid> {
     if let Some(s) = &app.script {
         if let Some(i) = s.drilled {
-            return s.outcomes.get(i).map(|o| o.grid.clone());
+            return s
+                .outcomes
+                .get(i)
+                .map(|o| filter_grid(&o.grid, &app.col_hidden));
         }
     }
     app.grid.clone()
+}
+
+/// The grid as it was fetched, before the session column filter. Used by the row
+/// detail popup, which must show every column even the hidden ones.
+fn full_grid(app: &App) -> Option<Grid> {
+    if let Some(s) = &app.script {
+        if let Some(i) = s.drilled {
+            return s.outcomes.get(i).map(|o| o.grid.clone());
+        }
+    }
+    app.grid_full.clone()
 }
 
 /// True when the results pane is showing a browsable table (not a query result,
@@ -2924,7 +3239,7 @@ fn connect_selected(app: &mut App, tx: &Tx) {
         if let Some(cfg) = app.connections.get(idx).cloned() {
             app.selected = Some(cfg.clone());
             app.picker_open = false;
-            app.grid = None;
+            app.clear_grid();
             app.script = None;
             app.ddl = None;
             app.page_state = None;
@@ -3015,6 +3330,9 @@ fn mouse(app: &mut App, tx: &Tx, m: MouseEvent) {
         || app.filter_prompt.is_some()
         || app.db_picker_open
         || app.snippet_open
+        || app.col_picker_open
+        || app.recent_open
+        || app.table_prompt.is_some()
         || app.help_open;
     match m.kind {
         MouseEventKind::ScrollUp | MouseEventKind::ScrollDown => {
@@ -3085,7 +3403,13 @@ fn mouse(app: &mut App, tx: &Tx, m: MouseEvent) {
 
     match m.kind {
         MouseEventKind::Down(MouseButton::Left) => {
-            if app.confirm.is_some() || app.edit_dialog.is_some() || app.snippet_open {
+            if app.confirm.is_some()
+                || app.edit_dialog.is_some()
+                || app.snippet_open
+                || app.col_picker_open
+                || app.recent_open
+                || app.table_prompt.is_some()
+            {
                 return;
             }
             if app.cell_popup.is_some() {
@@ -3309,8 +3633,11 @@ fn sidebar_click(app: &mut App, tx: &Tx, x: u16, y: u16) {
     if rel < 0 {
         return;
     }
-    // row 0 = connection header, then optional database selector row
-    let header = 1 + if sidebar_db_row(app) { 1 } else { 0 };
+    // row 0 = connection header, then optional database selector row and the
+    // table-filter row (both only when the connection is open).
+    let header = 1
+        + if sidebar_db_row(app) { 1 } else { 0 }
+        + if app.tables_all.is_empty() { 0 } else { 1 };
     if rel == 1 && sidebar_db_row(app) {
         // clicking the database row opens the switcher
         open_db_picker(app);
@@ -3322,7 +3649,10 @@ fn sidebar_click(app: &mut App, tx: &Tx, x: u16, y: u16) {
     }
     let _ = x;
     let cap = (area.height as usize)
-        .saturating_sub(2 + if sidebar_db_row(app) { 1 } else { 0 })
+        .saturating_sub(
+            2 + if sidebar_db_row(app) { 1 } else { 0 }
+                + if app.tables_all.is_empty() { 0 } else { 1 },
+        )
         .max(1);
     let sel = app.table_list.selected();
     let start = sel
@@ -3356,8 +3686,19 @@ fn sidebar_db_label(app: &App) -> String {
 // ── editor / cmd input / preview ──
 
 fn editor_key(app: &mut App, tx: &Tx, k: KeyEvent) {
+    // The completion popup owns the keyboard while it is open: Tab / Enter
+    // accept, Esc cancels, arrows move, anything else keeps typing (and refines
+    // the candidate list).
+    if app.completion.is_some() {
+        completion_key(app, k);
+        return;
+    }
     match (k.modifiers, k.code) {
         (m, KeyCode::Char('j')) if m.contains(KeyModifiers::CONTROL) => run_current(app, tx),
+        // Ctrl-Space (some terminals send NUL): table / column / keyword prefix
+        // completion at the cursor.
+        (m, KeyCode::Char(' ')) if m.contains(KeyModifiers::CONTROL) => open_completion(app),
+        (m, KeyCode::Null) if m.contains(KeyModifiers::CONTROL) => open_completion(app),
         (KeyModifiers::NONE, KeyCode::F(5)) => run_current(app, tx),
         (KeyModifiers::NONE, KeyCode::Tab) => {
             app.focus = if app.backend_kind == Backend::Sql {
@@ -3462,6 +3803,9 @@ fn preview_key(app: &mut App, tx: &Tx, k: KeyEvent) {
         }
         KeyCode::Char('s') => sort_column(app, tx, false),
         KeyCode::Char('f') => open_filter_prompt(app),
+        // Bare-key aliases for the two view commands (mobile reachability).
+        KeyCode::Char('w') => toggle_compact(app),
+        KeyCode::Char('c') => open_col_picker(app),
         // Delete the focused row: builds a bound `DELETE … WHERE …` and routes it
         // through the same red confirmation layer as every other write.
         KeyCode::Delete => delete_row(app),
@@ -3534,8 +3878,18 @@ fn preview_key(app: &mut App, tx: &Tx, k: KeyEvent) {
                     return;
                 }
             }
-            open_cell_popup(app);
+            // Row-expand mode: in compact (mobile) mode Enter opens the whole row
+            // as a vertical column=value list — the narrow-screen replacement for
+            // reading a truncated cell.
+            if compact_active(app.compact, app.layout_mode) {
+                open_row_popup(app);
+            } else {
+                open_cell_popup(app);
+            }
         }
+        // `v`: full cell value. Kept alongside Enter so the cell popup stays
+        // reachable when Enter means "expand the row" in compact mode.
+        KeyCode::Char('v') => open_cell_popup(app),
         _ => {}
     }
 }
@@ -3629,6 +3983,405 @@ fn filter_prompt_key(app: &mut App, tx: &Tx, k: KeyEvent) {
     }
 }
 
+// ── mobile efficiency: compact columns / column visibility / recents / filter ──
+
+/// Ctrl-Shift-C — toggle the compact column-width mode. The first press always
+/// flips whatever the current (possibly automatic) state is, so the user sees an
+/// immediate change on any screen size.
+fn toggle_compact(app: &mut App) {
+    let now = compact_active(app.compact, app.layout_mode);
+    app.compact = Some(!now);
+    let on = compact_active(app.compact, app.layout_mode);
+    app.status = if on {
+        format!(
+            "{} · 列宽≤{} 自适应，尽量一屏放下（Alt-C / w 关闭）",
+            compact_label(app),
+            COMPACT_MAX_CELL
+        )
+    } else {
+        format!("{} · 列宽按内容（Alt-C / w 开启）", compact_label(app))
+    };
+}
+
+/// Ctrl-Shift-H — open the column-visibility picker for the grid on screen.
+fn open_col_picker(app: &mut App) {
+    let Some(grid) = app.grid_full.clone() else {
+        app.status = "没有可选择的列（先打开一张表或执行查询）".into();
+        return;
+    };
+    if grid.columns.is_empty() || app.grid_kind == GridKind::Columns {
+        app.status = "当前视图不支持列选择".into();
+        return;
+    }
+    app.col_picker_open = true;
+    app.col_picker_list.select(Some(0));
+}
+
+fn col_picker_key(app: &mut App, k: KeyEvent) {
+    let n = app
+        .grid_full
+        .as_ref()
+        .map(|g| g.columns.len())
+        .unwrap_or(0);
+    match k.code {
+        KeyCode::Esc | KeyCode::Enter | KeyCode::Char('q') => {
+            app.col_picker_open = false;
+        }
+        KeyCode::Up | KeyCode::Char('k') => {
+            if n > 0 {
+                let i = app
+                    .col_picker_list
+                    .selected()
+                    .map(|i| i.saturating_sub(1))
+                    .unwrap_or(0);
+                app.col_picker_list.select(Some(i));
+            }
+        }
+        KeyCode::Down | KeyCode::Char('j') => {
+            if n > 0 {
+                let i = app
+                    .col_picker_list
+                    .selected()
+                    .map(|i| (i + 1).min(n - 1))
+                    .unwrap_or(0);
+                app.col_picker_list.select(Some(i));
+            }
+        }
+        KeyCode::Char(' ') => toggle_col_visible(app),
+        // `a` shows every column again, `x` narrows to just the first.
+        KeyCode::Char('a') => {
+            app.col_hidden.clear();
+            app.reapply_col_filter();
+            app.status = "已显示全部列".into();
+        }
+        KeyCode::Char('x') => {
+            if let Some(grid) = app.grid_full.clone() {
+                app.col_hidden = grid.columns.iter().skip(1).cloned().collect();
+                app.reapply_col_filter();
+                app.status = "仅保留第一列".into();
+            }
+        }
+        _ => {}
+    }
+}
+
+/// Space in the column picker: hide / show the highlighted column. The last
+/// visible column can never be hidden.
+fn toggle_col_visible(app: &mut App) {
+    let Some(grid) = app.grid_full.clone() else {
+        return;
+    };
+    let Some(i) = app.col_picker_list.selected() else {
+        return;
+    };
+    let Some(name) = grid.columns.get(i).cloned() else {
+        return;
+    };
+    if app.col_hidden.remove(&name) {
+        app.reapply_col_filter();
+        app.status = format!("显示列 {name}");
+    } else {
+        let visible = grid
+            .columns
+            .iter()
+            .filter(|c| !app.col_hidden.contains(c.as_str()))
+            .count();
+        if visible <= 1 {
+            app.status = "至少保留一列".into();
+            return;
+        }
+        app.col_hidden.insert(name.clone());
+        app.reapply_col_filter();
+        app.status = format!("隐藏列 {name} · 会话内记住");
+    }
+}
+
+/// Ctrl-Shift-R — jump straight to one of the last five browsed tables.
+fn open_recent_tables(app: &mut App) {
+    if app.recent_tables.is_empty() {
+        app.status = "还没有浏览过表".into();
+        return;
+    }
+    app.recent_open = true;
+    app.recent_list.select(Some(0));
+}
+
+fn recent_key(app: &mut App, tx: &Tx, k: KeyEvent) {
+    let n = app.recent_tables.len();
+    match k.code {
+        KeyCode::Esc | KeyCode::Char('q') => app.recent_open = false,
+        KeyCode::Up | KeyCode::Char('k') => {
+            if n > 0 {
+                let i = app
+                    .recent_list
+                    .selected()
+                    .map(|i| i.saturating_sub(1))
+                    .unwrap_or(0);
+                app.recent_list.select(Some(i));
+            }
+        }
+        KeyCode::Down | KeyCode::Char('j') => {
+            if n > 0 {
+                let i = app
+                    .recent_list
+                    .selected()
+                    .map(|i| (i + 1).min(n - 1))
+                    .unwrap_or(0);
+                app.recent_list.select(Some(i));
+            }
+        }
+        KeyCode::Enter => {
+            if let Some(i) = app.recent_list.selected() {
+                open_recent(app, tx, i);
+            }
+        }
+        _ => {}
+    }
+}
+
+/// Remember a table at the head of the recents list (max 5, unique).
+fn remember_recent_table(app: &mut App, db: &str, table: &str) {
+    let entry = (db.to_string(), table.to_string());
+    app.recent_tables.retain(|e| e != &entry);
+    app.recent_tables.insert(0, entry);
+    app.recent_tables.truncate(5);
+}
+
+fn open_recent(app: &mut App, tx: &Tx, idx: usize) {
+    let Some((db, table)) = app.recent_tables.get(idx).cloned() else {
+        return;
+    };
+    app.recent_open = false;
+    // Another database: switch first and let the table-list reply open the table.
+    if db != app.current_db() {
+        let Some(pos) = app.databases.iter().position(|d| *d == db) else {
+            app.status = format!("✗ 数据库 {db} 不在当前连接中");
+            return;
+        };
+        app.db_index = pos;
+        app.pending_open_table = Some(table.clone());
+        app.pending_table = None;
+        app.status = format!("切换到 {db} 并打开 {table} …");
+        reload_tables(app, tx);
+        return;
+    }
+    if let Some(pos) = app.tables.iter().position(|t| t.name == table) {
+        app.table_list.select(Some(pos));
+        open_table_data(app, tx);
+    } else {
+        app.status = format!("✗ 未找到表 {table}（可能被过滤或已删除）");
+    }
+}
+
+// ── sidebar table filter (`/`, filter-as-you-type) ──
+
+/// Recompute the visible table list from `tables_all` + `table_filter`, keeping
+/// the previously selected table selected when it still matches.
+fn apply_table_filter(app: &mut App) {
+    let prev = app.selected_table().map(|t| t.name.clone());
+    let needle = app.table_filter.trim().to_lowercase();
+    app.tables = if needle.is_empty() {
+        app.tables_all.clone()
+    } else {
+        app.tables_all
+            .iter()
+            .filter(|t| t.name.to_lowercase().contains(&needle))
+            .cloned()
+            .collect()
+    };
+    let n = app.tables.len();
+    if n == 0 {
+        app.table_list.select(None);
+        return;
+    }
+    let sel = prev
+        .and_then(|p| app.tables.iter().position(|t| t.name == p))
+        .unwrap_or(0)
+        .min(n - 1);
+    app.table_list.select(Some(sel));
+}
+
+fn open_table_filter(app: &mut App) {
+    if app.tables_all.is_empty() {
+        app.status = "还没有表可过滤".into();
+        return;
+    }
+    let mut ta = TextArea::from([app.table_filter.clone()]);
+    ta.move_cursor(CursorMove::End);
+    app.table_prompt = Some(ta);
+}
+
+fn table_filter_key(app: &mut App, k: KeyEvent) {
+    match k.code {
+        KeyCode::Enter => {
+            app.table_filter = app
+                .table_prompt
+                .as_ref()
+                .map(|t| t.lines().join(" ").trim().to_string())
+                .unwrap_or_default();
+            app.table_prompt = None;
+            apply_table_filter(app);
+            let (n, total) = (app.tables.len(), app.tables_all.len());
+            app.status = if app.table_filter.is_empty() {
+                format!("{total} 个表/视图")
+            } else {
+                format!("过滤「{}」· {n}/{total} 个表 · Esc 清除", app.table_filter)
+            };
+        }
+        KeyCode::Esc => {
+            app.table_prompt = None;
+            app.table_filter.clear();
+            apply_table_filter(app);
+            app.status = format!("已清除表过滤 · {} 个表/视图", app.tables.len());
+        }
+        _ => {
+            if let Some(t) = app.table_prompt.as_mut() {
+                t.input(k);
+            }
+            app.table_filter = app
+                .table_prompt
+                .as_ref()
+                .map(|t| t.lines().join(" ").trim().to_string())
+                .unwrap_or_default();
+            apply_table_filter(app);
+        }
+    }
+}
+
+// ── SQL prefix completion (Ctrl-Space) ──
+
+/// Keywords offered alongside table / column names. Small on purpose: a TUI
+/// completion is a shortcut for long identifiers, not a SQL parser.
+const SQL_KEYWORDS: &[&str] = &[
+    "SELECT", "FROM", "WHERE", "GROUP BY", "ORDER BY", "HAVING", "LIMIT", "OFFSET",
+    "INSERT INTO", "UPDATE", "DELETE FROM", "SET", "VALUES", "JOIN", "LEFT JOIN",
+    "INNER JOIN", "ON", "AS", "AND", "OR", "NOT", "NULL", "IS NULL", "LIKE", "IN",
+    "BETWEEN", "DISTINCT", "COUNT", "SUM", "AVG", "MIN", "MAX", "CASE", "WHEN",
+    "THEN", "ELSE", "END", "ASC", "DESC", "CREATE TABLE", "ALTER TABLE", "DROP TABLE",
+    "UNION", "UNION ALL", "EXPLAIN", "WITH",
+];
+
+/// The identifier fragment ending at the cursor, and how many characters it is.
+fn word_before_cursor(ta: &TextArea) -> (usize, String) {
+    let (row, col) = ta.cursor();
+    let line = ta.lines().get(row).cloned().unwrap_or_default();
+    let chars: Vec<char> = line.chars().collect();
+    let end = col.min(chars.len());
+    let mut start = end;
+    while start > 0 {
+        let c = chars[start - 1];
+        if c.is_alphanumeric() || c == '_' || c == '.' {
+            start -= 1;
+        } else {
+            break;
+        }
+    }
+    (end - start, chars[start..end].iter().collect())
+}
+
+/// Candidate list for the word before the cursor: the columns of the table on
+/// screen, every table of the connection, then SQL keywords.
+fn completion_candidates(app: &App, prefix: &str) -> Vec<String> {
+    let needle = prefix.to_lowercase();
+    let mut out: Vec<String> = Vec::new();
+    let push = |name: &str, out: &mut Vec<String>| {
+        if out.iter().any(|x| x == name) {
+            return;
+        }
+        if needle.is_empty() || name.to_lowercase().starts_with(&needle) {
+            out.push(name.to_string());
+        }
+    };
+    if let Some(meta) = &app.table_meta {
+        for c in &meta.columns {
+            push(&c.name, &mut out);
+        }
+    }
+    if let Some(grid) = full_grid(app) {
+        for c in &grid.columns {
+            push(c, &mut out);
+        }
+    }
+    for t in &app.tables_all {
+        push(&t.name, &mut out);
+    }
+    for k in SQL_KEYWORDS {
+        push(k, &mut out);
+    }
+    out.truncate(8);
+    out
+}
+
+fn open_completion(app: &mut App) {
+    let (n, prefix) = word_before_cursor(&app.editor);
+    let _ = n;
+    let items = completion_candidates(app, &prefix);
+    if items.is_empty() {
+        app.status = format!("无可补全项（前缀「{prefix}」）");
+        return;
+    }
+    app.completion = Some(Completion {
+        items,
+        sel: 0,
+        prefix,
+    });
+}
+
+/// Recompute the candidate list after the user typed another character.
+fn refresh_completion(app: &mut App) {
+    let (_, prefix) = word_before_cursor(&app.editor);
+    let items = completion_candidates(app, &prefix);
+    if items.is_empty() {
+        app.completion = None;
+        return;
+    }
+    let sel = app.completion.as_ref().map(|c| c.sel).unwrap_or(0).min(items.len() - 1);
+    app.completion = Some(Completion { items, sel, prefix });
+}
+
+fn accept_completion(app: &mut App) {
+    let Some(c) = app.completion.clone() else {
+        return;
+    };
+    let Some(item) = c.items.get(c.sel).cloned() else {
+        app.completion = None;
+        return;
+    };
+    let back = c.prefix.chars().count();
+    if back > 0 {
+        // `delete_str` deletes *forward* from the cursor, so step back to the
+        // start of the fragment first.
+        let (row, col) = app.editor.cursor();
+        app.editor
+            .move_cursor(CursorMove::Jump(row as u16, col.saturating_sub(back) as u16));
+        app.editor.delete_str(back);
+    }
+    app.editor.insert_str(item);
+    app.completion = None;
+}
+
+fn completion_key(app: &mut App, k: KeyEvent) {
+    let n = app.completion.as_ref().map(|c| c.items.len()).unwrap_or(0);
+    match k.code {
+        KeyCode::Esc => app.completion = None,
+        KeyCode::Up => {
+            if let Some(c) = app.completion.as_mut() {
+                c.sel = c.sel.saturating_sub(1);
+            }
+        }
+        KeyCode::Down => {
+            if let Some(c) = app.completion.as_mut() {
+                c.sel = (c.sel + 1).min(n.saturating_sub(1));
+            }
+        }
+        KeyCode::Tab | KeyCode::Enter => accept_completion(app),
+        _ => {
+            app.editor.input(k);
+            refresh_completion(app);
+        }
+    }
+}
+
 /// 1-based absolute row number of the cursor across all pages.
 fn cursor_abs_row(app: &App) -> usize {
     match &app.page_state {
@@ -3666,9 +4419,10 @@ fn open_cell_popup(app: &mut App) {
     });
 }
 
-/// Open the focused row as a vertical `column = value` list.
+/// Open the focused row as a vertical `column = value` list. Uses the unfiltered
+/// grid so a column hidden with Ctrl-Shift-H is still readable here.
 fn open_row_popup(app: &mut App) {
-    let Some(grid) = active_grid(app) else {
+    let Some(grid) = full_grid(app) else {
         return;
     };
     let Some(row) = grid.rows.get(app.sel) else {
@@ -4665,7 +5419,7 @@ fn visible_now(app: &App, grid: &Grid, off: usize) -> usize {
         grid,
         off,
         app.grid_avail.max(MIN_CELL_WIDTH),
-        max_cell_width(app.layout_mode),
+        app.grid_max_cell.max(MIN_CELL_WIDTH),
     )
     .max(1)
 }
@@ -4856,6 +5610,31 @@ fn query_tab_title(sql: &str) -> String {
 }
 
 impl App {
+    /// Store a freshly fetched grid: the unfiltered original is kept so the
+    /// column-visibility filter can be re-applied later, and the display grid is
+    /// the session-filtered view. The structure field list is never filtered.
+    fn set_grid(&mut self, grid: Grid) {
+        let shown = if self.grid_kind == GridKind::Columns {
+            grid.clone()
+        } else {
+            filter_grid(&grid, &self.col_hidden)
+        };
+        self.grid = Some(shown);
+        self.grid_full = Some(grid);
+    }
+
+    fn clear_grid(&mut self) {
+        self.grid = None;
+        self.grid_full = None;
+    }
+
+    /// Re-apply the session column selection to the grid on screen.
+    fn reapply_col_filter(&mut self) {
+        if let Some(full) = self.grid_full.clone() {
+            self.grid = Some(filter_grid(&full, &self.col_hidden));
+        }
+    }
+
     /// Copy the on-screen query result back into its tab before leaving it.
     fn save_result_tab(&mut self) {
         let idx = self.result_tab;
@@ -4864,6 +5643,7 @@ impl App {
         }
         if let Some(tab) = self.result_tabs.get_mut(idx) {
             tab.grid = self.grid.clone();
+            tab.grid_full = self.grid_full.clone();
             tab.script = self.script.clone();
             tab.kind = self.grid_kind;
             tab.sel = self.sel;
@@ -4877,7 +5657,13 @@ impl App {
         let Some(tab) = self.result_tabs.get(self.result_tab).cloned() else {
             return;
         };
-        self.grid = tab.grid;
+        self.grid_full = tab.grid_full.clone();
+        self.grid = match &tab.grid_full {
+            Some(full) if tab.kind != GridKind::Columns => {
+                Some(filter_grid(full, &self.col_hidden))
+            }
+            _ => tab.grid,
+        };
         self.script = tab.script;
         self.grid_kind = tab.kind;
         self.sel = tab.sel;
@@ -4900,7 +5686,10 @@ fn push_result_tab(
     app.save_result_tab();
     app.result_tabs.push(ResultTab {
         title,
-        grid: grid.clone(),
+        grid: grid
+            .as_ref()
+            .map(|g| if kind == GridKind::Columns { g.clone() } else { filter_grid(g, &app.col_hidden) }),
+        grid_full: grid.clone(),
         script: script.clone(),
         kind,
         sel: 0,
@@ -4913,9 +5702,13 @@ fn push_result_tab(
         app.result_tabs.remove(0);
         app.result_tab = app.result_tab.saturating_sub(1);
     }
-    app.grid = grid;
-    app.script = script;
     app.grid_kind = kind;
+    if let Some(g) = grid {
+        app.set_grid(g);
+    } else {
+        app.clear_grid();
+    }
+    app.script = script;
     app.sel = 0;
     app.col_offset = 0;
     app.col_cursor = 0;
@@ -4939,7 +5732,10 @@ fn replace_result_tab(
     let idx = app.result_tab.min(app.result_tabs.len() - 1);
     app.result_tabs[idx] = ResultTab {
         title,
-        grid: grid.clone(),
+        grid: grid
+            .as_ref()
+            .map(|g| if kind == GridKind::Columns { g.clone() } else { filter_grid(g, &app.col_hidden) }),
+        grid_full: grid.clone(),
         script: script.clone(),
         kind,
         sel: 0,
@@ -4947,9 +5743,13 @@ fn replace_result_tab(
         col_cursor: 0,
     };
     app.result_tab = idx;
-    app.grid = grid;
-    app.script = script;
     app.grid_kind = kind;
+    if let Some(g) = grid {
+        app.set_grid(g);
+    } else {
+        app.clear_grid();
+    }
+    app.script = script;
     app.sel = 0;
     app.col_offset = 0;
     app.col_cursor = 0;
@@ -5074,6 +5874,8 @@ fn snippet_key(app: &mut App, tx: &Tx, k: KeyEvent) {
             }
         }
         KeyCode::Char('r') if k.modifiers.is_empty() => open_snippets(app, tx),
+        // `s`: save the editor's SQL as a new DBX favourite.
+        KeyCode::Char('s') if k.modifiers.is_empty() => open_snippet_name(app),
         KeyCode::Enter => {
             if let Some(i) = app.snippet_list.selected() {
                 if let Some((name, sql)) = app.snippets.get(i).cloned() {
@@ -5091,6 +5893,59 @@ fn snippet_key(app: &mut App, tx: &Tx, k: KeyEvent) {
             }
         }
         _ => {}
+    }
+}
+
+/// Name prompt for "save the current SQL as a favourite".
+fn open_snippet_name(app: &mut App) {
+    let sql = app.editor_sql();
+    if sql.trim().is_empty() {
+        app.status = "编辑器为空：先写 SQL 再收藏".into();
+        return;
+    }
+    let mut ta = TextArea::from([query_tab_title(&sql)]);
+    // Select the default so typing replaces it, but it stays visible/editable.
+    ta.select_all();
+    app.snippet_name = Some(ta);
+}
+
+fn snippet_name_key(app: &mut App, tx: &Tx, k: KeyEvent) {
+    match k.code {
+        KeyCode::Enter => {
+            let mut name = app
+                .snippet_name
+                .as_ref()
+                .map(|t| t.lines().join(" ").trim().to_string())
+                .unwrap_or_default();
+            app.snippet_name = None;
+            if name.is_empty() {
+                app.status = "片段名称不能为空".into();
+                return;
+            }
+            // DBX stores snippet names with a `.sql` suffix.
+            if !name.to_ascii_lowercase().ends_with(".sql") {
+                name.push_str(".sql");
+            }
+            let Some(cfg) = app.selected.clone() else {
+                return;
+            };
+            let sql = app.editor_sql();
+            app.status = format!("保存片段 {name} …");
+            spawn_op(
+                &app.backend,
+                tx,
+                Op::SaveSnippet(Box::new(cfg), name, sql),
+            );
+        }
+        KeyCode::Esc => {
+            app.snippet_name = None;
+            app.status = "已取消收藏".into();
+        }
+        _ => {
+            if let Some(t) = app.snippet_name.as_mut() {
+                t.input(k);
+            }
+        }
     }
 }
 
@@ -5166,6 +6021,18 @@ fn ui(f: &mut Frame, app: &mut App) {
     if app.snippet_open {
         render_snippets(f, f.area(), app);
     }
+    if app.recent_open {
+        render_recent_tables(f, f.area(), app);
+    }
+    if app.col_picker_open {
+        render_col_picker(f, f.area(), app);
+    }
+    if app.table_prompt.is_some() {
+        render_table_filter(f, f.area(), app);
+    }
+    if app.snippet_name.is_some() {
+        render_snippet_name(f, f.area(), app);
+    }
     if let Some(confirm) = app.confirm.clone() {
         render_confirm(f, f.area(), &confirm);
     }
@@ -5183,6 +6050,10 @@ fn ui(f: &mut Frame, app: &mut App) {
     }
     if app.help_open {
         render_help(f, f.area(), app);
+    }
+    // The completion popup sits just under the editor, over whatever is below.
+    if app.completion.is_some() {
+        render_completion(f, app);
     }
     if app.mouse_debug {
         render_mouse_debug(f, f.area(), app);
@@ -5288,8 +6159,31 @@ fn spinner_frame(i: usize) -> char {
 /// Right-hand section of the status bar: context about the current result set.
 fn context_info(app: &App) -> String {
     let mut parts: Vec<String> = Vec::new();
-    // Touch fallback: vertical wheel pans columns (Ctrl-G). Shown first so it
-    // survives the status-bar truncation on a narrow phone screen.
+    // Mobile efficiency markers go first: on a phone the status bar is narrow,
+    // and whether the wide table now fits is the single most useful fact.
+    let mut fits: Option<usize> = None;
+    if let Some(grid) = &app.grid {
+        if app.grid_kind != GridKind::Columns && !grid.columns.is_empty() {
+            let ncols = grid.columns.len();
+            if app.grid_frozen + app.vis_cols.max(1) >= ncols {
+                fits = Some(ncols);
+            }
+        }
+    }
+    if let Some(ncols) = fits {
+        parts.push(format!("全部 {ncols} 列已适配"));
+    }
+    if compact_active(app.compact, app.layout_mode) {
+        parts.push(if app.compact.is_none() {
+            "紧凑列".into()
+        } else {
+            "紧凑列 手动".into()
+        });
+    }
+    if !app.col_hidden.is_empty() {
+        parts.push(format!("隐藏列 {}", app.col_hidden.len()));
+    }
+    // Touch fallback: vertical wheel pans columns (Ctrl-G).
     if app.pan_mode {
         parts.push("横滚 开".into());
     }
@@ -5350,7 +6244,12 @@ fn context_info(app: &App) -> String {
                 1 => "1|".to_string(),
                 f => format!("1-{f}|"),
             };
-            parts.push(format!("列 {pin}{}-{}/{}", off + 1, off + vis, ncols));
+            // When every column is on screen the user needs to know there is
+            // nothing left to scroll to — the whole point of compact mode. That
+            // marker was already pushed at the front of the list.
+            if app.grid_frozen + vis < ncols {
+                parts.push(format!("列 {pin}{}-{}/{}", off + 1, off + vis, ncols));
+            }
         }
     }
     if !app.batch.is_empty() {
@@ -5395,6 +6294,18 @@ fn render_status(f: &mut Frame, area: Rect, app: &App) {
 fn render_footer(f: &mut Frame, area: Rect, app: &App) {
     let text: String = if app.help_open {
         "快捷键速查 · ↑↓ 滚动 · Esc 关闭".into()
+    } else if app.table_prompt.is_some() {
+        "过滤表名 · 输入即筛选 · Enter 保留 · Esc 清除".into()
+    } else if app.recent_open {
+        "最近表 · ↑↓ 选择 · Enter 直达 · Esc 关闭".into()
+    } else if app.col_picker_open {
+        "列显示 · 空格勾选 · a 全选 · x 仅首列 · Esc 关闭".into()
+    } else if app.completion.is_some() {
+        "SQL 补全 · ↑↓ 选择 · Tab/Enter 上屏 · Esc 取消".into()
+    } else if app.snippet_name.is_some() {
+        "收藏为 SQL 片段 · 输入名称 · Enter 保存 · Esc 取消".into()
+    } else if app.snippet_open {
+        "↑↓ 选择 · Enter 插入编辑器 · s 收藏当前 SQL · r 刷新 · Esc 关闭".into()
     } else if app.filter_prompt.is_some() {
         "WHERE 过滤 · Enter 应用 · Esc 取消 · 留空回车清除".into()
     } else if app.row_popup.is_some() {
@@ -5414,11 +6325,11 @@ fn render_footer(f: &mut Frame, area: Rect, app: &App) {
                 Focus::Sidebar if app.selected.is_none() => {
                     "↑↓ 连接 · Enter 选 · c 新建 · q 隐藏".into()
                 }
-                Focus::Sidebar => "↑↓ 表 · d 切库 · Enter 数据 · r 结构 · ? 帮助".into(),
-                Focus::Editor => "Ctrl-J 运行 · ↑ 历史 · Tab 下一区".into(),
+                Focus::Sidebar => "↑↓ 表 · / 过滤 · t 最近表 · d 切库 · Enter 数据 · r 结构 · ? 帮助".into(),
+                Focus::Editor => "Ctrl-J 运行 · Ctrl-Space 补全 · ↑ 历史 · Tab 下一区".into(),
                 Focus::CmdInput => "Enter 执行 · Ctrl-L 换模式".into(),
                 Focus::Preview => {
-                    "↑↓ 行 · ←→ 列 · Enter 单元格 · e 编辑 · Del 删行 · f 过滤 · Ctrl-G 横滚 · ? 帮助".into()
+                    "↑↓ 行 · ←→ 列 · Enter 整行 · e 编辑 · Del 删行 · f 过滤 · Ctrl-G 横滚 · ? 帮助".into()
                 }
             },
         }
@@ -5430,14 +6341,16 @@ fn render_footer(f: &mut Frame, area: Rect, app: &App) {
                     "↑↓ 选择连接 · Enter 连接 · c 新建 · p 复制 · q 显隐列表 · Tab 直接写SQL".into()
                 }
                 Focus::Sidebar => {
-                    "↑↓ 表 · d/←→ 切库 · Enter 浏览数据 · r 表结构 · Tab SQL · o 换连接 · ? 帮助".into()
+                    "↑↓ 表 · / 过滤 · t 最近表 · d/←→ 切库 · Enter 浏览 · r 结构 · Tab SQL · ? 帮助".into()
                 }
-                Focus::Editor => "Ctrl-J/F5 运行 · Enter 换行 · ↑/↓ 历史 · Tab 下一区 · Esc 侧栏".into(),
+                Focus::Editor => {
+                    "Ctrl-J/F5 运行 · Ctrl-Space 补全 · Enter 换行 · ↑/↓ 历史 · Tab 下一区 · Esc 侧栏".into()
+                }
                 Focus::CmdInput => {
                     "Enter 执行 · [ ] 切 redis db · Ctrl-L 切 sql/redis/mongo · Esc 编辑器".into()
                 }
                 Focus::Preview => {
-                    "↑↓ 行(到边翻页) · ←→/hl 列 · Enter 单元格 · o 整行 · e 编辑 · i 插入 · Del 删行 · f 过滤 · s 排序 · Ctrl-G 横滚 · Ctrl-Y 导出 · Ctrl-A 自动折叠 · ? 帮助".into()
+                    "↑↓ 行(到边翻页) · ←→/hl 列 · Enter 整行/单元格 · e 编辑 · i 插入 · Del 删行 · f 过滤 · s 排序 · w 紧凑 · c 列显隐 · ? 帮助".into()
                 }
             },
         }
@@ -5789,8 +6702,12 @@ fn render_grid(f: &mut Frame, area: Rect, app: &mut App, grid: &Grid, kind: Grid
     }
 
     let inner_w = area.width.saturating_sub(2) as usize;
-    let max_cell = max_cell_width(app.layout_mode);
     let ncols = grid.columns.len();
+    // Compact (mobile) mode shares the pane among all columns so a wide table can
+    // fit without horizontal scrolling; otherwise each column keeps its natural
+    // content width, capped per layout.
+    let max_cell = grid_max_cell(app, ncols, inner_w, gutter);
+    app.grid_max_cell = max_cell;
     let widths: Vec<usize> = (0..ncols)
         .map(|ci| natural_width(grid, ci, max_cell))
         .collect();
@@ -6474,8 +7391,35 @@ fn render_sidebar(f: &mut Frame, area: Rect, app: &mut App) {
             ]));
         }
 
+        // table-name filter row: shows the active `/` filter, or the hint.
+        let filter_rows = if app.tables_all.is_empty() {
+            0
+        } else {
+            1
+        };
+        if filter_rows > 0 {
+            let w = (area.width as usize).saturating_sub(4).max(6);
+            let (mark, text, style) = if app.table_filter.is_empty() {
+                (
+                    "/ ",
+                    "/ 过滤表名".to_string(),
+                    Style::default().fg(Color::DarkGray),
+                )
+            } else {
+                (
+                    "▸ ",
+                    format!("/{} · {}/{}", app.table_filter, app.tables.len(), app.tables_all.len()),
+                    Style::default().fg(Color::Yellow),
+                )
+            };
+            lines.push(Line::from(vec![
+                Span::styled(mark, Style::default().fg(Color::Yellow)),
+                Span::styled(truncate_disp(&text, w), style),
+            ]));
+        }
+
         let cap = (area.height as usize)
-            .saturating_sub(2 + if sidebar_db_row(app) { 1 } else { 0 })
+            .saturating_sub(2 + if sidebar_db_row(app) { 1 } else { 0 } + filter_rows)
             .max(1);
         let sel = app.table_list.selected();
         let start = sel
@@ -6504,7 +7448,11 @@ fn render_sidebar(f: &mut Frame, area: Rect, app: &mut App) {
             )));
         }
 
-        let title = format!(" {} ({}) ", c.name, app.tables.len());
+        let title = if app.table_filter.is_empty() {
+            format!(" {} ({}) ", c.name, app.tables_all.len())
+        } else {
+            format!(" {} 表 {}/{} ", c.name, app.tables.len(), app.tables_all.len())
+        };
         f.render_widget(
             Paragraph::new(lines).block(
                 Block::default()
@@ -6785,6 +7733,243 @@ fn render_snippets(f: &mut Frame, area: Rect, app: &mut App) {
                 .add_modifier(Modifier::BOLD),
         );
     f.render_stateful_widget(list, box_area, &mut app.snippet_list);
+}
+
+/// Ctrl-Shift-H column-visibility overlay: space toggles the highlighted column,
+/// `a` shows all, `x` keeps only the first. Changes apply live behind the popup.
+fn render_col_picker(f: &mut Frame, area: Rect, app: &mut App) {
+    let Some(grid) = app.grid_full.clone() else {
+        return;
+    };
+    let w = area.width.min(if app.layout_mode == LayoutMode::Narrow {
+        area.width
+    } else {
+        52
+    });
+    let h = (grid.columns.len() as u16 + 2).clamp(3, area.height.saturating_sub(2));
+    let x = area.x + (area.width.saturating_sub(w)) / 2;
+    let y = area.y + (area.height.saturating_sub(h)) / 2;
+    let box_area = Rect {
+        x,
+        y,
+        width: w,
+        height: h,
+    };
+    f.render_widget(Clear, box_area);
+    let items: Vec<ListItem> = grid
+        .columns
+        .iter()
+        .enumerate()
+        .map(|(i, name)| {
+            let shown = !app.col_hidden.contains(name.as_str());
+            let mark = if shown { "[x] " } else { "[ ] " };
+            let style = if shown {
+                Style::default().fg(Color::Green)
+            } else {
+                Style::default().fg(Color::DarkGray)
+            };
+            ListItem::new(Line::from(vec![
+                Span::styled(mark, style),
+                Span::styled(
+                    truncate_disp(
+                        &fix_double_encoding(name),
+                        (box_area.width as usize).saturating_sub(6),
+                    ),
+                    style,
+                ),
+                Span::styled(
+                    format!("  {}", i + 1),
+                    Style::default().fg(Color::DarkGray),
+                ),
+            ]))
+        })
+        .collect();
+    let visible = grid
+        .columns
+        .iter()
+        .filter(|c| !app.col_hidden.contains(c.as_str()))
+        .count();
+    let list = List::new(items)
+        .block(
+            Block::default()
+                .borders(Borders::ALL)
+                .title(format!(
+                    " 列显示 {visible}/{} · 空格勾选 · a 全选 · x 仅首列 · Esc 关 ",
+                    grid.columns.len()
+                ))
+                .border_set(border::ROUNDED)
+                .border_style(Style::default().fg(Color::Cyan)),
+        )
+        .highlight_style(
+            Style::default()
+                .bg(Color::DarkGray)
+                .add_modifier(Modifier::BOLD),
+        );
+    f.render_stateful_widget(list, box_area, &mut app.col_picker_list);
+}
+
+/// Ctrl-Shift-R recent-table overlay: Enter jumps straight to the table.
+fn render_recent_tables(f: &mut Frame, area: Rect, app: &mut App) {
+    let w = area.width.min(if app.layout_mode == LayoutMode::Narrow {
+        area.width
+    } else {
+        54
+    });
+    let h = (app.recent_tables.len() as u16 + 2).clamp(3, area.height.saturating_sub(2));
+    let x = area.x + (area.width.saturating_sub(w)) / 2;
+    let y = area.y + (area.height.saturating_sub(h)) / 2;
+    let box_area = Rect {
+        x,
+        y,
+        width: w,
+        height: h,
+    };
+    f.render_widget(Clear, box_area);
+    let cur_db = app.current_db();
+    let items: Vec<ListItem> = app
+        .recent_tables
+        .iter()
+        .map(|(db, table)| {
+            let here = *db == cur_db;
+            ListItem::new(Line::from(vec![
+                Span::styled(
+                    if here { "● " } else { "○ " },
+                    Style::default().fg(if here { Color::Green } else { Color::DarkGray }),
+                ),
+                Span::styled(
+                    fix_double_encoding(table),
+                    Style::default().add_modifier(Modifier::BOLD),
+                ),
+                Span::styled(
+                    format!("  {}", fix_double_encoding(db)),
+                    Style::default().fg(Color::Cyan),
+                ),
+            ]))
+        })
+        .collect();
+    let list = List::new(items)
+        .block(
+            Block::default()
+                .borders(Borders::ALL)
+                .title(" 最近表 · ↑↓ Enter 直达 · Esc 关 ")
+                .border_set(border::ROUNDED)
+                .border_style(Style::default().fg(Color::Cyan)),
+        )
+        .highlight_style(
+            Style::default()
+                .bg(Color::DarkGray)
+                .add_modifier(Modifier::BOLD),
+        );
+    f.render_stateful_widget(list, box_area, &mut app.recent_list);
+}
+
+/// The `/` table-name filter prompt, drawn as a one-line box at the bottom.
+fn render_table_filter(f: &mut Frame, area: Rect, app: &mut App) {
+    let w = area.width.saturating_sub(4).max(20).min(area.width);
+    let h = 3.min(area.height);
+    let x = area.x + (area.width.saturating_sub(w)) / 2;
+    // Sit just above the footer line so the input is not clipped by it.
+    let y = area.y + area.height.saturating_sub(h + 1);
+    let box_area = Rect {
+        x,
+        y,
+        width: w,
+        height: h,
+    };
+    f.render_widget(Clear, box_area);
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .title(format!(
+            " 过滤表名 {}/{} · Enter 保留 · Esc 清除 ",
+            app.tables.len(),
+            app.tables_all.len()
+        ))
+        .border_set(border::ROUNDED)
+        .border_style(Style::default().fg(Color::Yellow));
+    let inner = block.inner(box_area);
+    f.render_widget(block, box_area);
+    if let Some(ta) = app.table_prompt.as_mut() {
+        ta.set_block(Block::default());
+        f.render_widget(&*ta, inner);
+    }
+}
+
+/// SQL prefix-completion popup, anchored just under the editor.
+fn render_completion(f: &mut Frame, app: &App) {
+    let Some(c) = app.completion.clone() else {
+        return;
+    };
+    let screen = f.area();
+    let ed = app.rects.editor;
+    let w = 40.min(screen.width.saturating_sub(2)).max(12);
+    let h = (c.items.len() as u16 + 2).min(screen.height.saturating_sub(1));
+    let x = (ed.x + 2).min(screen.x + screen.width.saturating_sub(w));
+    let mut y = ed.y + ed.height;
+    if y + h > screen.y + screen.height {
+        y = screen.y + screen.height - h;
+    }
+    let box_area = Rect {
+        x,
+        y,
+        width: w,
+        height: h,
+    };
+    f.render_widget(Clear, box_area);
+    let lines: Vec<Line> = c
+        .items
+        .iter()
+        .enumerate()
+        .map(|(i, item)| {
+            let style = if i == c.sel {
+                Style::default()
+                    .fg(Color::Black)
+                    .bg(Color::Cyan)
+                    .add_modifier(Modifier::BOLD)
+            } else {
+                Style::default()
+            };
+            Line::from(Span::styled(
+                truncate_disp(item, (w as usize).saturating_sub(3)),
+                style,
+            ))
+        })
+        .collect();
+    f.render_widget(
+        Paragraph::new(lines).block(
+            Block::default()
+                .borders(Borders::ALL)
+                .title(" 补全 · Tab 上屏 · ↑↓ · Esc ")
+                .border_set(border::ROUNDED)
+                .border_style(Style::default().fg(Color::Cyan)),
+        ),
+        box_area,
+    );
+}
+
+/// Name prompt for saving the editor's SQL into DBX's favourites.
+fn render_snippet_name(f: &mut Frame, area: Rect, app: &mut App) {
+    let w = area.width.saturating_sub(4).max(24).min(area.width);
+    let h = 3.min(area.height);
+    let x = area.x + (area.width.saturating_sub(w)) / 2;
+    let y = area.y + area.height.saturating_sub(h + 1);
+    let box_area = Rect {
+        x,
+        y,
+        width: w,
+        height: h,
+    };
+    f.render_widget(Clear, box_area);
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .title(" 收藏为 SQL 片段（DBX saved_sql_files）· Enter 保存 · Esc 取消 ")
+        .border_set(border::ROUNDED)
+        .border_style(Style::default().fg(Color::Green));
+    let inner = block.inner(box_area);
+    f.render_widget(block, box_area);
+    if let Some(ta) = app.snippet_name.as_mut() {
+        ta.set_block(Block::default());
+        f.render_widget(&*ta, inner);
+    }
 }
 
 /// Shared scrollable text popup used for both cell values and row details.
@@ -7115,6 +8300,9 @@ const HELP_ROWS: &[(&str, &str)] = &[
     ("Ctrl-A", "自动折叠 开 / 关（开=非焦点栏收起）"),
     ("Ctrl-W", "收起 / 展开当前焦点区域"),
     ("Ctrl-G", "横滚模式（触屏兜底：滚轮/上下滑 = 横滚列）"),
+    ("Alt-C / w", "紧凑列宽：窄屏自动共享列宽，宽表尽量一屏放下"),
+    ("Alt-H / c", "列显隐：空格勾选显示的列（会话内记住）"),
+    ("Alt-R / t", "最近浏览的 5 张表，Enter 直达（侧栏 t）"),
     ("Shift+← →", "列窗口横滚一列（任意区域，按住连滚）"),
     ("Ctrl-O", "SQL 片段收藏（DBX saved_sql_files）"),
     ("Ctrl-P", "EXPLAIN 当前 SQL（SQL 后端）"),
@@ -7122,6 +8310,8 @@ const HELP_ROWS: &[(&str, &str)] = &[
     ("DBXT_MOUSE_DEBUG=1", "启动时显示鼠标事件浮层（滑动无效时排查终端编码）"),
     ("— 侧栏 —", ""),
     ("↑ ↓", "移动表列表"),
+    ("/", "过滤表名（输入即筛选，Enter 保留，Esc 清除）"),
+    ("t", "最近表浮层（Enter 直达）"),
     ("Enter", "浏览表数据"),
     ("r", "表结构（字段 + DDL）"),
     ("d", "数据库列表（浮层内 r 刷新）"),
@@ -7143,8 +8333,9 @@ const HELP_ROWS: &[(&str, &str)] = &[
     ("[ ]", "切换本次会话的结果标签"),
     ("Ctrl-Y", "导出当前结果为 CSV（$HOME）"),
     ("Ctrl-N", "结果被截断时加载更多行"),
-    ("Enter", "查看完整单元格"),
-    ("o", "整行详情（纵向）"),
+    ("Enter", "整行详情（紧凑列模式）/ 完整单元格"),
+    ("v", "完整单元格（任意模式）"),
+    ("o", "整行详情（纵向，含隐藏列）"),
     ("e", "编辑单元格 → diff 确认后执行"),
     ("i", "快速插入 → diff 确认后执行"),
     ("Delete / Ctrl-D", "删除当前行 → 确认后执行"),
@@ -7153,6 +8344,9 @@ const HELP_ROWS: &[(&str, &str)] = &[
     ("s", "按当前列升 / 降序"),
     ("Ctrl-K", "附加排序键（多列排序）"),
     ("z", "钉住 / 取消首列"),
+    ("w / Alt-C", "紧凑列宽 开 / 关（窄屏默认自动开）"),
+    ("c / Alt-H", "列显隐浮层（空格勾选 / a 全选 / x 仅首列）"),
+    ("Alt-R", "最近表直达浮层"),
     ("t", "字段 ↔ DDL（表结构）"),
     ("Esc", "收起结果 / 关闭浮层"),
     ("— 编辑确认层 —", ""),
@@ -7162,6 +8356,7 @@ const HELP_ROWS: &[(&str, &str)] = &[
     ("Ctrl-T", "加入批量队列（Ctrl-S 打包事务提交）"),
     ("Ctrl-S / Ctrl-X", "提交 / 清空批量队列"),
     ("— 编辑器 / 命令 —", ""),
+    ("Ctrl-Space", "SQL 前缀补全（表名 / 列名 / 关键字，Tab 上屏）"),
     ("↑ ↓", "历史（首行 / 末行）"),
     ("[ ]", "Redis 逻辑库"),
     ("use <db>", "MongoDB 切库"),
@@ -7170,6 +8365,7 @@ const HELP_ROWS: &[(&str, &str)] = &[
     ("Esc / n", "取消"),
     ("— SQL 片段（Ctrl-O）—", ""),
     ("↑ ↓ / Enter", "选择 / 插入到编辑器"),
+    ("s", "把编辑器里的 SQL 收藏为片段（写入 DBX saved_sql_files）"),
     ("r / Esc", "刷新 / 关闭"),
 ];
 
@@ -7988,5 +9184,113 @@ mod tests {
     fn query_tab_title_is_first_line() {
         assert_eq!(query_tab_title("\n\nSELECT 1\nFROM t"), "SELECT 1");
         assert_eq!(query_tab_title("   "), "");
+    }
+
+    // ── mobile efficiency: compact columns ──
+
+    #[test]
+    fn compact_mode_is_automatic_only_on_a_narrow_terminal() {
+        assert!(compact_active(None, LayoutMode::Narrow));
+        assert!(!compact_active(None, LayoutMode::Mid));
+        assert!(!compact_active(None, LayoutMode::Wide));
+        // An explicit choice always wins, in both directions.
+        assert!(!compact_active(Some(false), LayoutMode::Narrow));
+        assert!(compact_active(Some(true), LayoutMode::Wide));
+    }
+
+    #[test]
+    fn compact_cap_shares_the_pane_so_all_columns_fit() {
+        // 40 usable columns, 5 columns: each may be 7 wide, and 5*7+4 = 39 fits.
+        let cap = compact_max_cell(42, 2, 5, 18);
+        assert_eq!(cap, 7);
+        assert!(5 * cap + 4 <= 40);
+        // A wide pane with few columns keeps its normal content cap.
+        assert_eq!(compact_max_cell(120, 2, 2, 44), 44);
+        // One column on a narrow pane is capped at the base, not at 8.
+        assert_eq!(compact_max_cell(42, 2, 1, 18), 18);
+    }
+
+    #[test]
+    fn compact_cap_stays_readable_when_columns_cannot_all_fit() {
+        // 20 columns on a phone: even 6 each cannot fit, so it scrolls but the
+        // columns stay at the readable minimum instead of collapsing to 1-2 cells.
+        let cap = compact_max_cell(42, 2, 20, 18);
+        assert_eq!(cap, COMPACT_MIN_CELL);
+        assert!(cap <= COMPACT_MAX_CELL);
+        // The empty grid is harmless.
+        assert_eq!(compact_max_cell(42, 2, 0, 18), COMPACT_MAX_CELL);
+    }
+
+    #[test]
+    fn filter_grid_hides_columns_and_keeps_values_aligned() {
+        let grid = Grid {
+            columns: vec!["id".into(), "name".into(), "secret".into()],
+            rows: vec![vec![
+                Val::Text("1".into()),
+                Val::Text("a".into()),
+                Val::Text("s".into()),
+            ]],
+            note: String::new(),
+        };
+        let hidden: HashSet<String> = ["secret".to_string()].into_iter().collect();
+        let out = filter_grid(&grid, &hidden);
+        assert_eq!(out.columns, vec!["id", "name"]);
+        assert_eq!(out.rows[0][0].text(), "1");
+        assert_eq!(out.rows[0][1].text(), "a");
+    }
+
+    #[test]
+    fn filter_grid_is_identity_without_hidden_columns() {
+        let grid = ten_col_grid();
+        let out = filter_grid(&grid, &HashSet::new());
+        assert_eq!(out.columns.len(), 10);
+        // Hiding every column still leaves one, so a grid never renders empty.
+        let all: HashSet<String> = grid.columns.iter().cloned().collect();
+        let out = filter_grid(&grid, &all);
+        assert_eq!(out.columns, vec!["c0"]);
+    }
+
+    // ── SQL completion ──
+
+    #[test]
+    fn word_before_cursor_takes_the_identifier_tail() {
+        let mut ta = TextArea::from(["select * from us"]);
+        ta.move_cursor(CursorMove::End);
+        let (n, w) = word_before_cursor(&ta);
+        assert_eq!((n, w.as_str()), (2, "us"));
+        // A dot is part of the word so `t.col` completes as one fragment.
+        let mut ta = TextArea::from(["select t.co"]);
+        ta.move_cursor(CursorMove::End);
+        assert_eq!(word_before_cursor(&ta).1, "t.co");
+        // Whitespace before the cursor yields an empty fragment (complete-all).
+        let mut ta = TextArea::from(["select "]);
+        ta.move_cursor(CursorMove::End);
+        assert_eq!(word_before_cursor(&ta).1, "");
+    }
+
+    // ── DBX favourites write-back ──
+
+    #[test]
+    fn iso_timestamp_matches_the_dbx_shape() {
+        let ts = now_iso8601();
+        assert_eq!(ts.len(), 20, "{ts}");
+        assert!(ts.ends_with('Z'), "{ts}");
+        assert_eq!(&ts[4..5], "-");
+        assert_eq!(&ts[10..11], "T");
+        assert!(ts[..4].chars().all(|c| c.is_ascii_digit()));
+        let year: i32 = ts[..4].parse().unwrap();
+        assert!((2024..2100).contains(&year), "{ts}");
+    }
+
+    #[test]
+    fn accepting_a_completion_replaces_the_prefix() {
+        let mut ta = TextArea::from(["select * from us"]);
+        ta.move_cursor(CursorMove::End);
+        let (n, _) = word_before_cursor(&ta);
+        let (row, col) = ta.cursor();
+        ta.move_cursor(CursorMove::Jump(row as u16, col.saturating_sub(n) as u16));
+        ta.delete_str(n);
+        ta.insert_str("users");
+        assert_eq!(ta.lines(), ["select * from users"]);
     }
 }
