@@ -84,21 +84,45 @@ fn layout_mode(cols: u16) -> LayoutMode {
     }
 }
 
-/// Effective collapse state of a pane. A manual override always wins; otherwise
-/// (on anything but a wide terminal) unfocused aux panes collapse to a one-line
-/// strip so the focused pane owns the space.
+/// Effective collapse state of a pane. A manual per-pane override always wins;
+/// otherwise the single `auto_collapse` master switch decides: on = unfocused
+/// aux panes collapse to a one-line strip so the focused pane owns the space
+/// (the old responsive behaviour); off = every pane stays expanded.
 fn pane_eff_collapsed(app: &App, pane: usize) -> bool {
-    if let Some(v) = app.pane_override.get(pane).copied().flatten() {
+    resolve_collapse(
+        app.auto_collapse,
+        app.focus,
+        pane,
+        app.pane_override.get(pane).copied().flatten(),
+    )
+}
+
+/// Pure form of the collapse rule, so it can be unit-tested without an `App`.
+fn resolve_collapse(auto: bool, focus: Focus, pane: usize, manual: Option<bool>) -> bool {
+    if let Some(v) = manual {
         return v;
     }
-    if app.layout_mode == LayoutMode::Wide {
+    if !auto {
         return false;
     }
     match pane {
-        PANE_SIDEBAR => app.focus != Focus::Sidebar,
-        PANE_EDITOR => !matches!(app.focus, Focus::Editor | Focus::CmdInput),
+        PANE_SIDEBAR => focus != Focus::Sidebar,
+        PANE_EDITOR => !matches!(focus, Focus::Editor | Focus::CmdInput),
         _ => false,
     }
+}
+
+/// Ctrl-A — one master switch for the whole responsive-collapse behaviour.
+/// On: unfocused aux panes collapse (the old behaviour). Off: everything stays
+/// expanded. Per-pane overrides are cleared so the two modes never mix.
+fn toggle_auto_collapse(app: &mut App) {
+    app.auto_collapse = !app.auto_collapse;
+    app.pane_override = [None; 3];
+    app.status = if app.auto_collapse {
+        "自动折叠：开 · 非焦点栏收起（Ctrl-A 关闭）".into()
+    } else {
+        "自动折叠：关 · 所有栏展开（Ctrl-A 开启）".into()
+    };
 }
 
 fn pane_name(pane: usize) -> &'static str {
@@ -275,6 +299,11 @@ struct TableDataReq {
 struct Confirm {
     sql: String,
     reasons: Vec<String>,
+    /// True when a successful run should refresh the current table page in place
+    /// (row edits, deletes, queued batches) instead of replacing the grid.
+    refresh: bool,
+    /// True when accepting the confirmation should also drain the queued batch.
+    clear_batch: bool,
 }
 
 #[derive(Clone, Copy, PartialEq)]
@@ -429,6 +458,15 @@ fn wrap_text(text: &str, width: usize) -> Vec<String> {
         out.push(String::new());
     }
     out
+}
+
+/// Wrap a multi-line SQL statement for display, dropping blank lines so the
+/// preview stays compact.
+fn wrap_sql_lines(sql: &str, width: usize) -> Vec<String> {
+    wrap_text(sql, width)
+        .into_iter()
+        .filter(|l| !l.trim().is_empty())
+        .collect()
 }
 
 // ─── dangerous-statement detection ───────────────────────────────────────────
@@ -967,8 +1005,10 @@ struct App {
     pending_write_msg: Option<String>,
     // queued edits for one transactional batch commit (Ctrl-S)
     batch: Vec<String>,
-    // manual per-pane collapse override (None = auto: collapse when unfocused)
+    // manual per-pane collapse override (None = follow `auto_collapse`)
     pane_override: [Option<bool>; 3],
+    // master switch for responsive collapse: on = unfocused panes collapse
+    auto_collapse: bool,
 
     // help overlay
     help_open: bool,
@@ -1171,6 +1211,7 @@ async fn run_app(mut terminal: ratatui::DefaultTerminal, backend: Arc<LocalBacke
         pending_write_msg: None,
         batch: Vec::new(),
         pane_override: [None; 3],
+        auto_collapse: false,
         help_open: false,
         help_scroll: 0,
         table_meta: None,
@@ -1671,11 +1712,19 @@ fn confirm_key(app: &mut App, tx: &Tx, k: KeyEvent) {
         KeyCode::Enter | KeyCode::Char('y') | KeyCode::Char('Y') => {
             if let Some(c) = app.confirm.take() {
                 app.push_history(&c.sql);
+                if c.clear_batch {
+                    app.batch.clear();
+                }
+                // Row edits / deletes / batches refresh the current page on success.
+                if c.refresh {
+                    app.pending_write = true;
+                }
                 execute_sql(app, tx, c.sql);
             }
         }
         KeyCode::Esc | KeyCode::Char('n') | KeyCode::Char('N') => {
             app.confirm = None;
+            app.pending_write = false;
             app.status = "已取消".into();
         }
         _ => {}
@@ -1736,12 +1785,12 @@ fn browse_key(app: &mut App, tx: &Tx, k: KeyEvent) {
 
     // transactional batch queue: Ctrl-S commits, Ctrl-X discards
     if k.modifiers.contains(KeyModifiers::CONTROL) && k.code == KeyCode::Char('s') {
-        commit_batch(app, tx);
+        commit_batch(app);
         return;
     }
     if k.modifiers.contains(KeyModifiers::CONTROL) && k.code == KeyCode::Char('x') {
         if app.batch.is_empty() {
-            app.status = "批量队列为空（编辑时按 b 加入）".into();
+            app.status = "批量队列为空（编辑时按 Ctrl-T 加入）".into();
         } else {
             let n = app.batch.len();
             app.batch.clear();
@@ -1781,13 +1830,26 @@ fn browse_key(app: &mut App, tx: &Tx, k: KeyEvent) {
         cycle_focus(app, false);
         return;
     }
-    if k.code == KeyCode::Char('B')
-        && !k.modifiers.contains(KeyModifiers::CONTROL)
+
+    // Layout toggles are Ctrl-combos so no bare uppercase key is needed, and they
+    // are kept out of the text inputs so typing is never hijacked.
+    //   Ctrl-A = auto-collapse master switch
+    //   Ctrl-W = collapse / expand just the focused pane
+    if k.modifiers.contains(KeyModifiers::CONTROL)
         && !k.modifiers.contains(KeyModifiers::ALT)
         && !matches!(app.focus, Focus::Editor | Focus::CmdInput)
     {
-        toggle_pane_collapse(app);
-        return;
+        match k.code {
+            KeyCode::Char('a') => {
+                toggle_auto_collapse(app);
+                return;
+            }
+            KeyCode::Char('w') => {
+                toggle_pane_collapse(app);
+                return;
+            }
+            _ => {}
+        }
     }
 
     match app.focus {
@@ -2878,19 +2940,20 @@ fn cmd_input_key(app: &mut App, tx: &Tx, k: KeyEvent) {
 }
 
 fn preview_key(app: &mut App, tx: &Tx, k: KeyEvent) {
-    // Ctrl-F / Ctrl-B page the result set.
+    // Every results-pane command that needs a modifier is a Ctrl combo, so no
+    // bare uppercase letter is required. Handle them here and swallow any other
+    // Ctrl combo so it can never fall through to a plain-key action.
     if k.modifiers.contains(KeyModifiers::CONTROL) {
         match k.code {
-            KeyCode::Char('f') => {
-                page_turn(app, tx, true);
-                return;
-            }
-            KeyCode::Char('b') => {
-                page_turn(app, tx, false);
-                return;
-            }
+            KeyCode::Char('f') => page_turn(app, tx, true),
+            KeyCode::Char('b') => page_turn(app, tx, false),
+            KeyCode::Char('e') => app.focus = Focus::Editor,
+            KeyCode::Char('k') => sort_column(app, tx, true),
+            KeyCode::Char('r') => clear_filter(app, tx),
+            KeyCode::Char('d') => delete_row(app),
             _ => {}
         }
+        return;
     }
     let screen = viewport_rows(app) as u16;
     let ddl = app.struct_view == StructView::Ddl && app.ddl.is_some();
@@ -2913,10 +2976,9 @@ fn preview_key(app: &mut App, tx: &Tx, k: KeyEvent) {
             app.focus = Focus::Sidebar;
         }
         KeyCode::Char('e') => edit_cell(app),
-        KeyCode::Char('E') => app.focus = Focus::Editor,
         KeyCode::Char('i') => quick_insert(app),
         KeyCode::Char('o') => open_row_popup(app),
-        KeyCode::Char('t') | KeyCode::Char('T') => {
+        KeyCode::Char('t') => {
             if app.ddl.is_some() {
                 app.struct_view = match app.struct_view {
                     StructView::Fields => StructView::Ddl,
@@ -2926,11 +2988,10 @@ fn preview_key(app: &mut App, tx: &Tx, k: KeyEvent) {
             }
         }
         KeyCode::Char('s') => sort_column(app, tx, false),
-        KeyCode::Char('S') => sort_column(app, tx, true),
-        // `f` filters; Shift-F clears. Freeze-first-column moves to `z`.
-        KeyCode::Char('F') => clear_filter(app, tx),
-        KeyCode::Char('f') if k.modifiers.contains(KeyModifiers::SHIFT) => clear_filter(app, tx),
         KeyCode::Char('f') => open_filter_prompt(app),
+        // Delete the focused row: builds a bound `DELETE … WHERE …` and routes it
+        // through the same red confirmation layer as every other write.
+        KeyCode::Delete => delete_row(app),
         KeyCode::Char('z') => {
             app.freeze_first = !app.freeze_first;
             app.status = if app.freeze_first {
@@ -3273,6 +3334,97 @@ impl EditDialog {
     }
 }
 
+/// Build the `WHERE` clause that identifies one row: the table's primary key
+/// when the column metadata is loaded, otherwise every column (with a warning
+/// flag). Returns `(clause, keys, no_pk)`; `1 = 1` is the last resort when even
+/// the column list is unusable.
+fn row_where_clause(
+    app: &App,
+    grid: &Grid,
+    row: &[Val],
+    table: &str,
+) -> (String, Vec<String>, bool) {
+    let (keys, no_pk) = match app.table_meta.as_ref().filter(|m| m.table == table) {
+        Some(meta) => {
+            let pks: Vec<String> = meta
+                .columns
+                .iter()
+                .filter(|c| c.is_primary_key)
+                .map(|c| c.name.clone())
+                .collect();
+            if pks.is_empty() {
+                (grid.columns.clone(), true)
+            } else {
+                (pks, false)
+            }
+        }
+        None => (grid.columns.clone(), true),
+    };
+    let db_type = app.selected.as_ref().map(|c| c.db_type);
+    let q = |name: &str| quote_table_identifier(db_type, name);
+    let mut conds: Vec<String> = Vec::new();
+    for k in &keys {
+        let Some(ci) = grid.columns.iter().position(|c| c == k) else {
+            continue;
+        };
+        let Some(v) = row.get(ci) else {
+            continue;
+        };
+        conds.push(format!(
+            "{} = {}",
+            q(k),
+            val_literal(v, column_type(app, table, k).as_deref())
+        ));
+    }
+    let clause = if conds.is_empty() {
+        "1 = 1".to_string()
+    } else {
+        conds.join(" AND ")
+    };
+    (clause, keys, no_pk)
+}
+
+/// `Delete` / `Ctrl-D` — delete the focused row. The `DELETE … WHERE …` is built
+/// from the primary key (or every column, with a warning) and always goes
+/// through the red confirmation layer; nothing is deleted until Enter.
+fn delete_row(app: &mut App) {
+    if !in_table_data_view(app) {
+        app.status = "仅表格浏览支持删除行".into();
+        return;
+    }
+    let Some(grid) = active_grid(app) else {
+        return;
+    };
+    let Some(ps) = app.page_state.clone() else {
+        return;
+    };
+    let Some(cfg) = app.selected.clone() else {
+        return;
+    };
+    let Some(row) = grid.rows.get(app.sel).cloned() else {
+        app.status = "没有可删除的行".into();
+        return;
+    };
+    let (where_clause, keys, no_pk) = row_where_clause(app, &grid, &row, &ps.table);
+    let q = |name: &str| quote_table_identifier(Some(cfg.db_type), name);
+    let sql = format!("DELETE FROM {}\nWHERE {};", q(&ps.table), where_clause);
+    let mut reasons: Vec<String> = Vec::new();
+    if no_pk {
+        reasons.push("⚠ 未检测到主键：将按全部列匹配删除，请确认只命中这一行".into());
+    } else {
+        reasons.push(format!("将删除 1 行（主键 {}）", keys.join(", ")));
+    }
+    reasons.push("DELETE 不可撤销，Enter 后立即执行".into());
+    reasons.push(format!("WHERE {where_clause}"));
+    app.confirm = Some(Confirm {
+        sql,
+        reasons,
+        refresh: true,
+        clear_batch: false,
+    });
+    app.status = "删除确认 · Enter 执行 · Esc 取消".into();
+}
+
 /// `e` — open a diff-style confirmation layer for the focused cell. The user
 /// types the new value, sees old → new plus the WHERE clause, and only then is
 /// the UPDATE sent (Enter). Esc cancels, `v` hands the SQL to the editor, `b`
@@ -3303,43 +3455,7 @@ fn edit_cell(app: &mut App) {
 
     // Primary keys drive the WHERE clause; fall back to every column (with a
     // warning) when the table has none or its metadata is not loaded yet.
-    let (keys, no_pk) = match app.table_meta.as_ref().filter(|m| m.table == ps.table) {
-        Some(meta) => {
-            let pks: Vec<String> = meta
-                .columns
-                .iter()
-                .filter(|c| c.is_primary_key)
-                .map(|c| c.name.clone())
-                .collect();
-            if pks.is_empty() {
-                (grid.columns.clone(), true)
-            } else {
-                (pks, false)
-            }
-        }
-        None => (grid.columns.clone(), true),
-    };
-
-    let q = |name: &str| quote_table_identifier(Some(cfg.db_type), name);
-    let mut conds: Vec<String> = Vec::new();
-    for k in &keys {
-        let Some(ci) = grid.columns.iter().position(|c| c == k) else {
-            continue;
-        };
-        let Some(v) = row.get(ci) else {
-            continue;
-        };
-        conds.push(format!(
-            "{} = {}",
-            q(k),
-            val_literal(v, column_type(app, &ps.table, k).as_deref())
-        ));
-    }
-    let where_clause = if conds.is_empty() {
-        "1 = 1".to_string()
-    } else {
-        conds.join(" AND ")
-    };
+    let (where_clause, keys, no_pk) = row_where_clause(app, &grid, &row, &ps.table);
 
     let dt = column_type(app, &ps.table, &col);
     let initial = match &val {
@@ -3365,7 +3481,7 @@ fn edit_cell(app: &mut App) {
         insert_preview: Vec::new(),
     });
     app.status = format!(
-        "编辑 {col} → Enter 确认提交 · Esc 取消 · Ctrl-V 转编辑器 · Ctrl-T 加入批量"
+        "编辑 {col} → Enter 确认执行 · Esc 取消 · Ctrl-V 转编辑器 · Ctrl-T 加入批量"
     );
 }
 
@@ -3437,7 +3553,7 @@ fn quick_insert(app: &mut App) {
         insert_preview: preview,
     });
     app.status = format!(
-        "插入 {} → Enter 确认提交 · Esc 取消 · v 转编辑器微调 · b 加入批量",
+        "插入 {} → Enter 确认执行 · Esc 取消 · Ctrl-V 转编辑器 · Ctrl-T 加入批量",
         ps.table
     );
 }
@@ -3488,6 +3604,8 @@ fn submit_edit_sql(app: &mut App, tx: &Tx, sql: String) {
         app.confirm = Some(Confirm {
             sql,
             reasons: vec![reason],
+            refresh: true,
+            clear_batch: false,
         });
         return;
     }
@@ -3496,10 +3614,12 @@ fn submit_edit_sql(app: &mut App, tx: &Tx, sql: String) {
     execute_sql(app, tx, sql);
 }
 
-/// Ctrl-S — run every queued edit inside one transaction.
-fn commit_batch(app: &mut App, tx: &Tx) {
+/// Ctrl-S — package every queued edit into one transaction and ask for
+/// confirmation. The full `BEGIN … COMMIT` script is shown in the red layer;
+/// nothing runs until Enter (Esc keeps the queue intact).
+fn commit_batch(app: &mut App) {
     if app.batch.is_empty() {
-        app.status = "批量队列为空（编辑时按 b 加入）".into();
+        app.status = "批量队列为空（编辑时按 Ctrl-T 加入）".into();
         return;
     }
     let n = app.batch.len();
@@ -3510,16 +3630,16 @@ fn commit_batch(app: &mut App, tx: &Tx) {
         script.push_str(";\n");
     }
     script.push_str("COMMIT;");
-    app.batch.clear();
-    app.push_history(&script);
-    app.pending_write = true;
-    app.loading = true;
-    app.status = format!("提交批量事务（{n} 条）…");
-    let Some(cfg) = app.selected.clone() else {
-        return;
-    };
-    let db = app.current_db();
-    spawn_op(&app.backend, tx, Op::Query(Box::new(cfg), db, script));
+    app.confirm = Some(Confirm {
+        sql: script,
+        reasons: vec![
+            format!("批量事务：{n} 条修改将在同一个 BEGIN … COMMIT 中执行"),
+            "任一语句失败则整体回滚；Enter 后立即执行".into(),
+        ],
+        refresh: true,
+        clear_batch: true,
+    });
+    app.status = format!("批量提交确认（{n} 条）· Enter 执行 · Esc 取消");
 }
 
 
@@ -3552,7 +3672,7 @@ fn open_filter_prompt(app: &mut App) {
     app.filter_prompt = Some(ta);
 }
 
-/// Shift-F — drop the active filter and reload the first page.
+/// Ctrl-R — drop the active filter and reload the first page.
 fn clear_filter(app: &mut App, tx: &Tx) {
     let has_filter = app
         .page_state
@@ -3709,7 +3829,12 @@ fn run_sql(app: &mut App, tx: &Tx) {
         }
     }
     if !reasons.is_empty() {
-        app.confirm = Some(Confirm { sql, reasons });
+        app.confirm = Some(Confirm {
+            sql,
+            reasons,
+            refresh: false,
+            clear_batch: false,
+        });
         return;
     }
     app.push_history(&sql);
@@ -4060,6 +4185,12 @@ fn context_info(app: &App) -> String {
         Focus::CmdInput => parts.push("焦点 命令".into()),
         Focus::Preview => parts.push("焦点 结果".into()),
     }
+    // Small marker for the responsive-collapse master switch (Ctrl-A).
+    parts.push(if app.auto_collapse {
+        "自动折叠 开".into()
+    } else {
+        "自动折叠 关".into()
+    });
     if let Some(ps) = &app.page_state {
         let pages = ps
             .total
@@ -4132,7 +4263,7 @@ fn render_footer(f: &mut Frame, area: Rect, app: &App) {
     } else if app.cell_popup.is_some() {
         "单元格 · ↑↓ 滚动 · Esc/Enter 关闭".into()
     } else if app.edit_dialog.is_some() {
-        "✎ 编辑确认 · Enter 提交 · Esc 取消 · Ctrl-V 转编辑器 · Ctrl-T 加入批量".into()
+        "✎ 编辑确认 · Enter 执行 · Esc 取消 · Ctrl-V 转编辑器 · Ctrl-T 加入批量".into()
     } else if app.db_picker_open {
         "↑↓ 选择数据库 · Enter 切换 · r 刷新 · Esc 关闭".into()
     } else if app.confirm.is_some() {
@@ -4148,7 +4279,7 @@ fn render_footer(f: &mut Frame, area: Rect, app: &App) {
                 Focus::Editor => "Ctrl-J 运行 · ↑ 历史 · Tab 下一区".into(),
                 Focus::CmdInput => "Enter 执行 · Ctrl-L 换模式".into(),
                 Focus::Preview => {
-                    "↑↓ 行 · ←→ 列 · Enter 单元格 · e 编辑 · f 过滤 · B 收起 · ? 帮助".into()
+                    "↑↓ 行 · ←→ 列 · Enter 单元格 · e 编辑 · Del 删行 · f 过滤 · Ctrl-A 折叠 · ? 帮助".into()
                 }
             },
         }
@@ -4167,7 +4298,7 @@ fn render_footer(f: &mut Frame, area: Rect, app: &App) {
                     "Enter 执行 · [ ] 切 redis db · Ctrl-L 切 sql/redis/mongo · Esc 编辑器".into()
                 }
                 Focus::Preview => {
-                    "↑↓ 行(到边翻页) · ←→/hl 列 · Enter 单元格 · o 整行 · e 编辑 · i 插入 · f 过滤 · s/S 排序 · z 钉首列 · B 收起 · Ctrl-S 批量提交 · ? 帮助 · Esc 收起".into()
+                    "↑↓ 行(到边翻页) · ←→/hl 列 · Enter 单元格 · o 整行 · e 编辑 · i 插入 · Del 删行 · f 过滤 · s 排序 · Ctrl-R 清过滤 · Ctrl-A 自动折叠 · ? 帮助".into()
                 }
             },
         }
@@ -4307,7 +4438,7 @@ fn render_sidebar_strip(f: &mut Frame, area: Rect, app: &mut App) {
     } else {
         text.push_str("▸ 未连接");
     }
-    text.push_str(" · 点击/B 展开");
+    text.push_str(" · 点击/Ctrl-W 展开");
     let style = if focused {
         Style::default()
             .fg(Color::Black)
@@ -4351,7 +4482,7 @@ fn render_editor_strip(f: &mut Frame, area: Rect, app: &mut App) {
 /// One-line summary shown in place of the results pane when it is collapsed.
 fn render_results_strip(f: &mut Frame, area: Rect, app: &mut App) {
     let n = result_row_count(app);
-    let text = format!("结果 ▸ {n} 行 · 点击/B 展开");
+    let text = format!("结果 ▸ {n} 行 · 点击/Ctrl-W 展开");
     f.render_widget(
         Paragraph::new(truncate_disp(&text, area.width as usize))
             .style(Style::default().fg(Color::Gray)),
@@ -4681,22 +4812,22 @@ fn render_grid(f: &mut Frame, area: Rect, app: &mut App, grid: &Grid, kind: Grid
         let (ts, tl) = scrollbar_geom(scrollable_total, win_start, visible, bar_len);
         let tl = tl.max(1).min(bar_len);
         let mut spans: Vec<Span> = Vec::new();
+        // A half-height bar (lower block) instead of a full `█` keeps the
+        // indicator visually thin on the bottom border.
         if ts > 0 {
             spans.push(Span::styled(
-                "─".repeat(ts),
+                "▁".repeat(ts),
                 Style::default().fg(Color::DarkGray),
             ));
         }
         spans.push(Span::styled(
-            "█".repeat(tl),
-            Style::default()
-                .fg(Color::LightGreen)
-                .add_modifier(Modifier::BOLD),
+            "▄".repeat(tl),
+            Style::default().fg(Color::LightGreen),
         ));
         let after = bar_len.saturating_sub(ts + tl);
         if after > 0 {
             spans.push(Span::styled(
-                "─".repeat(after),
+                "▁".repeat(after),
                 Style::default().fg(Color::DarkGray),
             ));
         }
@@ -4772,8 +4903,9 @@ fn vbar_lines(total: usize, start: usize, win: usize, height: usize) -> Vec<Line
     (0..height)
         .map(|i| {
             if i >= ts && i < ts + tl {
+                // Half-width block: a thin vertical thumb on the right border.
                 Line::from(Span::styled(
-                    "█",
+                    "▐",
                     Style::default().fg(Color::LightGreen),
                 ))
             } else {
@@ -5526,6 +5658,20 @@ fn render_edit_dialog(f: &mut Frame, area: Rect, app: &mut App) {
                     ),
                 ]));
             }
+            // The full statement is always shown: nothing is executed from a
+            // summary alone.
+            let sql_lines = wrap_sql_lines(&d.sql(), inner_w.saturating_sub(2));
+            header_lines.push(Line::from(""));
+            header_lines.push(Line::from(Span::styled(
+                "生成的 SQL（Enter 执行）",
+                Style::default().fg(Color::DarkGray),
+            )));
+            for l in &sql_lines {
+                header_lines.push(Line::from(Span::styled(
+                    l.clone(),
+                    Style::default().fg(Color::White),
+                )));
+            }
             let header_h = header_lines.len() as u16;
             let h = (header_h + 3 + 1 + 2).min(area.height);
             let x = area.x + (area.width.saturating_sub(w)) / 2;
@@ -5549,14 +5695,22 @@ fn render_edit_dialog(f: &mut Frame, area: Rect, app: &mut App) {
                 .border_style(Style::default().fg(Color::Yellow));
             let inner = block.inner(box_area);
             f.render_widget(block, box_area);
+            // Keep room for the value input + hint even on a short terminal.
+            let max_header = inner.height.saturating_sub(3 + 1) as usize;
+            let shown: Vec<Line> = header_lines
+                .iter()
+                .take(max_header)
+                .cloned()
+                .collect();
+            let shown_h = shown.len() as u16;
             let hdr_area = Rect {
                 x: inner.x,
                 y: inner.y,
                 width: inner.width,
-                height: header_h.min(inner.height),
+                height: shown_h.min(inner.height),
             };
-            f.render_widget(Paragraph::new(header_lines), hdr_area);
-            let ta_y = inner.y + header_h;
+            f.render_widget(Paragraph::new(shown), hdr_area);
+            let ta_y = inner.y + shown_h;
             let ta_h = 3.min((inner.y + inner.height).saturating_sub(ta_y));
             if ta_h > 0 {
                 let ta_area = Rect {
@@ -5568,7 +5722,7 @@ fn render_edit_dialog(f: &mut Frame, area: Rect, app: &mut App) {
                 if let Some(dd) = app.edit_dialog.as_mut() {
                     let b = Block::default()
                         .borders(Borders::ALL)
-                        .title(" 新值 · Enter 提交 ")
+                        .title(" 新值 · Enter 执行 ")
                         .border_set(border::ROUNDED)
                         .border_style(Style::default().fg(Color::Green));
                     dd.new_input.set_block(b);
@@ -5585,7 +5739,7 @@ fn render_edit_dialog(f: &mut Frame, area: Rect, app: &mut App) {
                 };
                 f.render_widget(
                     Paragraph::new(truncate_disp(
-                        "Enter 提交 · Esc 取消 · Ctrl-V 转编辑器 · Ctrl-T 加入批量",
+                        "Enter 执行 · Esc 取消 · Ctrl-V 转编辑器 · Ctrl-T 加入批量",
                         inner_w,
                     ))
                     .style(Style::default().fg(Color::DarkGray)),
@@ -5612,8 +5766,16 @@ fn render_edit_dialog(f: &mut Frame, area: Rect, app: &mut App) {
                     ),
                 ]));
             }
+            lines.push(Line::from(""));
             lines.push(Line::from(Span::styled(
-                "Enter 提交 · Esc 取消 · v 转编辑器微调 · b 加入批量",
+                "生成的 SQL（Enter 执行）",
+                Style::default().fg(Color::DarkGray),
+            )));
+            for l in wrap_sql_lines(&d.sql(), inner_w.saturating_sub(2)) {
+                lines.push(Line::from(Span::styled(l, Style::default().fg(Color::White))));
+            }
+            lines.push(Line::from(Span::styled(
+                "Enter 执行 · Esc 取消 · Ctrl-V 转编辑器 · Ctrl-T 加入批量",
                 Style::default().fg(Color::DarkGray),
             )));
             let h = (lines.len() as u16 + 2).min(area.height);
@@ -5710,7 +5872,8 @@ const HELP_ROWS: &[(&str, &str)] = &[
     ("F5 / Ctrl-J", "执行当前 SQL"),
     ("Tab / Shift-Tab", "循环切换区域（侧栏 → 编辑器 → 结果）"),
     ("Alt-1 / 2 / 3", "直接聚焦 侧栏 / 编辑器 / 结果"),
-    ("B", "收起 / 展开当前焦点区域"),
+    ("Ctrl-A", "自动折叠 开 / 关（开=非焦点栏收起）"),
+    ("Ctrl-W", "收起 / 展开当前焦点区域"),
     ("?", "本帮助"),
     ("— 侧栏 —", ""),
     ("↑ ↓", "移动表列表"),
@@ -5726,20 +5889,22 @@ const HELP_ROWS: &[(&str, &str)] = &[
     ("n / p", "下一页 / 上一页"),
     ("Ctrl-F / Ctrl-B", "下一页 / 上一页"),
     ("← → / h l", "单元格光标（列窗口跟随）"),
+    ("Shift+滚轮 / 横滚", "横向滚动列（触屏左右滑动）"),
     ("底部进度条", "当前列窗口位置 · 点击可跳转"),
     ("Enter", "查看完整单元格"),
     ("o", "整行详情（纵向）"),
-    ("e", "编辑单元格 → diff 确认后提交"),
-    ("i", "快速插入 → diff 确认后提交"),
+    ("e", "编辑单元格 → diff 确认后执行"),
+    ("i", "快速插入 → diff 确认后执行"),
+    ("Delete / Ctrl-D", "删除当前行 → 确认后执行"),
     ("f", "WHERE 过滤（预填当前列）"),
-    ("Shift-F", "清除过滤"),
+    ("Ctrl-R", "清除过滤"),
     ("s", "按当前列升 / 降序"),
-    ("Shift-S", "附加排序键（多列排序）"),
+    ("Ctrl-K", "附加排序键（多列排序）"),
     ("z", "钉住 / 取消首列"),
     ("t", "字段 ↔ DDL（表结构）"),
     ("Esc", "收起结果 / 关闭浮层"),
     ("— 编辑确认层 —", ""),
-    ("Enter", "提交（UPDATE / INSERT）"),
+    ("Enter", "执行（UPDATE / INSERT，SQL 全文可见）"),
     ("Esc", "取消编辑"),
     ("Ctrl-V", "将生成的 SQL 转入编辑器微调"),
     ("Ctrl-T", "加入批量队列（Ctrl-S 打包事务提交）"),
@@ -5748,8 +5913,8 @@ const HELP_ROWS: &[(&str, &str)] = &[
     ("↑ ↓", "历史（首行 / 末行）"),
     ("[ ]", "Redis 逻辑库"),
     ("use <db>", "MongoDB 切库"),
-    ("— 危险操作确认 —", ""),
-    ("Enter / y", "执行"),
+    ("— 危险操作 / 删除确认 —", ""),
+    ("Enter / y", "执行（SQL 全文可见）"),
     ("Esc / n", "取消"),
 ];
 
@@ -5825,10 +5990,14 @@ fn render_confirm(f: &mut Frame, area: Rect, confirm: &Confirm) {
             avail.min(72)
         }
     };
-    let body: Vec<String> = wrap_text(&one_line(&confirm.sql), w.saturating_sub(4) as usize);
-    let lines_n = body.len().min(6);
-    let content_h = confirm.reasons.len() + lines_n + 3;
-    let h = (content_h as u16 + 2).min(area.height.saturating_sub(2));
+    let inner_w = w.saturating_sub(4) as usize;
+    // Keep the statement's own line structure so a multi-line UPDATE / DELETE /
+    // BEGIN … COMMIT stays readable; nothing is run from a summary alone.
+    let sql_lines = wrap_sql_lines(&confirm.sql, inner_w);
+    let max_h = area.height.saturating_sub(2) as usize;
+    // reasons + blank + SQL + blank + hint, plus the two border rows
+    let needed = confirm.reasons.len() + sql_lines.len() + 5;
+    let h = needed.min(max_h).max(3) as u16;
     let x = area.x + (area.width.saturating_sub(w)) / 2;
     let y = area.y + (area.height.saturating_sub(h)) / 2;
     let box_area = Rect {
@@ -5849,10 +6018,23 @@ fn render_confirm(f: &mut Frame, area: Rect, confirm: &Confirm) {
         )));
     }
     lines.push(Line::from(""));
-    for l in body.iter().take(6) {
+    let sql_room = (h as usize).saturating_sub(confirm.reasons.len() + 5);
+    let truncated = sql_lines.len() > sql_room;
+    let shown_sql = if truncated {
+        sql_room.saturating_sub(1)
+    } else {
+        sql_room
+    };
+    for l in sql_lines.iter().take(shown_sql) {
         lines.push(Line::from(Span::styled(
             l.clone(),
             Style::default().fg(Color::White),
+        )));
+    }
+    if truncated {
+        lines.push(Line::from(Span::styled(
+            "…（语句过长，已截断显示）",
+            Style::default().fg(Color::DarkGray),
         )));
     }
     lines.push(Line::from(""));
@@ -6223,5 +6405,48 @@ mod tests {
         assert_eq!(new_value_literal("42", Some("int")), "42");
         assert_eq!(new_value_literal("42", Some("varchar(10)")), "'42'");
         assert_eq!(new_value_literal("O'Brien", Some("text")), "'O''Brien'");
+    }
+
+    #[test]
+    fn auto_collapse_switch_controls_unfocused_panes() {
+        // Off → everything stays expanded, at any width.
+        assert!(!resolve_collapse(false, Focus::Preview, PANE_SIDEBAR, None));
+        assert!(!resolve_collapse(false, Focus::Editor, PANE_SIDEBAR, None));
+        // On → unfocused aux panes collapse at every width.
+        assert!(resolve_collapse(true, Focus::Preview, PANE_SIDEBAR, None));
+        assert!(resolve_collapse(true, Focus::Sidebar, PANE_EDITOR, None));
+        // The focused pane never collapses; the results pane is never auto-collapsed.
+        assert!(!resolve_collapse(true, Focus::Sidebar, PANE_SIDEBAR, None));
+        assert!(!resolve_collapse(true, Focus::Editor, PANE_EDITOR, None));
+        assert!(!resolve_collapse(true, Focus::Sidebar, PANE_RESULTS, None));
+        // A manual per-pane override always wins, even against the master switch.
+        assert!(resolve_collapse(false, Focus::Sidebar, PANE_SIDEBAR, Some(true)));
+        assert!(!resolve_collapse(true, Focus::Preview, PANE_SIDEBAR, Some(false)));
+    }
+
+    #[test]
+    fn wrap_sql_lines_keeps_statement_shape() {
+        let lines = wrap_sql_lines("UPDATE t\nSET a = 1\nWHERE id = 2;", 40);
+        assert_eq!(lines, vec!["UPDATE t", "SET a = 1", "WHERE id = 2;"]);
+        // blank lines are dropped so the preview stays compact
+        assert_eq!(wrap_sql_lines("A\n\nB", 10), vec!["A", "B"]);
+    }
+
+    #[test]
+    fn help_has_no_bare_uppercase_shortcuts() {
+        // Regression guard for the R8 keymap: every shortcut must be lowercase,
+        // a named key, or a Ctrl/Alt/Shift/F-key combination — never a lone
+        // uppercase letter the user has to reach with Shift.
+        for (key, _) in HELP_ROWS {
+            if key.starts_with('—') {
+                continue;
+            }
+            for tok in key.split(['/', ' ', '+']).filter(|t| !t.is_empty()) {
+                assert!(
+                    !(tok.len() == 1 && tok.chars().all(|c| c.is_ascii_uppercase())),
+                    "bare uppercase shortcut in help: {tok:?} ({key})"
+                );
+            }
+        }
     }
 }
