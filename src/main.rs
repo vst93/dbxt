@@ -2,7 +2,7 @@
 // Apache-2.0. Reuses DBX connection storage (dbx.db), native drivers, SQL safety.
 #![recursion_limit = "512"]
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::io::Write;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -1000,6 +1000,158 @@ struct Rects {
     hbar_next: Rect,
 }
 
+// ─── touch / swipe gesture layer ─────────────────────────────────────────────
+
+/// How a horizontal swipe is recognised, from `DBXT_DRAG_PAN`:
+///
+/// * `button` (default) — a held left button that moves (`MouseEventKind::Drag`),
+///   which is how phone terminals encode a left/right swipe when they do not
+///   emit a horizontal wheel at all;
+/// * `any` — also treat bare motion (`MouseEventKind::Moved`) as a swipe, for
+///   terminals that report a touch drag without a button; a desktop mouse also
+///   sends `Moved` constantly, so this is opt-in only;
+/// * `off` — no swipe handling (wheel and keys only).
+#[derive(Clone, Copy, PartialEq, Debug)]
+enum DragPan {
+    Off,
+    Button,
+    Any,
+}
+
+impl DragPan {
+    fn from_env() -> Self {
+        Self::parse(&std::env::var("DBXT_DRAG_PAN").unwrap_or_default())
+    }
+
+    fn parse(v: &str) -> Self {
+        match v.trim().to_ascii_lowercase().as_str() {
+            "off" | "0" | "no" | "none" | "false" => DragPan::Off,
+            "any" | "all" | "motion" | "moved" | "touch" => DragPan::Any,
+            _ => DragPan::Button,
+        }
+    }
+}
+
+/// Finger columns of travel that make up one pan step (2:1 keeps a slow swipe
+/// moving without making a fast flick jump the whole table away).
+const DRAG_COLS_PER_STEP: i32 = 2;
+/// A gesture that travelled this far is a swipe, not a tap.
+const DRAG_TAP_SLOP: i32 = 2;
+/// Cap on the columns one (possibly coalesced) drag event may pan.
+const DRAG_MAX_STEPS: i32 = 4;
+
+/// Turn finger travel into whole pan steps, carrying the remainder so a slow
+/// swipe still moves the window instead of being rounded away.
+fn pan_steps(accum: &mut i32, dx: i32) -> i32 {
+    let cap = DRAG_MAX_STEPS * DRAG_COLS_PER_STEP;
+    *accum = (*accum + dx).clamp(-cap, cap);
+    let steps = *accum / DRAG_COLS_PER_STEP;
+    *accum -= steps * DRAG_COLS_PER_STEP;
+    steps
+}
+
+/// State machine that turns "button held + moved horizontally" into column pans.
+/// A touch left/right swipe reaches us as `Drag(Left)` (button-event tracking) or
+/// `Moved` (any-event tracking); a horizontal wheel (`ScrollLeft`/`ScrollRight`)
+/// is a different, much rarer encoding, so both paths exist.
+#[derive(Default, Clone, Copy)]
+struct PanGesture {
+    /// position of the previous mouse event, for the travel delta
+    last: Option<(u16, u16)>,
+    /// button currently held (a `Down` was seen)
+    held: Option<MouseButton>,
+    /// travel not yet converted into pan steps
+    accum: i32,
+    /// the gesture has travelled far enough to be a swipe, not a tap
+    moved: bool,
+    /// the terminal has sent at least one `Up`; only then may a tap be deferred
+    saw_up: bool,
+}
+
+impl PanGesture {
+    /// Feed one mouse event.
+    ///
+    /// `None` means "not part of a swipe, handle it normally"; `Some(steps)` means
+    /// the event belongs to a swipe and the caller should swallow it, panning the
+    /// column window by `steps` columns (`0` = swipe, but no step completed yet).
+    fn feed(&mut self, kind: MouseEventKind, col: u16, row: u16, mode: DragPan) -> Option<i32> {
+        let prev = self.last.replace((col, row));
+        match kind {
+            MouseEventKind::Down(b) => {
+                self.held = Some(b);
+                self.accum = 0;
+                self.moved = false;
+                None
+            }
+            MouseEventKind::Up(_) => {
+                self.held = None;
+                self.accum = 0;
+                self.moved = false;
+                self.saw_up = true;
+                None
+            }
+            MouseEventKind::Drag(b) => {
+                if mode == DragPan::Off || b != MouseButton::Left {
+                    return None;
+                }
+                match self.held {
+                    Some(MouseButton::Left) => {}
+                    // another button owns this gesture (e.g. desktop text selection)
+                    Some(_) => return None,
+                    // Some terminals drop the press and only report the drag; start
+                    // the gesture from the first drag event in that case.
+                    None => {
+                        self.held = Some(MouseButton::Left);
+                        self.accum = 0;
+                        self.moved = false;
+                    }
+                }
+                self.travel(prev, col, row)
+            }
+            MouseEventKind::Moved => {
+                let touching = match mode {
+                    DragPan::Off => return None,
+                    DragPan::Any => true,
+                    DragPan::Button => self.held == Some(MouseButton::Left),
+                };
+                if !touching {
+                    return None;
+                }
+                self.travel(prev, col, row)
+            }
+            _ => None,
+        }
+    }
+
+    fn travel(&mut self, prev: Option<(u16, u16)>, col: u16, row: u16) -> Option<i32> {
+        let (pc, pr) = prev?;
+        let dx = col as i32 - pc as i32;
+        let dy = row as i32 - pr as i32;
+        if dx.abs() >= DRAG_TAP_SLOP || dy.abs() >= DRAG_TAP_SLOP {
+            // The finger travelled: whatever happens next, this was not a tap.
+            self.moved = true;
+        }
+        if dy.abs() > dx.abs() {
+            // Vertical-dominant travel is not a horizontal pan: rows keep moving
+            // through the wheel, which every terminal reports.
+            self.accum = 0;
+            return Some(0);
+        }
+        Some(pan_steps(&mut self.accum, dx))
+    }
+
+    /// True once the gesture travelled far enough that it must not also click.
+    fn is_swipe(&self) -> bool {
+        self.moved
+    }
+
+    /// A tap may only be deferred to its `Up` on a terminal that sends `Up`
+    /// events; otherwise the press itself has to click or tapping would break.
+    fn can_defer_tap(&self) -> bool {
+        self.saw_up
+    }
+}
+
 /// Panes that can be collapsed in the responsive layout.
 const PANE_SIDEBAR: usize = 0;
 const PANE_EDITOR: usize = 1;
@@ -1071,11 +1223,22 @@ struct App {
     //   pan_mode: vertical wheel pans columns instead of rows (for phone terminals
     //   that never emit a horizontal wheel for a left/right swipe).
     pan_mode: bool,
+    //   drag_pan: how a swipe is recognised (see `DragPan`).
+    drag_pan: DragPan,
+    //   gesture: swipe state for the drag → column-pan path.
+    gesture: PanGesture,
+    //   pending_tap: a results-pane click waiting for its `Up`, so the press that
+    //   starts a swipe does not also select a row / jump the scrollbar.
+    pending_tap: Option<(u16, u16)>,
     //   When `DBXT_EVENT_TRACE` is set, mouse/resize events are appended here so a
     //   user can report exactly what their terminal sends. Keystrokes are never
     //   traced (a password field would leak).
     trace_path: Option<PathBuf>,
     last_event: Option<String>,
+    //   `DBXT_MOUSE_DEBUG`: same log plus a live on-screen event readout, so a
+    //   phone user can see what a swipe is encoded as without leaving the TUI.
+    mouse_debug: bool,
+    mouse_log: VecDeque<String>,
 
     // successive query results, switchable with `[` / `]`
     result_tabs: Vec<ResultTab>,
@@ -1110,6 +1273,11 @@ struct App {
     grid_gutter: u16,
     grid_frozen: usize,
     grid_widths: Vec<usize>,
+    /// width available to the scrollable column window, captured while rendering.
+    /// `pan_columns` recomputes the visible-column count from it so the cell
+    /// cursor lands inside the window the renderer will actually draw (a stale
+    /// count would let `window_for_cursor` undo the pan).
+    grid_avail: usize,
 
     confirm: Option<Confirm>,
 
@@ -1214,6 +1382,18 @@ impl App {
 
 // ─── main ────────────────────────────────────────────────────────────────────
 
+/// `VAR=1` (or `true`) → the default path under the temp dir, `VAR=<path>` → that
+/// path, unset/empty → `None`.
+fn env_log_path(var: &str, default_name: &str) -> Option<PathBuf> {
+    let v = std::env::var_os(var).filter(|v| !v.is_empty())?;
+    let s = v.to_string_lossy().to_string();
+    if s == "1" || s.eq_ignore_ascii_case("true") {
+        Some(std::env::temp_dir().join(default_name))
+    } else {
+        Some(PathBuf::from(s))
+    }
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     let db_path: PathBuf = match std::env::args().nth(1) {
@@ -1233,7 +1413,10 @@ async fn main() -> Result<()> {
 
     let terminal = ratatui::init();
     // ratatui 0.29's init() does not enable mouse capture; do it explicitly so the
-    // touch (Down) / wheel (Scroll) layer receives events.
+    // touch (Down) / wheel (Scroll) layer receives events. crossterm's command
+    // enables normal (1000), button-event (1002) and any-event (1003) tracking plus
+    // SGR encoding (1006), so press, release, `Drag` and bare `Moved` all reach us —
+    // the drag path a phone's horizontal swipe needs is therefore live.
     let _ = execute!(std::io::stdout(), EnableMouseCapture);
     let res = run_app(terminal, backend).await;
     let _ = execute!(std::io::stdout(), DisableMouseCapture);
@@ -1249,16 +1432,12 @@ async fn run_app(mut terminal: ratatui::DefaultTerminal, backend: Arc<LocalBacke
 
     // `DBXT_EVENT_TRACE=<path>` (or `=1` for the default path) records mouse and
     // resize events so a user can tell us exactly what their phone terminal sends.
-    let trace_path = std::env::var_os("DBXT_EVENT_TRACE")
-        .filter(|v| !v.is_empty())
-        .map(|v| {
-            let s = v.to_string_lossy().to_string();
-            if s == "1" {
-                PathBuf::from("/tmp/dbxt-events.log")
-            } else {
-                PathBuf::from(s)
-            }
-        });
+    // `DBXT_MOUSE_DEBUG=1` does the same, defaults the log to the temp dir, and adds
+    // a live on-screen readout.
+    let mouse_debug = std::env::var_os("DBXT_MOUSE_DEBUG").is_some_and(|v| !v.is_empty());
+    let trace_path = env_log_path("DBXT_EVENT_TRACE", "dbxt-events.log").or_else(|| {
+        mouse_debug.then(|| env_log_path("DBXT_MOUSE_DEBUG", "dbxt-mouse.log")).flatten()
+    });
 
     let mut app = App {
         backend: backend.clone(),
@@ -1302,6 +1481,11 @@ async fn run_app(mut terminal: ratatui::DefaultTerminal, backend: Arc<LocalBacke
         help_open: false,
         help_scroll: 0,
         pan_mode: false,
+        drag_pan: DragPan::from_env(),
+        gesture: PanGesture::default(),
+        pending_tap: None,
+        mouse_debug,
+        mouse_log: VecDeque::new(),
         trace_path,
         last_event: None,
         result_tabs: Vec::new(),
@@ -1322,6 +1506,7 @@ async fn run_app(mut terminal: ratatui::DefaultTerminal, backend: Arc<LocalBacke
         grid_gutter: 0,
         grid_frozen: 0,
         grid_widths: Vec::new(),
+        grid_avail: 0,
         confirm: None,
         loading: false,
         spinner: 0,
@@ -1753,7 +1938,9 @@ fn columns_grid(cols: &[ColumnInfo]) -> Grid {
 fn handle_event(app: &mut App, tx: &Tx, ev: Event) {
     trace_event(app, &ev);
     match ev {
-        Event::Key(k) if k.kind == KeyEventKind::Press => key(app, tx, k),
+        Event::Key(k) if matches!(k.kind, KeyEventKind::Press | KeyEventKind::Repeat) => {
+            key(app, tx, k)
+        }
         Event::Paste(s) => match app.focus {
             Focus::Editor => {
                 app.editor.insert_str(s);
@@ -1957,6 +2144,18 @@ fn browse_key(app: &mut App, tx: &Tx, k: KeyEvent) {
             }
             _ => {}
         }
+    }
+
+    // Shift-← / Shift-→ pan the column window from any pane — the keyboard twin of
+    // a horizontal swipe, for terminals that report neither a horizontal wheel nor
+    // a drag. Holding the key repeats (the terminal auto-repeats), so a long press
+    // scrolls continuously. The text inputs keep Shift-←/→ for selection.
+    if k.modifiers.contains(KeyModifiers::SHIFT)
+        && matches!(k.code, KeyCode::Left | KeyCode::Right)
+        && !matches!(app.focus, Focus::Editor | Focus::CmdInput)
+    {
+        pan_columns(app, if k.code == KeyCode::Left { -1 } else { 1 });
+        return;
     }
 
     // Tab / Shift-Tab cycle panes; B toggles the focused pane's collapse state.
@@ -2797,8 +2996,26 @@ fn scroll(app: &mut App, tx: &Tx, delta: i32) {
 
 fn mouse(app: &mut App, tx: &Tx, m: MouseEvent) {
     let r = app.rects;
+    // Forensics first: every event the terminal actually delivered is recorded,
+    // including the ones an overlay swallows, so `DBXT_MOUSE_DEBUG` shows the
+    // truth rather than what we happened to act on.
+    if app.mouse_debug {
+        let desc = describe_mouse(&m);
+        app.mouse_log.push_back(desc);
+        while app.mouse_log.len() > MOUSE_DEBUG_LINES {
+            app.mouse_log.pop_front();
+        }
+    }
     // Overlays own the wheel while they are open; scrolling the grid underneath a
     // modal would be invisible and confusing.
+    let overlay_open = app.confirm.is_some()
+        || app.edit_dialog.is_some()
+        || app.cell_popup.is_some()
+        || app.row_popup.is_some()
+        || app.filter_prompt.is_some()
+        || app.db_picker_open
+        || app.snippet_open
+        || app.help_open;
     match m.kind {
         MouseEventKind::ScrollUp | MouseEventKind::ScrollDown => {
             let up = m.kind == MouseEventKind::ScrollUp;
@@ -2826,29 +3043,46 @@ fn mouse(app: &mut App, tx: &Tx, m: MouseEvent) {
                 };
                 return;
             }
-            if app.confirm.is_some()
-                || app.edit_dialog.is_some()
-                || app.filter_prompt.is_some()
-                || app.db_picker_open
-                || app.snippet_open
-            {
+            if overlay_open {
                 return;
             }
         }
-        MouseEventKind::ScrollLeft | MouseEventKind::ScrollRight
-            if app.confirm.is_some()
-                || app.edit_dialog.is_some()
-                || app.cell_popup.is_some()
-                || app.row_popup.is_some()
-                || app.filter_prompt.is_some()
-                || app.db_picker_open
-                || app.snippet_open
-                || app.help_open =>
-        {
-            return;
-        }
+        MouseEventKind::ScrollLeft | MouseEventKind::ScrollRight if overlay_open => return,
         _ => {}
     }
+
+    // ── swipe layer: a held button moving horizontally pans the columns ──
+    //
+    // A phone terminal that never emits a horizontal wheel encodes a left/right
+    // swipe as `Drag(Left)` (button-event tracking) or `Moved` (any-event
+    // tracking) — a gesture the wheel-only code could not see at all. Panning
+    // ignores focus, exactly like the horizontal wheel.
+    if !overlay_open {
+        // A tap is only confirmed on its `Up`, so the press that starts a swipe
+        // does not also select a row / jump the scrollbar. A gesture that turned
+        // into a swipe drops the pending tap instead.
+        if let MouseEventKind::Up(MouseButton::Left) = m.kind {
+            let swipe = app.gesture.is_swipe();
+            let _ = app.gesture.feed(m.kind, m.column, m.row, app.drag_pan);
+            let tap = app.pending_tap.take();
+            if let Some((cx, cy)) = tap {
+                if !swipe {
+                    result_click(app, cx, cy);
+                }
+            }
+            return;
+        }
+        if let Some(steps) = app.gesture.feed(m.kind, m.column, m.row, app.drag_pan) {
+            if steps != 0 {
+                pan_columns(app, steps);
+            }
+            if app.gesture.is_swipe() {
+                app.pending_tap = None;
+            }
+            return;
+        }
+    }
+
     match m.kind {
         MouseEventKind::Down(MouseButton::Left) => {
             if app.confirm.is_some() || app.edit_dialog.is_some() || app.snippet_open {
@@ -2904,7 +3138,15 @@ fn mouse(app: &mut App, tx: &Tx, m: MouseEvent) {
                     return;
                 }
                 app.focus = Focus::Preview;
-                result_click(app, m.column, m.row);
+                // A touch swipe starts with the same press as a tap, so defer the
+                // click to the matching `Up` and drop it when the gesture becomes a
+                // swipe. Terminals that never send `Up` keep press-to-click
+                // (`can_defer_tap`), so tapping can never regress.
+                if app.gesture.can_defer_tap() {
+                    app.pending_tap = Some((m.column, m.row));
+                } else {
+                    result_click(app, m.column, m.row);
+                }
                 return;
             }
             if rect_contains(r.sidebar, m.column, m.row) {
@@ -2921,14 +3163,14 @@ fn mouse(app: &mut App, tx: &Tx, m: MouseEvent) {
         }
         MouseEventKind::ScrollUp => {
             if wheel_pans_columns(app, &m) {
-                move_col_cursor(app, -1);
+                pan_columns(app, -1);
             } else {
                 scroll(app, tx, -1);
             }
         }
         MouseEventKind::ScrollDown => {
             if wheel_pans_columns(app, &m) {
-                move_col_cursor(app, 1);
+                pan_columns(app, 1);
             } else {
                 scroll(app, tx, 1);
             }
@@ -4405,17 +4647,83 @@ fn has_h_scroll(app: &App) -> bool {
     if app.grid_kind == GridKind::Columns {
         return false;
     }
-    let n = active_grid(app).map(|g| g.columns.len()).unwrap_or(0);
-    n > app.grid_frozen + app.vis_cols.max(1)
+    let Some(grid) = active_grid(app) else {
+        return false;
+    };
+    let n = grid.columns.len();
+    if n == 0 {
+        return false;
+    }
+    n > app.grid_frozen + visible_now(app, &grid, app.col_offset)
 }
 
-/// Move the column window by `delta` columns. Returns true when a grid with a
-/// horizontal overflow handled it (so the caller can suppress row scrolling).
+/// How many columns fit starting at `off`, using the geometry the last render
+/// captured. Exact rather than remembered, so a pan can place the cell cursor
+/// where the renderer will actually keep the window.
+fn visible_now(app: &App, grid: &Grid, off: usize) -> usize {
+    visible_cols(
+        grid,
+        off,
+        app.grid_avail.max(MIN_CELL_WIDTH),
+        max_cell_width(app.layout_mode),
+    )
+    .max(1)
+}
+
+/// Pure core of `pan_columns`: move the window by `delta` columns and place the
+/// cell cursor inside it. `vis` is the number of columns that fit at the new
+/// origin, so the result is exactly what `window_for_cursor` will keep.
+fn pan_window(
+    n: usize,
+    frozen: usize,
+    off: usize,
+    cursor: usize,
+    vis: usize,
+    delta: i32,
+) -> (usize, usize) {
+    if n == 0 {
+        return (off, cursor);
+    }
+    let min_off = frozen.min(n - 1);
+    let next = (off as i32 + delta).clamp(min_off as i32, n as i32 - 1) as usize;
+    let cursor = if cursor >= frozen {
+        let hi = (next + vis.max(1) - 1).min(n - 1);
+        cursor.clamp(next, hi)
+    } else {
+        cursor
+    };
+    (next, cursor)
+}
+
+/// Pan the visible column *window* by `delta` columns and pull the cell cursor
+/// along so it never leaves the screen.
+///
+/// The window itself moves: a wheel notch, a swipe step or a `◀`/`▶` tap has to
+/// change what is on screen immediately. (Moving only the cursor, as the first
+/// implementation did, made a horizontal swipe look dead until the cursor had
+/// walked past the right edge of the window.)
+/// Returns true when a grid with a horizontal overflow handled it.
 fn pan_columns(app: &mut App, delta: i32) -> bool {
     if !has_h_scroll(app) {
         return false;
     }
-    move_col_cursor(app, delta);
+    let Some(grid) = active_grid(app) else {
+        return false;
+    };
+    let n = grid.columns.len();
+    let min_off = app.grid_frozen.min(n - 1);
+    let target = (app.col_offset as i32 + delta).clamp(min_off as i32, n as i32 - 1) as usize;
+    let vis = visible_now(app, &grid, target);
+    let (off, cursor) = pan_window(
+        n,
+        app.grid_frozen,
+        app.col_offset,
+        app.col_cursor,
+        vis,
+        delta,
+    );
+    app.col_offset = off;
+    app.col_cursor = cursor;
     true
 }
 
@@ -4430,8 +4738,84 @@ fn wheel_pans_columns(app: &App, m: &MouseEvent) -> bool {
     wants_pan && has_h_scroll(app)
 }
 
+/// How many recent mouse events the `DBXT_MOUSE_DEBUG` overlay keeps.
+const MOUSE_DEBUG_LINES: usize = 6;
+
+/// The exact wire encoding that would produce this event, so a user can report
+/// (or replay) the bytes their terminal sends. crossterm parses both the modern
+/// SGR encoding and the legacy X10 one, so both are printed.
+fn mouse_wire_hint(m: &MouseEvent) -> String {
+    let base = match m.kind {
+        MouseEventKind::Down(MouseButton::Left) => 0,
+        MouseEventKind::Down(MouseButton::Middle) => 1,
+        MouseEventKind::Down(MouseButton::Right) => 2,
+        MouseEventKind::Up(_) => 3,
+        MouseEventKind::Drag(MouseButton::Left) => 32,
+        MouseEventKind::Drag(MouseButton::Middle) => 33,
+        MouseEventKind::Drag(MouseButton::Right) => 34,
+        MouseEventKind::Moved => 35,
+        MouseEventKind::ScrollUp => 64,
+        MouseEventKind::ScrollDown => 65,
+        MouseEventKind::ScrollLeft => 66,
+        MouseEventKind::ScrollRight => 67,
+    };
+    let mut cb = base;
+    if m.modifiers.contains(KeyModifiers::SHIFT) {
+        cb += 4;
+    }
+    if m.modifiers.contains(KeyModifiers::ALT) {
+        cb += 8;
+    }
+    if m.modifiers.contains(KeyModifiers::CONTROL) {
+        cb += 16;
+    }
+    let x = m.column as u32 + 1;
+    let y = m.row as u32 + 1;
+    let end = if matches!(m.kind, MouseEventKind::Up(_)) {
+        'm'
+    } else {
+        'M'
+    };
+    let mut out = format!("SGR \\x1b[<{cb};{x};{y}{end}");
+    // Legacy X10 encoding: three bytes after `ESC [ M`, each offset by 32.
+    if x <= 223 && y <= 223 && cb + 32 <= 255 {
+        out.push_str(&format!(
+            " | X10 \\x1b[M {}+32 {}+32 {}+32",
+            cb, m.column, m.row
+        ));
+    }
+    out
+}
+
+/// One line describing a mouse event, with the encoding it arrived in.
+fn describe_mouse(m: &MouseEvent) -> String {
+    let mods = if m.modifiers.is_empty() {
+        String::new()
+    } else {
+        format!(" mods={:?}", m.modifiers)
+    };
+    format!(
+        "{:?} @({},{}){} · {}",
+        m.kind,
+        m.column,
+        m.row,
+        mods,
+        mouse_wire_hint(m)
+    )
+}
+
 /// Human-readable description of the mouse/resize events we trace.
 fn describe_event(ev: &Event) -> Option<String> {
+    match ev {
+        Event::Mouse(m) => Some(format!("Mouse {}", describe_mouse(m))),
+        Event::Resize(w, h) => Some(format!("Resize {w}x{h}")),
+        _ => None,
+    }
+}
+
+/// Short one-line form used by the status bar, so a long wire encoding never
+/// crowds out the page / row / column readout next to it.
+fn describe_event_short(ev: &Event) -> Option<String> {
     match ev {
         Event::Mouse(m) => {
             let mods = if m.modifiers.is_empty() {
@@ -4462,7 +4846,7 @@ fn trace_event(app: &mut App, ev: &Event) {
             let _ = writeln!(f, "{desc}");
         }
     }
-    app.last_event = Some(desc);
+    app.last_event = describe_event_short(ev);
 }
 
 /// Short tab label for a query: its first non-empty line.
@@ -4800,6 +5184,43 @@ fn ui(f: &mut Frame, app: &mut App) {
     if app.help_open {
         render_help(f, f.area(), app);
     }
+    if app.mouse_debug {
+        render_mouse_debug(f, f.area(), app);
+    }
+}
+
+/// Live mouse-event readout for `DBXT_MOUSE_DEBUG`: a small floating panel drawn
+/// last, over the normal UI, so a phone user can swipe and read what their
+/// terminal encoded it as without the layout changing underneath.
+fn render_mouse_debug(f: &mut Frame, area: Rect, app: &App) {
+    if app.mouse_log.is_empty() || area.width < 30 || area.height < 8 {
+        return;
+    }
+    let w = area.width.saturating_sub(4).min(78);
+    let inner_w = w.saturating_sub(2) as usize;
+    let lines: Vec<Line> = app
+        .mouse_log
+        .iter()
+        .map(|l| Line::from(truncate_disp(l, inner_w)))
+        .collect();
+    let h = (lines.len() as u16 + 2).min(area.height.saturating_sub(2));
+    let rect = Rect {
+        x: area.x + area.width.saturating_sub(w) - 2,
+        y: area.y + 1,
+        width: w,
+        height: h,
+    };
+    let title = format!(" 鼠标事件 DBXT_MOUSE_DEBUG · 横滑={:?} ", app.drag_pan);
+    f.render_widget(Clear, rect);
+    f.render_widget(
+        Paragraph::new(lines).block(
+            Block::default()
+                .borders(Borders::ALL)
+                .border_style(Style::default().fg(Color::Magenta))
+                .title(Span::styled(title, Style::default().fg(Color::Magenta))),
+        ),
+        rect,
+    );
 }
 
 fn fit_status(msg: &str, width: usize) -> String {
@@ -4889,12 +5310,15 @@ fn context_info(app: &App) -> String {
         parts.push(format!("结果 {}/{}", app.result_tab + 1, app.result_tabs.len()));
     }
     // Live event readout while `DBXT_EVENT_TRACE` is set, so a user can report
-    // exactly which events their terminal sends for a swipe.
-    if app.trace_path.is_some() {
-        if let Some(ev) = &app.last_event {
-            parts.push(format!("事件 {ev}"));
-        }
-    }
+    // exactly which events their terminal sends for a swipe. Pushed last so the
+    // page / row / column readout survives the status-bar truncation (the event
+    // text is the first thing that can go); with the `DBXT_MOUSE_DEBUG` panel on
+    // screen the status bar keeps its width instead.
+    let event_part = if app.trace_path.is_some() && !app.mouse_debug {
+        app.last_event.as_ref().map(|ev| format!("事件 {ev}"))
+    } else {
+        None
+    };
     if let Some(ps) = &app.page_state {
         let pages = ps
             .total
@@ -4932,12 +5356,23 @@ fn context_info(app: &App) -> String {
     if !app.batch.is_empty() {
         parts.push(format!("批量 {} 待提交", app.batch.len()));
     }
+    if let Some(ev) = event_part {
+        parts.push(ev);
+    }
     parts.join(" · ")
 }
 
 fn render_status(f: &mut Frame, area: Rect, app: &App) {
     let right = context_info(app);
-    let right_w = (disp_width(&right) as u16 + 2).min(area.width / 2);
+    // While events are being traced the context block carries one extra field
+    // (the last mouse/resize event), so let it use more of the line — otherwise
+    // the row/column readout next to it would be the first thing cut off.
+    let cap = if app.trace_path.is_some() && !app.mouse_debug {
+        area.width.saturating_sub(24).max(area.width / 2)
+    } else {
+        area.width / 2
+    };
+    let right_w = (disp_width(&right) as u16 + 2).min(cap);
     let chunks = Layout::horizontal([Constraint::Min(10), Constraint::Length(right_w)]).split(area);
     let style = if app.status.starts_with('✗') {
         Style::default().fg(Color::Red)
@@ -5368,6 +5803,7 @@ fn render_grid(f: &mut Frame, area: Rect, app: &mut App, grid: &Grid, kind: Grid
         };
     const GAP: usize = 1;
     let avail = inner_w.saturating_sub(left_w + GAP).max(MIN_CELL_WIDTH);
+    app.grid_avail = avail;
     let (off, visible) = window_for_cursor(
         grid,
         app.col_cursor,
@@ -6679,9 +7115,11 @@ const HELP_ROWS: &[(&str, &str)] = &[
     ("Ctrl-A", "自动折叠 开 / 关（开=非焦点栏收起）"),
     ("Ctrl-W", "收起 / 展开当前焦点区域"),
     ("Ctrl-G", "横滚模式（触屏兜底：滚轮/上下滑 = 横滚列）"),
+    ("Shift+← →", "列窗口横滚一列（任意区域，按住连滚）"),
     ("Ctrl-O", "SQL 片段收藏（DBX saved_sql_files）"),
     ("Ctrl-P", "EXPLAIN 当前 SQL（SQL 后端）"),
     ("?", "本帮助"),
+    ("DBXT_MOUSE_DEBUG=1", "启动时显示鼠标事件浮层（滑动无效时排查终端编码）"),
     ("— 侧栏 —", ""),
     ("↑ ↓", "移动表列表"),
     ("Enter", "浏览表数据"),
@@ -6697,7 +7135,8 @@ const HELP_ROWS: &[(&str, &str)] = &[
     ("n / p", "下一页 / 上一页"),
     ("Ctrl-F / Ctrl-B", "下一页 / 上一页"),
     ("← → / h l", "单元格光标（列窗口跟随）"),
-    ("Shift/Alt+滚轮 · 横滚", "横向滚动列（触屏左右滑动）"),
+    ("Shift/Alt+滚轮 · 横滑", "横向滚动列（触屏左右滑动 / 拖动）"),
+    ("Shift+← →", "横滚列一列（任意区域，按住连滚）"),
     ("Ctrl-G", "横滚模式：纵向滚轮/上下滑改为横滚列"),
     ("◀ ▶（底部）", "点击向左/右翻一屏列（触屏可用）"),
     ("底部进度条", "当前列窗口位置 · 点击可跳转"),
@@ -6995,6 +7434,233 @@ mod tests {
         assert!(has_keyword("delete from t where x=1", "where"));
         assert!(!has_keyword("select * from somewhere", "where"));
         assert!(!has_keyword("update t set a='nowhere'", "where"));
+    }
+
+    // ── swipe / drag → column pan ──
+
+    fn mouse(kind: MouseEventKind, column: u16, row: u16) -> MouseEvent {
+        MouseEvent {
+            kind,
+            column,
+            row,
+            modifiers: KeyModifiers::NONE,
+        }
+    }
+
+    #[test]
+    fn pan_steps_carries_the_remainder_and_caps_a_jump() {
+        let mut a = 0;
+        // half a step is kept, not rounded away
+        assert_eq!(pan_steps(&mut a, 1), 0);
+        assert_eq!(pan_steps(&mut a, 1), 1);
+        assert_eq!(a, 0);
+        assert_eq!(pan_steps(&mut a, -1), 0);
+        assert_eq!(pan_steps(&mut a, -1), -1);
+        // a coalesced jump (one event carrying the whole swipe) is capped
+        let mut b = 0;
+        assert_eq!(pan_steps(&mut b, 100), DRAG_MAX_STEPS);
+        assert_eq!(b, 0);
+        assert_eq!(pan_steps(&mut b, -100), -DRAG_MAX_STEPS);
+    }
+
+    #[test]
+    fn drag_left_pans_and_becomes_a_swipe() {
+        let mut g = PanGesture::default();
+        // the press itself is still handled as a potential tap
+        assert_eq!(
+            g.feed(MouseEventKind::Down(MouseButton::Left), 10, 5, DragPan::Button),
+            None
+        );
+        assert!(!g.is_swipe());
+        // one column of travel: not enough for a step, and not yet a swipe
+        assert_eq!(
+            g.feed(MouseEventKind::Drag(MouseButton::Left), 11, 5, DragPan::Button),
+            Some(0)
+        );
+        assert!(!g.is_swipe());
+        assert_eq!(
+            g.feed(MouseEventKind::Drag(MouseButton::Left), 13, 5, DragPan::Button),
+            Some(1)
+        );
+        assert!(g.is_swipe(), "2 columns of travel is a swipe, not a tap");
+        assert_eq!(
+            g.feed(MouseEventKind::Drag(MouseButton::Left), 15, 5, DragPan::Button),
+            Some(1)
+        );
+        // releasing swallows nothing else and re-arms the tap logic
+        assert_eq!(
+            g.feed(MouseEventKind::Up(MouseButton::Left), 15, 5, DragPan::Button),
+            None
+        );
+        assert!(!g.is_swipe());
+    }
+
+    #[test]
+    fn a_drag_leftward_pans_the_other_way() {
+        let mut g = PanGesture::default();
+        g.feed(MouseEventKind::Down(MouseButton::Left), 20, 5, DragPan::Button);
+        assert_eq!(
+            g.feed(MouseEventKind::Drag(MouseButton::Left), 16, 5, DragPan::Button),
+            Some(-2)
+        );
+    }
+
+    #[test]
+    fn vertical_travel_is_neither_a_pan_nor_a_tap() {
+        let mut g = PanGesture::default();
+        g.feed(MouseEventKind::Down(MouseButton::Left), 10, 5, DragPan::Button);
+        assert_eq!(
+            g.feed(MouseEventKind::Drag(MouseButton::Left), 10, 9, DragPan::Button),
+            Some(0)
+        );
+        assert!(g.is_swipe(), "a vertical drag must not fire the deferred tap");
+    }
+
+    #[test]
+    fn bare_motion_is_a_swipe_only_when_opted_in() {
+        // A desktop mouse sends `Moved` all the time, so it must be inert by
+        // default (otherwise moving the mouse would scroll the table).
+        let mut g = PanGesture::default();
+        assert_eq!(g.feed(MouseEventKind::Moved, 10, 5, DragPan::Button), None);
+        assert_eq!(g.feed(MouseEventKind::Moved, 14, 5, DragPan::Button), None);
+        assert!(!g.is_swipe());
+        // ... unless the user asked for it (touch terminals that never send a press)
+        let mut h = PanGesture::default();
+        assert_eq!(h.feed(MouseEventKind::Moved, 10, 5, DragPan::Any), None);
+        assert_eq!(h.feed(MouseEventKind::Moved, 12, 5, DragPan::Any), Some(1));
+        // but a held left button also qualifies in the default mode
+        let mut i = PanGesture::default();
+        i.feed(MouseEventKind::Down(MouseButton::Left), 10, 5, DragPan::Button);
+        assert_eq!(i.feed(MouseEventKind::Moved, 12, 5, DragPan::Button), Some(1));
+    }
+
+    #[test]
+    fn other_buttons_and_off_mode_pass_through() {
+        let mut g = PanGesture::default();
+        assert_eq!(
+            g.feed(MouseEventKind::Drag(MouseButton::Left), 10, 5, DragPan::Off),
+            None
+        );
+        assert_eq!(
+            g.feed(MouseEventKind::Moved, 14, 5, DragPan::Off),
+            None
+        );
+        // a right-button drag (text selection on a desktop) is not a swipe
+        let mut h = PanGesture::default();
+        assert_eq!(
+            h.feed(MouseEventKind::Down(MouseButton::Right), 10, 5, DragPan::Button),
+            None
+        );
+        assert_eq!(
+            h.feed(MouseEventKind::Drag(MouseButton::Right), 14, 5, DragPan::Button),
+            None
+        );
+        assert_eq!(
+            h.feed(MouseEventKind::Drag(MouseButton::Left), 18, 5, DragPan::Button),
+            None
+        );
+    }
+
+    #[test]
+    fn a_drag_without_a_press_still_starts_a_gesture() {
+        // Some terminals (and tmux forwarding) report the drag but drop the press.
+        // The first event only establishes the reference position, so it is not
+        // swallowed (it cannot be turned into travel yet) ...
+        let mut g = PanGesture::default();
+        assert_eq!(
+            g.feed(MouseEventKind::Drag(MouseButton::Left), 10, 5, DragPan::Button),
+            None
+        );
+        // ... and every later drag pans from it.
+        assert_eq!(
+            g.feed(MouseEventKind::Drag(MouseButton::Left), 14, 5, DragPan::Button),
+            Some(2)
+        );
+    }
+
+    #[test]
+    fn taps_are_deferred_only_once_a_release_was_seen() {
+        let mut g = PanGesture::default();
+        assert!(!g.can_defer_tap(), "press-to-click until an Up is proven");
+        g.feed(MouseEventKind::Up(MouseButton::Left), 10, 5, DragPan::Button);
+        assert!(g.can_defer_tap());
+    }
+
+    #[test]
+    fn drag_pan_mode_parses_its_env_values() {
+        assert_eq!(DragPan::parse(""), DragPan::Button);
+        assert_eq!(DragPan::parse("1"), DragPan::Button);
+        assert_eq!(DragPan::parse(" Button "), DragPan::Button);
+        assert_eq!(DragPan::parse("OFF"), DragPan::Off);
+        assert_eq!(DragPan::parse("none"), DragPan::Off);
+        assert_eq!(DragPan::parse("any"), DragPan::Any);
+        assert_eq!(DragPan::parse("Moved"), DragPan::Any);
+    }
+
+    #[test]
+    fn pan_window_moves_the_window_and_keeps_the_cursor_inside() {
+        // window 4..6 (2 columns wide), cursor parked on the right edge
+        let (off, cursor) = pan_window(10, 0, 4, 5, 2, 1);
+        assert_eq!((off, cursor), (5, 5));
+        // panning left past the cursor pulls it back to the new window's right edge
+        let (off, cursor) = pan_window(10, 0, 5, 5, 2, -3);
+        assert_eq!((off, cursor), (2, 3));
+        // the window never scrolls into the pinned prefix
+        let (off, _) = pan_window(10, 1, 1, 1, 2, -5);
+        assert_eq!(off, 1);
+        // a cursor inside the pinned prefix stays there
+        let (off, cursor) = pan_window(10, 1, 1, 0, 2, 3);
+        assert_eq!((off, cursor), (4, 0));
+        // the right edge stops at the last column
+        let (off, cursor) = pan_window(10, 0, 7, 8, 2, 9);
+        assert_eq!((off, cursor), (9, 9));
+        // an empty grid is a no-op
+        assert_eq!(pan_window(0, 0, 0, 0, 2, 1), (0, 0));
+    }
+
+    /// The bug that made a swipe look dead: the cursor was clamped with a stale
+    /// visible-column count, so `window_for_cursor` on the next render pulled the
+    /// window straight back to where it started.
+    #[test]
+    fn pan_places_the_cursor_where_window_for_cursor_keeps_the_window() {
+        let grid = ten_col_grid();
+        let (avail, max_cell, frozen) = (21, 44, 1);
+        // walk the window right one column at a time with the cursor parked on the
+        // right edge (exactly what a swipe leaves behind)
+        let mut off = 1;
+        let mut cursor = 1;
+        for _ in 0..8 {
+            let target = (off + 1).min(grid.columns.len() - 1);
+            let vis = visible_cols(&grid, target, avail, max_cell).max(1);
+            let (next_off, next_cursor) = pan_window(grid.columns.len(), frozen, off, cursor, vis, 1);
+            off = next_off;
+            cursor = next_cursor;
+            let vis = visible_cols(&grid, off, avail, max_cell).max(1);
+            assert_eq!(
+                window_for_cursor(&grid, cursor, off, avail, max_cell, frozen),
+                (off, vis),
+                "render must keep the window the pan chose (off={off}, cursor={cursor})"
+            );
+        }
+        assert_eq!(off, 9);
+    }
+
+    #[test]
+    fn wire_hint_shows_the_exact_encoding() {
+        let left = MouseEvent {
+            kind: MouseEventKind::ScrollLeft,
+            column: 11,
+            row: 4,
+            modifiers: KeyModifiers::SHIFT,
+        };
+        let hint = mouse_wire_hint(&left);
+        assert!(hint.contains("<70;12;5M"), "{hint}"); // 66 + 4 for shift
+        assert!(hint.contains("X10"), "{hint}");
+        let drag = mouse(MouseEventKind::Drag(MouseButton::Left), 0, 0);
+        assert!(mouse_wire_hint(&drag).contains("<32;1;1M"));
+        let up = mouse(MouseEventKind::Up(MouseButton::Left), 2, 3);
+        assert!(mouse_wire_hint(&up).contains("<3;3;4m"), "SGR release uses a lowercase m");
+        assert!(describe_mouse(&drag).contains("Drag(Left)"));
     }
 
     #[test]

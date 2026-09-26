@@ -19,7 +19,7 @@ Early but usable. Verified end-to-end against real MySQL 8.4, Redis and MongoDB 
 - ✅ **Filter / sort**: `f` opens a `WHERE` prompt pre-filled with the focused column (`"col" = `) and reloads from page 1 with that predicate; the syntax quick-reference (`= != > < >= <= LIKE IN BETWEEN IS NULL AND/OR`, plus the MySQL/PG quoting differences) is shown inside the prompt. The active filter is shown in the title and status bar **and** as a `⚑` badge on the filtered column header. `Ctrl-R` clears it. `s` sorts by the focused column (ascending ↔ descending) and `Ctrl-K` appends an extra sort key; sorted headers show `▲`/`▼` (with a rank for multi-column sorts). Filter and sort both survive page turns
 - ✅ **Horizontal scroll progress bar**: a **half-height** track + thumb is drawn along the bottom border of the result grid, showing which slice of the columns is on screen next to a `列 1|3-8/21` label; it hides automatically when every column fits, and clicking the track jumps the column window there. A matching half-width vertical position indicator is drawn on the right border
 - ✅ **Table structure**: `r` shows the field list (type / key / nullable / default / comment); `t` toggles the `SHOW CREATE TABLE` DDL (dialect-aware, built by the DBX kernel)
-- ✅ **Wide tables / horizontal scrolling**: `←`/`→` (or `h`/`l`) move a cell-level cursor and the column window follows it; `Shift`+wheel and the horizontal wheel (a touch left/right swipe) scroll columns directly, the first data column can be pinned with `z` (the row-number gutter is always pinned); the current column is highlighted in the header and the focused cell is highlighted in the body; `Enter` opens the full, untruncated cell value in a popup. The status bar always shows `列 1|3-8/21`-style horizontal position, and the bottom progress bar makes it obvious at a glance. The same cell cursor and column scrolling work inside a drilled-down script result
+- ✅ **Wide tables / horizontal scrolling**: `←`/`→` (or `h`/`l`) move a cell-level cursor and the column window follows it; `Shift`+wheel, the horizontal wheel, a left/right **swipe** (a touch drag) and `Shift`+`←`/`→` pan the window directly, the first data column can be pinned with `z` (the row-number gutter is always pinned); the current column is highlighted in the header and the focused cell is highlighted in the body; `Enter` opens the full, untruncated cell value in a popup. The status bar always shows `列 1|3-8/21`-style horizontal position, and the bottom progress bar makes it obvious at a glance. The same cell cursor and column scrolling work inside a drilled-down script result
 - ✅ **Result grid**: the header stays in sync with column scrolling, `NULL` (italic) and the empty string (`''`) render differently, and execution time / affected rows are shown
 - ✅ **Database switching**: `d` opens a database list (`↑`/`↓` + `Enter` to switch, `Esc` to close, `r` to reload the list in place) — the same gesture works for MySQL/PostgreSQL databases, MongoDB databases and Redis logical DBs. The current database is shown permanently in the sidebar (click it to open the list); `←`/`→` in the sidebar stay as a quick cycle, and `[`/`]` stay as a Redis shortcut. The current table selection is kept across a switch when the new database has a table with the same name
 - ✅ **DML**: `INSERT`/`UPDATE`/`DELETE` report affected rows; every generated write (`e` / `i` / `Delete`) and the transactional batch go through a confirmation layer that shows the full SQL, and `DROP`/`TRUNCATE` and `WHERE`-less `UPDATE`/`DELETE` additionally pop the red dangerous-statement confirmation before running
@@ -104,6 +104,15 @@ dbxt /path/to/dir-containing-dbx.db
 DBX_DATA_DIR=/path/to/dir dbxt
 ```
 
+### Environment variables
+
+| Variable | Effect |
+| --- | --- |
+| `DBX_DATA_DIR` | directory holding the DBX store (`dbx.db`) |
+| `DBXT_EVENT_TRACE=<path>` (or `=1`) | append every mouse/resize event, with the exact sequence it arrived in, to that file, and echo the last one in the status bar |
+| `DBXT_MOUSE_DEBUG=1` (or `=<path>`) | the same log (`$TMPDIR/dbxt-mouse.log` by default) plus a live floating event panel — how to report what a phone swipe actually sends |
+| `DBXT_DRAG_PAN=button\|any\|off` | how a swipe is recognised: a held-button drag (default), also bare motion, or nothing |
+
 ### Keys
 
 | Context | Keys | Action |
@@ -126,6 +135,7 @@ DBX_DATA_DIR=/path/to/dir dbxt
 | Anywhere | `Ctrl-A` | toggle auto-collapse (on = unfocused panes collapse, off = all expanded) |
 | Anywhere | `Ctrl-W` | collapse / expand the focused pane |
 | Anywhere | `Ctrl-G` | toggle pan mode — vertical wheel / up-down swipe pans columns (touch fallback) |
+| Anywhere | `Shift`+`←` / `Shift`+`→` | pan the column window one column (hold to repeat; the text inputs keep `Shift`+arrow for selection) |
 | Anywhere | `Ctrl-O` | saved SQL snippets (DBX's `saved_sql_files`), insert into the editor |
 | Anywhere | `Ctrl-P` | `EXPLAIN` the editor's SQL (SQL backends) |
 | Anywhere | `Ctrl-S` / `Ctrl-X` | commit / discard the queued transactional batch |
@@ -139,7 +149,7 @@ DBX_DATA_DIR=/path/to/dir dbxt
 | Results | `n` / `p` | next / previous data page, keeping the relative row |
 | Results | `Ctrl-F` / `Ctrl-B` | next / previous data page |
 | Results | `←` `→` `h` `l` | move the cell cursor (the column window follows) |
-| Results | `Shift`/`Alt`+wheel, horizontal wheel | pan columns |
+| Results | `Shift`/`Alt`+wheel, horizontal wheel, left/right swipe | pan columns |
 | Results | `Ctrl-G` | pan mode: the vertical wheel pans columns instead of rows |
 | Results | `◀` `▶` on the bottom bar | tap to pan one window of columns (touch-friendly) |
 | Results | `[` / `]` | previous / next result tab (successive queries) |
@@ -172,30 +182,43 @@ DBX_DATA_DIR=/path/to/dir dbxt
 
 ### Mouse / touch
 
-Touch taps in terminals are delivered as mouse-down events, so this works on touch devices (including Android Termux) and through tmux mouse passthrough:
+Touch taps in terminals are delivered as mouse-down events (confirmed on release when the terminal reports releases), so this works on touch devices (including Android Termux) and through tmux mouse passthrough:
 
 - Click a row to select; click the same row again to confirm (connect, browse data)
 - Click a cell to move the cell cursor there; click a statement row in a script to drill in
 - Click a table in the sidebar to select it, click again to browse its data; click the database row to open the database list
 - Click the bottom progress bar to jump the column window; click the `◀` / `▶` at either end to pan one window of columns; click a collapsed pane strip to expand and focus it
 - Click an area (editor, command input, results) to focus it
-- Wheel scrolls rows (and auto-flips the page at an edge); `Shift`+wheel and `Alt`+wheel scroll columns; the horizontal wheel — what a touch screen sends for a left/right swipe — scrolls columns directly too
+- Wheel scrolls rows (and auto-flips the page at an edge); `Shift`+wheel and `Alt`+wheel scroll columns; the horizontal wheel and a left/right **swipe** — whatever a touch screen sends for it — scroll columns directly too
 
-**Horizontal scrolling on a phone.** Touch terminals disagree about what a left/right swipe means. dbxt accepts every encoding it has seen, and gives you two fallbacks that need no horizontal wheel at all:
+**Horizontal scrolling on a phone.** Touch terminals disagree about what a left/right swipe means, so dbxt accepts every encoding it has seen and also offers fallbacks that need no horizontal wheel at all:
 
-- a horizontal wheel (`ScrollLeft` / `ScrollRight`) pans the columns **whatever pane has focus**, so a swipe works even after you tapped the sidebar or the editor;
+- a **horizontal wheel** (`ScrollLeft` / `ScrollRight`, SGR buttons 66/67) pans the columns **whatever pane has focus**, so a swipe works even after you tapped the sidebar or the editor;
+- a **drag** — a held left button that moves (`Drag(Left)`, SGR button 32) — is read as a swipe and pans by finger travel (two columns of travel per column panned, capped per event). This is what many phone terminals actually send for a left/right swipe, and before R10 it was invisible to dbxt. A mostly-vertical drag is left alone (rows keep moving through the wheel), and a swipe no longer also counts as a tap: inside the results pane the click is confirmed on release and dropped once the finger moves;
+- **bare motion** (`Moved`, SGR button 35) is ignored by default, because a desktop mouse emits it continuously; a terminal that reports a touch drag without a press can be served with `DBXT_DRAG_PAN=any`;
 - `Shift`+wheel and `Alt`+wheel pan the columns;
+- **`Shift`+`←` / `Shift`+`→` pan one column from any pane** — the keyboard fallback, and holding the key repeats, so it scrolls continuously (in the SQL editor / command line `Shift`+arrow stays a text selection);
 - `Ctrl-G` turns on **pan mode**, after which the plain vertical wheel (the one gesture every terminal reports) pans columns instead of rows — the state shows as `横滚 开` in the status bar;
-- the `◀` / `▶` buttons on the bottom bar pan a whole window per tap (taps are the one gesture that is always delivered), and the bar itself is clickable to jump;
-- `←` / `→` (or `h` / `l`) move the cell cursor and drag the column window with it.
+- the `◀` / `▶` buttons on the bottom bar pan a whole window per tap (taps are the one gesture that is always delivered), and the bar itself is clickable to jump.
 
-If a swipe still does nothing, run dbxt with `DBXT_EVENT_TRACE=/tmp/dbxt-events.log` (or `=1`): every **mouse and resize** event is appended to that file and the last one is echoed in the status bar, so you can see exactly what your terminal sends. Keystrokes are never traced, so a password typed into the connection form cannot leak into the log.
+Under tmux, keep `set -g mouse on` so the outer terminal reports the swipe and tmux forwards it to the pane.
+
+**When a swipe still does nothing.** Start dbxt with `DBXT_MOUSE_DEBUG=1`: a floating panel shows the last six mouse events together with the exact sequence each one arrived in (e.g. `Drag(Left) @(21,11) · SGR \x1b[<32;22;12M`), and the same lines are appended to `$TMPDIR/dbxt-mouse.log` (`DBXT_EVENT_TRACE=<path>` writes the log without the panel). Swipe on the phone and read the panel:
+
+| The panel shows | What it means |
+| --- | --- |
+| `ScrollLeft` / `ScrollRight` | the terminal sends a horizontal wheel — panning works directly |
+| `Drag(Left)` | the swipe is a held-button drag — dbxt pans it (default `DBXT_DRAG_PAN=button`) |
+| `Moved` | the terminal reports motion without a press — run dbxt with `DBXT_DRAG_PAN=any` |
+| nothing at all | the terminal never reports the swipe (or tmux has `mouse` off) — use `Shift`+`←`/`→`, `Ctrl-G` pan mode or the `◀`/`▶` buttons |
+
+Keystrokes are never traced, so a password typed into the connection form cannot leak into the log or the panel.
 
 ### Interaction notes
 
 **Continuous row browsing.** Table data is still fetched 50 rows at a time, but the page boundary is invisible to the keyboard: `↑`/`↓` (and the wheel) load the neighbouring page when the cursor runs off an edge, landing on the row you would have reached anyway. `n`/`p` and `Ctrl-F`/`Ctrl-B` turn a whole page while keeping the cursor on the same relative row, so paging never throws you back to the top. The status bar always shows `第 3/8 页 · 行 102/400`.
 
-**Wide tables.** Each grid has a cell cursor. `←`/`→` (or `h`/`l`) move it and the visible column window follows, with the header of the current column highlighted. `z` pins the first data column next to the always-pinned row-number gutter, so a primary key stays visible while you scroll to the right. `Enter` opens the focused cell in a popup, which is how over-wide values stay readable. The status bar always shows the horizontal position as `列 1|3-8/21` (pinned | scrolled). `Shift`+wheel and the horizontal wheel (which is what a touch screen sends for a left/right swipe) scroll the columns directly. The same cursor and scrolling work in a drilled-down script result.
+**Wide tables.** Each grid has a cell cursor. `←`/`→` (or `h`/`l`) move it and the visible column window follows, with the header of the current column highlighted. `z` pins the first data column next to the always-pinned row-number gutter, so a primary key stays visible while you scroll to the right. `Enter` opens the focused cell in a popup, which is how over-wide values stay readable. The status bar always shows the horizontal position as `列 1|3-8/21` (pinned | scrolled). `Shift`+wheel, the horizontal wheel and a left/right swipe (a drag) move the **window** itself, one column per notch, so the table responds immediately. The same cursor and scrolling work in a drilled-down script result.
 
 **Editing without surprises.** `e` opens a diff-style confirmation layer: it shows the column, the old value, the `WHERE` clause, the detected primary key and the **full generated `UPDATE`**, and lets you type the new value inline. `Enter` executes, `Esc` cancels, `Ctrl-V` moves the generated `UPDATE` into the SQL editor for hand-editing, and `Ctrl-T` queues it instead of running it. `i` shows the whole `INSERT` statement the same way, and `Delete` / `Ctrl-D` shows the bound `DELETE … WHERE …` in a red confirmation. The `WHERE` is built from the table's primary key; a keyless table matches every column instead and warns in the layer. A generated write that somehow lacks a bound `WHERE` (or uses `WHERE 1 = 1`) still trips the ordinary dangerous-statement confirmation. After a successful write the affected-row count is reported and the current page is reloaded in place; a failure echoes the server error verbatim.
 
