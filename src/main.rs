@@ -381,12 +381,189 @@ struct RowPopup {
 /// SQL prefix-completion popup in the editor (Ctrl-Space). Tab / Enter accept,
 /// Esc cancels; typing keeps refining the candidate list.
 #[derive(Clone)]
+struct CompletionItem {
+    text: String,
+    /// `T` table, `C` column, `K` keyword — shown in the popup.
+    kind: char,
+}
+
+#[derive(Clone)]
 struct Completion {
-    items: Vec<String>,
+    items: Vec<CompletionItem>,
     sel: usize,
-    /// The identifier fragment immediately before the cursor that is replaced
-    /// when a candidate is accepted.
-    prefix: String,
+    /// Characters immediately before the cursor that are replaced when a
+    /// candidate is accepted (the fragment after the last `.` when qualified).
+    replace: usize,
+}
+
+/// The context the cursor sits in, used to order / restrict candidates.
+#[derive(Clone, PartialEq, Debug)]
+enum CompCtx {
+    /// After `table.` — only that table's columns.
+    Qualified(String),
+    /// After `FROM ` / `JOIN ` / `INTO ` — tables first.
+    TableList,
+    /// After `WHERE ` / `ON ` / `SET ` … — columns first.
+    Column,
+    /// Anything else — the historical columns → tables → keywords order.
+    Any,
+}
+
+// ─── persistent TUI config (~/.config/dbxt/tui.json) ─────────────────────────
+
+/// Per `(database, table)` preferences restored when the table is reopened.
+#[derive(Clone, Default, PartialEq)]
+struct TablePrefs {
+    /// Columns hidden for this table (DBX column-visibility equivalent).
+    hidden: HashSet<String>,
+    /// Compact-column choice; `None` = follow the global default.
+    compact: Option<bool>,
+    /// Last ORDER BY expression (without the `ORDER BY` keyword).
+    order_by: Option<String>,
+}
+
+/// The whole on-disk config. Parsing is deliberately forgiving: a missing file,
+/// an unknown version, a truncated body or a single malformed table entry all
+/// fall back to defaults instead of failing to start.
+#[derive(Clone, Default)]
+struct TuiConfig {
+    /// Global compact-column default, used when a table has no stored choice.
+    compact: Option<bool>,
+    tables: HashMap<(String, String), TablePrefs>,
+}
+
+impl TuiConfig {
+    /// Read `path`, tolerating every kind of corruption (returns defaults).
+    fn load(path: &std::path::Path) -> Self {
+        let Ok(text) = std::fs::read_to_string(path) else {
+            return Self::default();
+        };
+        let Ok(v) = serde_json::from_str::<serde_json::Value>(&text) else {
+            return Self::default();
+        };
+        let mut cfg = Self::default();
+        cfg.compact = v.get("compact").and_then(|b| b.as_bool());
+        if let Some(tables) = v.get("tables").and_then(|t| t.as_object()) {
+            for (db, by_table) in tables {
+                let Some(by_table) = by_table.as_object() else {
+                    continue;
+                };
+                for (table, prefs) in by_table {
+                    let Some(prefs) = prefs.as_object() else {
+                        continue;
+                    };
+                    let hidden = prefs
+                        .get("hidden")
+                        .and_then(|h| h.as_array())
+                        .map(|a| {
+                            a.iter()
+                                .filter_map(|x| x.as_str().map(str::to_string))
+                                .collect()
+                        })
+                        .unwrap_or_default();
+                    let compact = prefs.get("compact").and_then(|b| b.as_bool());
+                    let order_by = prefs
+                        .get("order_by")
+                        .and_then(|o| o.as_str())
+                        .filter(|s| !s.trim().is_empty())
+                        .map(str::to_string);
+                    cfg.tables.insert(
+                        (db.clone(), table.clone()),
+                        TablePrefs {
+                            hidden,
+                            compact,
+                            order_by,
+                        },
+                    );
+                }
+            }
+        }
+        cfg
+    }
+
+    /// Write the config back, creating the parent directory. Best-effort: a
+    /// read-only config dir must never interrupt the TUI.
+    fn save(&self, path: &std::path::Path) {
+        let mut tables = serde_json::Map::new();
+        let mut keys: Vec<&(String, String)> = self.tables.keys().collect();
+        keys.sort();
+        for (db, table) in keys {
+            let prefs = &self.tables[&(db.clone(), table.clone())];
+            if prefs.hidden.is_empty() && prefs.compact.is_none() && prefs.order_by.is_none() {
+                continue;
+            }
+            let mut hidden: Vec<&String> = prefs.hidden.iter().collect();
+            hidden.sort();
+            let mut entry = serde_json::Map::new();
+            entry.insert(
+                "hidden".into(),
+                serde_json::Value::Array(
+                    hidden
+                        .iter()
+                        .map(|c| serde_json::Value::String((*c).clone()))
+                        .collect(),
+                ),
+            );
+            if let Some(c) = prefs.compact {
+                entry.insert("compact".into(), serde_json::Value::Bool(c));
+            }
+            if let Some(o) = &prefs.order_by {
+                entry.insert("order_by".into(), serde_json::Value::String(o.clone()));
+            }
+            let by_table = tables
+                .entry(db.clone())
+                .or_insert_with(|| serde_json::Value::Object(serde_json::Map::new()));
+            if let Some(map) = by_table.as_object_mut() {
+                map.insert(table.clone(), serde_json::Value::Object(entry));
+            }
+        }
+        let mut root = serde_json::Map::new();
+        root.insert("version".into(), serde_json::Value::from(1));
+        if let Some(c) = self.compact {
+            root.insert("compact".into(), serde_json::Value::Bool(c));
+        }
+        root.insert("tables".into(), serde_json::Value::Object(tables));
+        if let Some(parent) = path.parent() {
+            let _ = std::fs::create_dir_all(parent);
+        }
+        let text = serde_json::Value::Object(root).to_string();
+        // Atomic-ish: write a sibling temp file then rename so a crash never
+        // leaves a half-written config behind.
+        let tmp = path.with_extension("json.tmp");
+        if std::fs::write(&tmp, text).is_ok() {
+            let _ = std::fs::rename(&tmp, path);
+        }
+    }
+
+    fn table(&self, db: &str, table: &str) -> Option<&TablePrefs> {
+        self.tables.get(&(db.to_string(), table.to_string()))
+    }
+
+    fn entry(&mut self, db: &str, table: &str) -> &mut TablePrefs {
+        self.tables
+            .entry((db.to_string(), table.to_string()))
+            .or_default()
+    }
+}
+
+/// Resolve the config file path. `DBXT_CONFIG` overrides it (tests / portable
+/// setups), `DBXT_NO_PERSIST=1` disables persistence entirely.
+fn config_path() -> Option<PathBuf> {
+    if let Some(p) = std::env::var_os("DBXT_CONFIG").filter(|v| !v.is_empty()) {
+        return Some(PathBuf::from(p));
+    }
+    if std::env::var_os("DBXT_NO_PERSIST").is_some_and(|v| !v.is_empty()) {
+        return None;
+    }
+    let base = std::env::var_os("XDG_CONFIG_HOME")
+        .filter(|v| !v.is_empty())
+        .map(PathBuf::from)
+        .or_else(|| {
+            std::env::var_os("HOME")
+                .filter(|v| !v.is_empty())
+                .map(|h| PathBuf::from(h).join(".config"))
+        })?;
+    Some(base.join("dbxt").join("tui.json"))
 }
 
 // ─── text helpers ────────────────────────────────────────────────────────────
@@ -1297,6 +1474,21 @@ struct App {
     /// SQL prefix-completion popup in the editor (Ctrl-Space).
     completion: Option<Completion>,
 
+    // ── persistent preferences (db.table granularity) ──
+    /// Column visibility / compact / sort restored per `(database, table)`.
+    config: TuiConfig,
+    config_path: Option<PathBuf>,
+
+    // ── result-grid search (`/` in the results pane) ──
+    /// The modal input while `/` is being typed (filter-as-you-type).
+    result_filter: Option<TextArea<'static>>,
+    /// Active search needle; non-empty hides every non-matching row.
+    result_needle: String,
+    /// Displayed row index → row index in the unfiltered grid (row filter map).
+    result_rows: Vec<usize>,
+    /// Last SQL sent to the backend, used to guess a table for `y`.
+    last_sql: Option<String>,
+
     // WHERE filter prompt (modal text input)
     filter_prompt: Option<TextArea<'static>>,
 
@@ -1497,10 +1689,16 @@ fn env_log_path(var: &str, default_name: &str) -> Option<PathBuf> {
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    let db_path: PathBuf = match std::env::args().nth(1) {
+    // The positional argument is the `dbx.db` file itself. A directory is also
+    // accepted (and joined with `dbx.db`) so the historical documented usage
+    // keeps working.
+    let mut db_path: PathBuf = match std::env::args().nth(1) {
         Some(p) => PathBuf::from(p),
         None => storage_db_path().map_err(|e| anyhow::anyhow!(e))?,
     };
+    if db_path.is_dir() {
+        db_path = db_path.join("dbx.db");
+    }
     if !db_path.exists() {
         if let Some(parent) = db_path.parent() {
             std::fs::create_dir_all(parent)?;
@@ -1508,7 +1706,7 @@ async fn main() -> Result<()> {
     }
     let backend = Arc::new(LocalBackend::open(&db_path).await.map_err(|e| {
         anyhow::anyhow!(
-            "打开 DBX 数据目录失败 ({db_path:?}): {e}\n(可用 DBX_DATA_DIR 或传入 dbx.db 目录参数)"
+            "打开 DBX 存储文件失败 ({db_path:?}): {e}\n(可用 DBX_DATA_DIR 指定目录，或把 dbx.db 文件路径作为第一个位置参数传入)"
         )
     })?);
 
@@ -1539,6 +1737,13 @@ async fn run_app(mut terminal: ratatui::DefaultTerminal, backend: Arc<LocalBacke
     let trace_path = env_log_path("DBXT_EVENT_TRACE", "dbxt-events.log").or_else(|| {
         mouse_debug.then(|| env_log_path("DBXT_MOUSE_DEBUG", "dbxt-mouse.log")).flatten()
     });
+
+    let config_path = config_path();
+    let config = config_path
+        .as_deref()
+        .map(TuiConfig::load)
+        .unwrap_or_default();
+    let config_compact = config.compact;
 
     let mut app = App {
         backend: backend.clone(),
@@ -1576,7 +1781,7 @@ async fn run_app(mut terminal: ratatui::DefaultTerminal, backend: Arc<LocalBacke
         freeze_first: true,
         cell_popup: None,
         row_popup: None,
-        compact: None,
+        compact: config_compact,
         col_hidden: HashSet::new(),
         col_picker_open: false,
         col_picker_list: ListState::default(),
@@ -1586,6 +1791,12 @@ async fn run_app(mut terminal: ratatui::DefaultTerminal, backend: Arc<LocalBacke
         recent_list: ListState::default(),
         pending_open_table: None,
         completion: None,
+        config,
+        config_path,
+        result_filter: None,
+        result_needle: String::new(),
+        result_rows: Vec::new(),
+        last_sql: None,
         filter_prompt: None,
         edit_dialog: None,
         pending_write: false,
@@ -1863,6 +2074,14 @@ fn apply_op_result(app: &mut App, res: OpResult, tx: &Tx) {
             }
         }
         OpResult::Query(r, sql, cap) => {
+            // Remember the SQL so `y` can guess a table name for a query result.
+            app.last_sql = Some(sql.clone());
+            // A fresh run starts a new result, so drop any previous row search
+            // (a `Ctrl-N` load-more keeps it, since it is the same result).
+            if cap <= QUERY_MAX_ROWS {
+                app.result_needle.clear();
+                app.result_filter = None;
+            }
             // A statement that returned no columns is a write/DDL, and one that
             // reports affected rows (e.g. `INSERT … RETURNING`) changed data too:
             // any cached COUNT(*) may be stale now.
@@ -1912,6 +2131,10 @@ fn apply_op_result(app: &mut App, res: OpResult, tx: &Tx) {
         }
         OpResult::Script(outcomes) => {
             app.count_cache.clear();
+            // A script result replaces any grid on screen; a result-row search
+            // (which only applies to a data grid) must not leak into it.
+            app.result_needle.clear();
+            app.result_filter = None;
             let n = outcomes.len();
             let errors = outcomes.iter().filter(|o| o.error.is_some()).count();
             let affected: u64 = outcomes.iter().map(|o| o.affected).sum();
@@ -2197,6 +2420,12 @@ fn browse_key(app: &mut App, tx: &Tx, k: KeyEvent) {
     }
     if app.cell_popup.is_some() {
         popup_key(app, k, PopupTarget::Cell);
+        return;
+    }
+
+    // Result-row search prompt (`/` in the results pane) is modal while typing.
+    if app.result_filter.is_some() {
+        result_filter_key(app, k);
         return;
     }
 
@@ -2679,7 +2908,15 @@ fn open_table_data(app: &mut App, tx: &Tx) {
     app.pending_focus = Some(Focus::Preview);
     app.page_pending = true;
     app.table_meta = None;
+    app.result_needle.clear();
+    app.result_filter = None;
     remember_recent_table(app, &app.current_db(), &table.0);
+    // Restore this table's persisted preferences (db.table granularity).
+    let db = app.current_db();
+    let prefs = app.config.table(&db, &table.0).cloned().unwrap_or_default();
+    app.col_hidden = prefs.hidden;
+    app.compact = prefs.compact.or(app.compact);
+    let order_by = prefs.order_by;
     app.page_state = Some(PageState {
         table: table.0.clone(),
         table_type: Some(table.1.clone()),
@@ -2688,7 +2925,7 @@ fn open_table_data(app: &mut App, tx: &Tx) {
         total: None,
         has_next: false,
         filter: String::new(),
-        order_by: None,
+        order_by: order_by.clone(),
     });
     app.loading = true;
     app.status = format!("加载 {}.{} 数据…", app.current_db(), table.0);
@@ -2715,7 +2952,7 @@ fn open_table_data(app: &mut App, tx: &Tx) {
             page: 0,
             page_size: PAGE_SIZE,
             filter: String::new(),
-            order_by: None,
+            order_by,
             known_total: known,
             gen,
         })),
@@ -3078,6 +3315,41 @@ fn filter_grid(grid: &Grid, hidden: &HashSet<String>) -> Grid {
     }
 }
 
+/// True when any cell of `row` contains `needle` (already lower-cased). NULL is
+/// matched as the text `null` so `/null` finds real NULLs.
+fn row_matches(row: &[Val], needle: &str) -> bool {
+    if needle.is_empty() {
+        return true;
+    }
+    row.iter().any(|v| {
+        let s = match v {
+            Val::Null => "null",
+            Val::Text(s) => s.as_str(),
+        };
+        s.to_lowercase().contains(needle)
+    })
+}
+
+/// Keep only the rows matching the active result-row search. An empty needle (or
+/// one that is all whitespace) returns the grid unchanged, so this is a no-op
+/// when no search is active.
+fn apply_row_search(grid: Grid, needle: &str) -> Grid {
+    let needle = needle.trim().to_lowercase();
+    if needle.is_empty() {
+        return grid;
+    }
+    let rows = grid
+        .rows
+        .into_iter()
+        .filter(|r| row_matches(r, &needle))
+        .collect();
+    Grid {
+        columns: grid.columns,
+        rows,
+        note: grid.note,
+    }
+}
+
 /// Natural width of one grid column: the widest of its header and cells,
 /// clamped to `[MIN_CELL_WIDTH, max_cell]`.
 fn natural_width(grid: &Grid, ci: usize, max_cell: usize) -> usize {
@@ -3135,14 +3407,14 @@ fn move_col_cursor(app: &mut App, delta: i32) {
 
 /// The grid the cell cursor currently operates on: a drilled script result
 /// takes precedence over the top-level grid (which is empty while a script is
-/// shown).
+/// shown). Hidden columns and the active result-row search are applied, so the
+/// row / column cursor and CSV export see exactly what is on screen.
 fn active_grid(app: &App) -> Option<Grid> {
     if let Some(s) = &app.script {
         if let Some(i) = s.drilled {
-            return s
-                .outcomes
-                .get(i)
-                .map(|o| filter_grid(&o.grid, &app.col_hidden));
+            let full = s.outcomes.get(i)?.grid.clone();
+            let cols = filter_grid(&full, &app.col_hidden);
+            return Some(apply_row_search(cols, &app.result_needle));
         }
     }
     app.grid.clone()
@@ -3268,7 +3540,7 @@ fn result_row_count(app: &App) -> usize {
         if s.drilled.is_none() {
             return s.outcomes.len();
         }
-        return s.outcomes[s.drilled.unwrap_or(0)].grid.rows.len();
+        return active_grid(app).map(|g| g.rows.len()).unwrap_or(0);
     }
     if app.struct_view == StructView::Ddl && app.ddl.is_some() {
         return 0;
@@ -3706,7 +3978,9 @@ fn editor_key(app: &mut App, tx: &Tx, k: KeyEvent) {
         // Ctrl-Space (some terminals send NUL): table / column / keyword prefix
         // completion at the cursor.
         (m, KeyCode::Char(' ')) if m.contains(KeyModifiers::CONTROL) => open_completion(app),
-        (m, KeyCode::Null) if m.contains(KeyModifiers::CONTROL) => open_completion(app),
+        (m, KeyCode::Null) if m.contains(KeyModifiers::CONTROL) || m.is_empty() => {
+            open_completion(app)
+        }
         (KeyModifiers::NONE, KeyCode::F(5)) => run_current(app, tx),
         (KeyModifiers::NONE, KeyCode::Tab) => {
             app.focus = if app.backend_kind == Backend::Sql {
@@ -3776,6 +4050,20 @@ fn preview_key(app: &mut App, tx: &Tx, k: KeyEvent) {
     }
     let screen = viewport_rows(app) as u16;
     let ddl = app.struct_view == StructView::Ddl && app.ddl.is_some();
+    // Esc clears an active result search before it does anything else. This
+    // applies to the top-level grid and to a drilled script result; only the
+    // script *list* has no search to clear.
+    if k.code == KeyCode::Esc
+        && !app.result_needle.is_empty()
+        && !ddl
+        && app.script.as_ref().map_or(true, |s| s.drilled.is_some())
+    {
+        app.result_needle.clear();
+        app.rebuild_view();
+        app.sel = 0;
+        app.status = "已清除结果搜索".into();
+        return;
+    }
     match k.code {
         KeyCode::Esc => {
             if let Some(s) = &mut app.script {
@@ -3784,6 +4072,9 @@ fn preview_key(app: &mut App, tx: &Tx, k: KeyEvent) {
                     app.sel = 0;
                     app.col_offset = 0;
                     app.col_cursor = 0;
+                    // A result search does not apply to the statement list.
+                    app.result_needle.clear();
+                    app.result_filter = None;
                     return;
                 }
             }
@@ -3811,6 +4102,10 @@ fn preview_key(app: &mut App, tx: &Tx, k: KeyEvent) {
         }
         KeyCode::Char('s') => sort_column(app, tx, false),
         KeyCode::Char('f') => open_filter_prompt(app),
+        // `/` searches the visible result rows (filter-as-you-type).
+        KeyCode::Char('/') => open_result_filter(app),
+        // `y` copies the focused row as an INSERT statement (OSC 52 + file).
+        KeyCode::Char('y') => copy_row_sql(app),
         // Bare-key aliases for the two view commands (mobile reachability).
         KeyCode::Char('w') => toggle_compact(app),
         KeyCode::Char('c') => open_col_picker(app),
@@ -3876,7 +4171,20 @@ fn preview_key(app: &mut App, tx: &Tx, k: KeyEvent) {
                 }
             }
         }
-        KeyCode::Char('n') => page_turn(app, tx, true),
+        KeyCode::Char('n') => {
+            if app.result_needle.trim().is_empty() {
+                page_turn(app, tx, true);
+            } else {
+                search_move(app, 1);
+            }
+        }
+        KeyCode::Char('N') => {
+            if app.result_needle.trim().is_empty() {
+                app.status = "先按 / 搜索结果，再用 n/N 跳转命中".into();
+            } else {
+                search_move(app, -1);
+            }
+        }
         KeyCode::Char('p') => page_turn(app, tx, false),
         KeyCode::Enter => {
             if let Some(s) = &app.script {
@@ -3991,6 +4299,90 @@ fn filter_prompt_key(app: &mut App, tx: &Tx, k: KeyEvent) {
     }
 }
 
+// ── result-grid search (`/` in the results pane) ──
+
+/// `/` in the results pane: filter visible rows as you type. The current needle
+/// is loaded for editing, so `/` again refines an existing search.
+fn open_result_filter(app: &mut App) {
+    if app.grid_kind == GridKind::Columns {
+        app.status = "表结构视图不支持搜索".into();
+        return;
+    }
+    // The script *list* has no data grid to search; once a statement is drilled
+    // into, its result is a normal grid and search applies.
+    if app.script.as_ref().is_some_and(|s| s.drilled.is_none()) {
+        app.status = "脚本列表不支持搜索（先 Enter 进入某条语句的结果）".into();
+        return;
+    }
+    if active_grid(app).is_none() {
+        app.status = "没有可搜索的结果".into();
+        return;
+    }
+    let mut ta = TextArea::from([app.result_needle.clone()]);
+    ta.set_placeholder_text("搜索本页结果行…");
+    ta.move_cursor(CursorMove::End);
+    app.result_filter = Some(ta);
+}
+
+/// Filter-as-you-type handler for the result search prompt.
+fn result_filter_key(app: &mut App, k: KeyEvent) {
+    match k.code {
+        KeyCode::Enter => {
+            app.result_filter = None;
+            let n = result_row_count(app);
+            app.status = if app.result_needle.trim().is_empty() {
+                "结果搜索已清除".into()
+            } else {
+                format!(
+                    "搜索「{}」· {n} 行命中 · n/N 跳转 · Esc 清除",
+                    app.result_needle
+                )
+            };
+        }
+        KeyCode::Esc => {
+            app.result_filter = None;
+            app.result_needle.clear();
+            app.rebuild_view();
+            app.sel = 0;
+            app.status = "已清除结果搜索".into();
+        }
+        _ => {
+            if let Some(t) = &mut app.result_filter {
+                t.input(k);
+            }
+            app.result_needle = app
+                .result_filter
+                .as_ref()
+                .map(|t| t.lines().join(" ").trim().to_string())
+                .unwrap_or_default();
+            app.rebuild_view();
+            app.sel = 0;
+            let n = result_row_count(app);
+            app.status = if app.result_needle.trim().is_empty() {
+                "输入以搜索结果行…".into()
+            } else {
+                format!("搜索「{}」· {n} 行命中", app.result_needle)
+            };
+        }
+    }
+}
+
+/// `n` / `N` while a result search is active: cycle through the matching rows
+/// (the filter already hides every non-match, so every visible row is a hit).
+fn search_move(app: &mut App, dir: i32) {
+    let n = result_row_count(app);
+    if n == 0 {
+        app.status = format!("搜索「{}」· 0 行命中", app.result_needle);
+        return;
+    }
+    if dir > 0 {
+        app.sel = (app.sel + 1) % n;
+    } else {
+        app.sel = (app.sel + n - 1) % n;
+    }
+    app.status = format!("搜索「{}」· 命中 {}/{n}", app.result_needle, app.sel + 1);
+}
+
 // ── mobile efficiency: compact columns / column visibility / recents / filter ──
 
 /// Ctrl-Shift-C — toggle the compact column-width mode. The first press always
@@ -4009,6 +4401,14 @@ fn toggle_compact(app: &mut App) {
     } else {
         format!("{} · 列宽按内容（Alt-C / w 开启）", compact_label(app))
     };
+    // Persist the choice: as the global default and, when a table is open, for
+    // that exact `database.table` so reopening it restores the mode.
+    app.config.compact = app.compact;
+    if let Some(ps) = app.page_state.clone() {
+        let db = app.current_db();
+        app.config.entry(&db, &ps.table).compact = app.compact;
+    }
+    app.persist();
 }
 
 /// Ctrl-Shift-H — open the column-visibility picker for the grid on screen.
@@ -4060,13 +4460,15 @@ fn col_picker_key(app: &mut App, k: KeyEvent) {
         KeyCode::Char('a') => {
             app.col_hidden.clear();
             app.reapply_col_filter();
-            app.status = "已显示全部列".into();
+            app.persist_cols();
+            app.status = "已显示全部列（已记住）".into();
         }
         KeyCode::Char('x') => {
             if let Some(grid) = app.grid_full.clone() {
                 app.col_hidden = grid.columns.iter().skip(1).cloned().collect();
                 app.reapply_col_filter();
-                app.status = "仅保留第一列".into();
+                app.persist_cols();
+                app.status = "仅保留第一列（已记住）".into();
             }
         }
         _ => {}
@@ -4087,7 +4489,8 @@ fn toggle_col_visible(app: &mut App) {
     };
     if app.col_hidden.remove(&name) {
         app.reapply_col_filter();
-        app.status = format!("显示列 {name}");
+        app.persist_cols();
+        app.status = format!("显示列 {name} · 已记住");
     } else {
         let visible = grid
             .columns
@@ -4100,7 +4503,8 @@ fn toggle_col_visible(app: &mut App) {
         }
         app.col_hidden.insert(name.clone());
         app.reapply_col_filter();
-        app.status = format!("隐藏列 {name} · 会话内记住");
+        app.persist_cols();
+        app.status = format!("隐藏列 {name} · 已记住");
     }
 }
 
@@ -4287,64 +4691,239 @@ fn word_before_cursor(ta: &TextArea) -> (usize, String) {
     (end - start, chars[start..end].iter().collect())
 }
 
-/// Candidate list for the word before the cursor: the columns of the table on
-/// screen, every table of the connection, then SQL keywords.
-fn completion_candidates(app: &App, prefix: &str) -> Vec<String> {
-    let needle = prefix.to_lowercase();
-    let mut out: Vec<String> = Vec::new();
-    let push = |name: &str, out: &mut Vec<String>| {
-        if out.iter().any(|x| x == name) {
-            return;
-        }
-        if needle.is_empty() || name.to_lowercase().starts_with(&needle) {
-            out.push(name.to_string());
-        }
+/// Everything on the editor's lines up to (not including) the cursor, joined by
+/// newlines. Used to look at the keyword that precedes the fragment.
+fn text_before_cursor(ta: &TextArea) -> String {
+    let (row, col) = ta.cursor();
+    let lines = ta.lines();
+    let mut out = String::new();
+    for l in lines.iter().take(row) {
+        out.push_str(l);
+        out.push('\n');
+    }
+    if let Some(line) = lines.get(row) {
+        out.extend(line.chars().take(col));
+    }
+    out
+}
+
+/// Read the (possibly quoted, possibly `schema.`) identifier that precedes the
+/// final `.` at the cursor — the qualifier of a `qualifier.partial` form.
+/// Returns `None` when the cursor is not after such a form.
+fn qualifier_before_cursor(ta: &TextArea) -> Option<String> {
+    let (row, col) = ta.cursor();
+    let line = ta.lines().get(row).cloned().unwrap_or_default();
+    let chars: Vec<char> = line.chars().collect();
+    let mut i = col.min(chars.len());
+    // Step back over the fragment being completed to the dot.
+    while i > 0 && (chars[i - 1].is_alphanumeric() || chars[i - 1] == '_') {
+        i -= 1;
+    }
+    if i == 0 || chars[i - 1] != '.' {
+        return None;
+    }
+    i -= 1; // the dot
+    let end = i;
+    if end == 0 {
+        return None;
+    }
+    // A quoted qualifier (`` `t` ``, `"t"`, `[t]`) is read back to its opener.
+    let close = chars[end - 1];
+    let open = match close {
+        '`' => Some('`'),
+        '"' => Some('"'),
+        ']' => Some('['),
+        _ => None,
     };
+    if let Some(open) = open {
+        let mut j = end - 1;
+        while j > 0 {
+            j -= 1;
+            if chars[j] == open {
+                return Some(chars[j + 1..end - 1].iter().collect());
+            }
+        }
+        return None;
+    }
+    // A bare identifier, keeping only the last dot-separated segment.
+    let mut start = end;
+    while start > 0 && (chars[start - 1].is_alphanumeric() || chars[start - 1] == '_') {
+        start -= 1;
+    }
+    if start == end {
+        return None;
+    }
+    Some(chars[start..end].iter().collect())
+}
+
+/// Work out what the cursor is completing: the context and the fragment that
+/// would be replaced (after the last `.` for a qualified name).
+fn completion_context(ta: &TextArea) -> (CompCtx, String) {
+    let (n, word) = word_before_cursor(ta);
+    if let Some(dot) = word.rfind('.') {
+        let partial = word[dot + 1..].to_string();
+        if let Some(qual) = qualifier_before_cursor(ta) {
+            return (CompCtx::Qualified(qual), partial);
+        }
+        return (CompCtx::Any, partial);
+    }
+    // Drop the fragment being completed before looking at the preceding keyword.
+    let before = text_before_cursor(ta);
+    let keep = before.chars().count().saturating_sub(n);
+    let before: String = before.chars().take(keep).collect();
+    let head = before.trim_end();
+    let last = head
+        .split(|c: char| c.is_whitespace() || c == '(' || c == ',' || c == ';')
+        .filter(|s| !s.is_empty())
+        .last()
+        .unwrap_or("")
+        .to_ascii_uppercase();
+    let ctx = match last.as_str() {
+        "FROM" | "JOIN" | "INTO" | "UPDATE" | "TABLE" => CompCtx::TableList,
+        "WHERE" | "ON" | "SET" | "BY" | "HAVING" | "SELECT" | "AND" | "OR" => CompCtx::Column,
+        _ if head.ends_with('(') => CompCtx::Column,
+        _ => CompCtx::Any,
+    };
+    (ctx, word)
+}
+
+/// Column names known for the connection: the browsed table's metadata first,
+/// then whatever columns the current result grid carries.
+fn column_names(app: &App) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
     if let Some(meta) = &app.table_meta {
         for c in &meta.columns {
-            push(&c.name, &mut out);
+            if !out.contains(&c.name) {
+                out.push(c.name.clone());
+            }
         }
     }
     if let Some(grid) = full_grid(app) {
         for c in &grid.columns {
-            push(c, &mut out);
+            if !out.contains(c) {
+                out.push(c.clone());
+            }
         }
     }
-    for t in &app.tables_all {
-        push(&t.name, &mut out);
+    out
+}
+
+fn push_item(
+    out: &mut Vec<CompletionItem>,
+    seen: &mut HashSet<String>,
+    text: &str,
+    kind: char,
+    needle: &str,
+) {
+    let lower = text.to_lowercase();
+    if !seen.insert(lower.clone()) {
+        return;
     }
-    for k in SQL_KEYWORDS {
-        push(k, &mut out);
+    if needle.is_empty() || lower.starts_with(needle) {
+        out.push(CompletionItem {
+            text: text.to_string(),
+            kind,
+        });
+    }
+}
+
+fn push_names(
+    out: &mut Vec<CompletionItem>,
+    seen: &mut HashSet<String>,
+    names: &[String],
+    kind: char,
+    needle: &str,
+) {
+    for n in names {
+        push_item(out, seen, n, kind, needle);
+    }
+}
+
+/// Candidate list for the fragment before the cursor, ordered by context:
+/// `table.` → that table's columns only; after `FROM`/`JOIN` → tables first;
+/// after `WHERE`/`ON` → columns first; otherwise columns → tables → keywords.
+/// Matching is case-insensitive.
+fn completion_candidates(app: &App, ctx: &CompCtx, partial: &str) -> Vec<CompletionItem> {
+    let needle = partial.to_lowercase();
+    let mut out: Vec<CompletionItem> = Vec::new();
+    let mut seen: HashSet<String> = HashSet::new();
+    let cols = column_names(app);
+    let tables: Vec<String> = app.tables_all.iter().map(|t| t.name.clone()).collect();
+    let keywords: Vec<String> = SQL_KEYWORDS.iter().map(|k| (*k).to_string()).collect();
+    match ctx {
+        CompCtx::Qualified(q) => {
+            // Match the qualifier case-insensitively, so `USERS.` still offers
+            // the columns of `users`.
+            let qcols: Vec<String> = if let Some(meta) = app
+                .table_meta
+                .as_ref()
+                .filter(|m| m.table.eq_ignore_ascii_case(q))
+            {
+                meta.columns.iter().map(|c| c.name.clone()).collect()
+            } else if app
+                .page_state
+                .as_ref()
+                .is_some_and(|p| p.table.eq_ignore_ascii_case(q))
+            {
+                full_grid(app).map(|g| g.columns).unwrap_or_default()
+            } else {
+                cols.clone()
+            };
+            push_names(&mut out, &mut seen, &qcols, 'C', &needle);
+        }
+        CompCtx::TableList => {
+            push_names(&mut out, &mut seen, &tables, 'T', &needle);
+            push_names(&mut out, &mut seen, &cols, 'C', &needle);
+            push_names(&mut out, &mut seen, &keywords, 'K', &needle);
+        }
+        CompCtx::Column => {
+            push_names(&mut out, &mut seen, &cols, 'C', &needle);
+            push_names(&mut out, &mut seen, &tables, 'T', &needle);
+            push_names(&mut out, &mut seen, &keywords, 'K', &needle);
+        }
+        CompCtx::Any => {
+            push_names(&mut out, &mut seen, &cols, 'C', &needle);
+            push_names(&mut out, &mut seen, &tables, 'T', &needle);
+            push_names(&mut out, &mut seen, &keywords, 'K', &needle);
+        }
     }
     out.truncate(8);
     out
 }
 
 fn open_completion(app: &mut App) {
-    let (n, prefix) = word_before_cursor(&app.editor);
-    let _ = n;
-    let items = completion_candidates(app, &prefix);
+    let (ctx, partial) = completion_context(&app.editor);
+    let items = completion_candidates(app, &ctx, &partial);
     if items.is_empty() {
-        app.status = format!("无可补全项（前缀「{prefix}」）");
+        app.status = format!("无可补全项（前缀「{partial}」）");
         return;
     }
     app.completion = Some(Completion {
         items,
         sel: 0,
-        prefix,
+        replace: partial.chars().count(),
     });
 }
 
 /// Recompute the candidate list after the user typed another character.
 fn refresh_completion(app: &mut App) {
-    let (_, prefix) = word_before_cursor(&app.editor);
-    let items = completion_candidates(app, &prefix);
+    let (ctx, partial) = completion_context(&app.editor);
+    let items = completion_candidates(app, &ctx, &partial);
     if items.is_empty() {
         app.completion = None;
         return;
     }
-    let sel = app.completion.as_ref().map(|c| c.sel).unwrap_or(0).min(items.len() - 1);
-    app.completion = Some(Completion { items, sel, prefix });
+    let sel = app
+        .completion
+        .as_ref()
+        .map(|c| c.sel)
+        .unwrap_or(0)
+        .min(items.len() - 1);
+    app.completion = Some(Completion {
+        items,
+        sel,
+        replace: partial.chars().count(),
+    });
 }
 
 fn accept_completion(app: &mut App) {
@@ -4355,7 +4934,7 @@ fn accept_completion(app: &mut App) {
         app.completion = None;
         return;
     };
-    let back = c.prefix.chars().count();
+    let back = c.replace;
     if back > 0 {
         // `delete_str` deletes *forward* from the cursor, so step back to the
         // start of the fragment first.
@@ -4364,7 +4943,7 @@ fn accept_completion(app: &mut App) {
             .move_cursor(CursorMove::Jump(row as u16, col.saturating_sub(back) as u16));
         app.editor.delete_str(back);
     }
-    app.editor.insert_str(item);
+    app.editor.insert_str(&item.text);
     app.completion = None;
 }
 
@@ -4390,11 +4969,13 @@ fn completion_key(app: &mut App, k: KeyEvent) {
     }
 }
 
-/// 1-based absolute row number of the cursor across all pages.
+/// 1-based absolute row number of the cursor across all pages. The result-row
+/// search keeps a display→source map, so the reported number is the source row.
 fn cursor_abs_row(app: &App) -> usize {
+    let src = app.full_row_index().unwrap_or(app.sel);
     match &app.page_state {
-        Some(ps) => abs_row(ps.page, ps.page_size, app.sel),
-        None => app.sel + 1,
+        Some(ps) => abs_row(ps.page, ps.page_size, src),
+        None => src + 1,
     }
 }
 
@@ -4430,7 +5011,8 @@ fn open_row_popup(app: &mut App) {
     let Some(grid) = full_grid(app) else {
         return;
     };
-    let Some(row) = grid.rows.get(app.sel) else {
+    let idx = app.full_row_index().unwrap_or(app.sel);
+    let Some(row) = grid.rows.get(idx) else {
         return;
     };
     let mut lines: Vec<PopupLine> = Vec::new();
@@ -4516,6 +5098,286 @@ fn val_literal(v: &Val, data_type: Option<&str>) -> String {
                 sql_literal(s)
             }
         }
+    }
+}
+
+/// True for column types whose values are raw bytes and should be copied as a
+/// hex literal rather than a quoted string.
+fn is_binary_type(t: &str) -> bool {
+    let lower = t.trim().to_ascii_lowercase();
+    let base = lower.split(['(', ' ']).next().unwrap_or("");
+    matches!(
+        base,
+        "blob"
+            | "tinyblob"
+            | "mediumblob"
+            | "longblob"
+            | "binary"
+            | "varbinary"
+            | "bytea"
+            | "image"
+            | "bytes"
+    )
+}
+
+/// `X'0A1B'` — the portable SQL hex literal, used for binary columns so a copied
+/// row round-trips instead of being mangled by string escaping.
+fn hex_literal(s: &str) -> String {
+    let mut out = String::with_capacity(s.len() * 2 + 3);
+    out.push_str("X'");
+    for b in s.as_bytes() {
+        out.push_str(&format!("{b:02X}"));
+    }
+    out.push('\'');
+    out
+}
+
+/// Literal used by the copy-row-as-INSERT action: binary columns become hex,
+/// everything else follows the edit layer's rules.
+fn insert_literal(v: &Val, data_type: Option<&str>) -> String {
+    if let (Val::Text(s), Some(dt)) = (v, data_type) {
+        if is_binary_type(dt) {
+            return hex_literal(s);
+        }
+    }
+    val_literal(v, data_type)
+}
+
+/// Build `INSERT INTO t (cols…) VALUES (vals…)` for one row of `grid`.
+fn build_insert_sql(
+    cfg: &ConnectionConfig,
+    table: &str,
+    grid: &Grid,
+    row: &[Val],
+    app: &App,
+) -> String {
+    let q = |name: &str| quote_table_identifier(Some(cfg.db_type), name);
+    let cols = grid
+        .columns
+        .iter()
+        .map(|c| q(c))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let vals = grid
+        .columns
+        .iter()
+        .enumerate()
+        .map(|(ci, c)| {
+            let v = row.get(ci).cloned().unwrap_or(Val::Null);
+            insert_literal(&v, column_type(app, table, c).as_deref())
+        })
+        .collect::<Vec<_>>()
+        .join(", ");
+    format!("INSERT INTO {} ({})\nVALUES ({});", q(table), cols, vals)
+}
+
+fn is_ident_byte(b: u8) -> bool {
+    b.is_ascii_alphanumeric() || b == b'_' || b == b'$'
+}
+
+/// Read the (possibly quoted, possibly `schema.`) identifier at the start of
+/// `s`, returning its last dot-separated segment.
+fn read_ident(s: &str) -> Option<String> {
+    let mut rest = s.trim_start();
+    let mut last: Option<String> = None;
+    loop {
+        let bytes = rest.as_bytes();
+        let Some(&first) = bytes.first() else {
+            break;
+        };
+        let (seg, consumed) = match first {
+            b'`' | b'"' => {
+                let close = first as char;
+                let Some(i) = rest[1..].find(close) else {
+                    break;
+                };
+                (rest[1..1 + i].to_string(), i + 2)
+            }
+            b'[' => {
+                let Some(i) = rest[1..].find(']') else {
+                    break;
+                };
+                (rest[1..1 + i].to_string(), i + 2)
+            }
+            b if is_ident_byte(b) => {
+                let end = rest.bytes().position(|b| !is_ident_byte(b)).unwrap_or(rest.len());
+                (rest[..end].to_string(), end)
+            }
+            _ => break,
+        };
+        last = Some(seg);
+        rest = &rest[consumed..];
+        if let Some(r) = rest.strip_prefix('.') {
+            rest = r;
+            continue;
+        }
+        break;
+    }
+    last
+}
+
+/// Best-effort table name for a query result: the identifier after the first
+/// `FROM` / `JOIN` / `UPDATE` / `INTO` keyword.
+fn guess_table_from_sql(sql: &str) -> Option<String> {
+    let lower = sql.to_lowercase();
+    let bytes = lower.as_bytes();
+    for kw in ["from", "join", "update", "into"] {
+        let mut i = 0;
+        while let Some(pos) = lower[i..].find(kw) {
+            let start = i + pos;
+            let end = start + kw.len();
+            let before_ok = start == 0 || !is_ident_byte(bytes[start - 1]);
+            let after_ok = end >= bytes.len() || !is_ident_byte(bytes[end]);
+            if before_ok && after_ok {
+                let rest = sql[end..].trim_start();
+                // `FROM (SELECT …)` is a derived table, not a name.
+                if !rest.starts_with('(') {
+                    if let Some(name) = read_ident(rest) {
+                        return Some(name);
+                    }
+                }
+            }
+            i = end;
+        }
+    }
+    None
+}
+
+// ── clipboard (OSC 52 + file fallback) ──
+
+fn base64_encode(data: &[u8]) -> String {
+    const A: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut out = String::with_capacity(data.len().div_ceil(3) * 4);
+    for chunk in data.chunks(3) {
+        let b = [
+            chunk[0],
+            *chunk.get(1).unwrap_or(&0),
+            *chunk.get(2).unwrap_or(&0),
+        ];
+        let n = ((b[0] as u32) << 16) | ((b[1] as u32) << 8) | b[2] as u32;
+        out.push(A[((n >> 18) & 63) as usize] as char);
+        out.push(A[((n >> 12) & 63) as usize] as char);
+        out.push(if chunk.len() > 1 {
+            A[((n >> 6) & 63) as usize] as char
+        } else {
+            '='
+        });
+        out.push(if chunk.len() > 2 {
+            A[(n & 63) as usize] as char
+        } else {
+            '='
+        });
+    }
+    out
+}
+
+/// Where the clipboard file fallback is written (also printed in the status bar
+/// so a terminal that drops OSC 52 still has the text).
+fn clipboard_file_path() -> Option<PathBuf> {
+    if let Some(p) = std::env::var_os("DBXT_CLIPBOARD_FILE").filter(|v| !v.is_empty()) {
+        return Some(PathBuf::from(p));
+    }
+    if std::env::var_os("DBXT_NO_CLIPBOARD").is_some_and(|v| !v.is_empty()) {
+        return None;
+    }
+    let base = std::env::var_os("XDG_CACHE_HOME")
+        .filter(|v| !v.is_empty())
+        .map(PathBuf::from)
+        .or_else(|| {
+            std::env::var_os("HOME")
+                .filter(|v| !v.is_empty())
+                .map(|h| PathBuf::from(h).join(".cache"))
+        })
+        .unwrap_or_else(std::env::temp_dir);
+    Some(base.join("dbxt").join("clipboard.txt"))
+}
+
+/// Copy `text` to the terminal clipboard with OSC 52, and write the same text to
+/// a file as a fallback. Never returns an error: an unsupported terminal simply
+/// ignores the escape sequence, and the file path (if any) is reported so the
+/// text is still reachable.
+fn clipboard_copy(text: &str) -> Option<PathBuf> {
+    let path = clipboard_file_path();
+    let wrote = match &path {
+        Some(p) => {
+            if let Some(parent) = p.parent() {
+                let _ = std::fs::create_dir_all(parent);
+            }
+            std::fs::write(p, text).is_ok()
+        }
+        None => false,
+    };
+    if std::env::var_os("DBXT_CLIPBOARD").is_none_or(|v| v != "off") {
+        let b64 = base64_encode(text.as_bytes());
+        let seq = if std::env::var_os("TMUX").is_some() {
+            // tmux swallows a raw OSC; wrap it in a DCS passthrough with ESC
+            // doubled (needs `set -g set-clipboard on` to reach the terminal).
+            format!("\x1bPtmux;\x1b\x1b]52;c;{b64}\x07\x1b\\")
+        } else if std::env::var_os("STY").is_some() {
+            format!("\x1bP\x1b]52;c;{b64}\x07\x1b\\")
+        } else {
+            format!("\x1b]52;c;{b64}\x07")
+        };
+        let mut out = std::io::stdout();
+        let _ = out.write_all(seq.as_bytes());
+        let _ = out.flush();
+    }
+    if wrote {
+        path
+    } else {
+        None
+    }
+}
+
+/// `y` in the results pane: copy the focused row as an `INSERT` statement.
+fn copy_row_sql(app: &mut App) {
+    if app.grid_kind == GridKind::Columns {
+        app.status = "表结构视图没有可复制的数据行".into();
+        return;
+    }
+    if app.script.as_ref().is_some_and(|s| s.drilled.is_none()) {
+        app.status = "脚本列表没有可复制的行（先 Enter 进入某条语句的结果）".into();
+        return;
+    }
+    let Some(cfg) = app.selected.clone() else {
+        app.status = "✗ 未选择连接".into();
+        return;
+    };
+    let Some(full) = full_grid(app) else {
+        app.status = "没有可复制的行".into();
+        return;
+    };
+    let Some(orig) = app.full_row_index() else {
+        app.status = "没有可复制的行".into();
+        return;
+    };
+    let Some(row) = full.rows.get(orig).cloned() else {
+        app.status = "没有可复制的行".into();
+        return;
+    };
+    let table = if let Some(ps) = &app.page_state {
+        Some(ps.table.clone())
+    } else if let Some(s) = &app.script {
+        s.drilled
+            .and_then(|i| s.outcomes.get(i))
+            .and_then(|o| guess_table_from_sql(&o.sql))
+    } else {
+        app.last_sql.as_deref().and_then(guess_table_from_sql)
+    };
+    let Some(table) = table else {
+        app.status = "无法从当前结果确定表名（仅表格浏览与含 FROM 的查询支持 y）".into();
+        return;
+    };
+    let sql = build_insert_sql(&cfg, &table, &full, &row, app);
+    let n = sql.chars().count();
+    match clipboard_copy(&sql) {
+        Some(p) => {
+            app.status = format!(
+                "✓ 已复制 INSERT（{n} 字符）· OSC52 剪贴板 · 兜底 {}",
+                p.display()
+            )
+        }
+        None => app.status = format!("✓ 已复制 INSERT（{n} 字符）· OSC52 剪贴板"),
     }
 }
 
@@ -5048,6 +5910,10 @@ fn sort_column(app: &mut App, tx: &Tx, append: bool) {
     } else {
         "升序"
     };
+    // Persist the sort for this table so reopening it restores the order.
+    let db = app.current_db();
+    app.config.entry(&db, &ps.table).order_by = next.clone();
+    app.persist();
     reload_table_view(app, tx, ps.filter.clone(), next, 0);
     app.status = format!(
         "按 {col} {dir}{}",
@@ -5650,27 +6516,105 @@ fn query_tab_title(sql: &str) -> String {
 impl App {
     /// Store a freshly fetched grid: the unfiltered original is kept so the
     /// column-visibility filter can be re-applied later, and the display grid is
-    /// the session-filtered view. The structure field list is never filtered.
+    /// the filtered view (hidden columns + the result-row search). The structure
+    /// field list is never filtered.
     fn set_grid(&mut self, grid: Grid) {
-        let shown = if self.grid_kind == GridKind::Columns {
-            grid.clone()
-        } else {
-            filter_grid(&grid, &self.col_hidden)
-        };
-        self.grid = Some(shown);
         self.grid_full = Some(grid);
+        self.rebuild_view();
     }
 
     fn clear_grid(&mut self) {
         self.grid = None;
         self.grid_full = None;
+        self.result_rows.clear();
     }
 
     /// Re-apply the session column selection to the grid on screen.
     fn reapply_col_filter(&mut self) {
-        if let Some(full) = self.grid_full.clone() {
-            self.grid = Some(filter_grid(&full, &self.col_hidden));
+        self.rebuild_view();
+    }
+
+    /// Recompute the displayed grid from `grid_full` by applying the hidden-column
+    /// set and the result-row search, and rebuild the display→source row map that
+    /// the popups and `y` (copy as INSERT) rely on.
+    fn rebuild_view(&mut self) {
+        let Some(full) = self.grid_full.clone() else {
+            self.grid = None;
+            self.result_rows.clear();
+            return;
+        };
+        let cols = if self.grid_kind == GridKind::Columns {
+            full.clone()
+        } else {
+            filter_grid(&full, &self.col_hidden)
+        };
+        let needle = self.result_needle.trim().to_lowercase();
+        if needle.is_empty() || self.grid_kind == GridKind::Columns {
+            self.result_rows = (0..cols.rows.len()).collect();
+            self.grid = Some(cols);
+            return;
         }
+        let mut rows = Vec::new();
+        let mut map = Vec::new();
+        for (i, r) in cols.rows.iter().enumerate() {
+            if row_matches(r, &needle) {
+                rows.push(r.clone());
+                map.push(i);
+            }
+        }
+        self.grid = Some(Grid {
+            columns: cols.columns,
+            rows,
+            note: cols.note,
+        });
+        self.result_rows = map;
+    }
+
+    /// Index of the focused display row in the *unfiltered* grid. The result-row
+    /// search keeps a display→source map, so this is the identity when no row
+    /// filter is active. Handles both the top-level grid and a drilled script
+    /// result.
+    fn full_row_index(&self) -> Option<usize> {
+        if let Some(s) = &self.script {
+            let i = s.drilled?;
+            let full = &s.outcomes.get(i)?.grid;
+            let needle = self.result_needle.trim().to_lowercase();
+            if needle.is_empty() {
+                return (self.sel < full.rows.len()).then_some(self.sel);
+            }
+            // filter_grid only drops columns, so row indices still line up with
+            // `full.rows`; the map translates the searched display row back.
+            let cols = filter_grid(full, &self.col_hidden);
+            let map: Vec<usize> = cols
+                .rows
+                .iter()
+                .enumerate()
+                .filter(|(_, r)| row_matches(r, &needle))
+                .map(|(i, _)| i)
+                .collect();
+            return map.get(self.sel).copied();
+        }
+        if self.result_rows.is_empty() {
+            return None;
+        }
+        self.result_rows.get(self.sel).copied()
+    }
+
+    /// Persist the in-memory config (best-effort, silent on failure).
+    fn persist(&self) {
+        if let Some(p) = &self.config_path {
+            self.config.save(p);
+        }
+    }
+
+    /// Save the current table's hidden-column set under its `(database, table)`.
+    fn persist_cols(&mut self) {
+        let Some(ps) = self.page_state.clone() else {
+            return;
+        };
+        let db = self.current_db();
+        self.config.entry(&db, &ps.table).hidden = self.col_hidden.clone();
+        self.persist();
     }
 
     /// Copy the on-screen query result back into its tab before leaving it.
@@ -5696,15 +6640,15 @@ impl App {
             return;
         };
         self.grid_full = tab.grid_full.clone();
-        self.grid = match &tab.grid_full {
-            Some(full) if tab.kind != GridKind::Columns => {
-                Some(filter_grid(full, &self.col_hidden))
-            }
-            _ => tab.grid,
-        };
         self.script = tab.script;
         self.grid_kind = tab.kind;
-        self.sel = tab.sel;
+        if self.script.is_some() {
+            // A result search belongs to a data grid, not the script list.
+            self.result_needle.clear();
+            self.result_filter = None;
+        }
+        self.rebuild_view();
+        self.sel = tab.sel.min(self.grid.as_ref().map(|g| g.rows.len()).unwrap_or(0).saturating_sub(1));
         self.col_offset = tab.col_offset;
         self.col_cursor = tab.col_cursor;
         self.page_state = None;
@@ -6068,6 +7012,9 @@ fn ui(f: &mut Frame, app: &mut App) {
     if app.table_prompt.is_some() {
         render_table_filter(f, f.area(), app);
     }
+    if app.result_filter.is_some() {
+        render_result_filter(f, f.area(), app);
+    }
     if app.snippet_name.is_some() {
         render_snippet_name(f, f.area(), app);
     }
@@ -6140,13 +7087,24 @@ fn fit_status(msg: &str, width: usize) -> String {
     if width == 0 {
         return String::new();
     }
-    if msg.starts_with('✗') {
-        // 错误：错误码 / 表名等根因在前中部，保留头部，尾部（诊断提示）截断
+    if msg.starts_with('✗') || msg.starts_with('✓') {
+        // 错误 / 成功确认：关键信息在前，保留头部，尾部截断
         truncate_disp(msg, width)
     } else {
-        // 普通消息：进度类根因常在尾部，保留尾部
-        let skip = n - (width - 1);
-        let tail: String = msg.chars().skip(skip).collect();
+        // 普通消息：进度类根因常在尾部，保留尾部。
+        // Keep the last `width - 1` *display cells* (not chars) so a CJK
+        // message is not over-skipped into an empty `…` on a narrow screen.
+        let budget = width - 1;
+        let mut tail = String::new();
+        let mut used = 0usize;
+        for c in msg.chars().rev() {
+            let cw = disp_width(&c.to_string());
+            if used + cw > budget {
+                break;
+            }
+            used += cw;
+            tail.insert(0, c);
+        }
         format!("…{tail}")
     }
 }
@@ -6334,6 +7292,8 @@ fn render_footer(f: &mut Frame, area: Rect, app: &App) {
         "快捷键速查 · ↑↓ 滚动 · Esc 关闭".into()
     } else if app.table_prompt.is_some() {
         "过滤表名 · 输入即筛选 · Enter 保留 · Esc 清除".into()
+    } else if app.result_filter.is_some() {
+        "搜索结果 · 输入即筛选 · Enter 保留 · Esc 清除".into()
     } else if app.recent_open {
         "最近表 · ↑↓ 选择 · Enter 直达 · Esc 关闭".into()
     } else if app.col_picker_open {
@@ -6367,7 +7327,7 @@ fn render_footer(f: &mut Frame, area: Rect, app: &App) {
                 Focus::Editor => "Ctrl-J 运行 · Ctrl-Space 补全 · ↑ 历史 · Tab 下一区".into(),
                 Focus::CmdInput => "Enter 执行 · Ctrl-L 换模式".into(),
                 Focus::Preview => {
-                    "↑↓ 行 · ←→ 列 · Enter 整行 · e 编辑 · Del 删行 · f 过滤 · Ctrl-G 横滚 · ? 帮助".into()
+                    "↑↓ 行 · ←→ 列 · Enter 整行 · e 编辑 · Del 删行 · f 过滤 · / 搜索 · y 复制INSERT · Ctrl-G 横滚 · ? 帮助".into()
                 }
             },
         }
@@ -6388,7 +7348,7 @@ fn render_footer(f: &mut Frame, area: Rect, app: &App) {
                     "Enter 执行 · [ ] 切 redis db · Ctrl-L 切 sql/redis/mongo · Esc 编辑器".into()
                 }
                 Focus::Preview => {
-                    "↑↓ 行(到边翻页) · ←→/hl 列 · Enter 整行/单元格 · e 编辑 · i 插入 · Del 删行 · f 过滤 · s 排序 · w 紧凑 · c 列显隐 · ? 帮助".into()
+                    "↑↓ 行(到边翻页) · ←→/hl 列 · Enter 整行/单元格 · e 编辑 · i 插入 · Del 删行 · y 复制INSERT · f 过滤 · / 搜索 · s 排序 · w 紧凑 · c 列显隐 · ? 帮助".into()
                 }
             },
         }
@@ -6593,7 +7553,8 @@ fn render_results_pane(f: &mut Frame, area: Rect, app: &mut App) {
         if let Some(i) = s.drilled {
             let o = &s.outcomes[i];
             let title = format!(
-                " 语句 {} 结果 · {} · Esc 返回脚本 ",
+                " {}语句 {} 结果 · {} · Esc 返回脚本 ",
+                search_marker(app),
                 i + 1,
                 if o.grid.note.is_empty() {
                     "".to_string()
@@ -6601,8 +7562,9 @@ fn render_results_pane(f: &mut Frame, area: Rect, app: &mut App) {
                     o.grid.note.clone()
                 }
             );
-            let grid = o.grid.clone();
-            render_grid(f, area, app, &grid, GridKind::Query, &title);
+            if let Some(grid) = active_grid(app) {
+                render_grid(f, area, app, &grid, GridKind::Query, &title);
+            }
         } else {
             render_script_list(f, area, app, &s);
         }
@@ -6650,6 +7612,20 @@ fn render_results_pane(f: &mut Frame, area: Rect, app: &mut App) {
     );
 }
 
+/// Leading marker for an active result search, so the indicator stays visible
+/// even when a narrow pane clips the rest of the title.
+fn search_marker(app: &App) -> String {
+    if app.result_needle.trim().is_empty() {
+        String::new()
+    } else {
+        format!(
+            "🔍「{}」{} 命中 · ",
+            app.result_needle,
+            result_row_count(app)
+        )
+    }
+}
+
 fn grid_title(app: &App) -> String {
     match app.grid_kind {
         GridKind::TableData => {
@@ -6664,7 +7640,8 @@ fn grid_title(app: &App) -> String {
                 .unwrap_or_else(|| "总数未知".into());
             let more = if ps.has_next { " · n 下一页" } else { "" };
             format!(
-                " {}.{} · 第 {} 页 · {}–{} / {} · {}{}{} ",
+                " {}{}.{} · 第 {} 页 · {}–{} / {} · {}{}{} ",
+                search_marker(app),
                 fix_double_encoding(&app.current_db()),
                 fix_double_encoding(&ps.table),
                 ps.page + 1,
@@ -6695,13 +7672,14 @@ fn grid_title(app: &App) -> String {
                     .map(|t| t.title.clone())
                     .unwrap_or_default();
                 format!(
-                    " 结果 {}/{} · {note} · {} · [ ] 切换 ",
+                    " {}结果 {}/{} · {note} · {} · [ ] 切换 ",
+                    search_marker(app),
                     app.result_tab + 1,
                     app.result_tabs.len(),
                     truncate_disp(&title, 20)
                 )
             } else {
-                format!(" 结果 · {note} ")
+                format!(" {}结果 · {note} ", search_marker(app))
             }
         }
     }
@@ -6741,6 +7719,13 @@ fn render_grid(f: &mut Frame, area: Rect, app: &mut App, grid: &Grid, kind: Grid
 
     let inner_w = area.width.saturating_sub(2) as usize;
     let ncols = grid.columns.len();
+    // Highlight cells that match the active result search (`/` in the results).
+    let needle_lc = app.result_needle.trim().to_lowercase();
+    let needle = if needle_lc.is_empty() {
+        None
+    } else {
+        Some(needle_lc.as_str())
+    };
     // Compact (mobile) mode shares the pane among all columns so a wide table can
     // fit without horizontal scrolling; otherwise each column keeps its natural
     // content width, capped per layout.
@@ -6821,7 +7806,7 @@ fn render_grid(f: &mut Frame, area: Rect, app: &mut App, grid: &Grid, kind: Grid
         let mut cells: Vec<Cell> = vec![gutter_cell(i, i == sel)];
         for (ci, w) in widths.iter().enumerate().take(frozen) {
             cells.push(match row.get(ci) {
-                Some(v) => cell_widget_hl(v, *w, i == sel && ci == cc),
+                Some(v) => cell_widget_hl(v, *w, i == sel && ci == cc, needle),
                 None => Cell::from(""),
             });
         }
@@ -6875,7 +7860,7 @@ fn render_grid(f: &mut Frame, area: Rect, app: &mut App, grid: &Grid, kind: Grid
                 let mut cells: Vec<Cell> = Vec::new();
                 for (ci, w) in widths.iter().enumerate().skip(off).take(visible) {
                     cells.push(match row.get(ci) {
-                        Some(v) => cell_widget_hl(v, *w, i == sel && ci == cc),
+                        Some(v) => cell_widget_hl(v, *w, i == sel && ci == cc, needle),
                         None => Cell::from(""),
                     });
                 }
@@ -7109,7 +8094,7 @@ fn render_columns_grid(
         .map(|(i, row)| {
             let mut cells = vec![gutter_cell(i, i == app.sel)];
             cells.extend(row.iter().enumerate().map(|(ci, v)| {
-                cell_widget_hl(v, 40, i == app.sel && ci == cc)
+                cell_widget_hl(v, 40, i == app.sel && ci == cc, None)
             }));
             let mut r = Row::new(cells);
             if i == app.sel {
@@ -7245,11 +8230,31 @@ fn value_display(v: &Val) -> (String, Style) {
     }
 }
 
-/// Render one cell, optionally marking it as the focused cell.
-fn cell_widget_hl(v: &Val, w: usize, focused: bool) -> Cell<'static> {
+/// Style for a cell whose value matches the active result search.
+fn search_hit_style() -> Style {
+    Style::default()
+        .fg(Color::Black)
+        .bg(Color::Yellow)
+        .add_modifier(Modifier::BOLD)
+}
+
+/// Render one cell, optionally marking it as the focused cell or highlighting a
+/// search hit.
+fn cell_widget_hl(v: &Val, w: usize, focused: bool, needle: Option<&str>) -> Cell<'static> {
     if focused {
         let (text, _) = value_display(v);
         return Cell::from(Span::styled(truncate_disp(&text, w), focused_cell_style()));
+    }
+    let hit = needle.is_some_and(|n| {
+        let s = match v {
+            Val::Null => "null",
+            Val::Text(s) => s.as_str(),
+        };
+        !n.is_empty() && s.to_lowercase().contains(n)
+    });
+    if hit {
+        let (text, _) = value_display(v);
+        return Cell::from(Span::styled(truncate_disp(&text, w), search_hit_style()));
     }
     match v {
         Val::Null => Cell::from(Span::styled("NULL", null_style())),
@@ -7956,6 +8961,36 @@ fn render_table_filter(f: &mut Frame, area: Rect, app: &mut App) {
     }
 }
 
+/// Result-row search prompt (`/` in the results pane), styled like the table
+/// filter so both filter-as-you-type flows feel identical.
+fn render_result_filter(f: &mut Frame, area: Rect, app: &mut App) {
+    let w = area.width.saturating_sub(4).max(20).min(area.width);
+    let h = 3.min(area.height);
+    let x = area.x + (area.width.saturating_sub(w)) / 2;
+    let y = area.y + area.height.saturating_sub(h + 1);
+    let box_area = Rect {
+        x,
+        y,
+        width: w,
+        height: h,
+    };
+    f.render_widget(Clear, box_area);
+    let hits = result_row_count(app);
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .title(format!(
+            " 搜索结果 {hits} 行命中 · Enter 保留 · Esc 清除 "
+        ))
+        .border_set(border::ROUNDED)
+        .border_style(Style::default().fg(Color::Yellow));
+    let inner = block.inner(box_area);
+    f.render_widget(block, box_area);
+    if let Some(ta) = app.result_filter.as_mut() {
+        ta.set_block(Block::default());
+        f.render_widget(&*ta, inner);
+    }
+}
+
 /// SQL prefix-completion popup, anchored just under the editor.
 fn render_completion(f: &mut Frame, app: &App) {
     let Some(c) = app.completion.clone() else {
@@ -7990,17 +9025,19 @@ fn render_completion(f: &mut Frame, app: &App) {
             } else {
                 Style::default()
             };
-            Line::from(Span::styled(
-                truncate_disp(item, (w as usize).saturating_sub(3)),
-                style,
-            ))
+            let tag = item.kind.to_string();
+            let room = (w as usize).saturating_sub(6);
+            Line::from(vec![
+                Span::styled(format!("{:<room$}", truncate_disp(&item.text, room)), style),
+                Span::styled(format!("[{tag}]"), style.fg(Color::DarkGray)),
+            ])
         })
         .collect();
     f.render_widget(
         Paragraph::new(lines).block(
             Block::default()
                 .borders(Borders::ALL)
-                .title(" 补全 · Tab 上屏 · ↑↓ · Esc ")
+                .title(" 补全 · T表 C列 K关键字 · Tab 上屏 · ↑↓ · Esc ")
                 .border_set(border::ROUNDED)
                 .border_style(Style::default().fg(Color::Cyan)),
         ),
@@ -8379,7 +9416,7 @@ const HELP_ROWS: &[(&str, &str)] = &[
     ("Ctrl-W", "收起 / 展开当前焦点区域"),
     ("Ctrl-G", "横滚模式（触屏兜底：滚轮/上下滑 = 横滚列）"),
     ("Alt-C / w", "紧凑列宽：窄屏自动共享列宽，宽表尽量一屏放下"),
-    ("Alt-H / c", "列显隐：空格勾选显示的列（会话内记住）"),
+    ("Alt-H / c", "列显隐：空格勾选显示的列（按 库.表 记住，跨会话）"),
     ("Alt-R / t", "最近浏览的 5 张表，Enter 直达（侧栏 t）"),
     ("Shift+← →", "列窗口横滚一列（任意区域，按住连滚）"),
     ("Ctrl-O", "SQL 片段收藏（DBX saved_sql_files）"),
@@ -8414,6 +9451,9 @@ const HELP_ROWS: &[(&str, &str)] = &[
     ("底部进度条", "当前列窗口位置 · 点击可跳转"),
     ("[ ]", "切换本次会话的结果标签"),
     ("Ctrl-Y", "导出当前结果为 CSV（$HOME）"),
+    ("y", "复制当前行为 INSERT 语句（OSC52 + 文件兜底）"),
+    ("/", "搜索结果行（输入即筛选，Enter 保留，Esc 清除）"),
+    ("n / Shift-N", "搜索命中时：下 / 上一个命中（否则 n 翻页）"),
     ("Ctrl-N", "结果被截断时加载更多行"),
     ("Enter", "整行详情（紧凑列模式）/ 完整单元格"),
     ("v", "完整单元格（任意模式）"),
@@ -8426,8 +9466,8 @@ const HELP_ROWS: &[(&str, &str)] = &[
     ("s", "按当前列升 / 降序"),
     ("Ctrl-K", "附加排序键（多列排序）"),
     ("z", "钉住 / 取消首列"),
-    ("w / Alt-C", "紧凑列宽 开 / 关（窄屏默认自动开）"),
-    ("c / Alt-H", "列显隐浮层（空格勾选 / a 全选 / x 仅首列）"),
+    ("w / Alt-C", "紧凑列宽 开 / 关（窄屏默认自动开，按 库.表 记住）"),
+    ("c / Alt-H", "列显隐浮层（空格勾选 / a 全选 / x 仅首列，按 库.表 记住）"),
     ("Alt-R", "最近表直达浮层"),
     ("t", "字段 ↔ DDL（表结构）"),
     ("Esc", "收起结果 / 关闭浮层"),
@@ -8438,7 +9478,8 @@ const HELP_ROWS: &[(&str, &str)] = &[
     ("Ctrl-T", "加入批量队列（Ctrl-S 打包事务提交）"),
     ("Ctrl-S / Ctrl-X", "提交 / 清空批量队列"),
     ("— 编辑器 / 命令 —", ""),
-    ("Ctrl-Space", "SQL 前缀补全（表名 / 列名 / 关键字，Tab 上屏）"),
+    ("Ctrl-Space", "SQL 前缀补全（表名 T / 列名 C / 关键字 K，Tab 上屏）"),
+    ("补全上下文", "表名. 后只补该表列名；FROM/JOIN 后优先表名；WHERE/ON 后优先列名"),
     ("↑ ↓", "历史（首行 / 末行）"),
     ("[ ]", "Redis 逻辑库"),
     ("use <db>", "MongoDB 切库"),
@@ -8612,6 +9653,19 @@ mod tests {
         assert!(out.starts_with('…'));
         assert!(out.ends_with("done"));
         assert_eq!(disp_width(&out), 12);
+    }
+
+    #[test]
+    fn normal_cjk_message_keeps_a_visible_tail() {
+        // Display width != char count here: the old skip-by-chars logic dropped
+        // the whole message (just `…`) on a narrow screen.
+        let msg = "脚本列表不支持搜索（先 Enter 进入某条语句的结果）";
+        let out = fit_status(msg, 21);
+        assert!(out.starts_with('…'));
+        assert!(disp_width(&out) <= 21);
+        assert!(out.ends_with('）'));
+        // The tail must actually carry content, not be an empty `…`.
+        assert!(disp_width(&out) > 1);
     }
 
     #[test]
@@ -8985,7 +10039,7 @@ mod tests {
             .map(|row| {
                 Row::new(
                     row.iter()
-                        .map(|v| cell_widget_hl(v, 8, false))
+                        .map(|v| cell_widget_hl(v, 8, false, None))
                         .collect::<Vec<_>>(),
                 )
             })
@@ -9528,5 +10582,191 @@ mod tests {
         ta.delete_str(n);
         ta.insert_str("users");
         assert_eq!(ta.lines(), ["select * from users"]);
+    }
+
+    // ── R13: copy row as INSERT ──
+
+    #[test]
+    fn insert_literal_keeps_null_empty_and_quotes_apart() {
+        assert_eq!(insert_literal(&Val::Null, None), "NULL");
+        assert_eq!(insert_literal(&Val::Text(String::new()), None), "''");
+        assert_eq!(
+            insert_literal(&Val::Text("O'Brien".into()), None),
+            "'O''Brien'"
+        );
+        assert_eq!(
+            insert_literal(&Val::Text("a\\b".into()), None),
+            "'a\\\\b'"
+        );
+        // A numeric column keeps a real number bare.
+        assert_eq!(
+            insert_literal(&Val::Text("42".into()), Some("int")),
+            "42"
+        );
+        // A binary column becomes a portable hex literal.
+        assert_eq!(
+            insert_literal(&Val::Text("\u{0}\u{1}A".into()), Some("varbinary(8)")),
+            "X'000141'"
+        );
+        assert_eq!(insert_literal(&Val::Text("AB".into()), Some("bytea")), "X'4142'");
+    }
+
+    #[test]
+    fn binary_type_detection_ignores_length_params() {
+        assert!(is_binary_type("BLOB"));
+        assert!(is_binary_type("varbinary(255)"));
+        assert!(is_binary_type("bytea"));
+        assert!(!is_binary_type("varchar(255)"));
+        assert!(!is_binary_type("text"));
+    }
+
+    #[test]
+    fn table_name_is_guessed_from_common_statements() {
+        assert_eq!(guess_table_from_sql("select * from users"), Some("users".into()));
+        assert_eq!(
+            guess_table_from_sql("SELECT a FROM `shop`.`orders` WHERE x=1"),
+            Some("orders".into())
+        );
+        assert_eq!(
+            guess_table_from_sql("select * from (select 1)"),
+            None
+        );
+        assert_eq!(
+            guess_table_from_sql("update public.t set a=1"),
+            Some("t".into())
+        );
+        assert_eq!(guess_table_from_sql("select 1"), None);
+    }
+
+    #[test]
+    fn base64_matches_the_rfc_vectors() {
+        assert_eq!(base64_encode(b""), "");
+        assert_eq!(base64_encode(b"f"), "Zg==");
+        assert_eq!(base64_encode(b"fo"), "Zm8=");
+        assert_eq!(base64_encode(b"foo"), "Zm9v");
+        assert_eq!(base64_encode(b"foobar"), "Zm9vYmFy");
+    }
+
+    #[test]
+    fn row_search_matches_any_cell_and_null_as_text() {
+        let row = vec![Val::Text("Alice".into()), Val::Null, Val::Text("42".into())];
+        assert!(row_matches(&row, "alice"));
+        assert!(row_matches(&row, "null"));
+        assert!(row_matches(&row, "4"));
+        assert!(!row_matches(&row, "bob"));
+        assert!(row_matches(&row, ""));
+    }
+
+    #[test]
+    fn row_search_keeps_only_matching_rows_and_is_case_insensitive() {
+        let grid = Grid {
+            columns: vec!["name".into(), "city".into()],
+            rows: vec![
+                vec![Val::Text("Alice".into()), Val::Text("Beijing".into())],
+                vec![Val::Text("Bob".into()), Val::Text("Shanghai".into())],
+                vec![Val::Text("alice2".into()), Val::Null],
+            ],
+            note: String::new(),
+        };
+        // Empty / whitespace-only needles are a no-op.
+        assert_eq!(apply_row_search(grid.clone(), "").rows.len(), 3);
+        assert_eq!(apply_row_search(grid.clone(), "  ").rows.len(), 3);
+        // Case-insensitive substring across any column.
+        let hits = apply_row_search(grid.clone(), "ALICE");
+        assert_eq!(hits.rows.len(), 2);
+        assert!(matches!(&hits.rows[0][0], Val::Text(s) if s == "Alice"));
+        assert!(matches!(&hits.rows[1][0], Val::Text(s) if s == "alice2"));
+        // `null` finds real NULLs.
+        assert_eq!(apply_row_search(grid.clone(), "null").rows.len(), 1);
+        // No match yields an empty grid (but keeps the columns).
+        let none = apply_row_search(grid, "zzz");
+        assert!(none.rows.is_empty());
+        assert_eq!(none.columns.len(), 2);
+    }
+
+    #[test]
+    fn completion_candidates_are_tagged_deduped_and_case_insensitive() {
+        let mut out = Vec::new();
+        let mut seen = HashSet::new();
+        let names = vec!["id".to_string(), "ID".to_string(), "name".to_string()];
+        push_names(&mut out, &mut seen, &names, 'C', "i");
+        // `id` and `ID` collapse to one candidate (case-insensitive dedupe).
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].text, "id");
+        assert_eq!(out[0].kind, 'C');
+        // A table candidate keeps its `T` tag and matches case-insensitively.
+        let mut out = Vec::new();
+        let mut seen = HashSet::new();
+        push_item(&mut out, &mut seen, "Users", 'T', "us");
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].text, "Users");
+        assert_eq!(out[0].kind, 'T');
+    }
+
+    // ── R13: persistent config ──
+
+    #[test]
+    fn config_round_trips_and_tolerates_corruption() {
+        let path = std::env::temp_dir().join(format!("dbxt-test-{}.json", Uuid::new_v4()));
+        let mut cfg = TuiConfig::default();
+        cfg.compact = Some(true);
+        let e = cfg.entry("shop", "orders");
+        e.hidden = ["secret".to_string()].into_iter().collect();
+        e.compact = Some(false);
+        e.order_by = Some("\"id\" DESC".into());
+        cfg.save(&path);
+        let back = TuiConfig::load(&path);
+        assert_eq!(back.compact, Some(true));
+        let p = back.table("shop", "orders").unwrap();
+        assert_eq!(p.hidden.len(), 1);
+        assert!(p.hidden.contains("secret"));
+        assert_eq!(p.compact, Some(false));
+        assert_eq!(p.order_by.as_deref(), Some("\"id\" DESC"));
+
+        // A truncated / garbage file falls back to defaults instead of failing.
+        std::fs::write(&path, "{ not json").unwrap();
+        let broken = TuiConfig::load(&path);
+        assert!(broken.tables.is_empty());
+        assert_eq!(broken.compact, None);
+        // A missing file is fine too.
+        let _ = std::fs::remove_file(&path);
+        assert!(TuiConfig::load(&path).tables.is_empty());
+    }
+
+    // ── R13: context-aware completion ──
+
+    #[test]
+    fn completion_context_follows_the_cursor() {
+        let end = |s: &str| {
+            let mut ta = TextArea::from([s]);
+            ta.move_cursor(CursorMove::End);
+            ta
+        };
+        assert_eq!(completion_context(&end("select * from us")).0, CompCtx::TableList);
+        assert_eq!(completion_context(&end("select * from us")).1, "us");
+        assert_eq!(
+            completion_context(&end("select * from t left join ")).0,
+            CompCtx::TableList
+        );
+        assert_eq!(completion_context(&end("select * from t where ")).0, CompCtx::Column);
+        assert_eq!(completion_context(&end("select * from t on ")).0, CompCtx::Column);
+        assert_eq!(completion_context(&end("select * ")).0, CompCtx::Any);
+        let (ctx, partial) = completion_context(&end("select * from users.na"));
+        assert_eq!(ctx, CompCtx::Qualified("users".into()));
+        assert_eq!(partial, "na");
+        // `db.table.` → the qualifier is the last segment only.
+        assert_eq!(
+            completion_context(&end("select * from shop.orders.")).0,
+            CompCtx::Qualified("orders".into())
+        );
+        // Quoted / bracketed qualifiers are unquoted before matching.
+        assert_eq!(
+            completion_context(&end("select * from `users`.")).0,
+            CompCtx::Qualified("users".into())
+        );
+        assert_eq!(
+            completion_context(&end("select * from [users].")).0,
+            CompCtx::Qualified("users".into())
+        );
     }
 }

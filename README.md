@@ -16,7 +16,7 @@ Early but usable. Verified end-to-end against real MySQL 8.4, Redis and MongoDB 
 - ✅ **Row delete (`Delete` / `Ctrl-D`)**: builds a bound `DELETE FROM table WHERE pk = …` (all columns, with a warning, when there is no primary key) and always shows the full statement in the red confirmation layer — nothing is deleted until `Enter`. After success the current page is refreshed in place
 - ✅ **Transactional batch edits**: `Ctrl-T` in the edit layer queues a write (`批量 N 待提交` in the status bar); `Ctrl-S` opens a confirmation showing the whole `BEGIN … COMMIT` script and runs it as one transaction on `Enter` (reporting affected rows / errors), `Ctrl-X` discards the queue
 - ✅ **Row detail (`o`)**: shows the whole focused row as a scrollable vertical `column = value` list
-- ✅ **Filter / sort**: `f` opens a `WHERE` prompt pre-filled with the focused column (`"col" = `) and reloads from page 1 with that predicate; the syntax quick-reference (`= != > < >= <= LIKE IN BETWEEN IS NULL AND/OR`, plus the MySQL/PG quoting differences) is shown inside the prompt. The active filter is shown in the title and status bar **and** as a `⚑` badge on the filtered column header. `Ctrl-R` clears it. `s` sorts by the focused column (ascending ↔ descending) and `Ctrl-K` appends an extra sort key; sorted headers show `▲`/`▼` (with a rank for multi-column sorts). Filter and sort both survive page turns
+- ✅ **Filter / sort**: `f` opens a `WHERE` prompt pre-filled with the focused column (`"col" = `) and reloads from page 1 with that predicate; the syntax quick-reference (`= != > < >= <= LIKE IN BETWEEN IS NULL AND/OR`, plus the MySQL/PG quoting differences) is shown inside the prompt. The active filter is shown in the title and status bar **and** as a `⚑` badge on the filtered column header. `Ctrl-R` clears it. `s` sorts by the focused column (ascending ↔ descending) and `Ctrl-K` appends an extra sort key; sorted headers show `▲`/`▼` (with a rank for multi-column sorts). Filter and sort both survive page turns, and the sort is persisted per table
 - ✅ **Horizontal scroll progress bar**: a **half-height** track + thumb is drawn along the bottom border of the result grid, showing which slice of the columns is on screen next to a `列 1|3-8/21` label; it hides automatically when every column fits, and clicking the track jumps the column window there. A matching half-width vertical position indicator is drawn on the right border
 - ✅ **Table structure**: `r` shows the field list (type / key / nullable / default / comment); `t` toggles the `SHOW CREATE TABLE` DDL (dialect-aware, built by the DBX kernel)
 - ✅ **Wide tables / horizontal scrolling**: `←`/`→` (or `h`/`l`) move a cell-level cursor and the column window follows it; `Shift`+wheel, the horizontal wheel, a left/right **swipe** (a touch drag) and `Shift`+`←`/`→` pan the window directly, the first data column can be pinned with `z` (the row-number gutter is always pinned); the current column is highlighted in the header and the focused cell is highlighted in the body; `Enter` opens the full, untruncated cell value in a popup. The status bar always shows `列 1|3-8/21`-style horizontal position, and the bottom progress bar makes it obvious at a glance. The same cell cursor and column scrolling work inside a drilled-down script result
@@ -25,8 +25,11 @@ Early but usable. Verified end-to-end against real MySQL 8.4, Redis and MongoDB 
 - ✅ **DML**: `INSERT`/`UPDATE`/`DELETE` report affected rows; every generated write (`e` / `i` / `Delete`) and the transactional batch go through a confirmation layer that shows the full SQL, and `DROP`/`TRUNCATE` and `WHERE`-less `UPDATE`/`DELETE` additionally pop the red dangerous-statement confirmation before running
 - ✅ **Multi-statement scripts**: `a; b; c;` runs as a batch and shows one row per statement; `Enter` drills into a statement's result set (with the full cell cursor / column scrolling of the main grid)
 - ✅ **Help overlay**: `?` opens a keyboard cheat-sheet; every overlay (database list, cell value, row detail, filter prompt, help, confirmation) closes with `Esc`
-- ✅ **Mobile efficiency**: compact column widths (`Alt-C` / `w`) share the pane so a wide table fits on a phone screen and the status bar reads `全部 N 列已适配`; `Enter` expands the focused row as a vertical `column = value` list; `Alt-H` (`c`) hides columns for the session (DBX's column-visibility picker, by name); `/` filters table names as you type; `Alt-R` (`t`) jumps to one of the last five browsed tables. See *Mobile efficiency* below for the recommended phone workflow
-- ✅ **SQL completion**: `Ctrl-Space` in the editor completes the identifier at the cursor from the current table's columns, the connection's tables and a keyword list — `Tab` accepts, typing refines
+- ✅ **Mobile efficiency**: compact column widths (`Alt-C` / `w`) share the pane so a wide table fits on a phone screen and the status bar reads `全部 N 列已适配`; `Enter` expands the focused row as a vertical `column = value` list; `Alt-H` (`c`) hides columns (DBX's column-visibility picker, by name, persisted per `database.table`); `/` filters table names as you type; `Alt-R` (`t`) jumps to one of the last five browsed tables. See *Mobile efficiency* below for the recommended phone workflow
+- ✅ **Persistent per-table preferences**: compact mode, hidden columns and sort are saved to `~/.config/dbxt/tui.json` (keyed by `database.table`) and restored on reopen; a corrupt or missing config falls back to defaults
+- ✅ **Copy a row as SQL (`y`)**: `INSERT INTO … VALUES (…)` for the focused row, with NULL / empty-string / quote escaping and binary columns as `X'…'` hex; copied via OSC 52 (tmux passthrough aware) with a `~/.cache/dbxt/clipboard.txt` fallback
+- ✅ **Result search (`/`)**: filters the visible rows as you type, highlights matches, shows the hit count, and `n` / `Shift-N` cycle the hits (`Esc` clears)
+- ✅ **SQL completion**: `Ctrl-Space` completes the identifier at the cursor and follows the context (`table.` → columns only; `FROM`/`JOIN` → tables first; `WHERE`/`ON` → columns first), tagging candidates `T`/`C`/`K`; `Tab` accepts, typing refines
 - ✅ **Query favourites, both ways**: `Ctrl-O` inserts a DBX `saved_sql_files` snippet; `s` saves the editor's SQL back into that shared store (name prompt, `.sql` suffix, RFC3339 timestamp) so DBX Desktop sees it too
 - ✅ **No focus stealing**: a background page load updates the results in place and only moves focus to the grid when a table is first opened from the sidebar
 - ✅ **SQL editor**: multi-line, shell-style `↑`/`↓` history (seeded from DBX's shared query history), the results pane takes focus after a run
@@ -101,7 +104,9 @@ The first build compiles the full DBX kernel (several minutes; sqlite is bundled
 # default store (same as DBX Desktop)
 dbxt
 
-# explicit store directory (a copy you downloaded, a portable dir, etc.)
+# explicit store file (a copy you downloaded, a portable dir, etc.)
+dbxt /path/to/dbx.db
+# a directory is also accepted and joined with dbx.db
 dbxt /path/to/dir-containing-dbx.db
 # or
 DBX_DATA_DIR=/path/to/dir dbxt
@@ -116,6 +121,10 @@ DBX_DATA_DIR=/path/to/dir dbxt
 | `DBXT_MOUSE_DEBUG=1` (or `=<path>`) | the same log (`$TMPDIR/dbxt-mouse.log` by default) plus a live floating event panel — how to report what a phone swipe actually sends |
 | `DBXT_DRAG_PAN=button\|any\|off` | how a swipe is recognised: a held-button drag (default), also bare motion, or nothing |
 | `DBXT_NO_ITALIC=1` | render `NULL` in grey only — never rely on the terminal's italic face |
+| `DBXT_CONFIG=<path>` | where the persistent TUI config lives (default `~/.config/dbxt/tui.json`, honouring `XDG_CONFIG_HOME`) |
+| `DBXT_NO_PERSIST=1` | never read or write the TUI config |
+| `DBXT_CLIPBOARD=off` | do not emit the OSC 52 escape (the file fallback still works) |
+| `DBXT_CLIPBOARD_FILE=<path>` | where the copy fallback file is written (default `~/.cache/dbxt/clipboard.txt`) |
 
 ### Keys
 
@@ -142,7 +151,7 @@ DBX_DATA_DIR=/path/to/dir dbxt
 | Anywhere | `Ctrl-W` | collapse / expand the focused pane |
 | Anywhere | `Ctrl-G` | toggle pan mode — vertical wheel / up-down swipe pans columns (touch fallback) |
 | Anywhere | `Alt-C` (or `w` in the results) | toggle **compact column widths** — share the pane so a wide table fits with no horizontal scroll |
-| Anywhere | `Alt-H` (or `c` in the results) | **column visibility** picker (`Space` toggles, `a` all, `x` first only; remembered for the session) |
+| Anywhere | `Alt-H` (or `c` in the results) | **column visibility** picker (`Space` toggles, `a` all, `x` first only; persisted per `database.table`) |
 | Anywhere | `Alt-R` (or `t` in the sidebar) | **recent tables** overlay — the last five browsed tables, `Enter` jumps there |
 | Anywhere | `Shift`+`←` / `Shift`+`→` | pan the column window one column (hold to repeat; the text inputs keep `Shift`+arrow for selection) |
 | Anywhere | `Ctrl-O` | saved SQL snippets (DBX's `saved_sql_files`), insert into the editor |
@@ -164,6 +173,9 @@ DBX_DATA_DIR=/path/to/dir dbxt
 | Results | `◀` `▶` on the bottom bar | tap to pan one window of columns (touch-friendly) |
 | Results | `[` / `]` | previous / next result tab (successive queries) |
 | Results | `Ctrl-Y` | export the focused result to CSV under `$HOME` |
+| Results | `y` | copy the focused row as an `INSERT INTO … VALUES (…)` statement (OSC 52 clipboard + file fallback) |
+| Results | `/` | search the visible result rows as you type (`Enter` keeps it, `Esc` clears) |
+| Results | `n` / `Shift-N` | next / previous search hit (without an active search, `n` is the next page) |
 | Results | `Ctrl-N` | load more rows when the result was truncated at the cap |
 | Results | `Ctrl-E` | focus the SQL editor |
 | Results | `Enter` | open the focused cell in a popup — or, in compact column mode, **expand the whole row** (script view: drill into a statement's result) |
@@ -192,7 +204,7 @@ DBX_DATA_DIR=/path/to/dir dbxt
 | Table filter (`/`) | typing / `Enter` / `Esc` | filter live / keep the filter / clear it |
 | Column picker (`Alt-H`) | `Space` / `a` / `x` / `↑` `↓` / `Esc` | toggle one column / show all / keep only the first / move / close |
 | Recent tables (`Alt-R`) | `↑` `↓` / `Enter` / `Esc` | select / jump to the table / close |
-| SQL completion (`Ctrl-Space`) | `↑` `↓` / `Tab` `Enter` / `Esc` | select / accept / cancel (typing keeps refining) |
+| SQL completion (`Ctrl-Space`) | `↑` `↓` / `Tab` `Enter` / `Esc` | select / accept / cancel (typing keeps refining; candidates are tagged `T`/`C`/`K` and follow the cursor context) |
 | Help | `↑` `↓` `PgUp` `PgDn` / `Esc` `?` | scroll / close |
 | Confirmation | `Enter` `y` / `Esc` `n` | execute / cancel (full SQL shown) |
 
@@ -212,19 +224,25 @@ CSV export (`Ctrl-Y`) follows RFC 4180 and DBX: both `NULL` and the empty string
 
 ### Mobile efficiency (recommended phone workflow)
 
-A phone terminal is narrow, and no gesture is reliably delivered. So instead of betting on a swipe, dbxt makes a wide table *fit*: on a narrow terminal the columns are compressed automatically, a row expands to a vertical list on `Enter`, and columns you do not care about can be hidden for the session. Together these remove the need to scroll sideways at all — horizontal swiping is still there as a bonus for terminals that report it.
+A phone terminal is narrow, and no gesture is reliably delivered. So instead of betting on a swipe, dbxt makes a wide table *fit*: on a narrow terminal the columns are compressed automatically, a row expands to a vertical list on `Enter`, and columns you do not care about can be hidden (and the choice persisted per table). Together these remove the need to scroll sideways at all — horizontal swiping is still there as a bonus for terminals that report it.
 
 **1. Compact column widths (on by default below 50 columns).** Every column shares the pane equally (6–8 cells each, longer values get an ellipsis) so as many columns as possible land on screen at once. On a 42-column terminal a 20-column table goes from 3 visible columns to 5; on a 110-column terminal it goes from 7 to 11. When *every* column fits, the status bar says `全部 N 列已适配` and the bottom scroll bar disappears — you are done scrolling. `Alt-C` toggles it from anywhere, `w` in the results pane.
 
 **2. Row expand (`Enter`).** In compact mode `Enter` opens the focused row as a scrollable `column = value` list — every column, at full width, one per line — which is how a truncated cell is read on a small screen. `o` does the same in any mode, and `v` (or `Enter` outside compact mode) still opens just the focused cell.
 
-**3. Column visibility (`Alt-H`, or `c` in the results).** `Space` ticks a column off, `a` shows them all again, `x` keeps only the first. The choice is remembered for the browsing session (keyed by column name, so it follows you between tables) and applied to every later page and query result, so a table collapses to just the columns you care about — usually enough to make the horizontal scroll bar disappear entirely.
+**3. Column visibility (`Alt-H`, or `c` in the results).** `Space` ticks a column off, `a` shows them all again, `x` keeps only the first. The choice is remembered for the table (`database.table`, in `~/.config/dbxt/tui.json`) and restored the next time you open it, so a table collapses to just the columns you care about — usually enough to make the horizontal scroll bar disappear entirely.
 
 **4. `/` to filter tables.** With a long sidebar, type a few letters of the table name and only the matches remain (`Enter` keeps the filter, `Esc` clears it). Faster than scrolling on any screen size.
 
 **5. `Alt-R` (or `t`) for recent tables.** The last five browsed `database.table` pairs, newest first — `Enter` jumps straight there, switching database first when needed. Replaces hunting through the sidebar.
 
-**6. `Ctrl-Space` for SQL completion.** Completes the identifier at the cursor from the current table's columns, the connection's tables, and a keyword list; `Tab` accepts, `↑`/`↓` choose, and typing keeps refining the list.
+**6. `Ctrl-Space` for SQL completion.** Completes the identifier at the cursor and follows the context: after `table.` only that table's columns are offered, after `FROM` / `JOIN` tables come first, after `WHERE` / `ON` columns come first, and matching is case-insensitive. Each candidate carries its type (`T` table / `C` column / `K` keyword); `Tab` accepts, `↑`/`↓` choose, and typing keeps refining the list.
+
+**7. Persistence.** The compact-column toggle, the hidden-column set and the sort are written per `database.table` to `~/.config/dbxt/tui.json` (override with `DBXT_CONFIG`, disable with `DBXT_NO_PERSIST=1`) and restored when you reopen the table. A missing, truncated or corrupt config file is ignored and dbxt starts with defaults.
+
+**8. Copy a row as SQL (`y`).** Builds `INSERT INTO … VALUES (…)` for the focused row (hidden columns included, NULL/empty/quotes escaped, binary columns as `X'…'` hex) and copies it with OSC 52 — wrapped in a tmux DCS passthrough when inside tmux. The same text is always written to `~/.cache/dbxt/clipboard.txt` as a fallback, and the path is reported in the status bar; a terminal that ignores OSC 52 simply gets no clipboard and no error.
+
+**9. Search the result grid (`/`).** Filters the visible rows as you type, highlights the matching cells, and shows the hit count in the title; `n` / `Shift-N` cycle the hits and `Esc` clears the search. It is focus-scoped, so `/` in the results never clashes with the sidebar table filter.
 
 #### A note on `Ctrl-Shift` keys
 
@@ -293,8 +311,10 @@ Keystrokes are never traced, so a password typed into the connection form cannot
 - [ ] In-TUI connection editing / deletion (duplication is in via `p`)
 - [ ] Result export to JSON / XLSX (CSV is in via `Ctrl-Y`)
 - [ ] Persist dbxt-run SQL back into DBX's shared query history (it is read today)
-- [x] Schema-aware SQL completion — prefix completion of tables / columns / keywords is in via `Ctrl-Space`; full semantic (JOIN-aware) completion is still open
-- [ ] Persist the compact-column and column-visibility choices across sessions (they are per-session today, like DBX's column picker)
+- [x] Schema-aware SQL completion — context-aware prefix completion (tables / columns / keywords, tagged `T`/`C`/`K`) is in via `Ctrl-Space`; full JOIN-aware completion is still open
+- [x] Persist the compact-column and column-visibility choices across sessions — now stored per `database.table` in `~/.config/dbxt/tui.json` (sort included)
+- [ ] In-TUI result-row editing without a primary key (a stable row identity)
+- [ ] Search across pages / the whole result set (today `/` filters the loaded page)
 - [ ] Release builds for Windows, macOS (Intel/Apple Silicon), Linux (glibc + musl), Android Termux (aarch64 musl, static)
 
 ## License
