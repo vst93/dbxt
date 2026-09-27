@@ -8,7 +8,9 @@ A keyboard-first terminal UI for databases, built on the [DBX](https://github.co
 
 **Connections** — shared with DBX Desktop
 - Connections live in DBX's own SQLite store (`dbx.db`), so everything you configured there shows up automatically.
-- `c` creates a connection in-TUI, `e` edits the highlighted one (prefilled, including its SSH tunnel), `p` duplicates one into the form, `Enter` connects; rows are colour-coded by database family.
+- `c` creates a connection in-TUI, `e` edits the highlighted one (prefilled, including its SSH tunnel), `p` duplicates one into the form, `x` deletes one behind a red confirmation, `Enter` connects; rows are colour-coded by database family.
+- The connection form has a `color` row: `Space` cycles a preset palette (none → 10 colours → custom), `Enter` types a free-form `#RRGGBB`, and a live swatch previews the result. The colour is stored in DBX's own `color` field, so it round-trips with the desktop app, survives editing and duplication, and tints the sidebar, picker, title bar, status line and the `d` switcher header (the name stays fully readable — colour is only an accent).
+- `s` in the picker cycles the sort order: **name** (default) → **type** → **colour**, so all your production (red) connections line up together.
 - `d` opens a switcher — MySQL databases, PostgreSQL (and other schema-aware engines') **schemas then databases**, MongoDB databases and Redis logical DBs, all one gesture.
 - `o` returns to the picker; `r` reloads the list in place.
 
@@ -119,8 +121,8 @@ The TUI's `?` overlay and `dbxt --help` carry the complete list; this is the sho
 | Context | Keys |
 | --- | --- |
 | Global | `?` help · `Tab`/`Shift-Tab` panes · `Alt-1/2/3` focus · `F5`/`Ctrl-J` run · `Ctrl-C` quit |
-| Connections | `↑` `↓` move · `Enter` connect · `c` new · `e` edit · `p` duplicate · `d` database/schema switcher · `o` picker |
-| Connection form | `↑` `↓`/`Tab` fields · `Enter` edit/toggle/save · `Space` toggle `ssh_tunnel`/`ssl`/`ssh_auth` · `Esc` back |
+| Connections | `↑` `↓` move · `Enter` connect · `c` new · `e` edit · `p` duplicate · `s` sort (name/type/colour) · `x` delete · `d` database/schema switcher · `o` picker |
+| Connection form | `↑` `↓`/`Tab` fields · `Enter` edit/toggle/save · `Space` toggle `ssh_tunnel`/`ssl`/`ssh_auth`, cycle the `color` palette · `Esc` back |
 | SSH host key | `y`/`Enter` accept & remember · `s` this session only · `n`/`Esc` reject |
 | Sidebar | `↑` `↓` tables · `/` filter · `Enter` browse · `r` structure · `I` import CSV · `t` recent |
 | Results | `↑` `↓` rows · `←` `→` columns · `n`/`p` pages · `Enter`/`v` cell · `e` edit · `i` insert · `Delete` delete |
@@ -146,7 +148,7 @@ Early but usable. Verified end-to-end against real MySQL 8.4, PostgreSQL 16, Red
 - [x] MongoDB document browser with document CRUD
 - [x] SSH tunnels (password / key / agent, `~/.ssh/config` aliases and `ProxyJump`) with in-TUI create/edit
 - [x] Prebuilt archives for seven targets — only the Linux x86_64 build has been exercised locally, the others are untested
-- [ ] In-TUI connection deletion (editing and duplication are in)
+- [x] In-TUI connection deletion (red confirmation; config only, never database data)
 - [ ] Result export to XLSX, and search across pages
 - [ ] Excel (`.xlsx`) import
 - [ ] A dedicated Android/Termux build

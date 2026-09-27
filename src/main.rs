@@ -1119,6 +1119,17 @@ struct Confirm {
     /// Set for MongoDB document writes: Enter runs the matching insert / update /
     /// delete through the document driver, then reloads the current page.
     mongo: Option<MongoConfirm>,
+    /// Set for connection deletion: Enter removes the saved connection (never any
+    /// database data).
+    conn: Option<ConnConfirm>,
+}
+
+/// A pending connection deletion shown in the red confirmation layer.
+#[derive(Clone)]
+struct ConnConfirm {
+    id: String,
+    name: String,
+    db_type: String,
 }
 
 /// A pending Redis write shown in the red confirmation layer.
@@ -1892,6 +1903,9 @@ enum Op {
     /// Replace an existing saved connection (id is preserved). The kernel has no
     /// UPDATE, so the op removes then re-adds the same id.
     UpdateConn(Box<ConnectionConfig>),
+    /// Remove a saved connection from DBX's store (config only; never touches
+    /// the database's data).
+    DeleteConn { id: String, name: String },
     /// Read, decode and header-align a CSV against a table's columns, producing
     /// the preview plan.
     ImportPlan {
@@ -1923,6 +1937,8 @@ impl Op {
 
 enum OpResult {
     Connections(Vec<ConnectionConfig>),
+    /// A saved connection was removed (id + name for the status line).
+    ConnDeleted { id: String, name: String },
     Databases {
         databases: Vec<String>,
         /// Set when the driver could not enumerate databases but the
@@ -2764,6 +2780,11 @@ async fn run_op(backend: &LocalBackend, op: Op, tx: &Tx) -> OpResult {
                 Err(e) => OpResult::Error(format!("update: {e}")),
             }
         }
+        Op::DeleteConn { id, name } => match backend.remove_connection_for_mcp(&id).await {
+            Ok(true) => OpResult::ConnDeleted { id, name },
+            Ok(false) => OpResult::Error(tf("连接不存在: {}", &[&name])),
+            Err(e) => OpResult::Error(format!("delete: {e}")),
+        },
         Op::ImportPlan { cfg, db, schema, table, path, gen } => {
             let expanded = expand_home(&path.to_string_lossy());
             let bytes = match std::fs::read(&expanded) {
@@ -3009,6 +3030,7 @@ enum FormRow {
     Password,
     Database,
     Ssl,
+    Color,
     SshEnabled,
     SshHost,
     SshPort,
@@ -3031,6 +3053,10 @@ struct ConnForm {
     password: String,
     database: String,
     ssl: bool,
+    /// Connection colour as `#rrggbb` (empty = no colour, family default).
+    color: String,
+    /// Index into the `Space`-cycled colour stops (none / presets / custom).
+    color_sel: usize,
     // ── SSH tunnel (serialized to `transport_layers`) ──
     ssh_enabled: bool,
     ssh_host: String,
@@ -3062,6 +3088,8 @@ impl Default for ConnForm {
             password: String::new(),
             database: String::new(),
             ssl: false,
+            color: String::new(),
+            color_sel: 0,
             ssh_enabled: false,
             ssh_host: String::new(),
             ssh_port: "22".into(),
@@ -3080,6 +3108,130 @@ impl Default for ConnForm {
     }
 }
 
+/// Preset connection colours cycled by `Space` on the `color` form row. Index 0
+/// is "no colour" (the database-family default applies), the middle entries are
+/// terminal-safe RGB presets, and the final index is the free-form hex stop.
+const CONN_COLOR_PRESETS: [&str; 10] = [
+    "#e06c75", // red
+    "#e5c07b", // amber
+    "#98c379", // green
+    "#56b6c2", // cyan
+    "#61afef", // blue
+    "#c678dd", // purple
+    "#ff8800", // orange
+    "#00d7af", // teal
+    "#ffffff", // white
+    "#808080", // gray
+];
+/// Number of `color_sel` stops: none + presets + custom.
+const CONN_COLOR_STOPS: usize = CONN_COLOR_PRESETS.len() + 2;
+/// `color_sel` index of the free-form hex stop.
+const CONN_COLOR_CUSTOM: usize = CONN_COLOR_PRESETS.len() + 1;
+
+/// `color_sel` for a stored hex value: 0 when unset, the preset index when it
+/// matches a preset exactly, else the custom stop.
+fn color_sel_for(value: &str) -> usize {
+    let v = value.trim();
+    if v.is_empty() {
+        return 0;
+    }
+    if let Some(i) = CONN_COLOR_PRESETS.iter().position(|p| p.eq_ignore_ascii_case(v)) {
+        return i + 1;
+    }
+    CONN_COLOR_CUSTOM
+}
+
+/// Canonical colour value for a `color_sel` stop (the custom stop keeps the text
+/// the user typed).
+fn color_value_for(sel: usize, custom: &str) -> String {
+    if sel == 0 {
+        String::new()
+    } else if sel <= CONN_COLOR_PRESETS.len() {
+        CONN_COLOR_PRESETS[sel - 1].to_string()
+    } else {
+        custom.to_string()
+    }
+}
+
+/// Next `color_sel` stop, wrapping none → presets → custom → none.
+fn color_next_sel(sel: usize) -> usize {
+    (sel + 1) % CONN_COLOR_STOPS
+}
+
+/// Validate / normalise a form colour into the kernel's `#rrggbb` form. `Ok(None)`
+/// means "no colour"; `Err(())` means the text is not a valid hex colour.
+fn normalize_conn_color(raw: &str) -> Result<Option<String>, ()> {
+    let v = raw.trim();
+    if v.is_empty() {
+        return Ok(None);
+    }
+    if parse_hex_color(v).is_none() {
+        return Err(());
+    }
+    Ok(Some(format!("#{}", v.trim_start_matches('#').to_ascii_lowercase())))
+}
+
+/// Order the connection picker `s` cycles through.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum ConnSort {
+    Name,
+    Type,
+    Color,
+}
+
+impl ConnSort {
+    fn next(self) -> Self {
+        match self {
+            ConnSort::Name => ConnSort::Type,
+            ConnSort::Type => ConnSort::Color,
+            ConnSort::Color => ConnSort::Name,
+        }
+    }
+    fn label(self) -> &'static str {
+        match self {
+            ConnSort::Name => t("名称"),
+            ConnSort::Type => t("类型"),
+            ConnSort::Color => t("颜色"),
+        }
+    }
+}
+
+/// Grouping key used by the colour sort: connections that share an explicit
+/// colour stay together, and uncoloured ones group by database family so the
+/// default badge colours still line up.
+fn conn_color_group(cfg: &ConnectionConfig) -> String {
+    match cfg.color.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
+        Some(hex) => format!("c:{}", hex.trim_start_matches('#').to_ascii_lowercase()),
+        None => format!("t:{}", cfg.db_type.as_str().to_ascii_lowercase()),
+    }
+}
+
+/// Sort a connection list in place for the picker's `s` modes. Pure so it can be
+/// tested without an `App`.
+fn sort_connection_list(list: &mut [ConnectionConfig], mode: ConnSort) {
+    match mode {
+        ConnSort::Name => list.sort_by(|a, b| {
+            a.name
+                .to_lowercase()
+                .cmp(&b.name.to_lowercase())
+                .then_with(|| a.id.cmp(&b.id))
+        }),
+        ConnSort::Type => list.sort_by(|a, b| {
+            a.db_type
+                .as_str()
+                .cmp(b.db_type.as_str())
+                .then_with(|| a.name.to_lowercase().cmp(&b.name.to_lowercase()))
+                .then_with(|| a.id.cmp(&b.id))
+        }),
+        ConnSort::Color => list.sort_by(|a, b| {
+            conn_color_group(a)
+                .cmp(&conn_color_group(b))
+                .then_with(|| a.name.to_lowercase().cmp(&b.name.to_lowercase()))
+                .then_with(|| a.id.cmp(&b.id))
+        }),
+    }
+}
+
 /// The focusable rows for the current form state, in display order. Labels are
 /// technical keycaps kept identical in both languages (like the base fields).
 fn form_rows(f: &ConnForm) -> Vec<(FormRow, &'static str)> {
@@ -3092,6 +3244,7 @@ fn form_rows(f: &ConnForm) -> Vec<(FormRow, &'static str)> {
         (FormRow::Password, "password"),
         (FormRow::Database, "database"),
         (FormRow::Ssl, "ssl"),
+        (FormRow::Color, "color"),
         (FormRow::SshEnabled, "ssh_tunnel"),
     ];
     if f.ssh_enabled {
@@ -3122,6 +3275,7 @@ fn form_text_mut(f: &mut ConnForm, row: FormRow) -> Option<&mut String> {
         FormRow::Username => Some(&mut f.username),
         FormRow::Password => Some(&mut f.password),
         FormRow::Database => Some(&mut f.database),
+        FormRow::Color => Some(&mut f.color),
         FormRow::SshHost => Some(&mut f.ssh_host),
         FormRow::SshPort => Some(&mut f.ssh_port),
         FormRow::SshUser => Some(&mut f.ssh_user),
@@ -3158,6 +3312,8 @@ fn form_from_connection(cfg: &ConnectionConfig, name: String, edit_id: Option<St
         password: cfg.password.clone(),
         database: cfg.database.clone().unwrap_or_default(),
         ssl: cfg.ssl,
+        color: cfg.color.clone().unwrap_or_default(),
+        color_sel: color_sel_for(cfg.color.as_deref().unwrap_or("")),
         edit_id,
         ..ConnForm::default()
     };
@@ -3368,6 +3524,8 @@ struct App {
     connections: Vec<ConnectionConfig>,
     conn_list: ListState,
     picker_open: bool,
+    /// Order of the connection picker (`s` cycles name / type / colour).
+    conn_sort: ConnSort,
 
     selected: Option<ConnectionConfig>,
     databases: Vec<String>,
@@ -3879,6 +4037,7 @@ impl App {
             connections: Vec::new(),
             conn_list: ListState::default(),
             picker_open: true,
+            conn_sort: ConnSort::Name,
             selected: None,
             databases: Vec::new(),
             db_index: 0,
@@ -4142,12 +4301,27 @@ fn apply_op_result(app: &mut App, res: OpResult, tx: &Tx) {
     match res {
         OpResult::Connections(cs) => {
             let n = cs.len();
+            // Keep the highlight on the same connection across a reload.
+            let keep = app
+                .conn_list
+                .selected()
+                .and_then(|i| app.connections.get(i))
+                .map(|c| c.id.clone());
             app.connections = cs;
-            if !app.connections.is_empty() && app.conn_list.selected().is_none() {
-                app.conn_list.select(Some(0));
-            }
+            sort_connection_list(&mut app.connections, app.conn_sort);
+            let sel = keep
+                .and_then(|id| app.connections.iter().position(|c| c.id == id))
+                .or_else(|| (!app.connections.is_empty()).then_some(0));
+            app.conn_list.select(sel);
             app.picker_open = app.selected.is_none();
-            app.status = tf("{} 个连接 · ↑↓+Enter 选择 · c 新建", &[&(n)]);
+            app.status = tf("{} 个连接 · ↑↓+Enter 选择 · c 新建 · s 排序", &[&(n)]);
+        }
+        OpResult::ConnDeleted { id, name } => {
+            app.connections.retain(|c| c.id != id);
+            let n = app.connections.len();
+            let sel = app.conn_list.selected().unwrap_or(0).min(n.saturating_sub(1));
+            app.conn_list.select((n > 0).then_some(sel));
+            app.status = format!("✓ {}", tf("已删除连接 {}", &[&name]));
         }
         OpResult::Databases { databases: dbs, warning } => {
             let configured = app.selected.as_ref().and_then(|c| c.database.clone());
@@ -4988,6 +5162,11 @@ fn confirm_key(app: &mut App, tx: &Tx, k: KeyEvent) {
     match k.code {
         KeyCode::Enter | KeyCode::Char('y') | KeyCode::Char('Y') => {
             if let Some(c) = app.confirm.take() {
+                if let Some(cc) = c.conn {
+                    app.status = tf("删除连接 {}…", &[&cc.name]);
+                    app.spawn(tx, Op::DeleteConn { id: cc.id, name: cc.name });
+                    return;
+                }
                 if let Some(mc) = c.mongo {
                     run_mongo_action(app, tx, mc);
                     return;
@@ -5563,6 +5742,33 @@ fn sidebar_key(app: &mut App, tx: &Tx, k: KeyEvent) {
             KeyCode::Char('p') => duplicate_connection(app),
             // Edit the highlighted connection in place (form prefilled).
             KeyCode::Char('e') => edit_connection(app),
+            // Cycle the picker order: name → type → colour.
+            KeyCode::Char('s') => {
+                app.conn_sort = app.conn_sort.next();
+                app.sort_connections();
+                app.status = tf("排序：{} · s 切换（名称/类型/颜色）", &[&app.conn_sort.label()]);
+            }
+            // Delete the highlighted connection (red confirm; config only).
+            KeyCode::Char('x') | KeyCode::Delete => {
+                if let Some(idx) = app.conn_list.selected() {
+                    if let Some(cfg) = app.connections.get(idx) {
+                        app.confirm = Some(Confirm {
+                            sql: String::new(),
+                            reasons: Vec::new(),
+                            refresh: false,
+                            clear_batch: false,
+                            conn: Some(ConnConfirm {
+                                id: cfg.id.clone(),
+                                name: cfg.name.clone(),
+                                db_type: cfg.db_type.as_str().to_string(),
+                            }),
+                            redis: None,
+                            mongo: None,
+                        });
+                        app.status = tf("删除连接 {} · Enter 确认 · Esc 取消", &[&cfg.name]);
+                    }
+                }
+            }
             KeyCode::Char('q') => {
                 app.picker_open = !app.picker_open;
             }
@@ -7617,6 +7823,7 @@ fn redis_confirm_delete(app: &mut App) {
         ],
         refresh: false,
         clear_batch: false,
+        conn: None,
         redis: Some(RedisConfirm {
             db: app.redis_db,
             cmd,
@@ -7831,6 +8038,7 @@ fn redis_open_batch_confirm(
         ],
         refresh: false,
         clear_batch: false,
+        conn: None,
         redis: Some(RedisConfirm {
             db: app.redis_db,
             cmd: String::new(),
@@ -8127,6 +8335,7 @@ fn mongo_confirm_delete(app: &mut App) {
         ],
         refresh: false,
         clear_batch: false,
+        conn: None,
         redis: None,
         mongo: Some(MongoConfirm {
             db,
@@ -8192,6 +8401,7 @@ fn mongo_dialog_submit(app: &mut App, d: MongoDocDialog) {
                 ],
                 refresh: false,
                 clear_batch: false,
+                conn: None,
                 redis: None,
                 mongo: Some(MongoConfirm {
                     db: d.db.clone(),
@@ -8234,6 +8444,7 @@ fn mongo_dialog_submit(app: &mut App, d: MongoDocDialog) {
                 ],
                 refresh: false,
                 clear_batch: false,
+                conn: None,
                 redis: None,
                 mongo: Some(MongoConfirm {
                     db: d.db.clone(),
@@ -8382,6 +8593,7 @@ fn redis_prompt_key(app: &mut App, tx: &Tx, k: KeyEvent) {
         ],
         refresh: false,
         clear_batch: false,
+        conn: None,
         redis: Some(RedisConfirm {
             db: app.redis_db,
             cmd,
@@ -10150,6 +10362,7 @@ fn delete_row(app: &mut App) {
         reasons,
         refresh: true,
         clear_batch: false,
+        conn: None,
         redis: None,
         mongo: None,
     });
@@ -10324,6 +10537,7 @@ fn submit_edit_sql(app: &mut App, tx: &Tx, sql: String) {
             reasons: vec![reason],
             refresh: true,
             clear_batch: false,
+            conn: None,
             redis: None,
             mongo: None,
         });
@@ -10358,6 +10572,7 @@ fn commit_batch(app: &mut App) {
         ],
         refresh: true,
         clear_batch: true,
+        conn: None,
         redis: None,
         mongo: None,
     });
@@ -10557,6 +10772,7 @@ fn run_sql(app: &mut App, tx: &Tx) {
             reasons,
             refresh: false,
             clear_batch: false,
+            conn: None,
             redis: None,
             mongo: None,
         });
@@ -10685,6 +10901,9 @@ fn form_key(app: &mut App, tx: &Tx, k: KeyEvent) {
                     }
                 }
                 app.form.editing = false;
+                if cur == FormRow::Color {
+                    app.form.color_sel = color_sel_for(&app.form.color);
+                }
             }
             KeyCode::Backspace => {
                 if let Some(s) = form_text_mut(&mut app.form, cur) {
@@ -10696,6 +10915,8 @@ fn form_key(app: &mut App, tx: &Tx, k: KeyEvent) {
                     match cur {
                         FormRow::Port | FormRow::SshPort if !c.is_ascii_digit() => {}
                         FormRow::DbType => s.push(c.to_ascii_lowercase()),
+                        // Colour row only accepts `#` and hex digits.
+                        FormRow::Color if !(c.is_ascii_hexdigit() || c == '#') => {}
                         _ => s.push(c),
                     }
                 }
@@ -10722,6 +10943,15 @@ fn form_key(app: &mut App, tx: &Tx, k: KeyEvent) {
             FormRow::Ssl => app.form.ssl = !app.form.ssl,
             FormRow::SshEnabled => app.form.ssh_enabled = !app.form.ssh_enabled,
             FormRow::SshAuth => app.form.ssh_auth = app.form.ssh_auth.next(),
+            // Space cycles the colour palette; the custom stop opens the hex editor.
+            FormRow::Color => {
+                let next = color_next_sel(app.form.color_sel);
+                app.form.color_sel = next;
+                app.form.color = color_value_for(next, &app.form.color);
+                if next == CONN_COLOR_CUSTOM {
+                    app.form.editing = true;
+                }
+            }
             FormRow::Save => save_form(app, tx),
             FormRow::Port | FormRow::SshPort => {}
             _ => {
@@ -10831,6 +11061,15 @@ fn save_form(app: &mut App, tx: &Tx) {
             return;
         }
     };
+    // Colour is written from the form on both create and edit, so a colour set
+    // here survives and a desktop-set colour is kept when editing (prefilled).
+    let color = match normalize_conn_color(&f.color) {
+        Ok(c) => c,
+        Err(()) => {
+            app.form.err = t("颜色需为 #RRGGBB").into();
+            return;
+        }
+    };
     // Editing preserves fields the form does not expose (colour, notes, visible
     // databases, driver profile, …) by starting from the saved config.
     let mut cfg = match f
@@ -10874,6 +11113,7 @@ fn save_form(app: &mut App, tx: &Tx) {
         Some(f.database.trim().to_string())
     };
     cfg.ssl = f.ssl;
+    cfg.color = color;
     cfg.transport_layers = ssh_layer
         .into_iter()
         .map(TransportLayerConfig::Ssh)
@@ -10890,6 +11130,23 @@ fn save_form(app: &mut App, tx: &Tx) {
 }
 
 impl App {
+    /// Re-sort the connection picker in place for the current `s` mode, keeping
+    /// the highlight on the same connection (matched by id). The picker renders
+    /// `connections` directly, so an in-place sort keeps `conn_list` indices valid.
+    fn sort_connections(&mut self) {
+        let keep = self
+            .conn_list
+            .selected()
+            .and_then(|i| self.connections.get(i))
+            .map(|c| c.id.clone());
+        sort_connection_list(&mut self.connections, self.conn_sort);
+        if let Some(id) = keep {
+            if let Some(i) = self.connections.iter().position(|c| c.id == id) {
+                self.conn_list.select(Some(i));
+            }
+        }
+    }
+
     /// Select `db` in the database list, appending it when it is not present
     /// (MongoDB `use <db>` on a database with no collections yet).
     fn select_database(&mut self, db: &str) {
@@ -12707,6 +12964,13 @@ fn render_header(f: &mut Frame, area: Rect, app: &App) {
         .as_ref()
         .map(|c| format!("{} ({})",  c.name,  c.db_type.as_str()))
         .unwrap_or_else(|| t("未连接").into());
+    // The current connection carries its own colour in the title bar, matching
+    // the sidebar / picker (the name stays fully readable either way).
+    let conn_style = app
+        .selected
+        .as_ref()
+        .map(|c| Style::default().fg(connection_color(c)).add_modifier(Modifier::BOLD))
+        .unwrap_or_else(|| Style::default().add_modifier(Modifier::BOLD));
     let db = if app.selected.is_some() {
         if app.backend_kind == Backend::Redis {
             format!(" · db:{}",  app.redis_db)
@@ -12752,7 +13016,7 @@ fn render_header(f: &mut Frame, area: Rect, app: &App) {
                 .add_modifier(Modifier::BOLD),
         ),
         Span::raw(" "),
-        Span::styled(conn, Style::default().add_modifier(Modifier::BOLD)),
+        Span::styled(conn, conn_style),
         Span::styled(db, Style::default().fg(Color::Cyan)),
         Span::styled(mode, Style::default().fg(Color::Magenta)),
         Span::styled(spinner, Style::default().fg(Color::Yellow)),
@@ -12895,8 +13159,26 @@ fn render_status(f: &mut Frame, area: Rect, app: &App) {
     } else {
         Style::default().fg(Color::Gray)
     };
-    let msg = fit_status(&app.status, chunks[0].width as usize);
-    f.render_widget(Paragraph::new(msg).style(style), chunks[0]);
+    // A colour-coded connection badge leads the status line, so the active
+    // connection is visible even while a long status message is truncated.
+    let badge = app
+        .selected
+        .as_ref()
+        .map(|c| (truncate_disp(&c.name, 18), connection_color(c)));
+    let prefix_w = badge
+        .as_ref()
+        .map(|(n, _)| disp_width(&format!("● {n} ")) as u16)
+        .unwrap_or(0);
+    let msg = fit_status(&app.status, chunks[0].width.saturating_sub(prefix_w) as usize);
+    let mut left: Vec<Span> = Vec::new();
+    if let Some((name, color)) = badge {
+        left.push(Span::styled(
+            format!("● {name} "),
+            Style::default().fg(color).add_modifier(Modifier::BOLD),
+        ));
+    }
+    left.push(Span::styled(msg, style));
+    f.render_widget(Paragraph::new(Line::from(left)), chunks[0]);
     f.render_widget(
         Paragraph::new(truncate_disp(&right, chunks[1].width as usize))
             .style(Style::default().fg(Color::DarkGray)),
@@ -13101,6 +13383,8 @@ fn footer_hints_ctx(ctx: FooterCtx) -> Vec<Hint> {
             ("c", t("新建")),
             ("e", t("编辑")),
             ("p", t("复制")),
+            ("s", t("排序")),
+            ("x", t("删除")),
             ("q", t("显隐")),
         ],
         FooterView::NewConn => vec![
@@ -14600,6 +14884,13 @@ fn form_row_value(f: &ConnForm, row: FormRow) -> String {
         FormRow::Password => "*".repeat(f.password.chars().count()),
         FormRow::Database => f.database.clone(),
         FormRow::Ssl => if f.ssl { "y" } else { "n" }.to_string(),
+        FormRow::Color => {
+            if f.color.trim().is_empty() {
+                t("无（按类型）").to_string()
+            } else {
+                f.color.clone()
+            }
+        }
         FormRow::SshEnabled => if f.ssh_enabled { "y" } else { "n" }.to_string(),
         FormRow::SshHost => f.ssh_host.clone(),
         FormRow::SshPort => f.ssh_port.clone(),
@@ -14669,10 +14960,20 @@ fn render_form(f: &mut Frame, area: Rect, app: &mut App) {
         } else {
             Style::default()
         };
-        lines.push(Line::from(Span::styled(
-            format!("{marker}{label:16} {value}"),
-            style,
-        )));
+        lines.push(Line::from({
+            let mut spans = vec![Span::styled(
+                format!("{marker}{label:16} {value}"),
+                style,
+            )];
+            // Read-only colour preview swatch: the connection colour when set,
+            // else the database-family default the sidebar will use.
+            if row == FormRow::Color {
+                let swatch = parse_hex_color(&form.color)
+                    .unwrap_or_else(|| db_type_color(&form.db_type));
+                spans.push(Span::styled("  ███", Style::default().fg(swatch)));
+            }
+            spans
+        }));
         // The kernel forwards the tunnel to the connection's own host:port —
         // there is no separate remote-target field in TransportLayerConfig, so
         // it is shown (and overridden by editing host/port above).
@@ -14791,7 +15092,7 @@ fn render_conn_picker(f: &mut Frame, area: Rect, app: &mut App) {
         .block(
             Block::default()
                 .borders(Borders::ALL)
-                .title(t(" 连接 · ↑↓ Enter · c 新建 · p 复制 · q 隐藏 "))
+                .title(t(" 连接 · ↑↓ Enter · c 新建 · p 复制 · s 排序 · x 删除 · q 隐藏 "))
                 .border_set(border::ROUNDED),
         )
         .highlight_style(
@@ -14851,13 +15152,27 @@ fn render_db_picker(f: &mut Frame, area: Rect, app: &mut App) {
         _ if !app.schemas.is_empty() => t(" 模式 / 数据库 · ↑↓ Enter · Esc 关 "),
         _ => t(" 数据库 · ↑↓ Enter · Esc 关 "),
     };
+    // The `d` overlay header is tinted by the connection colour (with the name
+    // shown) so the switcher belongs visibly to the active connection.
+    let accent = app
+        .selected
+        .as_ref()
+        .map(connection_color)
+        .unwrap_or(Color::Cyan);
+    let title = match app.selected.as_ref() {
+        Some(c) => Span::styled(
+            format!(" ● {} ·{title}", truncate_disp(&c.name, 16)),
+            Style::default().fg(accent).add_modifier(Modifier::BOLD),
+        ),
+        None => Span::styled(title, Style::default().fg(accent)),
+    };
     let list = List::new(items)
         .block(
             Block::default()
                 .borders(Borders::ALL)
                 .title(title)
                 .border_set(border::ROUNDED)
-                .border_style(Style::default().fg(Color::Cyan)),
+                .border_style(Style::default().fg(accent)),
         )
         .highlight_style(
             Style::default()
@@ -15686,11 +16001,14 @@ const HELP_ROWS: &[(&str, &str)] = &[
     ("c", "新建连接"),
     ("e", "编辑选中连接（含 SSH 隧道，预填表单）"),
     ("p", "复制连接（预填表单）"),
+    ("s", "循环排序：名称 / 类型 / 颜色（同色连接排在一起）"),
+    ("x / Del", "删除选中连接（红色确认；只删配置，不删数据库数据）"),
     ("q", "折叠 / 展开连接列表"),
     ("— 连接表单 —", ""),
     ("↑ ↓ / Tab", "切换字段（开启 ssh_tunnel 后自动展开 SSH 段）"),
     ("Enter", "编辑字段 / 切换开关 / 保存连接"),
     ("Space", "切换 ssh_tunnel / ssl / 登录方式"),
+    ("color", "Space 循环预设颜色（无色→10 色→自定义），Enter 输入 #RRGGBB；色块为只读预览"),
     ("ssh_tunnel", "开启 SSH 跳板隧道（ssh_host / ssh_port / ssh_user / 登录方式）"),
     ("登录方式", "password / key（密钥路径 + 口令）/ agent（SSH_AUTH_SOCK）"),
     ("远端目标", "隧道转发目标 = 连接的 host:port（改 host / port 即改目标）"),
@@ -15838,7 +16156,54 @@ fn render_help(f: &mut Frame, area: Rect, app: &mut App) {
     );
 }
 
+/// The red layer for deleting a saved connection. Deliberately explicit that
+/// only the connection config is removed, never the database's data.
+fn render_conn_confirm(f: &mut Frame, area: Rect, cc: &ConnConfirm) {
+    let w = {
+        let avail = area.width.saturating_sub(4);
+        if avail < 30 {
+            area.width
+        } else {
+            avail.min(72)
+        }
+    };
+    let lines = vec![
+        Line::from(Span::styled(
+            tf("将删除连接 {} ({})", &[&cc.name, &cc.db_type]),
+            Style::default()
+                .fg(Color::Red)
+                .add_modifier(Modifier::BOLD),
+        )),
+        Line::from(""),
+        Line::from(Span::styled(
+            t("只删除这条连接配置，不会删除数据库里的任何数据"),
+            Style::default().fg(Color::Yellow),
+        )),
+        Line::from(""),
+        Line::from(Span::styled(
+            t("Enter/y 删除   Esc/n 取消"),
+            Style::default().fg(Color::Yellow),
+        )),
+    ];
+    let h = (lines.len() as u16 + 2).min(area.height).max(3.min(area.height));
+    let box_area = centered_overlay(area, w, h);
+    f.render_widget(Clear, box_area);
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .title(Span::styled(
+            t(" ⚠ 删除连接 "),
+            Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
+        ))
+        .border_set(border::THICK)
+        .border_style(Style::default().fg(Color::Red));
+    f.render_widget(Paragraph::new(lines).block(block), box_area);
+}
+
 fn render_confirm(f: &mut Frame, area: Rect, confirm: &Confirm) {
+    if let Some(cc) = &confirm.conn {
+        render_conn_confirm(f, area, cc);
+        return;
+    }
     let w = {
         let avail = area.width.saturating_sub(4);
         if avail < 30 {
@@ -16813,6 +17178,7 @@ mod tests {
                         reasons: vec!["no WHERE".into()],
                         refresh: false,
                         clear_batch: false,
+                        conn: None,
                         redis: None,
                         mongo: None,
                     })
@@ -18305,6 +18671,104 @@ mod tests {
     }
 
     #[test]
+    fn colour_palette_round_trips_and_wraps() {
+        // `color_sel` maps an unset colour to the "none" stop, an exact preset
+        // (case-insensitively) to its index, and anything else to custom.
+        assert_eq!(color_sel_for(""), 0);
+        assert_eq!(color_sel_for("  "), 0);
+        assert_eq!(color_sel_for("#e06c75"), 1);
+        assert_eq!(color_sel_for("#E06C75"), 1);
+        assert_eq!(color_sel_for("#123456"), CONN_COLOR_CUSTOM);
+        // …and back again for the value behind each stop.
+        assert_eq!(color_value_for(0, "#123456"), "");
+        assert_eq!(color_value_for(1, ""), "#e06c75");
+        assert_eq!(color_value_for(CONN_COLOR_CUSTOM, "#123456"), "#123456");
+        // Space wraps none → presets → custom → none.
+        let mut sel = 0usize;
+        for _ in 0..CONN_COLOR_STOPS {
+            sel = color_next_sel(sel);
+        }
+        assert_eq!(sel, 0);
+        assert_eq!(color_next_sel(CONN_COLOR_PRESETS.len()), CONN_COLOR_CUSTOM);
+        assert_eq!(color_next_sel(CONN_COLOR_CUSTOM), 0);
+    }
+
+    #[test]
+    fn connection_colour_normalises_to_lowercase_hex() {
+        assert_eq!(normalize_conn_color(""), Ok(None));
+        assert_eq!(normalize_conn_color("  "), Ok(None));
+        assert_eq!(normalize_conn_color("00FF00"), Ok(Some("#00ff00".into())));
+        assert_eq!(normalize_conn_color("#ABCDEF"), Ok(Some("#abcdef".into())));
+        assert_eq!(normalize_conn_color("nope"), Err(()));
+        assert_eq!(normalize_conn_color("#fff"), Err(()));
+    }
+
+    #[test]
+    fn form_from_connection_preserves_colour() {
+        let mut cfg = test_conn("mysql");
+        cfg.color = Some("#E06C75".into());
+        // Editing keeps the id and the colour; duplicating keeps the colour too.
+        let edit = form_from_connection(&cfg, cfg.name.clone(), Some(cfg.id.clone()));
+        assert_eq!(edit.color, "#E06C75");
+        assert_eq!(edit.color_sel, 1);
+        let dup = form_from_connection(&cfg, "copy".into(), None);
+        assert_eq!(dup.color, "#E06C75");
+        assert_eq!(dup.edit_id, None);
+        // A free-form hex lands on the custom stop and survives the round-trip.
+        cfg.color = Some("#123456".into());
+        let custom = form_from_connection(&cfg, cfg.name.clone(), None);
+        assert_eq!(custom.color_sel, CONN_COLOR_CUSTOM);
+        assert_eq!(normalize_conn_color(&custom.color).unwrap().as_deref(), Some("#123456"));
+    }
+
+    fn conn_for_sort(id: &str, name: &str, db_type: &str, color: Option<&str>) -> ConnectionConfig {
+        let mut c = test_conn(db_type);
+        c.id = id.into();
+        c.name = name.into();
+        c.color = color.map(str::to_string);
+        c
+    }
+
+    #[test]
+    fn connection_sort_covers_name_type_and_colour() {
+        let mut list = vec![
+            conn_for_sort("a", "prod-red", "mysql", Some("#e06c75")),
+            conn_for_sort("b", "alpha", "redis", Some("#61afef")),
+            conn_for_sort("c", "beta", "mysql", None),
+            conn_for_sort("d", "prod-red-2", "postgres", Some("#e06c75")),
+        ];
+        let names = |l: &[ConnectionConfig]| {
+            l.iter().map(|c| c.name.clone()).collect::<Vec<_>>()
+        };
+        sort_connection_list(&mut list, ConnSort::Name);
+        assert_eq!(names(&list), ["alpha", "beta", "prod-red", "prod-red-2"]);
+        sort_connection_list(&mut list, ConnSort::Type);
+        assert_eq!(names(&list), ["beta", "prod-red", "prod-red-2", "alpha"]);
+        // Colour mode groups the two reds together; uncoloured ones follow by
+        // family so the default badge colours still line up.
+        sort_connection_list(&mut list, ConnSort::Color);
+        assert_eq!(names(&list), ["alpha", "prod-red", "prod-red-2", "beta"]);
+        // `s` cycles name → type → colour → name.
+        assert_eq!(ConnSort::Name.next(), ConnSort::Type);
+        assert_eq!(ConnSort::Type.next(), ConnSort::Color);
+        assert_eq!(ConnSort::Color.next(), ConnSort::Name);
+    }
+
+    #[test]
+    fn sort_connections_keeps_the_highlight_on_the_same_connection() {
+        let mut app = test_app();
+        app.connections = vec![
+            conn_for_sort("a", "zeta", "mysql", None),
+            conn_for_sort("b", "alpha", "redis", None),
+        ];
+        app.conn_list.select(Some(0));
+        app.conn_sort = ConnSort::Name;
+        app.sort_connections();
+        assert_eq!(app.connections[0].id, "b");
+        assert_eq!(app.conn_list.selected(), Some(1));
+    }
+
+    #[test]
     fn query_tab_title_is_first_line() {
         assert_eq!(query_tab_title("\n\nSELECT 1\nFROM t"), "SELECT 1");
         assert_eq!(query_tab_title("   "), "");
@@ -19274,6 +19738,7 @@ mod tests {
             reasons: Vec::new(),
             refresh: false,
             clear_batch: false,
+            conn: None,
             redis: None,
             mongo: None,
         });

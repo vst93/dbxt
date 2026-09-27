@@ -294,6 +294,26 @@ pub static ALL_KEYS: &[&str] = &[
     "删行",
     "删除当前行 → 确认后执行",
     "删除确认 · Enter 执行 · Esc 取消",
+    "删除",
+    "删除连接 {}…",
+    "删除连接 {} · Enter 确认 · Esc 取消",
+    "删除选中连接（红色确认；只删配置，不删数据库数据）",
+    "排序",
+    "排序：{} · s 切换（名称/类型/颜色）",
+    "循环排序：名称 / 类型 / 颜色（同色连接排在一起）",
+    "名称",
+    "颜色",
+    "无（按类型）",
+    "颜色需为 #RRGGBB",
+    "只删除这条连接配置，不会删除数据库里的任何数据",
+    "Enter/y 删除   Esc/n 取消",
+    " ⚠ 删除连接 ",
+    "将删除连接 {} ({})",
+    "已删除连接 {}",
+    "连接不存在: {}",
+    "{} 个连接 · ↑↓+Enter 选择 · c 新建 · s 排序",
+    " 连接 · ↑↓ Enter · c 新建 · p 复制 · s 排序 · x 删除 · q 隐藏 ",
+    "Space 循环预设颜色（无色→10 色→自定义），Enter 输入 #RRGGBB；色块为只读预览",
     "刷新",
     "刷新 / 关闭",
     "刷新数据库列表…",
@@ -998,6 +1018,38 @@ fn en_of(zh: &'static str) -> Option<&'static str> {
         "删行" => Some("delete row"),
         "删除当前行 → 确认后执行" => Some("Delete current row → confirm before running"),
         "删除确认 · Enter 执行 · Esc 取消" => Some("Delete confirmation · Enter execute · Esc cancel"),
+        "删除" => Some("delete"),
+        "删除连接 {}…" => Some("Deleting connection {}…"),
+        "删除连接 {} · Enter 确认 · Esc 取消" => Some("Delete connection {} · Enter confirm · Esc cancel"),
+        "排序" => Some("sort"),
+        "排序：{} · s 切换（名称/类型/颜色）" => Some("Sort: {} · s cycles (name/type/colour)"),
+        "名称" => Some("name"),
+        "颜色" => Some("colour"),
+        "无（按类型）" => Some("none (by type)"),
+        "颜色需为 #RRGGBB" => Some("colour must be #RRGGBB"),
+        "只删除这条连接配置，不会删除数据库里的任何数据" => {
+            Some("Removes only this connection config; no database data is touched")
+        }
+        "Enter/y 删除   Esc/n 取消" => Some("Enter/y delete   Esc/n cancel"),
+        " ⚠ 删除连接 " => Some(" ⚠ Delete connection "),
+        "将删除连接 {} ({})" => Some("Delete connection {} ({})"),
+        "已删除连接 {}" => Some("Deleted connection {}"),
+        "连接不存在: {}" => Some("Connection not found: {}"),
+        "{} 个连接 · ↑↓+Enter 选择 · c 新建 · s 排序" => {
+            Some("{} connections · ↑↓+Enter select · c new · s sort")
+        }
+        " 连接 · ↑↓ Enter · c 新建 · p 复制 · s 排序 · x 删除 · q 隐藏 " => {
+            Some(" Connections · ↑↓ Enter · c new · p duplicate · s sort · x delete · q hide ")
+        }
+        "循环排序：名称 / 类型 / 颜色（同色连接排在一起）" => {
+            Some("Cycle sort: name / type / colour (same-colour connections group together)")
+        }
+        "删除选中连接（红色确认；只删配置，不删数据库数据）" => {
+            Some("Delete the selected connection (red confirm; config only, never database data)")
+        }
+        "Space 循环预设颜色（无色→10 色→自定义），Enter 输入 #RRGGBB；色块为只读预览" => {
+            Some("Space cycles preset colours (none → 10 colours → custom), Enter types #RRGGBB; the swatch is a read-only preview")
+        }
         "刷新" => Some("refresh"),
         "刷新 / 关闭" => Some("refresh / close"),
         "刷新数据库列表…" => Some("Refreshing database list…"),
