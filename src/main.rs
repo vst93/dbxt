@@ -2070,6 +2070,37 @@ fn stmt_outcome(sql: String, b: BatchStatementResult) -> StmtOutcome {
     }
 }
 
+/// The schema to hand the DDL generator. PostgreSQL's renderer always writes a
+/// `schema.table` name, so an empty schema yields the unusable `""."table"`;
+/// resolve the relation's visible schema (the one the sidebar browsed) first.
+/// Other engines treat the database as the schema and stay empty.
+async fn resolve_ddl_schema(
+    backend: &LocalBackend,
+    cfg: &ConnectionConfig,
+    db: &str,
+    table: &str,
+) -> String {
+    if !is_postgres_family(cfg.db_type.as_str()) {
+        return String::new();
+    }
+    let sql = format!(
+        "SELECT n.nspname FROM pg_catalog.pg_class c \
+         JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace \
+         WHERE c.relname = '{}' AND pg_catalog.pg_table_is_visible(c.oid) LIMIT 1",
+        table.replace('\'', "''")
+    );
+    match backend.execute_query(cfg, db, &sql, Some(1), Some(10)).await {
+        Ok(r) => r
+            .rows
+            .first()
+            .and_then(|row| row.first())
+            .and_then(|v| v.as_str())
+            .map(str::to_string)
+            .unwrap_or_default(),
+        Err(_) => String::new(),
+    }
+}
+
 async fn run_op(backend: &LocalBackend, op: Op, tx: &Tx) -> OpResult {
     match op {
         Op::ListConnections => match backend.load_connections().await {
@@ -2106,8 +2137,20 @@ async fn run_op(backend: &LocalBackend, op: Op, tx: &Tx) -> OpResult {
             Err(e) => OpResult::Error(format!("columns: {e}")),
         },
         Op::Ddl(cfg, db, table) => {
-            match dbx_core::schema::get_table_ddl_core(backend.state().as_ref(), &cfg.id, &db, "", &table, None)
-                .await
+            // PostgreSQL needs the real schema: the kernel renders
+            // `"schema"."table"`, so an empty schema becomes the invalid
+            // `""."table"`. Resolve the table's visible schema first (MySQL and
+            // friends leave it empty, where the database *is* the schema).
+            let schema = resolve_ddl_schema(backend, &cfg, &db, &table).await;
+            match dbx_core::schema::get_table_ddl_core(
+                backend.state().as_ref(),
+                &cfg.id,
+                &db,
+                &schema,
+                &table,
+                None,
+            )
+            .await
             {
                 Ok(ddl) => OpResult::Ddl { table, text: ddl },
                 Err(e) => OpResult::Ddl {
@@ -8696,24 +8739,162 @@ fn is_binary_type(t: &str) -> bool {
     )
 }
 
-/// `X'0A1B'` — the portable SQL hex literal, used for binary columns so a copied
-/// row round-trips instead of being mangled by string escaping.
-fn hex_literal(s: &str) -> String {
-    let mut out = String::with_capacity(s.len() * 2 + 3);
-    out.push_str("X'");
+/// The bare base of a declared type: `numeric(12,2)` → `numeric`,
+/// `timestamp with time zone` → `timestamp`, `text[]` → `text[]`.
+fn base_type(t: &str) -> String {
+    t.trim().to_ascii_lowercase().split(['(', ' ']).next().unwrap_or("").to_string()
+}
+
+/// Date/time families whose NOT NULL placeholder should be `CURRENT_TIMESTAMP`
+/// rather than an empty string.
+fn is_temporal_type(base: &str) -> bool {
+    matches!(
+        base,
+        "timestamp" | "timestamptz" | "datetime" | "date" | "time" | "timetz"
+    )
+}
+
+/// True for a column the server fills itself — auto-increment, PostgreSQL
+/// `serial`, an identity column, or a generated expression — so an INSERT
+/// template must omit it instead of writing a literal that skips the sequence.
+fn is_server_generated_column(c: &ColumnInfo) -> bool {
+    let extra = c.extra.as_deref().unwrap_or("").trim().to_ascii_lowercase();
+    if extra.contains("auto_increment") || extra.contains("generated") {
+        return true;
+    }
+    if matches!(extra.as_str(), "serial" | "bigserial" | "smallserial") {
+        return true;
+    }
+    c.column_default
+        .as_deref()
+        .map(|d| d.trim().to_ascii_lowercase().starts_with("nextval("))
+        .unwrap_or(false)
+}
+
+/// The placeholder a quick-insert template writes for one column. A declared
+/// default becomes `DEFAULT`; otherwise the value is chosen from the column's
+/// type and nullability so the generated statement is valid on the first try
+/// (PostgreSQL rejects `''` for boolean / timestamp / numeric columns, which is
+/// exactly what the old numeric-else-empty rule produced).
+fn insert_placeholder(c: &ColumnInfo) -> String {
+    if c.column_default.as_deref().map(|d| !d.trim().is_empty()).unwrap_or(false) {
+        return "DEFAULT".to_string();
+    }
+    if c.is_nullable {
+        return "NULL".to_string();
+    }
+    if let Some(first) = c.enum_values.as_ref().and_then(|v| v.first()) {
+        return sql_literal(first);
+    }
+    let base = base_type(&c.data_type);
+    if is_numeric_type(&c.data_type) {
+        "0".to_string()
+    } else if matches!(base.as_str(), "bool" | "boolean") {
+        "FALSE".to_string()
+    } else if is_temporal_type(&base) {
+        "CURRENT_TIMESTAMP".to_string()
+    } else if matches!(base.as_str(), "json" | "jsonb") || base.ends_with("[]") || base == "array" {
+        "'{}'".to_string()
+    } else {
+        "''".to_string()
+    }
+}
+
+/// True for the engines that speak PostgreSQL's dialect (double-quoted
+/// identifiers, `bytea`, `EXPLAIN (FORMAT TEXT)`): PostgreSQL proper plus the
+/// compatible forks dbxt already badges with the same colour.
+fn is_postgres_family(db_type: &str) -> bool {
+    matches!(
+        db_type.to_ascii_lowercase().as_str(),
+        "postgres"
+            | "postgresql"
+            | "opengauss"
+            | "gaussdb"
+            | "kingbase"
+            | "highgo"
+            | "cockroachdb"
+            | "redshift"
+            | "dm"
+            | "kwdb"
+    )
+}
+
+/// Uppercase hex for the bytes of `s` (the fallback when a binary cell is not
+/// already in the kernel's `0x…` form).
+fn hex_of_bytes(s: &str) -> String {
+    let mut out = String::with_capacity(s.len() * 2);
     for b in s.as_bytes() {
         out.push_str(&format!("{b:02X}"));
     }
-    out.push('\'');
     out
 }
 
-/// Literal used by the copy-row-as-INSERT action: binary columns become hex,
-/// everything else follows the edit layer's rules.
-fn insert_literal(v: &Val, data_type: Option<&str>) -> String {
+/// The hex digits of a `0x…` / `\x…` binary rendering, when `s` is one. The
+/// kernel hands binary columns to the UI as `0x<hex>`, so recovering the bytes
+/// here keeps a copied row from being hex-encoded a second time.
+fn binary_hex_digits(s: &str) -> Option<&str> {
+    let hex = s.strip_prefix("0x").or_else(|| s.strip_prefix("\\x"))?;
+    if !hex.is_empty() && hex.len() % 2 == 0 && hex.bytes().all(|b| b.is_ascii_hexdigit()) {
+        Some(hex)
+    } else {
+        None
+    }
+}
+
+/// A binary literal in the target dialect. PostgreSQL's `X'…'` is a bit string,
+/// not `bytea`, so it needs the `'\x…'::bytea` form; every other engine uses the
+/// portable `X'…'` hex literal.
+fn binary_literal(hex: &str, db_type: Option<&str>) -> String {
+    if db_type.map(is_postgres_family).unwrap_or(false) {
+        format!("'\\x{hex}'::bytea")
+    } else {
+        format!("X'{hex}'")
+    }
+}
+
+/// One element of a PostgreSQL array literal. Strings are quoted; numbers and
+/// booleans stay bare so the resulting `ARRAY[…]` infers the right element type.
+fn array_element_literal(v: &serde_json::Value) -> String {
+    match v {
+        serde_json::Value::Null => "NULL".to_string(),
+        serde_json::Value::Bool(true) => "TRUE".to_string(),
+        serde_json::Value::Bool(false) => "FALSE".to_string(),
+        serde_json::Value::Number(n) => n.to_string(),
+        serde_json::Value::String(s) => sql_literal(s),
+        other => sql_literal(&other.to_string()),
+    }
+}
+
+/// PostgreSQL array cells arrive as JSON (`["a","b"]`); an INSERT literal needs
+/// the `ARRAY[…]` form instead (and `'{}'` for the empty array, whose type an
+/// empty `ARRAY[]` would leave ambiguous). Returns `None` when the cell is not a
+/// JSON array, so the caller can fall back to the ordinary string literal.
+fn array_literal(s: &str, data_type: &str) -> Option<String> {
+    let items: Vec<serde_json::Value> = serde_json::from_str(s).ok()?;
+    let ty = data_type.trim();
+    let cast = if ty.ends_with("[]") { format!("::{ty}") } else { String::new() };
+    if items.is_empty() {
+        return Some(format!("'{{}}'{cast}"));
+    }
+    let lits: Vec<String> = items.iter().map(array_element_literal).collect();
+    Some(format!("ARRAY[{}]{cast}", lits.join(", ")))
+}
+
+/// Literal used by the copy-row-as-INSERT action: binary columns become a hex
+/// literal, array columns a PostgreSQL `ARRAY[…]`, everything else follows the
+/// edit layer's rules.
+fn insert_literal(v: &Val, data_type: Option<&str>, db_type: Option<&str>) -> String {
     if let (Val::Text(s), Some(dt)) = (v, data_type) {
         if is_binary_type(dt) {
-            return hex_literal(s);
+            let hex = binary_hex_digits(s)
+                .map(str::to_string)
+                .unwrap_or_else(|| hex_of_bytes(s));
+            return binary_literal(&hex, db_type);
+        }
+        if dt.trim().ends_with("[]") {
+            if let Some(lit) = array_literal(s, dt) {
+                return lit;
+            }
         }
     }
     val_literal(v, data_type)
@@ -8740,7 +8921,7 @@ fn build_insert_sql(
         .enumerate()
         .map(|(ci, c)| {
             let v = row.get(ci).cloned().unwrap_or(Val::Null);
-            insert_literal(&v, column_type(app, table, c).as_deref())
+            insert_literal(&v, column_type(app, table, c).as_deref(), Some(cfg.db_type.as_str()))
         })
         .collect::<Vec<_>>()
         .join(", ");
@@ -9205,12 +9386,7 @@ fn quick_insert(app: &mut App) {
     let cols: Vec<&ColumnInfo> = meta
         .columns
         .iter()
-        .filter(|c| {
-            !c.extra
-                .as_deref()
-                .map(|e| e.to_ascii_lowercase().contains("auto_increment"))
-                .unwrap_or(false)
-        })
+        .filter(|c| !is_server_generated_column(c))
         .collect();
     if cols.is_empty() {
         app.status = t("没有可插入的列").into();
@@ -9221,13 +9397,7 @@ fn quick_insert(app: &mut App) {
     let mut preview: Vec<(String, String)> = Vec::new();
     let mut vals: Vec<String> = Vec::new();
     for c in &cols {
-        let v = if is_numeric_type(&c.data_type) {
-            "0".to_string()
-        } else if c.is_nullable {
-            "NULL".to_string()
-        } else {
-            "''".to_string()
-        };
+        let v = insert_placeholder(c);
         vals.push(v.clone());
         preview.push((fix_double_encoding(&c.name), v));
     }
@@ -10410,7 +10580,7 @@ fn batch_insert_sql(
                     .enumerate()
                     .map(|(ci, _)| {
                         let v = row.get(ci).cloned().unwrap_or(Val::Null);
-                        insert_literal(&v, types.get(ci).and_then(|t| t.as_deref()))
+                        insert_literal(&v, types.get(ci).and_then(|t| t.as_deref()), Some(cfg.db_type.as_str()))
                     })
                     .collect::<Vec<_>>()
                     .join(", ");
@@ -16578,6 +16748,16 @@ mod tests {
             explain_sql_for("postgres", "select * from t").as_deref(),
             Some("EXPLAIN select * from t")
         );
+        // A write statement still becomes a plain EXPLAIN: PostgreSQL's
+        // `EXPLAIN ANALYZE` would actually run the INSERT/UPDATE/DELETE.
+        assert_eq!(
+            explain_sql_for("postgres", "INSERT INTO t (a) VALUES (1);").as_deref(),
+            Some("EXPLAIN INSERT INTO t (a) VALUES (1)")
+        );
+        assert_eq!(
+            explain_sql_for("postgres", "DELETE FROM t WHERE id = 1;").as_deref(),
+            Some("EXPLAIN DELETE FROM t WHERE id = 1")
+        );
         assert_eq!(
             explain_sql_for("sqlite", "SELECT 1").as_deref(),
             Some("EXPLAIN QUERY PLAN SELECT 1")
@@ -16956,27 +17136,107 @@ mod tests {
 
     #[test]
     fn insert_literal_keeps_null_empty_and_quotes_apart() {
-        assert_eq!(insert_literal(&Val::Null, None), "NULL");
-        assert_eq!(insert_literal(&Val::Text(String::new()), None), "''");
+        assert_eq!(insert_literal(&Val::Null, None, None), "NULL");
+        assert_eq!(insert_literal(&Val::Text(String::new()), None, None), "''");
         assert_eq!(
-            insert_literal(&Val::Text("O'Brien".into()), None),
+            insert_literal(&Val::Text("O'Brien".into()), None, None),
             "'O''Brien'"
         );
         assert_eq!(
-            insert_literal(&Val::Text("a\\b".into()), None),
+            insert_literal(&Val::Text("a\\b".into()), None, None),
             "'a\\\\b'"
         );
         // A numeric column keeps a real number bare.
         assert_eq!(
-            insert_literal(&Val::Text("42".into()), Some("int")),
+            insert_literal(&Val::Text("42".into()), Some("int"), None),
             "42"
         );
         // A binary column becomes a portable hex literal.
         assert_eq!(
-            insert_literal(&Val::Text("\u{0}\u{1}A".into()), Some("varbinary(8)")),
+            insert_literal(&Val::Text("\u{0}\u{1}A".into()), Some("varbinary(8)"), Some("mysql")),
             "X'000141'"
         );
-        assert_eq!(insert_literal(&Val::Text("AB".into()), Some("bytea")), "X'4142'");
+        // PostgreSQL bytea needs its own form — `X'…'` is a bit string there.
+        assert_eq!(
+            insert_literal(&Val::Text("AB".into()), Some("bytea"), Some("postgres")),
+            "'\\x4142'::bytea"
+        );
+    }
+
+    #[test]
+    fn insert_literal_recovers_binary_bytes_from_0x_rendering() {
+        // The kernel renders bytea/blob cells as `0x<hex>`; re-hexing that text
+        // used to write the ASCII of `0x…` instead of the original bytes.
+        assert_eq!(
+            insert_literal(&Val::Text("0xdeadbeef".into()), Some("bytea"), Some("postgres")),
+            "'\\xdeadbeef'::bytea"
+        );
+        assert_eq!(
+            insert_literal(&Val::Text("0xDEADBEEF".into()), Some("blob"), Some("mysql")),
+            "X'DEADBEEF'"
+        );
+        assert_eq!(
+            insert_literal(&Val::Text("\\x0a1b".into()), Some("bytea"), Some("postgres")),
+            "'\\x0a1b'::bytea"
+        );
+        // A non-hex `0x…`-looking string still falls back to raw-byte hex.
+        assert_eq!(
+            insert_literal(&Val::Text("0xzz".into()), Some("bytea"), Some("postgres")),
+            "'\\x30787A7A'::bytea"
+        );
+        assert_eq!(binary_hex_digits("0xdead"), Some("dead"));
+        assert_eq!(binary_hex_digits("0xde"), Some("de"));
+        assert_eq!(binary_hex_digits("0xdea"), None);
+        assert_eq!(binary_hex_digits("plain"), None);
+    }
+
+    #[test]
+    fn insert_literal_renders_postgres_arrays() {
+        // PostgreSQL arrays arrive as JSON; an INSERT needs `ARRAY[…]`, not the
+        // JSON text (which the server rejects as a malformed array literal).
+        assert_eq!(
+            insert_literal(&Val::Text("[\"admin\",\"beta\"]".into()), Some("text[]"), Some("postgres")),
+            "ARRAY['admin', 'beta']::text[]"
+        );
+        assert_eq!(
+            insert_literal(&Val::Text("[1,2,3]".into()), Some("integer[]"), Some("postgres")),
+            "ARRAY[1, 2, 3]::integer[]"
+        );
+        assert_eq!(
+            insert_literal(&Val::Text("[]".into()), Some("text[]"), Some("postgres")),
+            "'{}'::text[]"
+        );
+        // An element containing a quote or comma is quoted safely.
+        assert_eq!(
+            insert_literal(&Val::Text("[\"a,b\",\"O'Brien\"]".into()), Some("text[]"), Some("postgres")),
+            "ARRAY['a,b', 'O''Brien']::text[]"
+        );
+        // A non-array column is untouched.
+        assert_eq!(
+            insert_literal(&Val::Text("[1,2]".into()), Some("jsonb"), Some("postgres")),
+            "'[1,2]'"
+        );
+    }
+
+    #[test]
+    fn postgres_family_detection() {
+        assert!(is_postgres_family("postgres"));
+        assert!(is_postgres_family("PostgreSQL"));
+        assert!(is_postgres_family("opengauss"));
+        assert!(is_postgres_family("kingbase"));
+        assert!(!is_postgres_family("mysql"));
+        assert!(!is_postgres_family("sqlite"));
+        assert!(!is_postgres_family("redis"));
+    }
+
+    #[test]
+    fn identifier_quoting_follows_the_dialect() {
+        let pg = parse_database_type("postgres").unwrap();
+        let my = parse_database_type("mysql").unwrap();
+        // PostgreSQL double-quotes; MySQL backticks. Reserved words included.
+        assert_eq!(quote_table_identifier(Some(pg), "select"), "\"select\"");
+        assert_eq!(quote_table_identifier(Some(pg), "accounts"), "\"accounts\"");
+        assert_eq!(quote_table_identifier(Some(my), "select"), "`select`");
     }
 
     #[test]
@@ -16986,6 +17246,75 @@ mod tests {
         assert!(is_binary_type("bytea"));
         assert!(!is_binary_type("varchar(255)"));
         assert!(!is_binary_type("text"));
+    }
+
+    fn column(name: &str, ty: &str, nullable: bool, default: Option<&str>, extra: Option<&str>) -> ColumnInfo {
+        ColumnInfo {
+            name: name.into(),
+            data_type: ty.into(),
+            is_nullable: nullable,
+            column_default: default.map(str::to_string),
+            extra: extra.map(str::to_string),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn insert_template_skips_server_generated_columns() {
+        // MySQL auto-increment, PostgreSQL serial, identity and generated.
+        assert!(is_server_generated_column(&column("id", "int", false, None, Some("auto_increment"))));
+        assert!(is_server_generated_column(&column("id", "bigint", false, None, Some("bigserial"))));
+        assert!(is_server_generated_column(&column(
+            "id",
+            "bigint",
+            false,
+            None,
+            Some("generated by default as identity")
+        )));
+        assert!(is_server_generated_column(&column(
+            "total",
+            "numeric",
+            false,
+            None,
+            Some("generated always as (a + b) stored")
+        )));
+        // A plain nextval default also means the sequence owns the value.
+        assert!(is_server_generated_column(&column(
+            "id",
+            "bigint",
+            false,
+            Some("nextval('t_id_seq'::regclass)"),
+            None
+        )));
+        // Ordinary columns are not skipped.
+        assert!(!is_server_generated_column(&column("email", "text", false, None, None)));
+        assert!(!is_server_generated_column(&column("balance", "numeric(12,2)", false, Some("0.00"), None)));
+    }
+
+    #[test]
+    fn insert_placeholder_is_valid_for_the_column_type() {
+        // PostgreSQL NOT NULL columns: the old rule emitted `''`, which the
+        // server rejects for boolean / timestamp / numeric.
+        assert_eq!(insert_placeholder(&column("active", "boolean", false, None, None)), "FALSE");
+        assert_eq!(
+            insert_placeholder(&column("created_at", "timestamp with time zone", false, None, None)),
+            "CURRENT_TIMESTAMP"
+        );
+        assert_eq!(insert_placeholder(&column("qty", "integer", false, None, None)), "0");
+        assert_eq!(insert_placeholder(&column("meta", "jsonb", false, None, None)), "'{}'");
+        assert_eq!(insert_placeholder(&column("tags", "text[]", false, None, None)), "'{}'");
+        assert_eq!(insert_placeholder(&column("email", "text", false, None, None)), "''");
+        // A declared default is delegated to the server.
+        assert_eq!(
+            insert_placeholder(&column("balance", "numeric(12,2)", false, Some("0.00"), None)),
+            "DEFAULT"
+        );
+        // Nullable columns stay NULL.
+        assert_eq!(insert_placeholder(&column("note", "text", true, None, None)), "NULL");
+        // An enum NOT NULL picks its first label.
+        let mut mood = column("feeling", "mood", false, None, None);
+        mood.enum_values = Some(vec!["happy".into(), "sad".into()]);
+        assert_eq!(insert_placeholder(&mood), "'happy'");
     }
 
     #[test]

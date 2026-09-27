@@ -123,7 +123,9 @@ Per-table choices (compact widths, hidden columns, sort) are written to `~/.conf
 
 ## Status & roadmap
 
-Early but usable. Verified end-to-end against real MySQL 8.4, Redis and MongoDB servers.
+Early but usable. Verified end-to-end against real MySQL 8.4, PostgreSQL 16, Redis and MongoDB servers.
+
+**PostgreSQL** — the SQL backend speaks the PostgreSQL dialect end to end. Identifiers are double-quoted (`"schema"."table"`, reserved words included); `bytea` (`0x…` cells round-trip as `'\x…'::bytea`), `uuid`, `jsonb`, arrays (`ARRAY[…]`) and enums render in full and copy/export as valid SQL; `serial` / identity columns are skipped by the insert template so the sequence stays authoritative; and `Ctrl-P` issues a plain `EXPLAIN` (never `EXPLAIN ANALYZE`), so a write statement is planned without being executed. Structure and DDL read `pg_catalog` with an `information_schema` fallback, and the DDL resolves the relation's visible schema (`CREATE TABLE "public"."accounts"`, plus indexes, constraints and comments). Browsing covers the connection's `public` schema; tables in other schemas (e.g. `inv.items`) are not listed yet.
 
 - [x] SQL browsing, editing, transactions, filter/sort, completion, CSV import/export and result tabs
 - [x] Redis key browser with batch key operations

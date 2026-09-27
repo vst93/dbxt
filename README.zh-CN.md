@@ -123,7 +123,9 @@ cargo install --git https://github.com/vst93/dbxt
 
 ## 状态与路线图
 
-早期但已可用。已对真实 MySQL 8.4、Redis 和 MongoDB 端到端实测。
+早期但已可用。已对真实 MySQL 8.4、PostgreSQL 16、Redis 和 MongoDB 端到端实测。
+
+**PostgreSQL** —— SQL 后端全程按 PostgreSQL 方言工作。标识符用双引号（`"schema"."table"`，含保留字）；`bytea`（`0x…` 单元格可回写为 `'\x…'::bytea`）、`uuid`、`jsonb`、数组（`ARRAY[…]`）与枚举均完整显示，复制/导出为合法 SQL；插入模板跳过 `serial`/identity 列，让序列保持权威；`Ctrl-P` 走普通 `EXPLAIN`（绝不用 `EXPLAIN ANALYZE`），写语句只生成计划、不实际执行。表结构与 DDL 读取 `pg_catalog`（`information_schema` 兜底），DDL 会解析关系的可见 schema（`CREATE TABLE "public"."accounts"`，含索引、约束与注释）。浏览范围是连接的 `public` schema；其他 schema（如 `inv.items`）暂不列出。
 
 - [x] SQL 浏览、编辑、事务、过滤 / 排序、补全、CSV 导入 / 导出与结果标签
 - [x] Redis key 浏览器与批量 key 操作
