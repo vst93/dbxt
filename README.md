@@ -16,7 +16,7 @@ A keyboard-first terminal UI for databases, built on the [DBX](https://github.co
 - Multi-line editor with shell-style `↑`/`↓` history (seeded from DBX's shared query history); `F5` / `Ctrl-J` runs.
 - `Ctrl-Space` completes identifiers from context (tables / columns / keywords, tagged `T`/`C`/`K`); `Tab` accepts.
 - Every run keeps its own result tab (`[` / `]`); execution time and affected rows are shown.
-- `Ctrl-P` runs `EXPLAIN`, `Ctrl-Y` exports CSV, `Ctrl-N` loads more when a result hit the row cap.
+- `Ctrl-P` runs `EXPLAIN`, `Ctrl-Y` exports the result set (CSV / JSON / NDJSON / Markdown / INSERT), `Ctrl-N` loads more when a result hit the row cap.
 - `Ctrl-O` inserts a DBX saved snippet; `s` saves the editor's SQL back into that shared store.
 - Multi-statement scripts (`a; b; c;`) run as a batch, one row per statement; `Enter` drills into one.
 
@@ -30,6 +30,13 @@ A keyboard-first terminal UI for databases, built on the [DBX](https://github.co
 
 **Table structure**
 - `r` shows fields (type / key / nullable / default / comment); `t` toggles the dialect-aware `SHOW CREATE TABLE` DDL.
+
+**Import & export**
+- `I` imports a CSV into the focused table (the browsed table, else the sidebar selection). Enter a path (a leading `~` expands to `$HOME`) and confirm the preview: encoding, delimiter, row count and file size, the first five parsed rows, and the column mapping with per-column type inference (`int` / `float` / `bool` / `date` / `datetime` / `text`).
+- CSV headers match table columns by name (case-insensitive); a table column absent from the CSV keeps its default (usually `NULL`), and an extra CSV column blocks the import with a clear message.
+- `m` toggles append / overwrite (overwrite clears the table first and turns the preview border red), `s` toggles stop-on-error (default, reports the failing row) / skip-and-continue (reports every skipped row). Rows are written in transactional batches of 500 with per-batch progress.
+- Encoding is auto-detected — UTF-8, otherwise GB18030/GBK (the common Chinese encoding) — and the delimiter is sniffed from the header (`,` / `;` / TAB). Excel `.xlsx` is deliberately not supported.
+- `Ctrl-Y` exports the focused result set as CSV, JSON (array), NDJSON, Markdown, `INSERT` (one statement per row) or batched `INSERT` (multi-row `VALUES`). Pick a format, then a destination: blank copies via OSC 52, a path writes a file. Results over 10,000 rows warn that generation may take a moment.
 
 **Redis**
 - Connecting to Redis opens a paginated `SCAN` key browser (never `KEYS *`) with type + TTL badges, a server-side `MATCH` pattern (`/`) and logical-DB switching.
@@ -103,9 +110,9 @@ The TUI's `?` overlay and `dbxt --help` carry the complete list; this is the sho
 | --- | --- |
 | Global | `?` help · `Tab`/`Shift-Tab` panes · `Alt-1/2/3` focus · `F5`/`Ctrl-J` run · `Ctrl-C` quit |
 | Connections | `↑` `↓` move · `Enter` connect · `c` new · `p` duplicate · `d` database list · `o` picker |
-| Sidebar | `↑` `↓` tables · `/` filter · `Enter` browse · `r` structure · `t` recent |
+| Sidebar | `↑` `↓` tables · `/` filter · `Enter` browse · `r` structure · `I` import CSV · `t` recent |
 | Results | `↑` `↓` rows · `←` `→` columns · `n`/`p` pages · `Enter`/`v` cell · `e` edit · `i` insert · `Delete` delete |
-| Results (more) | `f` filter · `s` sort · `Ctrl-K` extra sort · `Ctrl-R` clear · `y` copy row · `/` search · `Ctrl-Y` CSV · `[` `]` tabs |
+| Results (more) | `f` filter · `s` sort · `Ctrl-K` extra sort · `Ctrl-R` clear · `y` copy row · `/` search · `Ctrl-Y` export · `[` `]` tabs |
 | Redis | `Space` select · `a` all · `Del`/`x`/`m` batch delete/TTL/rename · `/` MATCH · `n` more · `e` edit · `Enter` value |
 | MongoDB | `e` edit · `i` insert · `Del` delete · `f` filter · `n`/`p` pages · `r` indexes |
 | Overlays | `Enter`/`y` confirm · `Esc`/`n` cancel · `↑` `↓` scroll |
@@ -118,12 +125,13 @@ Per-table choices (compact widths, hidden columns, sort) are written to `~/.conf
 
 Early but usable. Verified end-to-end against real MySQL 8.4, Redis and MongoDB servers.
 
-- [x] SQL browsing, editing, transactions, filter/sort, completion, CSV export and result tabs
+- [x] SQL browsing, editing, transactions, filter/sort, completion, CSV import/export and result tabs
 - [x] Redis key browser with batch key operations
 - [x] MongoDB document browser with document CRUD
 - [x] Prebuilt archives for seven targets — only the Linux x86_64 build has been exercised locally, the others are untested
 - [ ] In-TUI connection editing / deletion (duplication is in via `p`)
-- [ ] Result export to JSON / XLSX, and search across pages
+- [ ] Result export to XLSX, and search across pages
+- [ ] Excel (`.xlsx`) import
 - [ ] A dedicated Android/Termux build
 
 ## License

@@ -55,6 +55,22 @@ const QUERY_MAX_ROWS: usize = 500;
 const QUERY_MORE_STEP: usize = 500;
 /// Hard ceiling for `Ctrl-N`; past this the user should refine the query.
 const QUERY_MAX_ROWS_CAP: usize = 20_000;
+/// Rows per transactional `INSERT` batch during a CSV import. Each chunk is one
+/// transaction, so a mid-chunk failure rolls back that chunk only.
+const IMPORT_CHUNK: usize = 500;
+/// Data rows shown in the import preview.
+const IMPORT_SAMPLE_ROWS: usize = 5;
+/// Rows sampled when inferring a CSV column's type.
+const IMPORT_INFER_SAMPLE: usize = 200;
+/// Result rows above which the export overlay warns that generation may take a
+/// moment (the work runs on the UI thread).
+const EXPORT_SLOW_ROWS: usize = 10_000;
+/// Rows per multi-row `INSERT` group for the batch INSERT export.
+const EXPORT_INSERT_BATCH: usize = 100;
+/// Import watchdog: a large CSV is many sequential statements, so the last-resort
+/// ceiling is far wider than a single query's (each statement still has its own
+/// 60 s driver timeout).
+const OP_WATCHDOG_IMPORT: Duration = Duration::from_secs(1800);
 /// Last-resort watchdog for a single backend call. The SQL path already asks the
 /// driver for a 60 s statement timeout, but Redis / MongoDB / metadata calls
 /// carry no timeout of their own: without this a dead server would leave the
@@ -883,6 +899,194 @@ struct TableDataReq {
     gen: u64,
 }
 
+// ─── CSV import ──────────────────────────────────────────────────────────────
+
+/// A CSV column's inferred SQL type. Only used to pick the right literal shape
+/// (bare number, TRUE/FALSE, quoted string); the target column's own type still
+/// has the final say when the value is written.
+#[derive(Clone, Copy, PartialEq, Debug)]
+enum ColType {
+    Int,
+    Float,
+    Bool,
+    Date,
+    DateTime,
+    Text,
+}
+
+impl ColType {
+    fn label(self) -> &'static str {
+        match self {
+            ColType::Int => "int",
+            ColType::Float => "float",
+            ColType::Bool => "bool",
+            ColType::Date => "date",
+            ColType::DateTime => "datetime",
+            ColType::Text => "text",
+        }
+    }
+}
+
+/// One target table column resolved against the CSV header.
+#[derive(Clone, Debug)]
+struct ImportCol {
+    /// Target column name.
+    name: String,
+    /// Index into the CSV row when the header matched a table column; `None`
+    /// means the column is absent from the CSV and is written as NULL/default.
+    src: Option<usize>,
+    /// Type inferred from the CSV values (Text when the column is absent).
+    ty: ColType,
+    /// The table column's declared type, used to keep genuinely numeric values
+    /// bare even when the CSV sample looked like text.
+    data_type: String,
+}
+
+/// How an import treats rows already in the table.
+#[derive(Clone, Copy, PartialEq, Debug)]
+enum ImportMode {
+    /// Append to the existing rows.
+    Append,
+    /// `DELETE FROM` the table first, then insert (red-confirmed).
+    Overwrite,
+}
+
+/// What to do when a row fails to insert.
+#[derive(Clone, Copy, PartialEq, Debug)]
+enum ImportOnError {
+    /// Stop at the first failure and report the row number (default).
+    Stop,
+    /// Skip the bad row and keep going, reporting every skipped row.
+    Skip,
+}
+
+/// The parsed, decoded and header-aligned CSV, ready to preview and import.
+#[derive(Clone)]
+struct ImportPlan {
+    path: PathBuf,
+    file_size: u64,
+    encoding: String,
+    delimiter: char,
+    /// CSV header names in file order.
+    headers: Vec<String>,
+    /// Every data row (raw field strings, empty = NULL).
+    rows: Vec<Vec<String>>,
+    /// Target table and database.
+    table: String,
+    db: String,
+    /// Target columns with their CSV source index and inferred type.
+    columns: Vec<ImportCol>,
+    /// CSV headers that match no table column (blocks the import when non-empty).
+    extra: Vec<String>,
+    /// Table columns absent from the CSV (imported as NULL/default).
+    missing: Vec<String>,
+    mode: ImportMode,
+    on_error: ImportOnError,
+    /// A blocking problem (unreadable file, no data, header mismatch).
+    error: Option<String>,
+}
+
+impl ImportPlan {
+    /// Columns actually written by the INSERT.
+    fn present(&self) -> Vec<&ImportCol> {
+        self.columns.iter().filter(|c| c.src.is_some()).collect()
+    }
+}
+
+/// The file-path step of the import flow (before the CSV is read).
+struct ImportPrompt {
+    input: TextArea<'static>,
+    table: String,
+    db: String,
+    /// Inline error from the previous attempt (file missing, bad header …).
+    error: Option<String>,
+}
+
+/// The outcome of one import run, shown in the completion overlay.
+#[derive(Clone)]
+struct ImportReport {
+    table: String,
+    mode: ImportMode,
+    total: usize,
+    inserted: usize,
+    /// `(1-based data row, error)` for rows skipped in skip mode.
+    skipped: Vec<(usize, String)>,
+    /// Set when stop mode aborted: the failing row and its error.
+    aborted: Option<(usize, String)>,
+    elapsed_ms: u128,
+}
+
+impl ImportReport {
+    fn ok(&self) -> bool {
+        self.aborted.is_none()
+    }
+}
+
+/// The import job handed to the backend task.
+struct ImportJob {
+    cfg: Box<ConnectionConfig>,
+    db: String,
+    table: String,
+    /// Present columns only (src is Some), in target order.
+    columns: Vec<ImportCol>,
+    rows: Vec<Vec<String>>,
+    mode: ImportMode,
+    on_error: ImportOnError,
+}
+
+// ─── export ──────────────────────────────────────────────────────────────────
+
+/// A result-set export format offered by `Ctrl-Y`.
+#[derive(Clone, Copy, PartialEq, Debug)]
+enum ExportFormat {
+    Csv,
+    JsonArray,
+    JsonNdjson,
+    Markdown,
+    Insert,
+    InsertBatch,
+}
+
+impl ExportFormat {
+    fn label(self) -> &'static str {
+        match self {
+            ExportFormat::Csv => "CSV",
+            ExportFormat::JsonArray => "JSON",
+            ExportFormat::JsonNdjson => "NDJSON",
+            ExportFormat::Markdown => "Markdown",
+            ExportFormat::Insert => "INSERT",
+            ExportFormat::InsertBatch => t("INSERT (批量)"),
+        }
+    }
+    fn description(self) -> &'static str {
+        match self {
+            ExportFormat::Csv => t("逗号分隔，NULL 为空字段"),
+            ExportFormat::JsonArray => t("JSON 数组，每个对象一行记录"),
+            ExportFormat::JsonNdjson => t("每行一个 JSON 对象（NDJSON）"),
+            ExportFormat::Markdown => t("Markdown 表格（| 转义）"),
+            ExportFormat::Insert => t("每行一条 INSERT INTO 语句"),
+            ExportFormat::InsertBatch => t("多行 VALUES 合并为一条 INSERT"),
+        }
+    }
+}
+
+/// All formats in overlay order.
+const EXPORT_FORMATS: &[ExportFormat] = &[
+    ExportFormat::Csv,
+    ExportFormat::JsonArray,
+    ExportFormat::JsonNdjson,
+    ExportFormat::Markdown,
+    ExportFormat::Insert,
+    ExportFormat::InsertBatch,
+];
+
+/// A generated export waiting for the destination (clipboard or file) step.
+struct ExportPending {
+    format: ExportFormat,
+    /// The table name guessed for INSERT exports (`None` for the other formats).
+    table: Option<String>,
+}
+
 #[derive(Clone)]
 struct Confirm {
     sql: String,
@@ -1657,6 +1861,18 @@ enum Op {
     SaveSnippet(Box<ConnectionConfig>, String, String),
     DatabasesRefresh(Box<ConnectionConfig>),
     AddConn(Box<ConnectionConfig>),
+    /// Read, decode and header-align a CSV against a table's columns, producing
+    /// the preview plan.
+    ImportPlan {
+        cfg: Box<ConnectionConfig>,
+        db: String,
+        table: String,
+        path: PathBuf,
+        /// Request id; a stale plan (cancelled or superseded) is discarded.
+        gen: u64,
+    },
+    /// Execute a prepared CSV import, reporting progress per chunk.
+    Import(Box<ImportJob>),
 }
 
 impl Op {
@@ -1667,6 +1883,7 @@ impl Op {
     fn watchdog(&self) -> Duration {
         match self {
             Op::Query(..) => OP_WATCHDOG_SQL,
+            Op::Import(_) => OP_WATCHDOG_IMPORT,
             _ => OP_WATCHDOG_FALLBACK,
         }
     }
@@ -1759,6 +1976,14 @@ enum OpResult {
     SnippetSaved(String),
     DatabasesRefresh(Vec<String>),
     Added(String),
+    /// A CSV preview plan (may carry a content error the preview displays).
+    ImportPlan { gen: u64, plan: Box<ImportPlan> },
+    /// The plan could not be built (unreadable file, no columns): routed back to
+    /// the path prompt.
+    ImportFailed { gen: u64, msg: String },
+    /// Chunk progress; does not count as the op finishing.
+    ImportProgress { done: usize, total: usize },
+    ImportDone(Box<ImportReport>),
     Error(String),
 }
 
@@ -1839,7 +2064,7 @@ fn stmt_outcome(sql: String, b: BatchStatementResult) -> StmtOutcome {
     }
 }
 
-async fn run_op(backend: &LocalBackend, op: Op) -> OpResult {
+async fn run_op(backend: &LocalBackend, op: Op, tx: &Tx) -> OpResult {
     match op {
         Op::ListConnections => match backend.load_connections().await {
             Ok(cs) => OpResult::Connections(cs),
@@ -2364,6 +2589,173 @@ async fn run_op(backend: &LocalBackend, op: Op) -> OpResult {
             Ok(saved) => OpResult::Added(tf("已保存: {} ({})", &[&(saved.name), &(saved.db_type.as_str())])),
             Err(e) => OpResult::Error(format!("save: {e}")),
         },
+        Op::ImportPlan { cfg, db, table, path, gen } => {
+            let expanded = expand_home(&path.to_string_lossy());
+            let bytes = match std::fs::read(&expanded) {
+                Ok(b) => b,
+                Err(e) => return OpResult::ImportFailed { gen, msg: tf("读取文件失败: {}", &[&(e)]) },
+            };
+            let (text, encoding) = decode_csv_bytes(&bytes);
+            let delimiter = detect_delimiter(&text);
+            let mut rows = parse_csv(&text, delimiter);
+            if rows.is_empty() {
+                return OpResult::ImportFailed { gen, msg: t("CSV 为空或无法解析").into() };
+            }
+            let headers = rows.remove(0);
+            if rows.is_empty() {
+                return OpResult::ImportFailed { gen, msg: t("CSV 没有数据行").into() };
+            }
+            let table_columns = match backend.get_columns(&cfg, &db, "", &table).await {
+                Ok(c) => c,
+                Err(e) => return OpResult::ImportFailed { gen, msg: tf("读取表结构失败: {}", &[&(e)]) },
+            };
+            let infer_rows: Vec<Vec<String>> = rows.iter().take(IMPORT_INFER_SAMPLE).cloned().collect();
+            let (columns, extra, missing) = align_import_columns(&headers, &infer_rows, &table_columns);
+            let error = if table_columns.is_empty() {
+                Some(t("目标表没有可对齐的列").to_string())
+            } else if extra.is_empty() && columns.iter().all(|c| c.src.is_none()) {
+                Some(t("CSV 表头与表列不匹配（无任何列名对应）").to_string())
+            } else if !extra.is_empty() {
+                Some(tf("CSV 有 {} 个多余列无法对齐（{}）", &[&extra.len(), &extra.join(", ")]))
+            } else {
+                None
+            };
+            OpResult::ImportPlan {
+                gen,
+                plan: Box::new(ImportPlan {
+                    path: expanded,
+                    file_size: bytes.len() as u64,
+                    encoding,
+                    delimiter,
+                    headers,
+                    rows,
+                    table,
+                    db,
+                    columns,
+                    extra,
+                    missing,
+                    mode: ImportMode::Append,
+                    on_error: ImportOnError::Stop,
+                    error,
+                }),
+            }
+        }
+        Op::Import(job) => {
+            let ImportJob {
+                cfg,
+                db,
+                table,
+                columns,
+                rows,
+                mode,
+                on_error,
+            } = *job;
+            let total = rows.len();
+            let start = Instant::now();
+            // Overwrite clears the table first. The DELETE is not part of the
+            // insert chunks, so a later failure leaves an empty (or partially
+            // filled) table — that is what an overwrite means.
+            if mode == ImportMode::Overwrite {
+                let del = format!(
+                    "DELETE FROM {};",
+                    quote_table_identifier(Some(cfg.db_type), &table)
+                );
+                if let Err(e) = backend.execute_query(&cfg, &db, &del, Some(1), Some(60)).await {
+                    return OpResult::ImportDone(Box::new(ImportReport {
+                        table,
+                        mode,
+                        total,
+                        inserted: 0,
+                        skipped: Vec::new(),
+                        aborted: Some((0, tf("清空表失败: {}", &[&(e)]))),
+                        elapsed_ms: start.elapsed().as_millis(),
+                    }));
+                }
+            }
+            let mut inserted = 0usize;
+            let mut skipped: Vec<(usize, String)> = Vec::new();
+            let mut aborted: Option<(usize, String)> = None;
+            for (ci, chunk) in import_chunks(&rows).into_iter().enumerate() {
+                let base = ci * IMPORT_CHUNK;
+                let script = chunk
+                    .iter()
+                    .map(|row| import_insert_sql(&cfg, &table, &columns, row))
+                    .collect::<Vec<_>>()
+                    .join("\n");
+                match on_error {
+                    // Stop mode: one transaction per chunk. A failure rolls the
+                    // chunk back and the backend names the failing statement.
+                    ImportOnError::Stop => {
+                        let options = QueryExecutionOptions {
+                            max_rows: Some(1),
+                            timeout_secs: Some(60),
+                            use_transaction: Some(true),
+                            ..Default::default()
+                        };
+                        match backend.execute_batch(&cfg, &db, None, &script, options).await {
+                            Ok(_) => inserted += chunk.len(),
+                            Err(e) => {
+                                aborted = Some((import_row_of_error(base, &e, chunk.len()), e));
+                                break;
+                            }
+                        }
+                    }
+                    // Skip mode: auto-commit with per-statement results, so the
+                    // exact failing rows can be reported and skipped.
+                    ImportOnError::Skip => {
+                        let options = QueryExecutionOptions {
+                            max_rows: Some(1),
+                            timeout_secs: Some(60),
+                            continue_on_error: true,
+                            ..Default::default()
+                        };
+                        match backend.execute_batch(&cfg, &db, None, &script, options).await {
+                            Ok(results) => {
+                                let mut bad = 0usize;
+                                for r in &results {
+                                    if r.execution_error {
+                                        bad += 1;
+                                        if let Some(i) = r.statement_index {
+                                            skipped.push((
+                                                base + i + 1,
+                                                r.error_message
+                                                    .clone()
+                                                    .unwrap_or_else(|| "unknown error".to_string()),
+                                            ));
+                                        }
+                                    }
+                                }
+                                inserted += results.len().saturating_sub(bad);
+                                if results.len() < chunk.len() {
+                                    aborted = Some((
+                                        base + results.len() + 1,
+                                        t("批量在中途停止（连接或会话错误）").to_string(),
+                                    ));
+                                    break;
+                                }
+                            }
+                            Err(e) => {
+                                aborted = Some((base + 1, tf("批量执行失败: {}", &[&(e)])));
+                                break;
+                            }
+                        }
+                    }
+                }
+                let _ = tx.send(OpResult::ImportProgress {
+                    done: (base + chunk.len()).min(total),
+                    total,
+                });
+            }
+            OpResult::ImportDone(Box::new(ImportReport {
+                table,
+                mode,
+                total,
+                inserted,
+                skipped,
+                aborted,
+                elapsed_ms: start.elapsed().as_millis(),
+            }))
+        }
     }
 }
 
@@ -2374,7 +2766,7 @@ fn spawn_op(backend: &Arc<LocalBackend>, tx: &Tx, op: Op) {
     tokio::spawn(async move {
         // The watchdog is the last resort: a server that accepts the socket but
         // never answers must surface an error, not a spinner that never stops.
-        let res = match tokio::time::timeout(limit, run_op(&backend, op)).await {
+        let res = match tokio::time::timeout(limit, run_op(&backend, op, &tx)).await {
             Ok(r) => r,
             Err(_) => OpResult::Error(tf("操作超时（{}s）· 服务器无响应或网络中断，请检查连接后用 d 重连", &[&(limit.as_secs())])),
         };
@@ -2803,6 +3195,29 @@ struct App {
 
     form: ConnForm,
 
+    // ── CSV import ──
+    /// The file-path step, before the CSV is read.
+    import_prompt: Option<ImportPrompt>,
+    /// The parsed preview / confirmation layer.
+    import_plan: Option<Box<ImportPlan>>,
+    /// Monotonic id of the latest plan request; a stale reply is discarded.
+    import_gen: u64,
+    /// Preview scroll offset.
+    import_scroll: u16,
+    /// `(done, total)` while an import runs.
+    import_progress: Option<(usize, usize)>,
+    /// The completion overlay.
+    import_report: Option<Box<ImportReport>>,
+
+    // ── result export (Ctrl-Y) ──
+    /// The format picker.
+    export_open: bool,
+    export_list: ListState,
+    /// The chosen format, waiting for a destination.
+    export_pending: Option<ExportPending>,
+    /// The destination prompt (blank = clipboard, else a file path).
+    export_path: Option<TextArea<'static>>,
+
     layout_mode: LayoutMode,
     term_h: u16,
     rects: Rects,
@@ -3197,6 +3612,16 @@ async fn run_app(mut terminal: ratatui::DefaultTerminal, backend: Arc<LocalBacke
         mongo_docs: Vec::new(),
         mongo_dialog: None,
         form: ConnForm::default(),
+        import_prompt: None,
+        import_plan: None,
+        import_gen: 0,
+        import_scroll: 0,
+        import_progress: None,
+        import_report: None,
+        export_open: false,
+        export_list: ListState::default(),
+        export_pending: None,
+        export_path: None,
         layout_mode: LayoutMode::Mid,
         term_h: 0,
         rects: Rects::default(),
@@ -3236,6 +3661,13 @@ async fn run_app(mut terminal: ratatui::DefaultTerminal, backend: Arc<LocalBacke
 }
 
 fn apply_op_result(app: &mut App, res: OpResult, tx: &Tx) {
+    // Chunk progress is an intermediate message: update the readout and leave
+    // the op (and the spinner) in flight.
+    if let OpResult::ImportProgress { done, total } = res {
+        app.import_progress = Some((done, total));
+        app.status = tf("导入 {} / {} 行…", &[&done, &total]);
+        return;
+    }
     // Only stop the spinner once every in-flight call has answered.
     app.pending_ops = app.pending_ops.saturating_sub(1);
     if app.pending_ops == 0 {
@@ -3802,7 +4234,67 @@ fn apply_op_result(app: &mut App, res: OpResult, tx: &Tx) {
             app.loading = true;
             app.spawn(tx, Op::ListConnections);
         }
+        OpResult::ImportPlan { gen, plan } => {
+            if gen != app.import_gen {
+                return;
+            }
+            app.import_prompt = None;
+            app.import_scroll = 0;
+            app.status = if plan.error.is_some() {
+                t("CSV 预览：存在错误，无法导入").into()
+            } else {
+                tf(
+                    "CSV 预览：{} 行 → {}.{} · Enter 导入",
+                    &[&plan.rows.len(), &plan.db, &plan.table],
+                )
+            };
+            app.import_plan = Some(plan);
+        }
+        OpResult::ImportFailed { gen, msg } => {
+            if gen != app.import_gen {
+                return;
+            }
+            app.status = format!("✗ {msg}");
+            if let Some(p) = app.import_prompt.as_mut() {
+                p.error = Some(msg);
+            }
+        }
+        OpResult::ImportDone(rep) => {
+            let table = rep.table.clone();
+            app.import_progress = None;
+            app.status = if rep.ok() {
+                tf(
+                    "✓ 导入完成 · 成功 {} 行 · 跳过 {} 行 · {}ms",
+                    &[&rep.inserted, &rep.skipped.len(), &rep.elapsed_ms],
+                )
+            } else {
+                let (row, err) = rep
+                    .aborted
+                    .as_ref()
+                    .map(|(r, e)| (*r, e.clone()))
+                    .unwrap_or((0, String::new()));
+                tf("✗ 导入中止于第 {} 行: {}", &[&row, &err])
+            };
+            // Refresh the browsed table when it is the import target.
+            let refresh = rep.ok()
+                && app
+                    .page_state
+                    .as_ref()
+                    .map(|p| p.table.as_str())
+                    .is_some_and(|t| t == table);
+            if refresh {
+                let (filter, order_by, page) = app
+                    .page_state
+                    .as_ref()
+                    .map(|p| (p.filter.clone(), p.order_by.clone(), p.page))
+                    .unwrap_or_default();
+                reload_table_view(app, tx, filter, order_by, page);
+            }
+            app.import_report = Some(rep);
+        }
+        OpResult::ImportProgress { .. } => {}
         OpResult::Error(e) => {
+            app.import_progress = None;
             app.page_pending = false;
             app.pending_sel = None;
             app.pending_focus = None;
@@ -4055,6 +4547,27 @@ fn browse_key(app: &mut App, tx: &Tx, k: KeyEvent) {
         help_key(app, k);
         return;
     }
+    // CSV import and result export overlays (newest, so checked before the rest).
+    if app.import_report.is_some() {
+        import_report_key(app, k);
+        return;
+    }
+    if app.import_plan.is_some() {
+        import_plan_key(app, tx, k);
+        return;
+    }
+    if app.import_prompt.is_some() {
+        import_prompt_key(app, tx, k);
+        return;
+    }
+    if app.export_path.is_some() {
+        export_path_key(app, k);
+        return;
+    }
+    if app.export_open {
+        export_key(app, k);
+        return;
+    }
     if app.filter_prompt.is_some() {
         filter_prompt_key(app, tx, k);
         return;
@@ -4182,6 +4695,19 @@ fn browse_key(app: &mut App, tx: &Tx, k: KeyEvent) {
         && app.backend_kind == Backend::Sql
     {
         explain_current(app, tx);
+        return;
+    }
+
+    // `I` imports a CSV into the focused table (sidebar) or the table open in
+    // the data browser. Uppercase on purpose: lowercase `i` is quick-insert in
+    // the results pane, and an import is a rare, deliberate action.
+    if k.code == KeyCode::Char('I')
+        && !k.modifiers.contains(KeyModifiers::CONTROL)
+        && !k.modifiers.contains(KeyModifiers::ALT)
+        && app.selected.is_some()
+        && !matches!(app.focus, Focus::Editor | Focus::CmdInput)
+    {
+        open_import_prompt(app);
         return;
     }
 
@@ -7050,7 +7576,7 @@ fn preview_key(app: &mut App, tx: &Tx, k: KeyEvent) {
             KeyCode::Char('d') => delete_row(app),
             // Ctrl-Y: export the focused grid to CSV; Ctrl-N: load more rows when
             // the previous query hit the row cap.
-            KeyCode::Char('y') => export_csv(app),
+            KeyCode::Char('y') => open_export(app),
             KeyCode::Char('n') => load_more_rows(app, tx),
             _ => {}
         }
@@ -9299,6 +9825,583 @@ fn grid_to_csv(grid: &Grid) -> String {
     out
 }
 
+// ── CSV import: parsing, decoding, inference and alignment ───────────────────
+
+/// Parse CSV text into rows of fields (RFC 4180, stdlib only). Handles quoted
+/// fields, doubled quotes inside a quoted field, embedded delimiters and
+/// newlines, LF / CRLF line endings, a leading UTF-8 BOM and blank lines.
+fn parse_csv(text: &str, delim: char) -> Vec<Vec<String>> {
+    let mut rows: Vec<Vec<String>> = Vec::new();
+    let mut row: Vec<String> = Vec::new();
+    let mut field = String::new();
+    let mut in_quotes = false;
+    let mut field_started = false;
+    let mut chars = text.chars().peekable();
+    if chars.peek() == Some(&'\u{feff}') {
+        chars.next();
+    }
+    while let Some(c) = chars.next() {
+        if in_quotes {
+            if c == '"' {
+                if chars.peek() == Some(&'"') {
+                    chars.next();
+                    field.push('"');
+                } else {
+                    in_quotes = false;
+                }
+            } else {
+                field.push(c);
+            }
+            continue;
+        }
+        if c == '"' && field.is_empty() {
+            in_quotes = true;
+            field_started = true;
+        } else if c == delim {
+            row.push(std::mem::take(&mut field));
+            field_started = false;
+        } else if c == '\n' || c == '\r' {
+            if c == '\r' && chars.peek() == Some(&'\n') {
+                chars.next();
+            }
+            if row.is_empty() && field.is_empty() && !field_started {
+                // A blank line carries no record.
+            } else {
+                row.push(std::mem::take(&mut field));
+                rows.push(std::mem::take(&mut row));
+            }
+            field_started = false;
+        } else {
+            field.push(c);
+            field_started = true;
+        }
+    }
+    if !row.is_empty() || !field.is_empty() || field_started {
+        row.push(field);
+        rows.push(row);
+    }
+    rows
+}
+
+/// Pick the delimiter from the first non-empty line: the candidate with the most
+/// unquoted occurrences wins, defaulting to a comma when none appears.
+fn detect_delimiter(text: &str) -> char {
+    let first = text.lines().find(|l| !l.trim().is_empty()).unwrap_or("");
+    let mut best = (',', 0usize);
+    for cand in [',', '\t', ';'] {
+        let mut n = 0usize;
+        let mut in_q = false;
+        for ch in first.chars() {
+            if ch == '"' {
+                in_q = !in_q;
+            } else if ch == cand && !in_q {
+                n += 1;
+            }
+        }
+        if n > best.1 {
+            best = (cand, n);
+        }
+    }
+    best.0
+}
+
+/// Decode CSV bytes to text, returning the text and an encoding label. UTF-8 is
+/// used verbatim; anything else is decoded as GB18030 (a GBK superset, the
+/// common Chinese encoding), falling back to a lossy UTF-8 replacement.
+fn decode_csv_bytes(bytes: &[u8]) -> (String, String) {
+    if let Ok(s) = std::str::from_utf8(bytes) {
+        return (s.to_string(), "UTF-8".to_string());
+    }
+    let (cow, _, had_errors) = encoding_rs::GB18030.decode(bytes);
+    if !had_errors {
+        return (cow.into_owned(), "GB18030/GBK".to_string());
+    }
+    (String::from_utf8_lossy(bytes).into_owned(), "UTF-8 (lossy)".to_string())
+}
+
+/// `YYYY-MM-DD` with a plausible month/day (a cheap sanity check, not a
+/// calendar).
+fn looks_like_date(s: &str) -> bool {
+    let b = s.as_bytes();
+    if b.len() != 10 || b[4] != b'-' || b[7] != b'-' {
+        return false;
+    }
+    let digits = |r: std::ops::Range<usize>| s[r].bytes().all(|c| c.is_ascii_digit());
+    if !(digits(0..4) && digits(5..7) && digits(8..10)) {
+        return false;
+    }
+    let m: u32 = s[5..7].parse().unwrap_or(0);
+    let d: u32 = s[8..10].parse().unwrap_or(0);
+    (1..=12).contains(&m) && (1..=31).contains(&d)
+}
+
+/// `YYYY-MM-DD HH:MM[:SS]` (or a `T` separator).
+fn looks_like_datetime(s: &str) -> bool {
+    let Some((date, rest)) = s.split_once([' ', 'T']) else {
+        return false;
+    };
+    if !looks_like_date(date) {
+        return false;
+    }
+    let parts: Vec<&str> = rest.split(':').collect();
+    if parts.len() < 2 || parts.len() > 3 {
+        return false;
+    }
+    if !parts
+        .iter()
+        .all(|p| p.len() == 2 && p.bytes().all(|c| c.is_ascii_digit()))
+    {
+        return false;
+    }
+    let h: u32 = parts[0].parse().unwrap_or(99);
+    let m: u32 = parts[1].parse().unwrap_or(99);
+    h < 24 && m < 60
+}
+
+/// Infer a column's type from its non-empty sample values. Empty values are
+/// ignored (they become NULL); a column with no values at all falls back to
+/// text.
+fn infer_col_type(values: &[&str]) -> ColType {
+    let mut seen = 0usize;
+    let mut all_int = true;
+    let mut all_float = true;
+    let mut all_bool = true;
+    let mut all_date = true;
+    let mut all_datetime = true;
+    for v in values.iter().map(|s| s.trim()).filter(|s| !s.is_empty()) {
+        seen += 1;
+        if v.parse::<i64>().is_err() {
+            all_int = false;
+        }
+        if v.parse::<f64>().is_err() {
+            all_float = false;
+        }
+        if !(v.eq_ignore_ascii_case("true") || v.eq_ignore_ascii_case("false")) {
+            all_bool = false;
+        }
+        if !looks_like_date(v) {
+            all_date = false;
+        }
+        if !looks_like_datetime(v) {
+            all_datetime = false;
+        }
+    }
+    if seen == 0 {
+        return ColType::Text;
+    }
+    if all_bool {
+        ColType::Bool
+    } else if all_int {
+        ColType::Int
+    } else if all_float {
+        ColType::Float
+    } else if all_datetime {
+        ColType::DateTime
+    } else if all_date {
+        ColType::Date
+    } else {
+        ColType::Text
+    }
+}
+
+/// Match CSV headers to table columns by trimmed, case-insensitive name (a
+/// surrounding backtick or double quote is ignored). Returns the columns in
+/// table order, the CSV headers that matched nothing, and the table columns
+/// absent from the CSV.
+fn align_import_columns(
+    headers: &[String],
+    infer_rows: &[Vec<String>],
+    table_columns: &[ColumnInfo],
+) -> (Vec<ImportCol>, Vec<String>, Vec<String>) {
+    let norm = |s: &str| s.trim().trim_matches(['`', '"']).to_ascii_lowercase();
+    let norm_headers: Vec<String> = headers.iter().map(|h| norm(h)).collect();
+    let mut used = vec![false; headers.len()];
+    let mut columns = Vec::with_capacity(table_columns.len());
+    let mut missing = Vec::new();
+    for col in table_columns {
+        let want = norm(&col.name);
+        let idx = norm_headers
+            .iter()
+            .position(|h| !h.is_empty() && *h == want);
+        match idx {
+            Some(i) => {
+                used[i] = true;
+                let vals: Vec<&str> = infer_rows
+                    .iter()
+                    .filter_map(|r| r.get(i))
+                    .map(String::as_str)
+                    .collect();
+                columns.push(ImportCol {
+                    name: col.name.clone(),
+                    src: Some(i),
+                    ty: infer_col_type(&vals),
+                    data_type: col.data_type.clone(),
+                });
+            }
+            None => {
+                missing.push(col.name.clone());
+                columns.push(ImportCol {
+                    name: col.name.clone(),
+                    src: None,
+                    ty: ColType::Text,
+                    data_type: col.data_type.clone(),
+                });
+            }
+        }
+    }
+    let extra = headers
+        .iter()
+        .enumerate()
+        .filter(|(i, h)| !used[*i] && !h.trim().is_empty())
+        .map(|(_, h)| h.clone())
+        .collect();
+    (columns, extra, missing)
+}
+
+/// SQL literal for one CSV field. An empty field is SQL NULL (the import
+/// convention); the inferred type decides whether a value stays bare, becomes
+/// TRUE/FALSE or is quoted. A numeric target column always keeps a genuine
+/// number bare, even when the sample looked like text.
+fn import_literal(raw: &str, ty: ColType, data_type: &str) -> String {
+    if raw.is_empty() {
+        return "NULL".to_string();
+    }
+    if is_numeric_type(data_type) && raw.parse::<f64>().is_ok() {
+        return raw.to_string();
+    }
+    match ty {
+        ColType::Int if raw.parse::<i64>().is_ok() => raw.to_string(),
+        ColType::Float if raw.parse::<f64>().is_ok() => raw.to_string(),
+        ColType::Bool if raw.eq_ignore_ascii_case("true") => "TRUE".to_string(),
+        ColType::Bool if raw.eq_ignore_ascii_case("false") => "FALSE".to_string(),
+        _ => sql_literal(raw),
+    }
+}
+
+/// `INSERT INTO t (cols…) VALUES (vals…);` for one import row.
+fn import_insert_sql(
+    cfg: &ConnectionConfig,
+    table: &str,
+    columns: &[ImportCol],
+    row: &[String],
+) -> String {
+    let q = |name: &str| quote_table_identifier(Some(cfg.db_type), name);
+    let present: Vec<&ImportCol> = columns.iter().filter(|c| c.src.is_some()).collect();
+    let cols = present
+        .iter()
+        .map(|c| q(&c.name))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let vals = present
+        .iter()
+        .map(|c| {
+            let raw = c
+                .src
+                .and_then(|i| row.get(i))
+                .map(String::as_str)
+                .unwrap_or("");
+            import_literal(raw, c.ty, &c.data_type)
+        })
+        .collect::<Vec<_>>()
+        .join(", ");
+    format!("INSERT INTO {} ({}) VALUES ({});", q(table), cols, vals)
+}
+
+/// Split rows into transaction-sized chunks (the last one may be short).
+fn import_chunks<T>(rows: &[T]) -> Vec<&[T]> {
+    rows.chunks(IMPORT_CHUNK).collect()
+}
+
+/// Expand a leading `~` to `$HOME`.
+fn expand_home(path: &str) -> PathBuf {
+    let trimmed = path.trim();
+    if trimmed == "~" {
+        if let Some(home) = std::env::var_os("HOME") {
+            return PathBuf::from(home);
+        }
+    }
+    if let Some(rest) = trimmed.strip_prefix("~/") {
+        if let Some(home) = std::env::var_os("HOME") {
+            return PathBuf::from(home).join(rest);
+        }
+    }
+    PathBuf::from(trimmed)
+}
+
+/// Human-readable byte size for the preview header.
+fn human_size(bytes: u64) -> String {
+    const UNITS: [&str; 4] = ["B", "KB", "MB", "GB"];
+    let mut value = bytes as f64;
+    let mut unit = 0usize;
+    while value >= 1024.0 && unit + 1 < UNITS.len() {
+        value /= 1024.0;
+        unit += 1;
+    }
+    if unit == 0 {
+        format!("{bytes} B")
+    } else {
+        format!("{value:.1} {}", UNITS[unit])
+    }
+}
+
+/// A delimiter's display label.
+fn delim_label(d: char) -> &'static str {
+    match d {
+        '\t' => "TAB",
+        ';' => ";",
+        _ => ",",
+    }
+}
+
+/// Row number (1-based) a stop-mode batch error refers to, when the backend
+/// names the failing statement (`Statement N failed: …`).
+fn import_row_of_error(base: usize, err: &str, chunk_len: usize) -> usize {
+    if let Some(pos) = err.find("Statement ") {
+        let rest = &err[pos + "Statement ".len()..];
+        let num: String = rest.chars().take_while(|c| c.is_ascii_digit()).collect();
+        if let Ok(n) = num.parse::<usize>() {
+            if (1..=chunk_len).contains(&n) {
+                return base + n;
+            }
+        }
+    }
+    base + 1
+}
+
+// ── export generators ────────────────────────────────────────────────────────
+
+/// A canonical integer: optional `-`, no leading zeros (except `0` itself).
+fn is_canonical_int(s: &str) -> bool {
+    let body = s.strip_prefix('-').unwrap_or(s);
+    if body.is_empty() || !body.bytes().all(|c| c.is_ascii_digit()) {
+        return false;
+    }
+    body == "0" || !body.starts_with('0')
+}
+
+/// A canonical decimal: an integer part without leading zeros and an optional
+/// fraction. `1e5` and `.5` stay strings (too easy to confuse with text).
+fn is_canonical_float(s: &str) -> bool {
+    let body = s.strip_prefix('-').unwrap_or(s);
+    let (int, frac) = match body.split_once('.') {
+        Some((i, f)) => (i, Some(f)),
+        None => (body, None),
+    };
+    if int.is_empty() || !int.bytes().all(|c| c.is_ascii_digit()) {
+        return false;
+    }
+    if !(int == "0" || !int.starts_with('0')) {
+        return false;
+    }
+    match frac {
+        None => true,
+        Some(f) => !f.is_empty() && f.bytes().all(|c| c.is_ascii_digit()),
+    }
+}
+
+/// JSON scalar for a cell: NULL → null, a canonical boolean/number is emitted
+/// natively, anything else stays a string (so `0123` never becomes 123).
+fn json_scalar(s: &str) -> serde_json::Value {
+    use serde_json::Value;
+    if s == "true" {
+        return Value::Bool(true);
+    }
+    if s == "false" {
+        return Value::Bool(false);
+    }
+    if is_canonical_int(s) {
+        if let Ok(n) = s.parse::<i64>() {
+            return Value::Number(n.into());
+        }
+    }
+    if is_canonical_float(s) {
+        if let Ok(f) = s.parse::<f64>() {
+            if let Some(n) = serde_json::Number::from_f64(f) {
+                return Value::Number(n);
+            }
+        }
+    }
+    Value::String(s.to_string())
+}
+
+/// One JSON object per grid row (serde handles all escaping).
+fn grid_row_object(grid: &Grid, row: &[Val]) -> serde_json::Map<String, serde_json::Value> {
+    let mut obj = serde_json::Map::new();
+    for (ci, name) in grid.columns.iter().enumerate() {
+        let v = row.get(ci).cloned().unwrap_or(Val::Null);
+        let jv = match v {
+            Val::Null => serde_json::Value::Null,
+            Val::Text(s) => json_scalar(&s),
+        };
+        obj.insert(name.clone(), jv);
+    }
+    obj
+}
+
+/// Pretty-printed JSON array of row objects.
+fn grid_to_json_array(grid: &Grid) -> String {
+    let arr: Vec<serde_json::Value> = grid
+        .rows
+        .iter()
+        .map(|row| serde_json::Value::Object(grid_row_object(grid, row)))
+        .collect();
+    serde_json::to_string_pretty(&serde_json::Value::Array(arr)).unwrap_or_else(|_| "[]".to_string())
+}
+
+/// NDJSON: one compact JSON object per line.
+fn grid_to_json_ndjson(grid: &Grid) -> String {
+    let mut out = String::new();
+    for row in &grid.rows {
+        let obj = serde_json::Value::Object(grid_row_object(grid, row));
+        if let Ok(s) = serde_json::to_string(&obj) {
+            out.push_str(&s);
+            out.push('\n');
+        }
+    }
+    out
+}
+
+/// Escape a Markdown table cell: pipes and backslashes are escaped, newlines
+/// become `<br>`.
+fn markdown_cell(s: &str) -> String {
+    s.replace('\\', "\\\\")
+        .replace('|', "\\|")
+        .replace("\r\n", "<br>")
+        .replace(['\n', '\r'], "<br>")
+}
+
+/// Markdown table. NULL renders as `NULL` (the grid's convention) while an empty
+/// string stays empty.
+fn grid_to_markdown(grid: &Grid) -> String {
+    let mut out = String::new();
+    out.push('|');
+    for c in &grid.columns {
+        out.push(' ');
+        out.push_str(&markdown_cell(c));
+        out.push_str(" |");
+    }
+    out.push('\n');
+    out.push('|');
+    for _ in &grid.columns {
+        out.push_str(" --- |");
+    }
+    out.push('\n');
+    for row in &grid.rows {
+        out.push('|');
+        for ci in 0..grid.columns.len() {
+            out.push(' ');
+            match row.get(ci) {
+                None | Some(Val::Null) => out.push_str("NULL"),
+                Some(Val::Text(s)) => out.push_str(&markdown_cell(s)),
+            }
+            out.push_str(" |");
+        }
+        out.push('\n');
+    }
+    out
+}
+
+/// Table name for an INSERT export, or `None` when it cannot be determined.
+fn export_insert_table(app: &App) -> Option<String> {
+    if let Some(ps) = &app.page_state {
+        return Some(ps.table.clone());
+    }
+    if let Some(s) = &app.script {
+        if let Some(t) = s
+            .drilled
+            .and_then(|i| s.outcomes.get(i))
+            .and_then(|o| guess_table_from_sql(&o.sql))
+        {
+            return Some(t);
+        }
+    }
+    app.last_sql.as_deref().and_then(guess_table_from_sql)
+}
+
+/// One `INSERT` per row, reusing the R13 row→INSERT generator.
+fn grid_to_inserts(cfg: &ConnectionConfig, table: &str, grid: &Grid, app: &App) -> String {
+    grid.rows
+        .iter()
+        .map(|row| build_insert_sql(cfg, table, grid, row, app))
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+/// Grouped multi-row `INSERT … VALUES (…),(…);` statements, `batch` rows each.
+fn grid_to_batch_inserts(
+    cfg: &ConnectionConfig,
+    table: &str,
+    grid: &Grid,
+    app: &App,
+    batch: usize,
+) -> String {
+    let types: Vec<Option<String>> = grid
+        .columns
+        .iter()
+        .map(|c| column_type(app, table, c))
+        .collect();
+    batch_insert_sql(cfg, table, &grid.columns, &grid.rows, &types, batch)
+}
+
+/// Pure multi-row INSERT generator (split out so it can be tested without an
+/// `App`). `types` is one declared column type per column, if known.
+fn batch_insert_sql(
+    cfg: &ConnectionConfig,
+    table: &str,
+    columns: &[String],
+    rows: &[Vec<Val>],
+    types: &[Option<String>],
+    batch: usize,
+) -> String {
+    let batch = batch.max(1);
+    let q = |name: &str| quote_table_identifier(Some(cfg.db_type), name);
+    let cols = columns.iter().map(|c| q(c)).collect::<Vec<_>>().join(", ");
+    let mut out = String::new();
+    for chunk in rows.chunks(batch) {
+        let groups = chunk
+            .iter()
+            .map(|row| {
+                let vals = columns
+                    .iter()
+                    .enumerate()
+                    .map(|(ci, _)| {
+                        let v = row.get(ci).cloned().unwrap_or(Val::Null);
+                        insert_literal(&v, types.get(ci).and_then(|t| t.as_deref()))
+                    })
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                format!("({vals})")
+            })
+            .collect::<Vec<_>>()
+            .join(",\n");
+        out.push_str(&format!("INSERT INTO {} ({}) VALUES\n{};\n", q(table), cols, groups));
+    }
+    out
+}
+
+/// Serialise the focused grid in the requested export format.
+fn render_export_content(
+    app: &App,
+    grid: &Grid,
+    format: ExportFormat,
+    table: Option<&str>,
+) -> String {
+    match format {
+        ExportFormat::Csv => grid_to_csv(grid),
+        ExportFormat::JsonArray => grid_to_json_array(grid),
+        ExportFormat::JsonNdjson => grid_to_json_ndjson(grid),
+        ExportFormat::Markdown => grid_to_markdown(grid),
+        ExportFormat::Insert => match (app.selected.as_ref(), table) {
+            (Some(cfg), Some(t)) => grid_to_inserts(cfg, t, grid, app),
+            _ => String::new(),
+        },
+        ExportFormat::InsertBatch => match (app.selected.as_ref(), table) {
+            (Some(cfg), Some(t)) => grid_to_batch_inserts(cfg, t, grid, app, EXPORT_INSERT_BATCH),
+            _ => String::new(),
+        },
+    }
+}
+
 /// True when the active grid has columns hidden to the right, i.e. horizontal
 /// panning would actually change what is on screen.
 fn has_h_scroll(app: &App) -> bool {
@@ -9789,8 +10892,8 @@ fn explain_current(app: &mut App, tx: &Tx) {
     }
 }
 
-/// `Ctrl-Y`: export the focused result grid to a CSV file under `$HOME`.
-fn export_csv(app: &mut App) {
+/// `Ctrl-Y`: open the export overlay for the focused result grid.
+fn open_export(app: &mut App) {
     let Some(grid) = active_grid(app) else {
         app.status = t("没有可导出的结果").into();
         return;
@@ -9799,33 +10902,286 @@ fn export_csv(app: &mut App) {
         app.status = t("没有可导出的列").into();
         return;
     }
-    let csv = grid_to_csv(&grid);
-    let dir = std::env::var_os("HOME")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from("."));
-    let ts = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(0);
-    let raw_label = match app.grid_kind {
-        GridKind::TableData => app
-            .page_state
-            .as_ref()
-            .map(|p| p.table.clone())
-            .unwrap_or_else(|| "table".into()),
-        _ => "query".into(),
+    let rows = grid.rows.len();
+    app.export_open = true;
+    app.export_list.select(Some(0));
+    app.export_pending = None;
+    app.export_path = None;
+    app.status = if rows > EXPORT_SLOW_ROWS {
+        tf("选择导出格式（{} 行，生成可能耗时）", &[&rows])
+    } else {
+        tf("选择导出格式（{} 行）", &[&rows])
     };
-    let label: String = raw_label
-        .chars()
-        .map(|c| if c == '/' || c == '\\' || c == ' ' { '_' } else { c })
-        .collect();
-    let path = dir.join(format!("dbxt-export-{label}-{ts}.csv"));
-    match std::fs::write(&path, csv.as_bytes()) {
-        Ok(_) => {
-            let rows = grid.rows.len();
-            app.status = tf("✓ 已导出 {} 行 → {}", &[&(rows), &(path.display())]);
+}
+
+/// Format-picker keys for the export overlay.
+fn export_key(app: &mut App, k: KeyEvent) {
+    let n = EXPORT_FORMATS.len();
+    match k.code {
+        KeyCode::Esc | KeyCode::Char('q') => {
+            app.export_open = false;
+            app.status = t("已取消导出").into();
         }
-        Err(e) => app.status = tf("✗ 导出失败: {}", &[&(e)]),
+        KeyCode::Up | KeyCode::Char('k') => {
+            let i = app
+                .export_list
+                .selected()
+                .map(|i| i.saturating_sub(1))
+                .unwrap_or(0);
+            app.export_list.select(Some(i));
+        }
+        KeyCode::Down | KeyCode::Char('j') => {
+            let i = app
+                .export_list
+                .selected()
+                .map(|i| (i + 1).min(n - 1))
+                .unwrap_or(0);
+            app.export_list.select(Some(i));
+        }
+        KeyCode::Enter => {
+            let idx = app.export_list.selected().unwrap_or(0).min(n - 1);
+            choose_export_format(app, EXPORT_FORMATS[idx]);
+        }
+        KeyCode::Char(c @ '1'..='6') => {
+            let idx = (c as usize) - ('1' as usize);
+            if idx < n {
+                choose_export_format(app, EXPORT_FORMATS[idx]);
+            }
+        }
+        _ => {}
+    }
+}
+
+/// Pick a format and move on to the destination prompt.
+fn choose_export_format(app: &mut App, format: ExportFormat) {
+    let table = if matches!(format, ExportFormat::Insert | ExportFormat::InsertBatch) {
+        match export_insert_table(app) {
+            Some(t) => Some(t),
+            None => {
+                app.status = t("无法确定表名，INSERT 导出不可用（先浏览表或含 FROM 的查询）").into();
+                app.export_open = false;
+                return;
+            }
+        }
+    } else {
+        None
+    };
+    let mut ta = TextArea::default();
+    ta.set_placeholder_text(t("留空 = 复制到剪贴板 · 输入路径 = 写入文件"));
+    app.export_pending = Some(ExportPending { format, table });
+    app.export_path = Some(ta);
+    app.export_open = false;
+}
+
+/// Destination prompt: blank copies via OSC 52, otherwise writes a file.
+fn export_path_key(app: &mut App, k: KeyEvent) {
+    let Some(mut ta) = app.export_path.take() else {
+        return;
+    };
+    if k.code == KeyCode::Esc {
+        app.export_pending = None;
+        app.status = t("已取消导出").into();
+        return;
+    }
+    if k.code != KeyCode::Enter {
+        ta.input(k);
+        app.export_path = Some(ta);
+        return;
+    }
+    let Some(pending) = app.export_pending.take() else {
+        return;
+    };
+    let Some(grid) = active_grid(app) else {
+        app.status = t("没有可导出的结果").into();
+        return;
+    };
+    let content = render_export_content(app, &grid, pending.format, pending.table.as_deref());
+    let input = ta.lines().join("\n");
+    let path = input.trim();
+    let label = pending.format.label();
+    if path.is_empty() {
+        let n = content.chars().count();
+        match clipboard_copy(&content) {
+            Some(p) => {
+                app.status = tf(
+                    "✓ 已导出 {} 到剪贴板（{} 字符）· 兜底 {}",
+                    &[&label, &n, &(p.display())],
+                )
+            }
+            None => {
+                app.status = tf("✓ 已导出 {} 到剪贴板（{} 字符）", &[&label, &n])
+            }
+        }
+    } else {
+        let expanded = expand_home(path);
+        match std::fs::write(&expanded, content.as_bytes()) {
+            Ok(_) => {
+                app.status = tf("✓ 已导出 {} → {}", &[&label, &(expanded.display())])
+            }
+            Err(e) => app.status = tf("✗ 写入失败: {}", &[&(e)]),
+        }
+    }
+}
+
+// ── CSV import: entry points and modal keys ──────────────────────────────────
+
+/// Resolve the table an `I` import targets: the table open in the data browser
+/// (only while the results pane is focused), else the sidebar's highlighted
+/// table. The focus check matters — after browsing a table and returning to the
+/// sidebar, the highlighted table may be a different one.
+fn import_target_table(app: &App) -> Option<String> {
+    if app.focus == Focus::Preview && app.grid_kind == GridKind::TableData {
+        if let Some(ps) = &app.page_state {
+            return Some(ps.table.clone());
+        }
+    }
+    app.selected_table().map(|t| t.name.clone())
+}
+
+/// `I`: open the CSV import flow for the current table.
+fn open_import_prompt(app: &mut App) {
+    if app.backend_kind != Backend::Sql {
+        app.status = t("仅 SQL 连接支持 CSV 导入").into();
+        return;
+    }
+    let Some(table) = import_target_table(app) else {
+        app.status = t("先选中一张表再按 I 导入").into();
+        return;
+    };
+    let db = app.current_db();
+    let mut input = TextArea::default();
+    input.set_placeholder_text(t("CSV 文件路径（支持 ~）"));
+    app.import_prompt = Some(ImportPrompt {
+        input,
+        table,
+        db,
+        error: None,
+    });
+    app.status = t("导入 CSV · 输入文件路径 · Enter 预览 · Esc 取消").into();
+}
+
+/// File-path prompt keys.
+fn import_prompt_key(app: &mut App, tx: &Tx, k: KeyEvent) {
+    let Some(mut p) = app.import_prompt.take() else {
+        return;
+    };
+    if k.code == KeyCode::Esc {
+        // Invalidate any plan request still in flight so a slow read cannot pop
+        // the preview open after the user cancelled.
+        app.import_gen = app.import_gen.wrapping_add(1);
+        app.status = t("已取消导入").into();
+        return;
+    }
+    if k.code != KeyCode::Enter {
+        p.input.input(k);
+        app.import_prompt = Some(p);
+        return;
+    }
+    let path = p.input.lines().join("\n").trim().to_string();
+    if path.is_empty() {
+        p.error = Some(t("请输入文件路径").to_string());
+        app.import_prompt = Some(p);
+        return;
+    }
+    let Some(cfg) = app.selected.clone() else {
+        p.error = Some(t("✗ 未选择连接").to_string());
+        app.import_prompt = Some(p);
+        return;
+    };
+    p.error = None;
+    let (table, db) = (p.table.clone(), p.db.clone());
+    app.import_prompt = Some(p);
+    app.import_gen = app.import_gen.wrapping_add(1);
+    let gen = app.import_gen;
+    app.loading = true;
+    app.status = tf("解析 {}…", &[&path]);
+    app.spawn(
+        tx,
+        Op::ImportPlan {
+            cfg: Box::new(cfg),
+            db,
+            table,
+            path: PathBuf::from(path),
+            gen,
+        },
+    );
+}
+
+/// Preview / confirmation layer keys.
+fn import_plan_key(app: &mut App, tx: &Tx, k: KeyEvent) {
+    let Some(mut plan) = app.import_plan.take() else {
+        return;
+    };
+    match k.code {
+        KeyCode::Esc => {
+            app.import_scroll = 0;
+            app.status = t("已取消导入").into();
+            return;
+        }
+        KeyCode::Up | KeyCode::Char('k') => {
+            app.import_scroll = app.import_scroll.saturating_sub(1);
+        }
+        KeyCode::Down | KeyCode::Char('j') => {
+            app.import_scroll = app.import_scroll.saturating_add(1);
+        }
+        KeyCode::Char('m') => {
+            plan.mode = match plan.mode {
+                ImportMode::Append => ImportMode::Overwrite,
+                ImportMode::Overwrite => ImportMode::Append,
+            };
+        }
+        KeyCode::Char('s') => {
+            plan.on_error = match plan.on_error {
+                ImportOnError::Stop => ImportOnError::Skip,
+                ImportOnError::Skip => ImportOnError::Stop,
+            };
+        }
+        KeyCode::Enter => {
+            if let Some(err) = plan.error.clone() {
+                app.status = format!("✗ {err}");
+                app.import_plan = Some(plan);
+                return;
+            }
+            start_import(app, tx, &plan);
+            return;
+        }
+        _ => {}
+    }
+    app.import_plan = Some(plan);
+}
+
+/// Turn the preview plan into a backend job and start it.
+fn start_import(app: &mut App, tx: &Tx, plan: &ImportPlan) {
+    let Some(cfg) = app.selected.clone() else {
+        app.status = t("✗ 未选择连接").into();
+        return;
+    };
+    let columns: Vec<ImportCol> = plan.present().into_iter().cloned().collect();
+    let job = ImportJob {
+        cfg: Box::new(cfg),
+        db: plan.db.clone(),
+        table: plan.table.clone(),
+        columns,
+        rows: plan.rows.clone(),
+        mode: plan.mode,
+        on_error: plan.on_error,
+    };
+    let total = job.rows.len();
+    app.import_progress = Some((0, total));
+    app.import_scroll = 0;
+    app.import_plan = None;
+    app.loading = true;
+    app.status = tf("导入 {} 行 → {}…", &[&total, &plan.table]);
+    app.spawn(tx, Op::Import(Box::new(job)));
+}
+
+/// Completion overlay keys.
+fn import_report_key(app: &mut App, k: KeyEvent) {
+    if matches!(
+        k.code,
+        KeyCode::Esc | KeyCode::Enter | KeyCode::Char('q')
+    ) {
+        app.import_report = None;
     }
 }
 
@@ -10028,6 +11384,21 @@ fn ui(f: &mut Frame, app: &mut App) {
     }
     if let Some(confirm) = app.confirm.clone() {
         render_confirm(f, f.area(), &confirm);
+    }
+    if app.import_prompt.is_some() {
+        render_import_prompt(f, f.area(), app);
+    }
+    if app.import_plan.is_some() {
+        render_import_plan(f, f.area(), app);
+    }
+    if app.import_report.is_some() {
+        render_import_report(f, f.area(), app);
+    }
+    if app.export_open {
+        render_export(f, f.area(), app);
+    }
+    if app.export_path.is_some() {
+        render_export_path(f, f.area(), app);
     }
     if let Some(popup) = app.cell_popup.clone() {
         render_text_popup(f, f.area(), &popup.title, &popup.lines, popup.scroll);
@@ -13001,6 +14372,7 @@ const HELP_ROWS: &[(&str, &str)] = &[
     ("t", "最近表浮层（Enter 直达）"),
     ("Enter", "浏览表数据"),
     ("r", "表结构（字段 + DDL）"),
+    ("I", "导入 CSV 到当前表（预览 + 追加/覆盖确认）"),
     ("d", "数据库列表（浮层内 r 刷新）"),
     ("← →", "切换数据库（快捷）"),
     ("o", "返回连接选择"),
@@ -13023,7 +14395,7 @@ const HELP_ROWS: &[(&str, &str)] = &[
     ("◀ ▶（底部）", "点击向左/右翻一屏列（触屏可用）"),
     ("底部进度条", "当前列窗口位置 · 点击可跳转"),
     ("[ ]", "切换本次会话的结果标签"),
-    ("Ctrl-Y", "导出当前结果为 CSV（$HOME）"),
+    ("Ctrl-Y", "导出当前结果（CSV / JSON / NDJSON / Markdown / INSERT）"),
     ("y", "复制当前行为 INSERT 语句（OSC52 + 文件兜底）"),
     ("/", "搜索结果行（输入即筛选，Enter 保留，Esc 清除）"),
     ("n / Shift-N", "搜索命中时：下 / 上一个命中（否则 n 翻页）"),
@@ -13214,6 +14586,506 @@ fn render_confirm(f: &mut Frame, area: Rect, confirm: &Confirm) {
         .border_set(border::THICK)
         .border_style(Style::default().fg(Color::Red));
     f.render_widget(Paragraph::new(lines).block(block), box_area);
+}
+
+// ── CSV import overlays ──────────────────────────────────────────────────────
+
+fn render_import_prompt(f: &mut Frame, area: Rect, app: &mut App) {
+    let w = {
+        let avail = area.width.saturating_sub(4);
+        if avail < 24 {
+            area.width
+        } else {
+            avail.min(78)
+        }
+    };
+    let h = 7.min(area.height);
+    let x = area.x + (area.width.saturating_sub(w)) / 2;
+    let y = area.y + (area.height.saturating_sub(h)) / 2;
+    let box_area = Rect {
+        x,
+        y,
+        width: w,
+        height: h,
+    };
+    f.render_widget(Clear, box_area);
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .title(t(" 导入 CSV · 输入文件路径 "))
+        .border_set(border::ROUNDED)
+        .border_style(Style::default().fg(Color::Cyan));
+    let inner = block.inner(box_area);
+    f.render_widget(block, box_area);
+    let hint_h = 2u16.min(inner.height.saturating_sub(1));
+    let ta_h = inner.height.saturating_sub(hint_h).max(1);
+    let ta_area = Rect {
+        x: inner.x,
+        y: inner.y,
+        width: inner.width,
+        height: ta_h,
+    };
+    let hint_area = Rect {
+        x: inner.x,
+        y: inner.y + ta_h,
+        width: inner.width,
+        height: hint_h,
+    };
+    let error = app
+        .import_prompt
+        .as_ref()
+        .and_then(|p| p.error.clone());
+    let target = app
+        .import_prompt
+        .as_ref()
+        .map(|p| format!("{}.{}", p.db, p.table))
+        .unwrap_or_default();
+    if let Some(p) = app.import_prompt.as_mut() {
+        p.input.set_block(Block::default());
+        f.render_widget(&p.input, ta_area);
+    }
+    if hint_h > 0 {
+        let first = match error {
+            Some(e) => Line::from(Span::styled(
+                format!("✗ {e}"),
+                Style::default().fg(Color::Red),
+            )),
+            None => Line::from(Span::styled(
+                t("~ 展开为 $HOME · UTF-8/GBK 自动探测 · 首行视为表头"),
+                Style::default().fg(Color::DarkGray),
+            )),
+        };
+        let second = Line::from(Span::styled(
+            tf("目标表: {}", &[&target]),
+            Style::default().fg(Color::DarkGray),
+        ));
+        f.render_widget(Paragraph::new(vec![first, second]), hint_area);
+    }
+}
+
+/// Build the preview lines for an import plan.
+fn import_plan_lines(plan: &ImportPlan) -> Vec<PopupLine> {
+    let plain = Style::default().fg(Color::White);
+    let dim = Style::default().fg(Color::DarkGray);
+    let head = Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD);
+    let warn = Style::default().fg(Color::Yellow);
+    let bad = Style::default().fg(Color::Red).add_modifier(Modifier::BOLD);
+    let mut lines: Vec<PopupLine> = Vec::new();
+    lines.push(PopupLine {
+        text: tf("目标表: {}.{}", &[&plan.db, &plan.table]),
+        style: head,
+    });
+    lines.push(PopupLine {
+        text: tf(
+            "文件: {} ({})",
+            &[&plan.path.display(), &human_size(plan.file_size)],
+        ),
+        style: plain,
+    });
+    lines.push(PopupLine {
+        text: tf(
+            "编码 {} · 分隔符 {} · 数据行 {}",
+            &[&plan.encoding, &delim_label(plan.delimiter), &plan.rows.len()],
+        ),
+        style: plain,
+    });
+    let mode_label = if plan.mode == ImportMode::Overwrite {
+        t("覆盖（先清空表）")
+    } else {
+        t("追加")
+    };
+    let err_label = if plan.on_error == ImportOnError::Skip {
+        t("跳过继续")
+    } else {
+        t("遇错停止")
+    };
+    lines.push(PopupLine {
+        text: tf(
+            "模式 {}（m 切换） · 错误行 {}（s 切换）",
+            &[&mode_label, &err_label],
+        ),
+        style: if plan.mode == ImportMode::Overwrite {
+            bad
+        } else {
+            warn
+        },
+    });
+    if let Some(err) = &plan.error {
+        lines.push(PopupLine {
+            text: format!("✗ {err}"),
+            style: bad,
+        });
+    }
+    lines.push(PopupLine {
+        text: String::new(),
+        style: plain,
+    });
+    lines.push(PopupLine {
+        text: tf(
+            "列映射（{} 列 · {} 缺失）",
+            &[&plan.columns.len(), &plan.missing.len()],
+        ),
+        style: head,
+    });
+    for c in &plan.columns {
+        let src = match c.src {
+            Some(i) => plan.headers.get(i).cloned().unwrap_or_default(),
+            None => "—".to_string(),
+        };
+        let suffix = if c.src.is_none() {
+            t("  ⚠ 缺失→默认")
+        } else {
+            ""
+        };
+        lines.push(PopupLine {
+            text: format!("  {} ← {} · {}{}", c.name, src, c.ty.label(), suffix),
+            style: if c.src.is_none() { warn } else { plain },
+        });
+    }
+    if !plan.extra.is_empty() {
+        lines.push(PopupLine {
+            text: tf("  ⚠ 多余列: {}", &[&plan.extra.join(", ")]),
+            style: bad,
+        });
+    }
+    lines.push(PopupLine {
+        text: String::new(),
+        style: plain,
+    });
+    lines.push(PopupLine {
+        text: tf(
+            "预览（前 {} 行）",
+            &[&plan.rows.len().min(IMPORT_SAMPLE_ROWS)],
+        ),
+        style: head,
+    });
+    for row in plan.rows.iter().take(IMPORT_SAMPLE_ROWS) {
+        let cells: Vec<String> = plan
+            .columns
+            .iter()
+            .map(|c| match c.src {
+                Some(i) => row.get(i).cloned().unwrap_or_else(|| "NULL".into()),
+                None => "NULL".into(),
+            })
+            .collect();
+        lines.push(PopupLine {
+            text: format!("  {}", cells.join(" | ")),
+            style: dim,
+        });
+    }
+    lines.push(PopupLine {
+        text: String::new(),
+        style: plain,
+    });
+    lines.push(PopupLine {
+        text: if plan.error.is_some() {
+            t("Esc 取消（存在错误，无法导入）").to_string()
+        } else {
+            t("Enter 开始导入 · m 追加/覆盖 · s 遇错停止/跳过 · ↑↓ 滚动 · Esc 取消").to_string()
+        },
+        style: warn,
+    });
+    lines
+}
+
+fn render_import_plan(f: &mut Frame, area: Rect, app: &mut App) {
+    let Some(plan) = app.import_plan.clone() else {
+        return;
+    };
+    let lines = import_plan_lines(&plan);
+    let w = {
+        let avail = area.width.saturating_sub(2);
+        if avail < 24 {
+            area.width
+        } else {
+            avail.min(96)
+        }
+    };
+    let inner_w = w.saturating_sub(4).max(1) as usize;
+    let body: Vec<Line> = lines
+        .iter()
+        .flat_map(|pl| {
+            let style = pl.style;
+            wrap_text(&pl.text, inner_w)
+                .into_iter()
+                .map(move |t| Line::from(Span::styled(t, style)))
+        })
+        .collect();
+    let total = body.len();
+    let max_h = area.height.saturating_sub(2).max(3);
+    let h = ((total as u16) + 2).min(max_h);
+    let inner_h = h.saturating_sub(2) as usize;
+    let x = area.x + (area.width.saturating_sub(w)) / 2;
+    let y = area.y + (area.height.saturating_sub(h)) / 2;
+    let box_area = Rect {
+        x,
+        y,
+        width: w,
+        height: h,
+    };
+    f.render_widget(Clear, box_area);
+    let max_scroll = total.saturating_sub(inner_h).min(u16::MAX as usize) as u16;
+    let scroll = app.import_scroll.min(max_scroll);
+    app.import_scroll = scroll;
+    let (style, title) = if plan.error.is_some() {
+        (
+            Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
+            t(" ⚠ CSV 导入 · 无法导入 "),
+        )
+    } else if plan.mode == ImportMode::Overwrite {
+        (
+            Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
+            t(" ⚠ CSV 导入 · 覆盖确认 "),
+        )
+    } else {
+        (Style::default().fg(Color::Cyan), t(" CSV 导入预览 "))
+    };
+    f.render_widget(
+        Paragraph::new(body).scroll((scroll, 0)).block(
+            Block::default()
+                .borders(Borders::ALL)
+                .title(title)
+                .border_set(border::THICK)
+                .border_style(style),
+        ),
+        box_area,
+    );
+}
+
+fn render_import_report(f: &mut Frame, area: Rect, app: &mut App) {
+    let Some(rep) = app.import_report.clone() else {
+        return;
+    };
+    let plain = Style::default().fg(Color::White);
+    let dim = Style::default().fg(Color::DarkGray);
+    let head = Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD);
+    let warn = Style::default().fg(Color::Yellow);
+    let bad = Style::default().fg(Color::Red).add_modifier(Modifier::BOLD);
+    let mut lines: Vec<PopupLine> = Vec::new();
+    let mode_label = if rep.mode == ImportMode::Overwrite {
+        t("覆盖")
+    } else {
+        t("追加")
+    };
+    lines.push(PopupLine {
+        text: tf("目标表: {}", &[&rep.table]),
+        style: head,
+    });
+    lines.push(PopupLine {
+        text: tf("模式: {}", &[&mode_label]),
+        style: plain,
+    });
+    lines.push(PopupLine {
+        text: tf(
+            "总行数 {} · 成功 {} · 跳过 {} · 耗时 {}ms",
+            &[&rep.total, &rep.inserted, &rep.skipped.len(), &rep.elapsed_ms],
+        ),
+        style: if rep.ok() { plain } else { warn },
+    });
+    if let Some((row, err)) = &rep.aborted {
+        lines.push(PopupLine {
+            text: tf("✗ 中止于第 {} 行: {}", &[&row, &err]),
+            style: bad,
+        });
+    }
+    if !rep.skipped.is_empty() {
+        lines.push(PopupLine {
+            text: String::new(),
+            style: plain,
+        });
+        lines.push(PopupLine {
+            text: tf("跳过的行（{}）", &[&rep.skipped.len()]),
+            style: head,
+        });
+        for (row, err) in rep.skipped.iter().take(50) {
+            lines.push(PopupLine {
+                text: tf("  第 {} 行: {}", &[&row, &err]),
+                style: dim,
+            });
+        }
+        if rep.skipped.len() > 50 {
+            lines.push(PopupLine {
+                text: tf("  … 其余 {} 行", &[&(rep.skipped.len() - 50)]),
+                style: dim,
+            });
+        }
+    }
+    lines.push(PopupLine {
+        text: String::new(),
+        style: plain,
+    });
+    lines.push(PopupLine {
+        text: t("Enter/Esc 关闭").to_string(),
+        style: warn,
+    });
+
+    let w = {
+        let avail = area.width.saturating_sub(4);
+        if avail < 24 {
+            area.width
+        } else {
+            avail.min(84)
+        }
+    };
+    let inner_w = w.saturating_sub(4).max(1) as usize;
+    let body: Vec<Line> = lines
+        .iter()
+        .flat_map(|pl| {
+            let style = pl.style;
+            wrap_text(&pl.text, inner_w)
+                .into_iter()
+                .map(move |t| Line::from(Span::styled(t, style)))
+        })
+        .collect();
+    let total = body.len();
+    let max_h = area.height.saturating_sub(4).max(3);
+    let h = ((total as u16) + 2).min(max_h);
+    let x = area.x + (area.width.saturating_sub(w)) / 2;
+    let y = area.y + (area.height.saturating_sub(h)) / 2;
+    let box_area = Rect {
+        x,
+        y,
+        width: w,
+        height: h,
+    };
+    f.render_widget(Clear, box_area);
+    let style = if rep.ok() {
+        Style::default().fg(Color::Green)
+    } else {
+        Style::default().fg(Color::Red)
+    };
+    let title = if rep.ok() {
+        t(" CSV 导入完成 ")
+    } else {
+        t(" ⚠ CSV 导入未完成 ")
+    };
+    f.render_widget(
+        Paragraph::new(body).block(
+            Block::default()
+                .borders(Borders::ALL)
+                .title(title)
+                .border_set(border::THICK)
+                .border_style(style),
+        ),
+        box_area,
+    );
+}
+
+// ── export overlays ──────────────────────────────────────────────────────────
+
+fn render_export(f: &mut Frame, area: Rect, app: &mut App) {
+    let w = {
+        let avail = area.width.saturating_sub(4);
+        if avail < 30 {
+            area.width
+        } else {
+            avail.min(76)
+        }
+    };
+    let h = (EXPORT_FORMATS.len() as u16 + 3).min(area.height);
+    let x = area.x + (area.width.saturating_sub(w)) / 2;
+    let y = area.y + (area.height.saturating_sub(h)) / 2;
+    let box_area = Rect {
+        x,
+        y,
+        width: w,
+        height: h,
+    };
+    f.render_widget(Clear, box_area);
+    let rows = active_grid(app).map(|g| g.rows.len()).unwrap_or(0);
+    let title = if rows > EXPORT_SLOW_ROWS {
+        tf(" 导出结果 · {} 行（生成可能耗时）· Esc 取消 ", &[&rows])
+    } else {
+        tf(" 导出结果 · {} 行 · ↑↓ Enter · Esc ", &[&rows])
+    };
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .title(title)
+        .border_set(border::ROUNDED)
+        .border_style(Style::default().fg(Color::Cyan));
+    let inner = block.inner(box_area);
+    f.render_widget(block, box_area);
+    let items: Vec<ListItem> = EXPORT_FORMATS
+        .iter()
+        .enumerate()
+        .map(|(i, fmt)| {
+            let text = format!("{}. {} — {}", i + 1, fmt.label(), fmt.description());
+            ListItem::new(Line::from(Span::styled(text, Style::default())))
+        })
+        .collect();
+    let list = List::new(items)
+        .highlight_style(
+            Style::default()
+                .fg(Color::Black)
+                .bg(Color::Cyan)
+                .add_modifier(Modifier::BOLD),
+        )
+        .highlight_symbol("> ");
+    let mut st = app.export_list.clone();
+    f.render_stateful_widget(list, inner, &mut st);
+    app.export_list = st;
+}
+
+fn render_export_path(f: &mut Frame, area: Rect, app: &mut App) {
+    let Some(pending) = app.export_pending.as_ref() else {
+        return;
+    };
+    let fmt = pending.format;
+    let w = {
+        let avail = area.width.saturating_sub(4);
+        if avail < 24 {
+            area.width
+        } else {
+            avail.min(78)
+        }
+    };
+    let h = 7.min(area.height);
+    let x = area.x + (area.width.saturating_sub(w)) / 2;
+    let y = area.y + (area.height.saturating_sub(h)) / 2;
+    let box_area = Rect {
+        x,
+        y,
+        width: w,
+        height: h,
+    };
+    f.render_widget(Clear, box_area);
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .title(tf(" 导出 {} · 目标 ", &[&fmt.label()]))
+        .border_set(border::ROUNDED)
+        .border_style(Style::default().fg(Color::Cyan));
+    let inner = block.inner(box_area);
+    f.render_widget(block, box_area);
+    let hint_h = 2u16.min(inner.height.saturating_sub(1));
+    let ta_h = inner.height.saturating_sub(hint_h).max(1);
+    let ta_area = Rect {
+        x: inner.x,
+        y: inner.y,
+        width: inner.width,
+        height: ta_h,
+    };
+    let hint_area = Rect {
+        x: inner.x,
+        y: inner.y + ta_h,
+        width: inner.width,
+        height: hint_h,
+    };
+    if let Some(ta) = app.export_path.as_mut() {
+        ta.set_block(Block::default());
+        f.render_widget(&*ta, ta_area);
+    }
+    if hint_h > 0 {
+        let hints = vec![
+            Line::from(Span::styled(
+                t("留空 = 复制到剪贴板（OSC52）· 输入路径 = 写入文件（支持 ~）"),
+                Style::default().fg(Color::DarkGray),
+            )),
+            Line::from(Span::styled(
+                t("Enter 确认 · Esc 取消"),
+                Style::default().fg(Color::DarkGray),
+            )),
+        ];
+        f.render_widget(Paragraph::new(hints), hint_area);
+    }
 }
 
 #[cfg(test)]
@@ -14061,18 +15933,25 @@ mod tests {
         // The connection-picker and editor Esc sections are documented too.
         assert!(keys.contains(&"— 连接选择 —"));
         assert!(HELP_ROWS.iter().any(|(_, d)| *d == "回到侧栏"));
+        // CSV import has a documented sidebar binding.
+        assert!(keys.contains(&"I"), "help is missing the CSV import binding");
     }
 
     #[test]
     fn help_has_no_bare_uppercase_shortcuts() {
         // Regression guard for the R8 keymap: every shortcut must be lowercase,
         // a named key, or a Ctrl/Alt/Shift/F-key combination — never a lone
-        // uppercase letter the user has to reach with Shift.
+        // uppercase letter the user has to reach with Shift. `I` is the single
+        // deliberate exception: CSV import is rare and deliberate, and lowercase
+        // `i` is already quick-insert in the results pane.
         for (key, _) in HELP_ROWS {
             if key.starts_with('—') {
                 continue;
             }
             for tok in key.split(['/', ' ', '+']).filter(|t| !t.is_empty()) {
+                if tok == "I" {
+                    continue;
+                }
                 assert!(
                     !(tok.len() == 1 && tok.chars().all(|c| c.is_ascii_uppercase())),
                     "bare uppercase shortcut in help: {tok:?} ({key})"
@@ -14120,6 +15999,224 @@ mod tests {
             note: String::new(),
         };
         assert_eq!(grid_to_csv(&grid), "id,name\n1,\n2,\"a,b\"\n");
+    }
+
+    // ── R22: CSV import ──
+
+    fn col_info(name: &str, ty: &str) -> ColumnInfo {
+        ColumnInfo {
+            name: name.into(),
+            data_type: ty.into(),
+            ..Default::default()
+        }
+    }
+
+    fn mysql_cfg() -> ConnectionConfig {
+        new_connection_config(
+            "t".into(),
+            "t".into(),
+            parse_database_type("mysql").unwrap(),
+            "127.0.0.1".into(),
+            13306,
+            "root".into(),
+            String::new(),
+            Some("shop".into()),
+            false,
+            None,
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn parse_csv_handles_quotes_commas_and_newlines() {
+        let rows = parse_csv("a,b\n\"x,1\",\"he said \"\"hi\"\"\"\n\"multi\nline\",2\n", ',');
+        assert_eq!(rows.len(), 3);
+        assert_eq!(rows[0], vec!["a", "b"]);
+        assert_eq!(rows[1], vec!["x,1", "he said \"hi\""]);
+        assert_eq!(rows[2], vec!["multi\nline", "2"]);
+    }
+
+    #[test]
+    fn parse_csv_strips_bom_blank_lines_and_crlf() {
+        let rows = parse_csv("\u{feff}a,b\r\n1,2\r\n\r\n", ',');
+        assert_eq!(rows, vec![vec!["a", "b"], vec!["1", "2"]]);
+        // A trailing delimiter keeps the empty field.
+        assert_eq!(parse_csv("a,\n", ','), vec![vec!["a", ""]]);
+    }
+
+    #[test]
+    fn detect_delimiter_prefers_the_densest() {
+        assert_eq!(detect_delimiter("a,b,c\n1,2,3"), ',');
+        assert_eq!(detect_delimiter("a;b;c\n1;2;3"), ';');
+        assert_eq!(detect_delimiter("a\tb\tc"), '\t');
+        // Quoted separators do not count.
+        assert_eq!(detect_delimiter("\"a,b\";\"c,d\";e"), ';');
+        assert_eq!(detect_delimiter("single"), ',');
+    }
+
+    #[test]
+    fn gbk_bytes_decode_to_chinese_text() {
+        let (bytes, _, _) = encoding_rs::GB18030.encode("编号,名称\n1,北京\n");
+        let (text, enc) = decode_csv_bytes(&bytes);
+        assert_eq!(enc, "GB18030/GBK");
+        assert!(text.contains("北京"), "{text}");
+        let (utf, enc2) = decode_csv_bytes("名称\n中文\n".as_bytes());
+        assert_eq!(enc2, "UTF-8");
+        assert!(utf.contains("中文"));
+    }
+
+    #[test]
+    fn type_inference_covers_common_shapes() {
+        assert_eq!(infer_col_type(&["1", "2", "-3"]), ColType::Int);
+        assert_eq!(infer_col_type(&["1.5", "2", "-0.25"]), ColType::Float);
+        assert_eq!(infer_col_type(&["true", "FALSE"]), ColType::Bool);
+        assert_eq!(infer_col_type(&["2026-06-27", "1999-01-02"]), ColType::Date);
+        assert_eq!(
+            infer_col_type(&["2026-06-27 10:00", "1999-01-02 23:59:59"]),
+            ColType::DateTime
+        );
+        assert_eq!(infer_col_type(&["abc", "1"]), ColType::Text);
+        // Empty values are ignored; an all-empty column is text.
+        assert_eq!(infer_col_type(&["", "42", " "]), ColType::Int);
+        assert_eq!(infer_col_type(&["", ""]), ColType::Text);
+    }
+
+    #[test]
+    fn header_alignment_matches_missing_and_extra() {
+        let headers = vec!["ID".to_string(), "name".to_string(), "junk".to_string()];
+        let rows = vec![vec!["1".to_string(), "Ada".to_string(), "x".to_string()]];
+        let cols = vec![
+            col_info("id", "int"),
+            col_info("name", "varchar(20)"),
+            col_info("age", "int"),
+        ];
+        let (mapped, extra, missing) = align_import_columns(&headers, &rows, &cols);
+        assert_eq!(mapped.len(), 3);
+        assert_eq!(mapped[0].src, Some(0));
+        assert_eq!(mapped[0].ty, ColType::Int);
+        assert_eq!(mapped[1].src, Some(1));
+        assert_eq!(mapped[1].ty, ColType::Text);
+        assert_eq!(mapped[2].src, None);
+        assert_eq!(extra, vec!["junk"]);
+        assert_eq!(missing, vec!["age"]);
+    }
+
+    #[test]
+    fn import_literal_nulls_bools_and_quotes() {
+        assert_eq!(import_literal("", ColType::Text, "varchar(10)"), "NULL");
+        assert_eq!(import_literal("42", ColType::Int, "int"), "42");
+        assert_eq!(import_literal("3.5", ColType::Float, "double"), "3.5");
+        assert_eq!(import_literal("true", ColType::Bool, "tinyint"), "TRUE");
+        assert_eq!(import_literal("FALSE", ColType::Bool, "tinyint"), "FALSE");
+        assert_eq!(import_literal("O'Brien", ColType::Text, "text"), "'O''Brien'");
+        // A numeric target keeps a number bare even when inference said text.
+        assert_eq!(import_literal("42", ColType::Text, "int"), "42");
+        assert_eq!(
+            import_literal("2026-06-27", ColType::Date, "date"),
+            "'2026-06-27'"
+        );
+    }
+
+    #[test]
+    fn import_insert_sql_uses_only_present_columns() {
+        let cfg = mysql_cfg();
+        let cols = vec![
+            ImportCol {
+                name: "id".into(),
+                src: Some(0),
+                ty: ColType::Int,
+                data_type: "int".into(),
+            },
+            ImportCol {
+                name: "name".into(),
+                src: Some(1),
+                ty: ColType::Text,
+                data_type: "varchar(20)".into(),
+            },
+            ImportCol {
+                name: "age".into(),
+                src: None,
+                ty: ColType::Text,
+                data_type: "int".into(),
+            },
+        ];
+        let sql = import_insert_sql(&cfg, "users", &cols, &["7".into(), "Ada".into()]);
+        assert_eq!(sql, "INSERT INTO `users` (`id`, `name`) VALUES (7, 'Ada');");
+    }
+
+    #[test]
+    fn import_chunks_split_at_the_chunk_size() {
+        let rows: Vec<usize> = (0..(IMPORT_CHUNK * 2 + 3)).collect();
+        let chunks = import_chunks(&rows);
+        assert_eq!(chunks.len(), 3);
+        assert_eq!(chunks[0].len(), IMPORT_CHUNK);
+        assert_eq!(chunks[1].len(), IMPORT_CHUNK);
+        assert_eq!(chunks[2].len(), 3);
+    }
+
+    #[test]
+    fn import_error_row_reads_the_statement_index() {
+        assert_eq!(import_row_of_error(1000, "Statement 3 failed: Duplicate entry", 500), 1003);
+        // Unparseable / out-of-range errors fall back to the chunk start.
+        assert_eq!(import_row_of_error(1000, "boom", 500), 1001);
+        assert_eq!(import_row_of_error(1000, "Statement 999 failed", 500), 1001);
+    }
+
+    // ── R22: export formats ──
+
+    #[test]
+    fn json_export_keeps_leading_zero_strings() {
+        let grid = Grid {
+            columns: vec!["zip".into(), "n".into(), "ok".into(), "nil".into()],
+            rows: vec![vec![
+                Val::Text("0123".into()),
+                Val::Text("42".into()),
+                Val::Text("true".into()),
+                Val::Null,
+            ]],
+            note: String::new(),
+        };
+        let out = grid_to_json_array(&grid);
+        assert!(out.contains("\"zip\": \"0123\""), "{out}");
+        assert!(out.contains("\"n\": 42"), "{out}");
+        assert!(out.contains("\"ok\": true"), "{out}");
+        assert!(out.contains("\"nil\": null"), "{out}");
+        let nd = grid_to_json_ndjson(&grid);
+        assert_eq!(nd.lines().count(), 1);
+        assert!(nd.starts_with('{') && nd.trim_end().ends_with('}'));
+    }
+
+    #[test]
+    fn markdown_export_escapes_pipes_and_newlines() {
+        let grid = Grid {
+            columns: vec!["a".into(), "b".into()],
+            rows: vec![
+                vec![Val::Text("x|y".into()), Val::Null],
+                vec![Val::Text("l1\nl2".into()), Val::Text("ok".into())],
+            ],
+            note: String::new(),
+        };
+        let md = grid_to_markdown(&grid);
+        assert!(md.starts_with("| a | b |\n| --- | --- |\n"), "{md}");
+        assert!(md.contains("| x\\|y | NULL |"), "{md}");
+        assert!(md.contains("| l1<br>l2 | ok |"), "{md}");
+    }
+
+    #[test]
+    fn batch_insert_groups_rows() {
+        let cfg = mysql_cfg();
+        let columns = vec!["id".to_string(), "name".to_string()];
+        let types = vec![Some("int".to_string()), Some("varchar(20)".to_string())];
+        let rows = vec![
+            vec![Val::Text("1".into()), Val::Text("a".into())],
+            vec![Val::Text("2".into()), Val::Null],
+            vec![Val::Text("3".into()), Val::Text("c".into())],
+        ];
+        let out = batch_insert_sql(&cfg, "t", &columns, &rows, &types, 2);
+        assert_eq!(
+            out,
+            "INSERT INTO `t` (`id`, `name`) VALUES\n(1, 'a'),\n(2, NULL);\nINSERT INTO `t` (`id`, `name`) VALUES\n(3, 'c');\n"
+        );
     }
 
     #[test]

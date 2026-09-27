@@ -1245,6 +1245,7 @@ dependencies = [
  "crossterm",
  "dbx-core",
  "dbx-mcp",
+ "encoding_rs",
  "futures",
  "ratatui",
  "serde_json",
