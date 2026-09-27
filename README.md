@@ -35,10 +35,18 @@ Early but usable. Verified end-to-end against real MySQL 8.4, Redis and MongoDB 
 - ✅ **SQL editor**: multi-line, shell-style `↑`/`↓` history (seeded from DBX's shared query history), the results pane takes focus after a run
 - ✅ MySQL server errors surfaced verbatim in the status line
 - ✅ **Responsive layout**: `Ctrl-A` is a single master switch for auto-collapse — off (the default) keeps every pane expanded; on collapses the unfocused sidebar / editor to a one-line strip so the focused pane owns the space. Below 50 columns the panes **stack vertically** (sidebar strip → editor → results). `Ctrl-W` collapses / expands just the focused pane (a manual override that always wins), `Tab`/`Shift-Tab` cycle panes, `Alt-1`/`Alt-2`/`Alt-3` jump straight to one, and clicking a collapsed strip expands and focuses it. The current auto-collapse state is shown in the status bar and the help overlay
-- ✅ Redis: connect, `SET`/`GET`/`KEYS`/`DBSIZE`, quoted args, and `[`/`]` db switching verified end-to-end
-- ✅ MongoDB: `db.col.find({})`, `use <db>` database switching, and multi-row output verified end-to-end
+- ✅ **Redis key browser**: connecting to a Redis connection opens a paginated `SCAN` key list (never a blocking `KEYS *`) with per-key type + TTL badges, a server-side `MATCH` pattern (`/`), `n` load-more, and logical-DB switching (`d`, `[`/`]`). Selecting a key renders its value **by type** — string (with byte size / truncation), hash (`field`/`value`/TTL), list (`index`/`value`), set, sorted set (`score`/`member`), stream (`id`/`fields`) and RedisJSON — with load-more for collections larger than 200 items. `e` edits a string body or a hash field, `x` sets the TTL, `m` renames, `Del` deletes the key, `y` copies the focused row; every mutation goes through the same red confirmation layer as SQL writes. The raw `redis-cli` console (`Ctrl-L`, then `Tab`) is still there for anything else
+- ✅ **MongoDB document browser**: connecting to a MongoDB connection lists collections, `Enter` browses documents as a grid (union of top-level keys, `_id` first) with `n`/`p` paging and a JSON filter (`f`, e.g. `{"age": {"$gt": 30}}`), and `r` shows the collection's indexes. `db.col.find({})`, `use <db>` and multi-row output remain available in the Mongo shell console
 - ✅ `dbxt --version` / `dbxt --help` answer without starting the TUI
 - ⚠️ Prebuilt binaries for Linux (x86_64 / ARM64, glibc + static musl), macOS (Intel / Apple Silicon) and Windows (x86_64) are produced by the release workflow; only the Linux x86_64 build has been exercised on this machine, so the other artifacts are untested. Android/Termux has no dedicated build — see *Installation*
+
+### Redis
+
+A Redis connection (auto-detected from its type) opens the **key browser** in the sidebar instead of a table list. Keys are fetched with `SCAN` in bounded pages — `KEYS *` is never issued, so a large keyspace cannot block the server — and each row shows a one-letter type badge (`S`tring, `H`ash, `L`ist, `s`Et, `Z`set, stream, `J`son) plus the TTL when the key expires. `/` edits the server-side `MATCH` pattern, `n` (or scrolling to the bottom) loads the next page, `r` rescans from the start, and `d` / `←` / `→` switch the 16 logical DBs. `Enter` opens the key: the results pane renders the value **per type** — string, hash, list, set, sorted set, stream and RedisJSON each get the columns that make sense — and `n` pulls the next 200 items when a collection is longer. `e` edits a string body or the focused hash field, `x` sets the TTL in seconds (`-1` persists, `0` deletes), `m` renames, `Del` deletes the key, and `y` copies the focused row as TSV. Every write is shown in the same red confirmation layer as SQL edits and only runs on `Enter`. For everything the browser does not cover, `Ctrl-L` (then `Tab` to the console) still gives you the raw `redis-cli` command line, quoted-argument aware, with `[`/`]` to switch DBs.
+
+### MongoDB
+
+A MongoDB connection lists collections in the sidebar. `Enter` browses the collection as a grid built from the union of each document's top-level keys (`_id` first, nested values as JSON), `n`/`p` page through it and `f` applies a JSON filter (`{"age": {"$gt": 30}}`), with `Ctrl-R`-style clearing when the filter is left blank. `r` shows the collection's indexes (name / columns / unique / primary / type / filter / TTL) as the Mongo analogue of a table structure. The Mongo shell console (`Ctrl-L`, then `Tab`) still handles `db.col.find({})`, `use <db>`, counts and anything else, and `d` switches databases.
 
 ## Relationship to DBX
 
@@ -261,6 +269,19 @@ DBX_DATA_DIR=/path/to/dir dbxt
 | Editor | `↑` / `↓` | history (on the first / last line) |
 | Editor | `Esc` | back to sidebar |
 | Redis input | `[` `]` | switch Redis database (db 0/1/2…) |
+| Redis key browser | `↑` `↓` | move in the key list |
+| Redis key browser | `/` | edit the server-side `MATCH` pattern (`Enter` applies, blank = `*`) |
+| Redis key browser | `n` / `End` | load the next `SCAN` page |
+| Redis key browser | `r` | rescan from the start with the current pattern |
+| Redis key browser | `←` `→` (`h` `l`) | switch logical DB (db 0/1/2…) |
+| Redis key browser | `Enter` | open the key's value by type |
+| Redis value | `e` / `x` / `m` / `Del` | edit string or hash field / set TTL / rename key / delete key (all confirmed) |
+| Redis value | `n` | load the next 200 items of a large hash / list / set / zset |
+| Redis value | `y` | copy the focused row as TSV |
+| Mongo collections | `r` | collection indexes (the Mongo analogue of a table structure) |
+| Mongo documents | `n` / `p` | next / previous document page |
+| Mongo documents | `f` | JSON filter (`Enter` applies, blank clears) |
+| Mongo documents | `y` | copy the focused document row as TSV |
 | MongoDB input | `use dbname` + `Enter` | switch database |
 | Results | `↑` `↓` `j` `k` | move the row cursor (auto-flips the page at an edge) |
 | Results | `PgUp` / `PgDn` | scroll a screen, carrying over the page boundary |

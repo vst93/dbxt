@@ -18,6 +18,9 @@ use crossterm::event::{
     KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
 };
 use crossterm::execute;
+use dbx_core::db::redis_driver::{
+    RedisBlob, RedisBlobEncoding, RedisCollectionPage, RedisKeyInfo, RedisValue, RedisValueData,
+};
 use dbx_core::models::connection::ConnectionConfig;
 use dbx_core::query::QueryExecutionOptions;
 use dbx_core::sql_dialect::{
@@ -70,7 +73,7 @@ enum Page {
     NewConn, // connection form
 }
 
-#[derive(Clone, Copy, PartialEq)]
+#[derive(Clone, Copy, PartialEq, Debug)]
 enum Backend {
     Sql,
     Redis,
@@ -183,9 +186,11 @@ fn cycle_focus(app: &mut App, forward: bool) {
 /// Which kind of content the results pane currently shows.
 #[derive(Clone, Copy, PartialEq)]
 enum GridKind {
-    Query,     // arbitrary SQL result
-    TableData, // paginated SELECT * of a table
-    Columns,   // table structure (field list)
+    Query,      // arbitrary SQL result
+    TableData,  // paginated SELECT * of a table
+    Columns,    // table structure (field list)
+    RedisValue, // a Redis key's value rendered per type
+    MongoDocs,  // paginated MongoDB documents
 }
 
 #[derive(Clone, Copy, PartialEq)]
@@ -255,6 +260,324 @@ impl Grid {
                 .collect(),
             note,
         }
+    }
+}
+
+// ─── Redis / Mongo value rendering ───────────────────────────────────────────
+
+/// Decode a standard base64 string without pulling in a dependency. Returns
+/// `None` on any malformed input, so a corrupt blob degrades to a placeholder
+/// instead of panicking.
+fn b64_decode(s: &str) -> Option<Vec<u8>> {
+    fn val(c: u8) -> Option<u8> {
+        match c {
+            b'A'..=b'Z' => Some(c - b'A'),
+            b'a'..=b'z' => Some(c - b'a' + 26),
+            b'0'..=b'9' => Some(c - b'0' + 52),
+            b'+' => Some(62),
+            b'/' => Some(63),
+            _ => None,
+        }
+    }
+    let bytes: Vec<u8> = s.bytes().filter(|b| !b.is_ascii_whitespace()).collect();
+    let mut out = Vec::with_capacity(bytes.len() / 4 * 3);
+    let mut acc: u32 = 0;
+    let mut bits: u32 = 0;
+    for &b in &bytes {
+        if b == b'=' {
+            break;
+        }
+        let v = val(b)?;
+        acc = (acc << 6) | v as u32;
+        bits += 6;
+        if bits >= 8 {
+            bits -= 8;
+            out.push((acc >> bits) as u8);
+        }
+    }
+    Some(out)
+}
+
+/// Human-readable form of a Redis blob. UTF-8 values are decoded; binary values
+/// are shown as hex so a terminal never receives raw control bytes.
+fn redis_blob_text(b: &RedisBlob) -> String {
+    let bytes = b64_decode(&b.raw_base64).unwrap_or_default();
+    match b.encoding {
+        RedisBlobEncoding::Utf8 => String::from_utf8(bytes)
+            .map(|s| sanitize_cell(&s))
+            .unwrap_or_else(|_| format!("<binary {} bytes>", b.raw_base64.len())),
+        RedisBlobEncoding::Binary => {
+            if bytes.is_empty() {
+                String::new()
+            } else {
+                let hex: String = bytes.iter().take(64).map(|b| format!("{b:02x}")).collect();
+                if bytes.len() > 64 {
+                    format!("0x{hex}… ({} bytes)", bytes.len())
+                } else {
+                    format!("0x{hex}")
+                }
+            }
+        }
+    }
+}
+
+/// Raw (unsanitized) text of a Redis blob, used to prefill an edit dialog. Only
+/// UTF-8 blobs are editable; binary ones return `None`.
+fn redis_blob_editable_text(b: &RedisBlob) -> Option<String> {
+    if b.encoding != RedisBlobEncoding::Utf8 {
+        return None;
+    }
+    b64_decode(&b.raw_base64).and_then(|bytes| String::from_utf8(bytes).ok())
+}
+
+/// Turn a fetched [`RedisValue`] into a grid the existing results pane can draw.
+fn redis_value_view(v: RedisValue) -> RedisValueView {
+    let mut row_keys: Vec<String> = Vec::new();
+    let (columns, rows, note): (Vec<String>, Vec<Vec<Val>>, String) = match &v.data {
+        RedisValueData::String {
+            content,
+            total_bytes,
+            truncated,
+        } => {
+            row_keys.push(String::new());
+            let size = total_bytes.unwrap_or(content.raw_base64.len() as u64);
+            let mut note = tf("{} 字节", &[&(size)]);
+            if *truncated {
+                note.push_str(t(" · 已截断"));
+            }
+            (vec![t("value").into()], vec![vec![Val::Text(redis_blob_text(content))]], note)
+        }
+        RedisValueData::Json { value } => {
+            row_keys.push(String::new());
+            (vec![t("value").into()], vec![vec![Val::Text(sanitize_cell(value))]], String::new())
+        }
+        RedisValueData::List { items, total, .. } => {
+            let rows = items
+                .iter()
+                .map(|it| {
+                    row_keys.push(it.index.to_string());
+                    vec![Val::Text(it.index.to_string()), Val::Text(redis_blob_text(&it.value))]
+                })
+                .collect();
+            (
+                vec![t("index").into(), t("value").into()],
+                rows,
+                tf("{} 个元素", &[&(total)]),
+            )
+        }
+        RedisValueData::Set { items, total, .. } => {
+            let rows = items
+                .iter()
+                .map(|it| {
+                    let m = redis_blob_text(&it.member);
+                    row_keys.push(m.clone());
+                    vec![Val::Text(m)]
+                })
+                .collect();
+            (vec![t("member").into()], rows, tf("{} 个成员", &[&(total)]))
+        }
+        RedisValueData::Hash { items, total, .. } => {
+            let rows = items
+                .iter()
+                .map(|it| {
+                    let f = redis_blob_text(&it.field);
+                    row_keys.push(f.clone());
+                    let ttl = match it.field_ttl {
+                        Some(-1) | None => Val::Null,
+                        Some(t) => Val::Text(format!("{t}s")),
+                    };
+                    vec![
+                        Val::Text(f),
+                        Val::Text(redis_blob_text(&it.value)),
+                        ttl,
+                    ]
+                })
+                .collect();
+            (
+                vec![t("field").into(), t("value").into(), "TTL".into()],
+                rows,
+                tf("{} 个字段", &[&(total)]),
+            )
+        }
+        RedisValueData::Zset { items, total, .. } => {
+            let rows = items
+                .iter()
+                .map(|it| {
+                    let m = redis_blob_text(&it.member);
+                    row_keys.push(m.clone());
+                    vec![Val::Text(it.score.clone()), Val::Text(m)]
+                })
+                .collect();
+            (
+                vec![t("score").into(), t("member").into()],
+                rows,
+                tf("{} 个成员", &[&(total)]),
+            )
+        }
+        RedisValueData::Stream {
+            entries,
+            total,
+            next_cursor,
+        } => {
+            let rows = entries
+                .iter()
+                .map(|e| {
+                    row_keys.push(e.id.clone());
+                    let fields = e
+                        .fields
+                        .iter()
+                        .map(|f| format!("{}={}", f.field, f.value))
+                        .collect::<Vec<_>>()
+                        .join(", ");
+                    vec![Val::Text(e.id.clone()), Val::Text(fields)]
+                })
+                .collect();
+            let mut note = total
+                .map(|t| tf("{} 条", &[&(t)]))
+                .unwrap_or_else(|| tf("{} 条", &[&(entries.len())]));
+            if next_cursor.is_some() {
+                note.push_str(t(" · 更多"));
+            }
+            (vec![t("id").into(), t("fields").into()], rows, note)
+        }
+        RedisValueData::Unknown => (
+            vec![t("value").into()],
+            vec![vec![Val::Text(t("（暂不支持的类型）").to_string())]],
+            String::new(),
+        ),
+    };
+    let scan_cursor = redis_value_cursor(&v.data);
+    let mut note = note;
+    if scan_cursor.is_some() && !note.contains("更多") {
+        note.push_str(t(" · 更多（n 加载）"));
+    }
+    RedisValueView {
+        key_display: v.key_display.clone(),
+        key_raw: v.key_raw.clone(),
+        redis_type: v.redis_type.clone(),
+        ttl: v.ttl,
+        grid: Grid {
+            columns,
+            rows,
+            note,
+        },
+        row_keys,
+        scan_cursor,
+        raw: v,
+    }
+}
+
+/// The continuation cursor of a collection value (None = complete).
+fn redis_value_cursor(data: &RedisValueData) -> Option<u64> {
+    match data {
+        RedisValueData::List { scan_cursor, .. }
+        | RedisValueData::Set { scan_cursor, .. }
+        | RedisValueData::Hash { scan_cursor, .. }
+        | RedisValueData::Zset { scan_cursor, .. } => *scan_cursor,
+        _ => None,
+    }
+}
+
+/// Turn one `LOAD MORE` collection page into grid rows + row keys + next cursor.
+fn redis_collection_page_rows(
+    page: &RedisCollectionPage,
+) -> (Vec<Vec<Val>>, Vec<String>, Option<u64>) {
+    let mut row_keys: Vec<String> = Vec::new();
+    match page {
+        RedisCollectionPage::List { items, scan_cursor } => {
+            let rows = items
+                .iter()
+                .map(|it| {
+                    row_keys.push(it.index.to_string());
+                    vec![Val::Text(it.index.to_string()), Val::Text(redis_blob_text(&it.value))]
+                })
+                .collect();
+            (rows, row_keys, *scan_cursor)
+        }
+        RedisCollectionPage::Set { items, scan_cursor } => {
+            let rows = items
+                .iter()
+                .map(|it| {
+                    let m = redis_blob_text(&it.member);
+                    row_keys.push(m.clone());
+                    vec![Val::Text(m)]
+                })
+                .collect();
+            (rows, row_keys, *scan_cursor)
+        }
+        RedisCollectionPage::Hash { items, scan_cursor } => {
+            let rows = items
+                .iter()
+                .map(|it| {
+                    let f = redis_blob_text(&it.field);
+                    row_keys.push(f.clone());
+                    let ttl = match it.field_ttl {
+                        Some(-1) | None => Val::Null,
+                        Some(t) => Val::Text(format!("{t}s")),
+                    };
+                    vec![Val::Text(f), Val::Text(redis_blob_text(&it.value)), ttl]
+                })
+                .collect();
+            (rows, row_keys, *scan_cursor)
+        }
+        RedisCollectionPage::Zset { items, scan_cursor } => {
+            let rows = items
+                .iter()
+                .map(|it| {
+                    let m = redis_blob_text(&it.member);
+                    row_keys.push(m.clone());
+                    vec![Val::Text(it.score.clone()), Val::Text(m)]
+                })
+                .collect();
+            (rows, row_keys, *scan_cursor)
+        }
+    }
+}
+
+/// Human TTL label for a key: `-1` never expires, `-2` key missing.
+fn redis_ttl_label(ttl: i64) -> String {
+    match ttl {
+        -1 => t("永不过期").to_string(),
+        -2 => t("不存在").to_string(),
+        n if n >= 0 => format!("{n}s"),
+        n => n.to_string(),
+    }
+}
+
+/// Flatten a page of MongoDB documents into a grid: the union of top-level keys
+/// (with `_id` first) becomes the columns, and each document is one row.
+fn mongo_docs_grid(docs: &[serde_json::Value]) -> Grid {
+    let mut keys: Vec<String> = Vec::new();
+    let mut seen: HashSet<String> = HashSet::new();
+    for doc in docs {
+        if let serde_json::Value::Object(map) = doc {
+            for k in map.keys() {
+                if seen.insert(k.clone()) {
+                    keys.push(k.clone());
+                }
+            }
+        }
+    }
+    if let Some(i) = keys.iter().position(|k| k == "_id") {
+        let id = keys.remove(i);
+        keys.insert(0, id);
+    }
+    let rows: Vec<Vec<Val>> = docs
+        .iter()
+        .map(|doc| {
+            keys.iter()
+                .map(|k| match doc.get(k) {
+                    Some(serde_json::Value::Null) | None => Val::Null,
+                    Some(serde_json::Value::String(s)) => Val::Text(sanitize_cell(s)),
+                    Some(other) => Val::Text(sanitize_cell(&other.to_string())),
+                })
+                .collect()
+        })
+        .collect();
+    Grid {
+        columns: keys,
+        rows,
+        note: tf("{} 个文档", &[&(docs.len())]),
     }
 }
 
@@ -338,6 +661,18 @@ struct Confirm {
     refresh: bool,
     /// True when accepting the confirmation should also drain the queued batch.
     clear_batch: bool,
+    /// Set for Redis writes: Enter runs `cmd` via the Redis console instead of
+    /// SQL, then reloads the key list / the named key's value.
+    redis: Option<RedisConfirm>,
+}
+
+/// A pending Redis write shown in the red confirmation layer.
+#[derive(Clone)]
+struct RedisConfirm {
+    db: u32,
+    cmd: String,
+    reload_value: Option<String>,
+    reload_list: bool,
 }
 
 #[derive(Clone, Copy, PartialEq)]
@@ -389,6 +724,83 @@ struct RowPopup {
     title: String,
     lines: Vec<PopupLine>,
     scroll: u16,
+}
+
+// ─── Redis key browser ───────────────────────────────────────────────────────
+
+/// Server-side SCAN state for the Redis key browser. Keys are appended page by
+/// page (never a full `KEYS *`), and `cursor == 0` marks the end of the keyspace.
+#[derive(Clone)]
+struct RedisScanState {
+    keys: Vec<RedisKeyInfo>,
+    /// Cursor to resume from; 0 means the scan is exhausted.
+    cursor: u64,
+    exhausted: bool,
+    /// `MATCH` pattern applied server-side (default `*`).
+    pattern: String,
+    /// `total_keys` hint reported by the server (DBSIZE-like).
+    total: u64,
+    /// Request generation, so a stale page cannot clobber a fresh scan.
+    gen: u64,
+}
+
+impl Default for RedisScanState {
+    fn default() -> Self {
+        Self {
+            keys: Vec::new(),
+            cursor: 0,
+            exhausted: false,
+            pattern: "*".to_string(),
+            total: 0,
+            gen: 0,
+        }
+    }
+}
+
+/// A Redis key's value prepared for the results grid. The raw value is kept so a
+/// grid row can be mapped back to its field / member for an edit or delete.
+#[derive(Clone)]
+struct RedisValueView {
+    key_display: String,
+    key_raw: String,
+    redis_type: String,
+    ttl: i64,
+    grid: Grid,
+    /// Grid row index → field / member / element id the row represents.
+    row_keys: Vec<String>,
+    /// Cursor for the next collection page, when the value is truncated.
+    scan_cursor: Option<u64>,
+    /// Raw value, used to prefill a string edit and to know the concrete type.
+    raw: RedisValue,
+}
+
+/// Which Redis input dialog is open. Every write goes through the shared red
+/// confirmation layer afterwards, so nothing mutates without a second Enter.
+#[derive(Clone, Copy, PartialEq, Debug)]
+enum RedisPromptKind {
+    /// `MATCH` pattern for the key browser.
+    Pattern,
+    /// New TTL in seconds for the focused key.
+    Ttl,
+    /// New key name for a RENAME.
+    Rename,
+    /// New string body for the focused string key.
+    StringValue,
+    /// New value for a hash field.
+    HashField,
+}
+
+#[derive(Clone)]
+struct RedisPrompt {
+    kind: RedisPromptKind,
+    title: String,
+    /// Key in the form a redis-cli command needs (the decoded display name).
+    key_display: String,
+    /// Base64 raw key, used to reload the value after the write.
+    key_raw: String,
+    /// Hash field name, when the prompt edits a hash member.
+    field: String,
+    input: TextArea<'static>,
 }
 
 /// SQL prefix-completion popup in the editor (Ctrl-Space). Tab / Enter accept,
@@ -867,6 +1279,56 @@ enum Op {
     TableColumns(Box<ConnectionConfig>, String, String),
     Query(Box<ConnectionConfig>, String, String, usize),
     Redis(Box<ConnectionConfig>, u32, String),
+    /// Paginated `SCAN` of the key browser.
+    RedisScan {
+        cfg: Box<ConnectionConfig>,
+        db: u32,
+        cursor: u64,
+        pattern: String,
+        count: usize,
+        gen: u64,
+        /// true → replace the list (fresh scan); false → append the next page.
+        append: bool,
+    },
+    /// Fetch one key's typed value for the detail pane.
+    RedisValue {
+        cfg: Box<ConnectionConfig>,
+        db: u32,
+        key_raw: String,
+    },
+    /// Execute a generated write command, then refresh the key list / value.
+    RedisWrite {
+        cfg: Box<ConnectionConfig>,
+        db: u32,
+        cmd: String,
+        reload_value: Option<String>,
+        reload_list: bool,
+    },
+    /// Append the next page of a large Redis collection value.
+    RedisMore {
+        cfg: Box<ConnectionConfig>,
+        db: u32,
+        key_raw: String,
+        key_type: String,
+        cursor: u64,
+        count: usize,
+    },
+    /// Paginated document browse for a MongoDB collection.
+    MongoDocs {
+        cfg: Box<ConnectionConfig>,
+        db: String,
+        collection: String,
+        page: usize,
+        page_size: usize,
+        filter: String,
+        gen: u64,
+    },
+    /// Collection indexes, shown as the Mongo analogue of a table structure.
+    MongoIndexes {
+        cfg: Box<ConnectionConfig>,
+        db: String,
+        collection: String,
+    },
     Mongo(Box<ConnectionConfig>, String, String),
     History(Box<ConnectionConfig>),
     Snippets(Box<ConnectionConfig>),
@@ -926,6 +1388,38 @@ enum OpResult {
     Script(Vec<StmtOutcome>),
     Redis(String),
     Mongo(String),
+    RedisKeys {
+        keys: Vec<RedisKeyInfo>,
+        cursor: u64,
+        total: u64,
+        gen: u64,
+        append: bool,
+    },
+    RedisValue(Box<RedisValueView>),
+    RedisWritten {
+        cmd: String,
+        summary: String,
+        reload_value: Option<String>,
+        reload_list: bool,
+    },
+    RedisMore {
+        rows: Vec<Vec<Val>>,
+        row_keys: Vec<String>,
+        cursor: Option<u64>,
+    },
+    MongoDocs {
+        grid: Box<Grid>,
+        total: u64,
+        has_next: bool,
+        page: usize,
+        collection: String,
+        filter: String,
+        gen: u64,
+    },
+    MongoIndexes {
+        collection: String,
+        grid: Box<Grid>,
+    },
     History(Vec<String>),
     Snippets(Vec<(String, String)>),
     SnippetSaved(String),
@@ -1032,7 +1526,7 @@ async fn run_op(backend: &LocalBackend, op: Op) -> OpResult {
                 databases: vec![cfg.database.clone().unwrap_or_default()],
                 warning: Some(match cfg.database.as_deref() {
                     Some(db) if !db.is_empty() => {
-                        tf("无法列举数据库（{}），仅使用配置库 {}", &[&(e), &(fix_double_encoding(&db))])
+                        tf("无法列举数据库（{}），仅使用配置库 {}", &[&(e), &(fix_double_encoding(db))])
                     }
                     _ => tf("无法列举数据库（{}），将使用连接默认库", &[&(e)]),
                 }),
@@ -1173,6 +1667,168 @@ async fn run_op(backend: &LocalBackend, op: Op) -> OpResult {
                     Ok(r) => OpResult::Query(Box::new(r), sql, cap),
                     Err(e) => OpResult::Error(format!("query: {e}")),
                 }
+            }
+        }
+        Op::RedisScan {
+            cfg,
+            db,
+            cursor,
+            pattern,
+            count,
+            gen,
+            append,
+        } => match dbx_core::redis_ops::redis_scan_keys_batch_core(
+            backend.state().as_ref(),
+            &cfg.id,
+            db,
+            cursor,
+            &pattern,
+            count,
+            REDIS_SCAN_ITERATIONS,
+            true,
+        )
+        .await
+        {
+            Ok(r) => OpResult::RedisKeys {
+                keys: r.keys,
+                cursor: r.cursor,
+                total: r.total_keys,
+                gen,
+                append,
+            },
+            Err(e) => OpResult::Error(format!("redis scan: {e}")),
+        },
+        Op::RedisValue { cfg, db, key_raw } => {
+            match dbx_core::redis_ops::redis_get_value_in_db_core(
+                backend.state().as_ref(),
+                &cfg.id,
+                db,
+                &key_raw,
+            )
+            .await
+            {
+                Ok(v) => OpResult::RedisValue(Box::new(redis_value_view(v))),
+                Err(e) => OpResult::Error(format!("redis value: {e}")),
+            }
+        }
+        Op::RedisWrite {
+            cfg,
+            db,
+            cmd,
+            reload_value,
+            reload_list,
+        } => match backend.execute_redis_command(&cfg, db, &cmd, true).await {
+            Ok(r) => {
+                let summary = serde_json::to_string(&r.value).unwrap_or_else(|_| format!("{:?}", r.value));
+                OpResult::RedisWritten {
+                    cmd,
+                    summary: truncate_disp(&one_line(&summary), 160),
+                    reload_value,
+                    reload_list,
+                }
+            }
+            Err(e) => OpResult::Error(format!("redis: {e}")),
+        },
+        Op::RedisMore {
+            cfg,
+            db,
+            key_raw,
+            key_type,
+            cursor,
+            count,
+        } => {
+            match dbx_core::redis_ops::redis_load_more_in_db_core(
+                backend.state().as_ref(),
+                &cfg.id,
+                db,
+                &key_raw,
+                &key_type,
+                cursor,
+                count,
+                None,
+                None,
+            )
+            .await
+            {
+                Ok(page) => {
+                    let (rows, row_keys, cursor) = redis_collection_page_rows(&page);
+                    OpResult::RedisMore {
+                        rows,
+                        row_keys,
+                        cursor,
+                    }
+                }
+                Err(e) => OpResult::Error(format!("redis load more: {e}")),
+            }
+        }
+        Op::MongoDocs {
+            cfg,
+            db,
+            collection,
+            page,
+            page_size,
+            filter,
+            gen,
+        } => {
+            let skip = (page * page_size) as u64;
+            // Fetch one extra document to detect whether a next page exists.
+            let limit = page_size as i64 + 1;
+            let filter = if filter.trim().is_empty() {
+                None
+            } else {
+                Some(filter.trim())
+            };
+            match dbx_core::mongo_ops::mongo_find_documents_core(
+                backend.state().as_ref(),
+                &cfg.id,
+                &db,
+                &collection,
+                skip,
+                limit,
+                filter,
+                None,
+                None,
+                None,
+            )
+            .await
+            {
+                Ok(r) => {
+                    let total = r.total;
+                    let mut docs = r.documents;
+                    let has_next = docs.len() > page_size;
+                    docs.truncate(page_size);
+                    let grid = mongo_docs_grid(&docs);
+                    OpResult::MongoDocs {
+                        grid: Box::new(grid),
+                        total,
+                        has_next,
+                        page,
+                        collection,
+                        filter: filter.unwrap_or("").to_string(),
+                        gen,
+                    }
+                }
+                Err(e) => OpResult::Error(format!("mongo docs: {e}")),
+            }
+        }
+        Op::MongoIndexes { cfg, db, collection } => {
+            match dbx_core::mongo_ops::mongo_list_index_specs_core(
+                backend.state().as_ref(),
+                &cfg.id,
+                &db,
+                &collection,
+            )
+            .await
+            {
+                Ok(specs) => {
+                    let qr = dbx_core::mongo_ops::mongo_indexes_query_result(specs, 500);
+                    let grid = Grid::from_query(qr.columns, &qr.rows, tf("{} 个索引", &[&(qr.rows.len())]));
+                    OpResult::MongoIndexes {
+                        collection,
+                        grid: Box::new(grid),
+                    }
+                }
+                Err(e) => OpResult::Error(format!("mongo indexes: {e}")),
             }
         }
         Op::Redis(cfg, db, cmd) => {
@@ -1702,6 +2358,15 @@ struct App {
     cmd_input: TextArea<'static>,
     cmd_output: Vec<String>,
     redis_db: u32,
+    // ── Redis key browser ──
+    redis_scan: RedisScanState,
+    redis_list: ListState,
+    redis_value: Option<RedisValueView>,
+    redis_prompt: Option<RedisPrompt>,
+    // ── MongoDB document browser ──
+    mongo_page: usize,
+    mongo_filter: String,
+    mongo_gen: u64,
 
     form: ConnForm,
 
@@ -2086,6 +2751,13 @@ async fn run_app(mut terminal: ratatui::DefaultTerminal, backend: Arc<LocalBacke
         cmd_input: TextArea::default(),
         cmd_output: Vec::new(),
         redis_db: 0,
+        redis_scan: RedisScanState::default(),
+        redis_list: ListState::default(),
+        redis_value: None,
+        redis_prompt: None,
+        mongo_page: 0,
+        mongo_filter: String::new(),
+        mongo_gen: 0,
         form: ConnForm::default(),
         layout_mode: LayoutMode::Mid,
         term_h: 0,
@@ -2166,13 +2838,19 @@ fn apply_op_result(app: &mut App, res: OpResult, tx: &Tx) {
             // auto-load tables for the selected database
             if let Some(cfg) = app.selected.clone() {
                 let db = app.current_db();
-                app.status = if db.is_empty() {
-                    tf("加载 {} 表…", &[&(cfg.name)])
+                if app.backend_kind == Backend::Redis {
+                    app.status = tf("加载 {} keys…", &[&(cfg.name)]);
+                    start_redis_scan(app, tx, true);
+                    app.spawn(tx, Op::History(Box::new(cfg)));
                 } else {
-                    tf("加载 {} 表…", &[&(fix_double_encoding(&db))])
-                };
-                app.spawn(tx, Op::ListTables(Box::new(cfg.clone()), db));
-                app.spawn(tx, Op::History(Box::new(cfg)));
+                    app.status = if db.is_empty() {
+                        tf("加载 {} 表…", &[&(cfg.name)])
+                    } else {
+                        tf("加载 {} 表…", &[&(fix_double_encoding(&db))])
+                    };
+                    app.spawn(tx, Op::ListTables(Box::new(cfg.clone()), db));
+                    app.spawn(tx, Op::History(Box::new(cfg)));
+                }
             }
             // A failed `list_databases` is not fatal (the configured database is
             // still used) but it must not be swallowed either.
@@ -2408,6 +3086,177 @@ fn apply_op_result(app: &mut App, res: OpResult, tx: &Tx) {
             app.cmd_output.push(s);
             trim_output(&mut app.cmd_output);
         }
+        OpResult::RedisKeys {
+            keys,
+            cursor,
+            total,
+            gen,
+            append,
+        } => {
+            // Drop a reply that belongs to an older scan (pattern / db changed).
+            if gen != app.redis_scan.gen {
+                return;
+            }
+            if append {
+                app.redis_scan.keys.extend(keys);
+            } else {
+                app.redis_scan.keys = keys;
+            }
+            app.redis_scan.cursor = cursor;
+            app.redis_scan.total = total;
+            app.redis_scan.exhausted = cursor == 0;
+            let n = app.redis_scan.keys.len();
+            let sel = app.redis_list.selected().unwrap_or(0).min(n.saturating_sub(1));
+            app.redis_list.select((n > 0).then_some(sel));
+            app.status = if app.redis_scan.exhausted {
+                tf("{} 个 key · 已全部加载", &[&(n)])
+            } else {
+                tf("{} 个 key · 已加载 {} · n 加载更多", &[&(total), &(n)])
+            };
+        }
+        OpResult::RedisValue(view) => {
+            let view = *view;
+            app.col_hidden.clear();
+            app.result_needle.clear();
+            app.result_filter = None;
+            app.result_tabs.clear();
+            app.result_tab = 0;
+            app.grid_kind = GridKind::RedisValue;
+            app.set_grid(view.grid.clone());
+            app.sel = 0;
+            app.col_offset = 0;
+            app.col_cursor = 0;
+            app.page_state = None;
+            app.script = None;
+            app.ddl = None;
+            app.struct_view = StructView::Fields;
+            app.redis_value = Some(view.clone());
+            app.focus = Focus::Preview;
+            let ttl = redis_ttl_label(view.ttl);
+            app.status = tf(
+                "{} · {} · TTL {}",
+                &[&(fix_double_encoding(&view.key_display)), &(view.redis_type), &(ttl)],
+            );
+        }
+        OpResult::RedisWritten {
+            cmd,
+            summary,
+            reload_value,
+            reload_list,
+        } => {
+            app.cmd_output.push(format!("redis[{}]> {cmd}",  app.redis_db));
+            app.cmd_output.push(summary.clone());
+            trim_output(&mut app.cmd_output);
+            app.status = tf("✓ {}", &[&(truncate_disp(&one_line(&cmd), 60))]);
+            if reload_list {
+                // The open value may no longer exist (DEL / RENAME), so drop it
+                // and show the refreshed key list instead of a stale value.
+                if reload_value.is_none() {
+                    app.redis_value = None;
+                    app.clear_grid();
+                    // The value pane is gone; hand focus back to the key list.
+                    app.focus = Focus::Sidebar;
+                }
+                start_redis_scan(app, tx, true);
+            }
+            if let Some(key) = reload_value {
+                if let Some(cfg) = app.selected.clone() {
+                    app.spawn(
+                        tx,
+                        Op::RedisValue {
+                            cfg: Box::new(cfg),
+                            db: app.redis_db,
+                            key_raw: key,
+                        },
+                    );
+                }
+            }
+        }
+        OpResult::RedisMore {
+            rows,
+            row_keys,
+            cursor,
+        } => {
+            let mut n = 0;
+            if let Some(view) = app.redis_value.as_mut() {
+                view.grid.rows.extend(rows);
+                view.row_keys.extend(row_keys);
+                view.scan_cursor = cursor;
+                n = view.grid.rows.len();
+                view.grid.note = if cursor.is_some() {
+                    tf("已加载 {} 项", &[&(n)]) + t(" · 更多（n 加载）")
+                } else {
+                    tf("已加载 {} 项 · 全部", &[&(n)])
+                };
+            }
+            if let Some(grid) = app.redis_value.as_ref().map(|v| v.grid.clone()) {
+                app.set_grid(grid);
+            }
+            app.status = if cursor.is_some() {
+                tf("已加载 {} 项 · n 继续", &[&(n)])
+            } else {
+                tf("已加载 {} 项 · 全部", &[&(n)])
+            };
+        }
+        OpResult::MongoDocs {
+            grid,
+            total,
+            has_next,
+            page,
+            collection,
+            filter,
+            gen,
+        } => {
+            if gen != app.mongo_gen {
+                return;
+            }
+            app.col_hidden.clear();
+            app.result_needle.clear();
+            app.result_filter = None;
+            app.result_tabs.clear();
+            app.result_tab = 0;
+            app.grid_kind = GridKind::MongoDocs;
+            let rows = grid.rows.len();
+            app.set_grid(*grid);
+            app.mongo_page = page;
+            app.mongo_filter = filter.clone();
+            app.page_state = Some(PageState {
+                table: collection.clone(),
+                table_type: None,
+                page,
+                page_size: MONGO_PAGE,
+                total: Some(total),
+                has_next,
+                filter,
+                order_by: None,
+            });
+            app.sel = app
+                .pending_sel
+                .take()
+                .map(|s| s.min(rows.saturating_sub(1)))
+                .unwrap_or(0);
+            app.script = None;
+            app.ddl = None;
+            app.struct_view = StructView::Fields;
+            app.focus = Focus::Preview;
+            app.status = tf(
+                "{}.{} · 第 {} 页 · {} 个文档 · 共 {} · n/p 翻页 · f 过滤",
+                &[&(fix_double_encoding(&app.current_db())), &(fix_double_encoding(&collection)), &(page + 1), &(rows), &(total)],
+            );
+        }
+        OpResult::MongoIndexes { collection, grid } => {
+            let n = grid.rows.len();
+            app.grid_kind = GridKind::Columns;
+            app.set_grid(*grid);
+            app.struct_view = StructView::Fields;
+            app.page_state = None;
+            app.script = None;
+            app.sel = 0;
+            app.col_offset = 0;
+            app.col_cursor = 0;
+            app.focus = Focus::Preview;
+            app.status = tf("{} 索引 · {} · Esc 返回", &[&(fix_double_encoding(&collection)), &(n)]);
+        }
         OpResult::Mongo(s) => {
             app.cmd_output.push(s);
             trim_output(&mut app.cmd_output);
@@ -2625,6 +3474,10 @@ fn confirm_key(app: &mut App, tx: &Tx, k: KeyEvent) {
     match k.code {
         KeyCode::Enter | KeyCode::Char('y') | KeyCode::Char('Y') => {
             if let Some(c) = app.confirm.take() {
+                if let Some(rc) = c.redis {
+                    run_redis_write(app, tx, rc.db, &rc.cmd, rc.reload_value, rc.reload_list);
+                    return;
+                }
                 app.push_history(&c.sql);
                 if c.clear_batch {
                     app.batch.clear();
@@ -2690,6 +3543,12 @@ fn browse_key(app: &mut App, tx: &Tx, k: KeyEvent) {
     // Database switcher overlay (`d`) is modal.
     if app.db_picker_open {
         db_picker_key(app, tx, k);
+        return;
+    }
+
+    // Redis input dialogs (pattern / TTL / rename / value) are modal.
+    if app.redis_prompt.is_some() {
+        redis_prompt_key(app, tx, k);
         return;
     }
 
@@ -2986,8 +3845,11 @@ fn db_picker_apply(app: &mut App, tx: &Tx, idx: usize) {
     match app.backend_kind {
         Backend::Redis => {
             app.redis_db = idx as u32;
+            app.redis_value = None;
+            app.clear_grid();
             app.set_placeholder();
             app.status = format!("redis db → {idx}");
+            start_redis_scan(app, tx, true);
         }
         _ => {
             if idx < app.databases.len() {
@@ -3048,6 +3910,66 @@ fn sidebar_key(app: &mut App, tx: &Tx, k: KeyEvent) {
         return;
     }
 
+    // Redis connection → key browser (SCAN pagination, pattern filter).
+    if app.backend_kind == Backend::Redis {
+        match k.code {
+            KeyCode::Tab => app.focus = Focus::Editor,
+            KeyCode::Char('c') => {
+                app.page = Page::NewConn;
+                app.form = ConnForm::default();
+            }
+            KeyCode::Char('p') => duplicate_connection(app),
+            KeyCode::Char('o') => back_to_picker(app),
+            // `r` rescans from cursor 0 with the current pattern.
+            KeyCode::Char('r') => {
+                app.status = t("重新扫描 keys…").into();
+                start_redis_scan(app, tx, true);
+            }
+            // `/` edits the server-side MATCH pattern.
+            KeyCode::Char('/') => open_redis_pattern_prompt(app),
+            // `n` fetches the next SCAN page.
+            KeyCode::Char('n') => start_redis_scan(app, tx, false),
+            KeyCode::Up | KeyCode::Char('k') => {
+                let n = app.redis_scan.keys.len();
+                if n > 0 {
+                    let i = app.redis_list.selected().map(|i| i.saturating_sub(1)).unwrap_or(0);
+                    app.redis_list.select(Some(i));
+                }
+            }
+            KeyCode::Down | KeyCode::Char('j') => {
+                let n = app.redis_scan.keys.len();
+                if n > 0 {
+                    let cur = app.redis_list.selected().unwrap_or(0);
+                    if cur + 1 >= n && !app.redis_scan.exhausted {
+                        // At the last loaded key: pull the next page, keeping the cursor.
+                        start_redis_scan(app, tx, false);
+                    } else {
+                        app.redis_list.select(Some((cur + 1).min(n - 1)));
+                    }
+                }
+            }
+            KeyCode::Home => {
+                if !app.redis_scan.keys.is_empty() {
+                    app.redis_list.select(Some(0));
+                }
+            }
+            KeyCode::End => {
+                let n = app.redis_scan.keys.len();
+                if n > 0 {
+                    app.redis_list.select(Some(n - 1));
+                }
+                if !app.redis_scan.exhausted {
+                    start_redis_scan(app, tx, false);
+                }
+            }
+            KeyCode::Enter => open_redis_value(app, tx),
+            KeyCode::Left | KeyCode::Char('h') => cycle_redis_db(app, tx, false),
+            KeyCode::Right | KeyCode::Char('l') => cycle_redis_db(app, tx, true),
+            _ => {}
+        }
+        return;
+    }
+
     // connection selected → table browser
     match k.code {
         KeyCode::Tab => app.focus = Focus::Editor,
@@ -3057,23 +3979,7 @@ fn sidebar_key(app: &mut App, tx: &Tx, k: KeyEvent) {
         }
         // Duplicate the current connection into the form (new id on save).
         KeyCode::Char('p') => duplicate_connection(app),
-        KeyCode::Char('o') => {
-            // back to connection picker
-            app.selected = None;
-            app.tables.clear();
-            app.tables_all.clear();
-            app.table_filter.clear();
-            app.columns.clear();
-            app.databases.clear();
-            app.clear_grid();
-            app.script = None;
-            app.ddl = None;
-            app.page_state = None;
-            app.col_offset = 0;
-            app.col_cursor = 0;
-            app.cell_popup = None;
-            app.picker_open = true;
-        }
+        KeyCode::Char('o') => back_to_picker(app),
         KeyCode::Char('r') => load_structure(app, tx),
         // `/` — filter-as-you-type over the table list (vim-style), the fast way
         // to reach a table when the sidebar is long.
@@ -3118,6 +4024,20 @@ fn load_structure(app: &mut App, tx: &Tx) {
     let Some(cfg) = app.selected.clone() else {
         return;
     };
+    if app.backend_kind == Backend::Mongo {
+        app.loading = true;
+        app.status = tf("加载 {} 索引…", &[&(fix_double_encoding(&table))]);
+        let db = app.current_db();
+        app.spawn(
+            tx,
+            Op::MongoIndexes {
+                cfg: Box::new(cfg),
+                db,
+                collection: table,
+            },
+        );
+        return;
+    }
     app.loading = true;
     app.status = tf("加载 {} 结构…", &[&(fix_double_encoding(&table))]);
     let db = app.current_db();
@@ -3135,6 +4055,24 @@ fn open_table_data(app: &mut App, tx: &Tx) {
     let Some(cfg) = app.selected.clone() else {
         return;
     };
+    if app.backend_kind == Backend::Mongo {
+        app.clear_grid();
+        app.script = None;
+        app.ddl = None;
+        app.struct_view = StructView::Fields;
+        app.col_offset = 0;
+        app.col_cursor = 0;
+        app.cell_popup = None;
+        app.row_popup = None;
+        app.sel = 0;
+        app.pending_sel = Some(0);
+        app.pending_focus = Some(Focus::Preview);
+        app.result_needle.clear();
+        app.result_filter = None;
+        remember_recent_table(app, &app.current_db(), &table.0);
+        open_mongo_collection(app, tx);
+        return;
+    }
     app.clear_grid();
     app.script = None;
     app.ddl = None;
@@ -3205,6 +4143,13 @@ fn open_table_data(app: &mut App, tx: &Tx) {
 fn goto_page(app: &mut App, tx: &Tx, page: usize, pending_sel: Option<usize>) -> bool {
     if app.page_pending {
         return false;
+    }
+    // MongoDB documents paginate with skip/limit rather than SQL OFFSET.
+    if app.grid_kind == GridKind::MongoDocs {
+        app.page_pending = true;
+        app.pending_sel = pending_sel;
+        reload_mongo_docs(app, tx, page);
+        return true;
     }
     let Some(ps) = app.page_state.clone() else {
         return false;
@@ -3757,6 +4702,7 @@ fn connect_selected(app: &mut App, tx: &Tx) {
         if let Some(cfg) = app.connections.get(idx).cloned() {
             app.selected = Some(cfg.clone());
             app.picker_open = false;
+            app.backend_kind = backend_for_connection(&cfg);
             app.clear_grid();
             app.script = None;
             app.ddl = None;
@@ -3765,11 +4711,321 @@ fn connect_selected(app: &mut App, tx: &Tx) {
             app.col_cursor = 0;
             app.cell_popup = None;
             app.cmd_output.clear();
+            app.redis_value = None;
+            app.redis_prompt = None;
+            app.redis_scan = RedisScanState::default();
+            app.redis_list = ListState::default();
+            app.mongo_filter.clear();
+            app.mongo_page = 0;
             app.set_placeholder();
             app.loading = true;
             app.status = tf("连接 {} ({})…", &[&(cfg.name), &(cfg.db_type.as_str())]);
-            app.spawn(tx, Op::Databases(Box::new(cfg)));
+            if app.backend_kind == Backend::Redis {
+                // Redis exposes 16 fixed logical databases; there is nothing to
+                // enumerate, so go straight to the first SCAN page.
+                app.databases = (0..16).map(|i| i.to_string()).collect();
+                app.db_index = 0;
+                app.redis_db = 0;
+                start_redis_scan(app, tx, true);
+                app.spawn(tx, Op::History(Box::new(cfg)));
+            } else {
+                app.spawn(tx, Op::Databases(Box::new(cfg)));
+            }
         }
+    }
+}
+
+/// Pick the interaction mode for a connection: a Redis connection opens the key
+/// browser, a MongoDB connection the document browser, everything else SQL.
+fn backend_for_connection(cfg: &ConnectionConfig) -> Backend {
+    match cfg.db_type.as_str() {
+        "redis" | "keydb" | "valkey" => Backend::Redis,
+        "mongodb" | "mongo" => Backend::Mongo,
+        _ => Backend::Sql,
+    }
+}
+
+/// How many keys one `SCAN` page asks for.
+const REDIS_SCAN_PAGE: usize = 100;
+/// How many server-side SCAN cycles a single page performs. `SCAN` is a hint, so
+/// a selective `MATCH` can return zero keys for several cycles; iterating a few
+/// times server-side keeps an empty first page rare without loading the whole
+/// keyspace.
+const REDIS_SCAN_ITERATIONS: usize = 5;
+/// How many documents one MongoDB page shows.
+const MONGO_PAGE: usize = 50;
+
+/// Request the next page of the Redis key browser. `reset` starts a fresh scan
+/// (used after a pattern change / logical-db switch / write) instead of
+/// appending; a reset also bumps the generation so a late reply is dropped.
+fn start_redis_scan(app: &mut App, tx: &Tx, reset: bool) {
+    let Some(cfg) = app.selected.clone() else {
+        return;
+    };
+    if reset {
+        app.redis_scan.keys.clear();
+        app.redis_scan.cursor = 0;
+        app.redis_scan.exhausted = false;
+        app.redis_scan.gen = app.redis_scan.gen.wrapping_add(1);
+    } else if app.redis_scan.exhausted {
+        return;
+    }
+    let gen = app.redis_scan.gen;
+    let cursor = app.redis_scan.cursor;
+    let pattern = app.redis_scan.pattern.clone();
+    app.loading = true;
+    app.spawn(
+        tx,
+        Op::RedisScan {
+            cfg: Box::new(cfg),
+            db: app.redis_db,
+            cursor,
+            pattern,
+            count: REDIS_SCAN_PAGE,
+            gen,
+            append: !reset,
+        },
+    );
+}
+
+/// Load the selected key's typed value into the results pane.
+fn open_redis_value(app: &mut App, tx: &Tx) {
+    let Some(cfg) = app.selected.clone() else {
+        return;
+    };
+    let Some(key) = app
+        .redis_list
+        .selected()
+        .and_then(|i| app.redis_scan.keys.get(i))
+        .map(|k| (k.key_raw.clone(), k.key_display.clone()))
+    else {
+        app.status = t("先选中一个 key").into();
+        return;
+    };
+    app.loading = true;
+    app.status = tf("加载 key {}…", &[&(fix_double_encoding(&key.1))]);
+    app.spawn(
+        tx,
+        Op::RedisValue {
+            cfg: Box::new(cfg),
+            db: app.redis_db,
+            key_raw: key.0,
+        },
+    );
+}
+
+/// Append the next page of a large Redis collection value.
+fn redis_load_more(app: &mut App, tx: &Tx) {
+    let Some(view) = app.redis_value.clone() else {
+        return;
+    };
+    let Some(cursor) = view.scan_cursor else {
+        app.status = t("已全部加载").into();
+        return;
+    };
+    let Some(cfg) = app.selected.clone() else {
+        return;
+    };
+    app.loading = true;
+    app.status = t("加载更多…").into();
+    app.spawn(
+        tx,
+        Op::RedisMore {
+            cfg: Box::new(cfg),
+            db: app.redis_db,
+            key_raw: view.key_raw,
+            key_type: view.redis_type,
+            cursor,
+            count: 200,
+        },
+    );
+}
+
+/// Reload one MongoDB collection page.
+fn reload_mongo_docs(app: &mut App, tx: &Tx, page: usize) {
+    let Some(cfg) = app.selected.clone() else {
+        return;
+    };
+    let Some(coll) = app.selected_table().map(|t| t.name.clone()) else {
+        return;
+    };
+    app.mongo_gen = app.mongo_gen.wrapping_add(1);
+    let gen = app.mongo_gen;
+    app.loading = true;
+    app.status = tf("加载 {} 文档…", &[&(fix_double_encoding(&coll))]);
+    app.spawn(
+        tx,
+        Op::MongoDocs {
+            cfg: Box::new(cfg),
+            db: app.current_db(),
+            collection: coll,
+            page,
+            page_size: MONGO_PAGE,
+            filter: app.mongo_filter.clone(),
+            gen,
+        },
+    );
+}
+
+/// Open the selected collection in the document browser (Mongo mode).
+fn open_mongo_collection(app: &mut App, tx: &Tx) {
+    app.mongo_page = 0;
+    app.mongo_filter.clear();
+    reload_mongo_docs(app, tx, 0);
+}
+
+/// Drop the current connection and show the connection picker again.
+fn back_to_picker(app: &mut App) {
+    app.selected = None;
+    app.tables.clear();
+    app.tables_all.clear();
+    app.table_filter.clear();
+    app.columns.clear();
+    app.databases.clear();
+    app.clear_grid();
+    app.script = None;
+    app.ddl = None;
+    app.page_state = None;
+    app.col_offset = 0;
+    app.col_cursor = 0;
+    app.cell_popup = None;
+    app.redis_value = None;
+    app.redis_scan = RedisScanState::default();
+    app.redis_list = ListState::default();
+    app.picker_open = true;
+}
+
+/// Switch the Redis logical database and rescan it.
+fn cycle_redis_db(app: &mut App, tx: &Tx, forward: bool) {
+    app.redis_db = if forward {
+        (app.redis_db + 1) % 16
+    } else {
+        (app.redis_db + 15) % 16
+    };
+    app.redis_value = None;
+    app.clear_grid();
+    app.set_placeholder();
+    app.status = tf("redis db → {}", &[&(app.redis_db)]);
+    start_redis_scan(app, tx, true);
+}
+
+/// Open the `/` pattern prompt (server-side SCAN MATCH).
+fn open_redis_pattern_prompt(app: &mut App) {
+    let mut ta = TextArea::from(vec![app.redis_scan.pattern.clone()]);
+    ta.set_placeholder_text(t("例: app:*（留空回车 = 全部 *）"));
+    ta.move_cursor(CursorMove::End);
+    app.redis_prompt = Some(RedisPrompt {
+        kind: RedisPromptKind::Pattern,
+        title: t("key 匹配模式（SCAN MATCH）").to_string(),
+        key_display: String::new(),
+        key_raw: String::new(),
+        field: String::new(),
+        input: ta,
+    });
+}
+
+/// Open a TTL edit prompt for the focused key.
+fn open_redis_ttl_prompt(app: &mut App) {
+    let Some(view) = app.redis_value.clone() else {
+        return;
+    };
+    let initial = if view.ttl >= 0 { view.ttl.to_string() } else { String::new() };
+    let mut ta = TextArea::from(vec![initial]);
+    ta.set_placeholder_text(t("秒数（-1 = 持久化，0 = 立即删除）"));
+    ta.move_cursor(CursorMove::End);
+    app.redis_prompt = Some(RedisPrompt {
+        kind: RedisPromptKind::Ttl,
+        title: tf("设置 TTL · {}", &[&(view.key_display)]),
+        key_display: view.key_display.clone(),
+        key_raw: view.key_raw.clone(),
+        field: String::new(),
+        input: ta,
+    });
+}
+
+/// Open a rename prompt for the focused key.
+fn open_redis_rename_prompt(app: &mut App) {
+    let Some(view) = app.redis_value.clone() else {
+        return;
+    };
+    let mut ta = TextArea::from(vec![view.key_display.clone()]);
+    ta.move_cursor(CursorMove::End);
+    app.redis_prompt = Some(RedisPrompt {
+        kind: RedisPromptKind::Rename,
+        title: tf("重命名 key · {}", &[&(view.key_display)]),
+        key_display: view.key_display.clone(),
+        key_raw: view.key_raw.clone(),
+        field: String::new(),
+        input: ta,
+    });
+}
+
+/// Open an edit prompt for the focused grid cell: a string key's whole body, or
+/// a hash field's value. Other Redis types are read-only for now.
+fn open_redis_edit(app: &mut App) {
+    let Some(view) = app.redis_value.clone() else {
+        return;
+    };
+    match &view.raw.data {
+        RedisValueData::String { content, .. } => {
+            let initial = redis_blob_editable_text(content).unwrap_or_default();
+            let mut ta = TextArea::from(initial.split('\n').collect::<Vec<_>>());
+            ta.move_cursor(CursorMove::End);
+            app.redis_prompt = Some(RedisPrompt {
+                kind: RedisPromptKind::StringValue,
+                title: tf("编辑 string · {}", &[&(view.key_display)]),
+                key_display: view.key_display.clone(),
+                key_raw: view.key_raw.clone(),
+                field: String::new(),
+                input: ta,
+            });
+        }
+        RedisValueData::Hash { .. } => {
+            let Some(field) = view.row_keys.get(app.sel).cloned() else {
+                return;
+            };
+            if field.is_empty() {
+                return;
+            }
+            let initial = app
+                .grid
+                .as_ref()
+                .and_then(|g| g.rows.get(app.sel))
+                .and_then(|r| r.get(1))
+                .map(|v| v.text().to_string())
+                .unwrap_or_default();
+            let mut ta = TextArea::from(initial.split('\n').collect::<Vec<_>>());
+            ta.move_cursor(CursorMove::End);
+            app.redis_prompt = Some(RedisPrompt {
+                kind: RedisPromptKind::HashField,
+                title: tf("编辑 hash 字段 · {} · {}", &[&(view.key_display), &(field)]),
+                key_display: view.key_display.clone(),
+                key_raw: view.key_raw.clone(),
+                field,
+                input: ta,
+            });
+        }
+        _ => {
+            app.status = t("该类型暂不支持直接编辑，可用命令行修改").into();
+        }
+    }
+}
+
+/// Which write a Redis prompt will generate. Kept as data so the confirmation
+/// layer shows the exact command before anything runs.
+fn redis_prompt_command(kind: RedisPromptKind, key: &str, field: &str, input: &str) -> String {
+    let q = |s: &str| {
+        // Quote with double quotes and escape so spaces / quotes survive the
+        // redis-cli tokenizer the backend uses.
+        let escaped = s.replace('\\', "\\\\").replace('"', "\\\"");
+        format!("\"{escaped}\"")
+    };
+    match kind {
+        RedisPromptKind::Ttl => format!("EXPIRE {} {}", q(key), input.trim()),
+        RedisPromptKind::Rename => format!("RENAME {} {}", q(key), q(input.trim())),
+        RedisPromptKind::StringValue => format!("SET {} {}", q(key), q(input)),
+        RedisPromptKind::HashField => format!("HSET {} {} {}", q(key), q(field), q(input)),
+        RedisPromptKind::Pattern => String::new(),
     }
 }
 
@@ -4151,6 +5407,35 @@ fn sidebar_click(app: &mut App, tx: &Tx, x: u16, y: u16) {
     if rel < 0 {
         return;
     }
+    // Redis: row 0 connection, row 1 logical DB, row 2 pattern, then keys.
+    if app.backend_kind == Backend::Redis && app.selected.is_some() {
+        if rel == 1 {
+            open_db_picker(app);
+            return;
+        }
+        let key_row = rel - 3;
+        if key_row < 0 {
+            return;
+        }
+        let _ = x;
+        let n = app.redis_scan.keys.len();
+        let cap = (area.height as usize).saturating_sub(5).max(1);
+        let sel = app.redis_list.selected();
+        let start = sel
+            .unwrap_or(0)
+            .saturating_sub(cap / 2)
+            .min(n.saturating_sub(cap.min(n)));
+        let idx = start + key_row as usize;
+        if idx >= n {
+            return;
+        }
+        if app.redis_list.selected() == Some(idx) {
+            open_redis_value(app, tx);
+        } else {
+            app.redis_list.select(Some(idx));
+        }
+        return;
+    }
     // row 0 = connection header, then optional database selector row and the
     // table-filter row (both only when the connection is open).
     let header = 1
@@ -4195,7 +5480,7 @@ fn sidebar_db_row(app: &App) -> bool {
 
 fn sidebar_db_label(app: &App) -> String {
     if app.backend_kind == Backend::Redis {
-        tf("redis db {} · d 切换", &[&(app.redis_db)])
+        tf("redis db {} · {} keys · d 切换", &[&(app.redis_db), &(app.redis_scan.keys.len())])
     } else {
         tf("{} · d 切换", &[&(fix_double_encoding(&app.current_db()))])
     }
@@ -4266,7 +5551,266 @@ fn cmd_input_key(app: &mut App, tx: &Tx, k: KeyEvent) {
     }
 }
 
+/// Execute a confirmed Redis write through the console, then refresh.
+fn run_redis_write(
+    app: &mut App,
+    tx: &Tx,
+    db: u32,
+    cmd: &str,
+    reload_value: Option<String>,
+    reload_list: bool,
+) {
+    let Some(cfg) = app.selected.clone() else {
+        app.status = t("✗ 未选择连接").into();
+        return;
+    };
+    app.loading = true;
+    app.status = tf("执行 {}…", &[&(truncate_disp(&one_line(cmd), 50))]);
+    app.spawn(
+        tx,
+        Op::RedisWrite {
+            cfg: Box::new(cfg),
+            db,
+            cmd: cmd.to_string(),
+            reload_value,
+            reload_list,
+        },
+    );
+}
+
+/// `y` in a Redis value / Mongo document grid: copy the focused row as tab-
+/// separated text (OSC52 clipboard, with the file fallback).
+fn copy_redis_row(app: &mut App) {
+    let Some(grid) = active_grid(app) else {
+        app.status = t("没有可复制的行").into();
+        return;
+    };
+    let Some(orig) = app.full_row_index() else {
+        app.status = t("没有可复制的行").into();
+        return;
+    };
+    let Some(row) = grid.rows.get(orig) else {
+        app.status = t("没有可复制的行").into();
+        return;
+    };
+    let text = row.iter().map(|v| v.text()).collect::<Vec<_>>().join("\t");
+    let n = text.chars().count();
+    match clipboard_copy(&text) {
+        Some(p) => app.status = tf("✓ 已复制（{} 字符）· 兜底 {}", &[&(n), &(p.display())]),
+        None => app.status = tf("✓ 已复制（{} 字符）· OSC52 剪贴板", &[&(n)]),
+    }
+}
+
+/// Confirm deleting the focused key (DEL). Data-destructive writes always go
+/// through the red layer, like every SQL row delete.
+fn redis_confirm_delete(app: &mut App) {
+    let Some(view) = app.redis_value.clone() else {
+        app.status = t("先选中一个 key").into();
+        return;
+    };
+    let cmd = format!("DEL \"{}\"",  view.key_display.replace('\\', "\\\\").replace('"', "\\\""));
+    app.confirm = Some(Confirm {
+        sql: cmd.clone(),
+        reasons: vec![
+            tf("将删除 key {}（不可撤销）", &[&(view.key_display)]),
+            t("DEL 不可撤销，Enter 后立即执行").into(),
+        ],
+        refresh: false,
+        clear_batch: false,
+        redis: Some(RedisConfirm {
+            db: app.redis_db,
+            cmd,
+            reload_value: None,
+            reload_list: true,
+        }),
+    });
+    app.status = t("删除确认 · Enter 执行 · Esc 取消").into();
+}
+
+/// Keys for a Redis value grid: edit the string / hash field, expire, rename,
+/// delete, plus the shared search / copy / popup infrastructure.
+fn redis_value_key(app: &mut App, tx: &Tx, k: KeyEvent) {
+    if k.modifiers.contains(KeyModifiers::CONTROL) {
+        match k.code {
+            KeyCode::Char('e') => app.focus = Focus::Editor,
+            KeyCode::Char('d') => redis_confirm_delete(app),
+            _ => {}
+        }
+        return;
+    }
+    if k.code == KeyCode::Esc && !app.result_needle.is_empty() {
+        app.result_needle.clear();
+        app.rebuild_view();
+        app.sel = 0;
+        app.status = t("已清除结果搜索").into();
+        return;
+    }
+    match k.code {
+        KeyCode::Esc => app.focus = Focus::Sidebar,
+        KeyCode::Char('e') => open_redis_edit(app),
+        // `n` loads the next page of a large hash / list / set / zset value.
+        KeyCode::Char('n') => redis_load_more(app, tx),
+        // `x` = expire (TTL), `m` = move / rename.
+        KeyCode::Char('x') => open_redis_ttl_prompt(app),
+        KeyCode::Char('m') => open_redis_rename_prompt(app),
+        KeyCode::Delete => redis_confirm_delete(app),
+        KeyCode::Char('o') => open_row_popup(app),
+        KeyCode::Char('v') => open_cell_popup(app),
+        KeyCode::Char('/') => open_result_filter(app),
+        KeyCode::Char('y') => copy_redis_row(app),
+        KeyCode::Char('z') => {
+            app.freeze_first = !app.freeze_first;
+        }
+        KeyCode::Up | KeyCode::Char('k') => move_cursor(app, tx, -1),
+        KeyCode::Down | KeyCode::Char('j') => move_cursor(app, tx, 1),
+        KeyCode::Left | KeyCode::Char('h') => move_col_cursor(app, -1),
+        KeyCode::Right | KeyCode::Char('l') => move_col_cursor(app, 1),
+        KeyCode::PageUp => screen_move(app, tx, -1),
+        KeyCode::PageDown => screen_move(app, tx, 1),
+        KeyCode::Home => app.sel = 0,
+        KeyCode::End => {
+            let n = result_row_count(app);
+            if n > 0 {
+                app.sel = n - 1;
+            }
+        }
+        KeyCode::Enter => {
+            if compact_active(app.compact, app.layout_mode) {
+                open_row_popup(app);
+            } else {
+                open_cell_popup(app);
+            }
+        }
+        _ => {}
+    }
+}
+
+/// Keys for a MongoDB document grid: JSON filter, pagination and the shared
+/// search / copy / popup infrastructure.
+fn mongo_docs_key(app: &mut App, tx: &Tx, k: KeyEvent) {
+    if k.modifiers.contains(KeyModifiers::CONTROL) {
+        match k.code {
+            KeyCode::Char('e') => app.focus = Focus::Editor,
+            KeyCode::Char('f') => page_turn(app, tx, true),
+            KeyCode::Char('b') => page_turn(app, tx, false),
+            _ => {}
+        }
+        return;
+    }
+    if k.code == KeyCode::Esc && !app.result_needle.is_empty() {
+        app.result_needle.clear();
+        app.rebuild_view();
+        app.sel = 0;
+        app.status = t("已清除结果搜索").into();
+        return;
+    }
+    match k.code {
+        KeyCode::Esc => app.focus = Focus::Sidebar,
+        KeyCode::Char('f') => open_mongo_filter_prompt(app),
+        KeyCode::Char('y') => copy_redis_row(app),
+        KeyCode::Char('o') => open_row_popup(app),
+        KeyCode::Char('v') => open_cell_popup(app),
+        KeyCode::Char('/') => open_result_filter(app),
+        KeyCode::Up | KeyCode::Char('k') => move_cursor(app, tx, -1),
+        KeyCode::Down | KeyCode::Char('j') => move_cursor(app, tx, 1),
+        KeyCode::Left | KeyCode::Char('h') => move_col_cursor(app, -1),
+        KeyCode::Right | KeyCode::Char('l') => move_col_cursor(app, 1),
+        KeyCode::PageUp => screen_move(app, tx, -1),
+        KeyCode::PageDown => screen_move(app, tx, 1),
+        KeyCode::Home => app.sel = 0,
+        KeyCode::End => {
+            let n = result_row_count(app);
+            if n > 0 {
+                app.sel = n - 1;
+            }
+        }
+        KeyCode::Char('n') => page_turn(app, tx, true),
+        KeyCode::Char('p') => page_turn(app, tx, false),
+        KeyCode::Enter => {
+            if compact_active(app.compact, app.layout_mode) {
+                open_row_popup(app);
+            } else {
+                open_cell_popup(app);
+            }
+        }
+        _ => {}
+    }
+}
+
+/// Open the MongoDB JSON filter prompt (prefilled with the active filter).
+fn open_mongo_filter_prompt(app: &mut App) {
+    let mut ta = TextArea::from(vec![app.mongo_filter.clone()]);
+    ta.set_placeholder_text(t("JSON 过滤，例: {\"age\": {\"$gt\": 30}}（留空 = 全部）"));
+    ta.move_cursor(CursorMove::End);
+    app.filter_prompt = Some(ta);
+}
+
+/// Handle a Redis input dialog. Enter turns the input into a command and routes
+/// it through the confirmation layer; the pattern dialog is read-only-safe and
+/// applies immediately.
+fn redis_prompt_key(app: &mut App, tx: &Tx, k: KeyEvent) {
+    let Some(mut p) = app.redis_prompt.take() else {
+        return;
+    };
+    if k.code == KeyCode::Esc {
+        app.status = t("已取消").into();
+        return;
+    }
+    if k.code != KeyCode::Enter {
+        p.input.input(k);
+        app.redis_prompt = Some(p);
+        return;
+    }
+    let input = p.input.lines().join("\n");
+    if p.kind == RedisPromptKind::Pattern {
+        let pat = input.trim();
+        app.redis_scan.pattern = if pat.is_empty() { "*".to_string() } else { pat.to_string() };
+        app.redis_value = None;
+        app.clear_grid();
+        app.status = tf("匹配模式 → {}", &[&(app.redis_scan.pattern)]);
+        start_redis_scan(app, tx, true);
+        return;
+    }
+    let cmd = redis_prompt_command(p.kind, &p.key_display, &p.field, &input);
+    if cmd.is_empty() {
+        return;
+    }
+    let (reload_value, reload_list) = match p.kind {
+        // A renamed key has a new name, so just refresh the list.
+        RedisPromptKind::Rename => (None, true),
+        RedisPromptKind::StringValue | RedisPromptKind::HashField => (Some(p.key_raw.clone()), false),
+        RedisPromptKind::Ttl => (Some(p.key_raw.clone()), true),
+        RedisPromptKind::Pattern => (None, false),
+    };
+    app.confirm = Some(Confirm {
+        sql: cmd.clone(),
+        reasons: vec![
+            tf("将执行 {}", &[&(truncate_disp(&one_line(&cmd), 60))]),
+            t("Enter 执行 · Esc 取消").into(),
+        ],
+        refresh: false,
+        clear_batch: false,
+        redis: Some(RedisConfirm {
+            db: app.redis_db,
+            cmd,
+            reload_value,
+            reload_list,
+        }),
+    });
+    app.status = t("确认写入 · Enter 执行 · Esc 取消").into();
+}
+
 fn preview_key(app: &mut App, tx: &Tx, k: KeyEvent) {
+    // A Redis value / Mongo document grid has its own keymap (edit, delete, TTL,
+    // rename, JSON filter) that must not fall through to the SQL row actions.
+    if app.backend_kind == Backend::Redis && app.grid_kind == GridKind::RedisValue {
+        redis_value_key(app, tx, k);
+        return;
+    }
+    if app.backend_kind == Backend::Mongo && app.grid_kind == GridKind::MongoDocs {
+        mongo_docs_key(app, tx, k);
+        return;
+    }
     // Every results-pane command that needs a modifier is a Ctrl combo, so no
     // bare uppercase letter is required. Handle them here and swallow any other
     // Ctrl combo so it can never fall through to a plain-key action.
@@ -4517,6 +6061,17 @@ fn filter_prompt_key(app: &mut App, tx: &Tx, k: KeyEvent) {
                 .map(|t| t.lines().join(" ").trim().to_string())
                 .unwrap_or_default();
             app.filter_prompt = None;
+            if app.grid_kind == GridKind::MongoDocs {
+                app.mongo_filter = filter.clone();
+                app.pending_sel = Some(0);
+                if filter.is_empty() {
+                    app.status = t("过滤已清除").into();
+                } else {
+                    app.status = tf("过滤: {}", &[&(filter)]);
+                }
+                reload_mongo_docs(app, tx, 0);
+                return;
+            }
             let order_by = app.page_state.as_ref().and_then(|p| p.order_by.clone());
             if filter.is_empty() {
                 app.status = t("过滤已清除").into();
@@ -5771,6 +7326,7 @@ fn delete_row(app: &mut App) {
         reasons,
         refresh: true,
         clear_batch: false,
+        redis: None,
     });
     app.status = t("删除确认 · Enter 执行 · Esc 取消").into();
 }
@@ -5947,6 +7503,7 @@ fn submit_edit_sql(app: &mut App, tx: &Tx, sql: String) {
             reasons: vec![reason],
             refresh: true,
             clear_batch: false,
+            redis: None,
         });
         return;
     }
@@ -5979,6 +7536,7 @@ fn commit_batch(app: &mut App) {
         ],
         refresh: true,
         clear_batch: true,
+        redis: None,
     });
     app.status = tf("批量提交确认（{} 条）· Enter 执行 · Esc 取消", &[&(n)]);
 }
@@ -6176,6 +7734,7 @@ fn run_sql(app: &mut App, tx: &Tx) {
             reasons,
             refresh: false,
             clear_batch: false,
+            redis: None,
         });
         return;
     }
@@ -6232,6 +7791,9 @@ fn run_cmd_line(app: &mut App, tx: &Tx) {
     app.loading = true;
     match app.backend_kind {
         Backend::Redis => {
+            // Show the console output rather than a stale value grid.
+            app.redis_value = None;
+            app.clear_grid();
             app.cmd_output
                 .push(format!("redis[{}]> {cmd}",  app.redis_db));
             app.spawn(
@@ -6240,6 +7802,9 @@ fn run_cmd_line(app: &mut App, tx: &Tx) {
             );
         }
         Backend::Mongo => {
+            // Show the console output rather than a stale document grid.
+            app.clear_grid();
+            app.page_state = None;
             // `use dbname` switches the mongo database locally. The selected
             // database (not a separate field) is what gets passed to every
             // command, so the shell prompt and the executed op can never drift.
@@ -7243,6 +8808,9 @@ fn ui(f: &mut Frame, app: &mut App) {
     if app.filter_prompt.is_some() {
         render_filter_prompt(f, f.area(), app);
     }
+    if app.redis_prompt.is_some() {
+        render_redis_prompt(f, f.area(), app);
+    }
     if app.edit_dialog.is_some() {
         render_edit_dialog(f, f.area(), app);
     }
@@ -7328,8 +8896,14 @@ fn render_header(f: &mut Frame, area: Rect, app: &App) {
         .as_ref()
         .map(|c| format!("{} ({})",  c.name,  c.db_type.as_str()))
         .unwrap_or_else(|| t("未连接").into());
-    let db = if app.selected.is_some() && !app.current_db().is_empty() {
-        format!(" · db:{}",  fix_double_encoding(&app.current_db()))
+    let db = if app.selected.is_some() {
+        if app.backend_kind == Backend::Redis {
+            format!(" · db:{}",  app.redis_db)
+        } else if !app.current_db().is_empty() {
+            format!(" · db:{}",  fix_double_encoding(&app.current_db()))
+        } else {
+            String::new()
+        }
     } else {
         String::new()
     };
@@ -7532,6 +9106,9 @@ enum FooterView {
     Confirm,
     ConnPicker,
     NewConn,
+    RedisKeys,
+    RedisValue,
+    MongoDocs,
     Browse,
 }
 
@@ -7575,6 +9152,12 @@ fn footer_ctx(app: &App) -> FooterCtx {
         FooterView::NewConn
     } else if app.picker_open && app.selected.is_none() {
         FooterView::ConnPicker
+    } else if app.backend_kind == Backend::Redis && app.selected.is_some() && app.focus == Focus::Sidebar {
+        FooterView::RedisKeys
+    } else if app.backend_kind == Backend::Redis && app.grid_kind == GridKind::RedisValue {
+        FooterView::RedisValue
+    } else if app.backend_kind == Backend::Mongo && app.grid_kind == GridKind::MongoDocs {
+        FooterView::MongoDocs
     } else {
         FooterView::Browse
     };
@@ -7647,6 +9230,34 @@ fn footer_hints_ctx(ctx: FooterCtx) -> Vec<Hint> {
             ("Enter", t("编辑/保存")),
             ("Esc", t("返回")),
             ("ssl", t("切换")),
+        ],
+        FooterView::RedisKeys => vec![
+            ("↑↓", t("key")),
+            ("/", t("匹配模式")),
+            ("Enter", t("查看值")),
+            ("n", t("更多")),
+            ("r", t("重扫")),
+            ("d", t("逻辑库")),
+            ("Tab", t("命令台")),
+        ],
+        FooterView::RedisValue => vec![
+            ("↑↓", t("行")),
+            ("←→", t("列")),
+            ("Enter", t("详情")),
+            ("e", t("编辑")),
+            ("x", t("TTL")),
+            ("m", t("重命名")),
+            ("n", t("更多")),
+            ("Del", t("删 key")),
+            ("/", t("搜索")),
+        ],
+        FooterView::MongoDocs => vec![
+            ("↑↓", t("行")),
+            ("←→", t("列")),
+            ("Enter", t("详情")),
+            ("n/p", t("翻页")),
+            ("f", t("JSON 过滤")),
+            ("/", t("搜索")),
         ],
         FooterView::Browse => match ctx.focus {
             Focus::Sidebar if !ctx.has_connection => vec![
@@ -7890,13 +9501,21 @@ fn render_sidebar_strip(f: &mut Frame, area: Rect, app: &mut App) {
     let focused = app.focus == Focus::Sidebar;
     let mut text = String::new();
     if let Some(c) = &app.selected {
-        text.push_str(&tf("▸ {} · {} 表", &[&(truncate_disp(&c.name, 16)), &(app.tables.len())]));
-        let db = app.current_db();
-        if !db.is_empty() {
-            text.push_str(&format!(" · {}",  fix_double_encoding(&db)));
-        }
-        if let Some(t) = app.selected_table() {
-            text.push_str(&format!(" · {}",  fix_double_encoding(&t.name)));
+        if app.backend_kind == Backend::Redis {
+            text.push_str(&tf("▸ {} · {} keys", &[&(truncate_disp(&c.name, 16)), &(app.redis_scan.keys.len())]));
+            text.push_str(&format!(" · db{}",  app.redis_db));
+            if let Some(v) = &app.redis_value {
+                text.push_str(&format!(" · {}",  fix_double_encoding(&v.key_display)));
+            }
+        } else {
+            text.push_str(&tf("▸ {} · {} 表", &[&(truncate_disp(&c.name, 16)), &(app.tables.len())]));
+            let db = app.current_db();
+            if !db.is_empty() {
+                text.push_str(&format!(" · {}",  fix_double_encoding(&db)));
+            }
+            if let Some(t) = app.selected_table() {
+                text.push_str(&format!(" · {}",  fix_double_encoding(&t.name)));
+            }
         }
     } else {
         text.push_str(t("▸ 未连接"));
@@ -8001,6 +9620,12 @@ fn render_results_pane(f: &mut Frame, area: Rect, app: &mut App) {
         } else {
             t("q 显示连接列表")
         }
+    } else if app.backend_kind == Backend::Redis {
+        if app.redis_scan.keys.is_empty() {
+            t("无 key · Tab 到命令台 · / 匹配模式 · r 重扫")
+        } else {
+            t("↑↓ 选 key · Enter 查看值 · n 更多 · / 匹配模式\nTab 到命令台 · Ctrl-L 切换模式")
+        }
     } else if app.tables.is_empty() {
         t("无表 · Tab 到 SQL 编辑器 · Ctrl-L 切 redis/mongo 命令行")
     } else {
@@ -8064,6 +9689,34 @@ fn grid_title(app: &App) -> String {
             } else {
                 tf(" {}结果 · {} ", &[&(search_marker(app)), &(note)])
             }
+        }
+        GridKind::RedisValue => {
+            let note = app.grid.as_ref().map(|g| g.note.clone()).unwrap_or_default();
+            match &app.redis_value {
+                Some(v) => tf(
+                    " {}Redis · {} · {} · TTL {} · {} · e 编辑 x TTL m 重命名 Del 删除 ",
+                    &[&(search_marker(app)), &(fix_double_encoding(&v.key_display)), &(v.redis_type), &(redis_ttl_label(v.ttl)), &(note)],
+                ),
+                None => tf(" {}Redis value · {} ", &[&(search_marker(app)), &(note)]),
+            }
+        }
+        GridKind::MongoDocs => {
+            let Some(ps) = &app.page_state else {
+                return t(" 文档 ").into();
+            };
+            let rows = app.grid.as_ref().map(|g| g.rows.len()).unwrap_or(0);
+            let offset = ps.page * ps.page_size;
+            let total = ps.total.map(|t| tf("共 {} 个", &[&(t)])).unwrap_or_else(|| t("总数未知").into());
+            let more = if ps.has_next { t(" · n 下一页") } else { "" };
+            let filt = if ps.filter.trim().is_empty() {
+                String::new()
+            } else {
+                tf(" · 过滤 {}", &[&(truncate_disp(&ps.filter, 24))])
+            };
+            tf(
+                " {}{}.{} · 第 {} 页 · {}–{} / {} · {}{}{} ",
+                &[&(search_marker(app)), &(fix_double_encoding(&app.current_db())), &(fix_double_encoding(&ps.table)), &(ps.page + 1), &(if rows == 0 { 0 } else { offset + 1 }), &(offset + rows), &(total), &(app.grid.as_ref().map(|g| g.note.clone()).unwrap_or_default()), &(more), &(filt)],
+            )
         }
     }
 }
@@ -8832,6 +10485,12 @@ fn render_sidebar(f: &mut Frame, area: Rect, app: &mut App) {
             ]));
         }
 
+        // Redis connections browse keys, not tables.
+        if app.backend_kind == Backend::Redis {
+            render_redis_sidebar(f, area, app, &mut lines);
+            return;
+        }
+
         // table-name filter row: shows the active `/` filter, or the hint.
         let filter_rows = if app.tables_all.is_empty() {
             0
@@ -8926,9 +10585,102 @@ fn render_sidebar(f: &mut Frame, area: Rect, app: &mut App) {
     }
 }
 
+/// Single-letter type badge shown next to a key in the sidebar.
+fn redis_type_badge(t: &str) -> (&'static str, Color) {
+    match t.to_ascii_lowercase().as_str() {
+        "string" => ("S", Color::Green),
+        "list" => ("L", Color::Yellow),
+        "set" => ("E", Color::Cyan),
+        "zset" => ("Z", Color::Magenta),
+        "hash" => ("H", Color::Blue),
+        "stream" => ("X", Color::LightRed),
+        "rejson-rl" | "json" => ("J", Color::LightYellow),
+        _ => ("?", Color::DarkGray),
+    }
+}
+
+/// Sidebar body for a Redis connection: a `/` pattern row followed by the SCAN
+/// key list with type + TTL badges.
+fn render_redis_sidebar(f: &mut Frame, area: Rect, app: &App, lines: &mut Vec<Line>) {
+    let focused = app.focus == Focus::Sidebar;
+    let w = (area.width as usize).saturating_sub(4).max(6);
+    // pattern row
+    let (mark, text, style) = if app.redis_scan.pattern == "*" {
+        (
+            "/ ",
+            t("/ 匹配模式（SCAN MATCH）").to_string(),
+            Style::default().fg(Color::DarkGray),
+        )
+    } else {
+        (
+            "▸ ",
+            format!("/{} · {} keys",  app.redis_scan.pattern,  app.redis_scan.keys.len()),
+            Style::default().fg(Color::Yellow),
+        )
+    };
+    lines.push(Line::from(vec![
+        Span::styled(mark, Style::default().fg(Color::Yellow)),
+        Span::styled(truncate_disp(&text, w), style),
+    ]));
+
+    // Header rows: connection + db row + pattern row.
+    let cap = (area.height as usize).saturating_sub(5).max(1);
+    let n = app.redis_scan.keys.len();
+    let sel = app.redis_list.selected();
+    let start = sel
+        .unwrap_or(0)
+        .saturating_sub(cap / 2)
+        .min(n.saturating_sub(cap.min(n)));
+    for (i, key) in app.redis_scan.keys.iter().enumerate().skip(start).take(cap) {
+        let (badge, color) = redis_type_badge(&key.key_type);
+        let ttl = if key.ttl >= 0 {
+            format!(" {}s",  key.ttl)
+        } else {
+            String::new()
+        };
+        let marker = if sel == Some(i) { "▸" } else { " " };
+        let name_w = w.saturating_sub(4 + ttl.len());
+        let name = truncate_disp(&fix_double_encoding(&key.key_display), name_w.max(4));
+        let row_style = if sel == Some(i) {
+            Style::default().fg(Color::Green).add_modifier(Modifier::BOLD)
+        } else {
+            Style::default()
+        };
+        lines.push(Line::from(vec![
+            Span::styled(marker, row_style),
+            Span::styled(badge, Style::default().fg(color).add_modifier(Modifier::BOLD)),
+            Span::styled(format!(" {name}"), row_style),
+            Span::styled(ttl, Style::default().fg(Color::DarkGray)),
+        ]));
+    }
+    if !app.redis_scan.exhausted {
+        lines.push(Line::from(Span::styled(
+            t("  n 加载更多…"),
+            Style::default().fg(Color::DarkGray),
+        )));
+    } else if n == 0 {
+        lines.push(Line::from(Span::styled(
+            t("  （无匹配 key）"),
+            Style::default().fg(Color::DarkGray),
+        )));
+    }
+
+    let conn = app.selected.as_ref().map(|c| c.name.clone()).unwrap_or_default();
+    let title = format!(" {} · {} keys ",  conn,  n);
+    f.render_widget(
+        Paragraph::new(lines.clone()).block(
+            Block::default()
+                .borders(Borders::ALL)
+                .title(title)
+                .border_set(border::ROUNDED)
+                .border_style(border_style(focused)),
+        ),
+        area,
+    );
+}
+
 fn render_form(f: &mut Frame, area: Rect, app: &mut App) {
-    let form = app.form.clone();
-    let box_w = if app.layout_mode == LayoutMode::Narrow {
+    let form = app.form.clone();    let box_w = if app.layout_mode == LayoutMode::Narrow {
         area.width.saturating_sub(2)
     } else {
         52.min(area.width.saturating_sub(4))
@@ -9711,6 +11463,76 @@ fn render_edit_dialog(f: &mut Frame, area: Rect, app: &mut App) {
     }
 }
 
+fn render_redis_prompt(f: &mut Frame, area: Rect, app: &mut App) {
+    let w = {
+        let avail = area.width.saturating_sub(4);
+        if avail < 24 {
+            area.width
+        } else {
+            avail.min(74)
+        }
+    };
+    let h = 7.min(area.height);
+    let x = area.x + (area.width.saturating_sub(w)) / 2;
+    let y = area.y + (area.height.saturating_sub(h)) / 2;
+    let box_area = Rect {
+        x,
+        y,
+        width: w,
+        height: h,
+    };
+    f.render_widget(Clear, box_area);
+    let title = app
+        .redis_prompt
+        .as_ref()
+        .map(|p| p.title.clone())
+        .unwrap_or_default();
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .title(Span::styled(
+            format!(" {} · {} ", truncate_disp(&title, 40), t("Enter 确认 · Esc 取消")),
+            Style::default().fg(Color::Yellow),
+        ))
+        .border_set(border::ROUNDED)
+        .border_style(Style::default().fg(Color::Yellow));
+    let inner = block.inner(box_area);
+    f.render_widget(block, box_area);
+    let ta_h = inner.height.saturating_sub(2).max(1);
+    let ta_area = Rect {
+        x: inner.x,
+        y: inner.y,
+        width: inner.width,
+        height: ta_h,
+    };
+    let hint_area = Rect {
+        x: inner.x,
+        y: inner.y + ta_h,
+        width: inner.width,
+        height: inner.height.saturating_sub(ta_h),
+    };
+    if let Some(p) = app.redis_prompt.as_mut() {
+        p.input.set_block(Block::default());
+        f.render_widget(&p.input, ta_area);
+    }
+    if hint_area.height > 0 {
+        let hint = match app.redis_prompt.as_ref().map(|p| p.kind) {
+            Some(RedisPromptKind::Pattern) => t("SCAN MATCH 模式，例 app:* · 支持 * ? []"),
+            Some(RedisPromptKind::Ttl) => t("秒数；-1 = 持久化，0 = 立即删除"),
+            Some(RedisPromptKind::Rename) => t("新 key 名（已存在的 key 会被覆盖）"),
+            Some(RedisPromptKind::StringValue) => t("新的 string 内容（支持多行）"),
+            Some(RedisPromptKind::HashField) => t("新的 hash 字段值"),
+            None => "",
+        };
+        f.render_widget(
+            Paragraph::new(Line::from(Span::styled(
+                hint,
+                Style::default().fg(Color::DarkGray),
+            ))),
+            hint_area,
+        );
+    }
+}
+
 fn render_filter_prompt(f: &mut Frame, area: Rect, app: &mut App) {
     let w = {
         let avail = area.width.saturating_sub(4);
@@ -9730,9 +11552,14 @@ fn render_filter_prompt(f: &mut Frame, area: Rect, app: &mut App) {
         height: h,
     };
     f.render_widget(Clear, box_area);
+    let title = if app.grid_kind == GridKind::MongoDocs {
+        t(" MongoDB 过滤 (JSON) · Enter 应用 · Esc 取消 · 留空清除 ")
+    } else {
+        t(" WHERE 过滤 · Enter 应用 · Esc 取消 · 留空清除 ")
+    };
     let block = Block::default()
         .borders(Borders::ALL)
-        .title(t(" WHERE 过滤 · Enter 应用 · Esc 取消 · 留空清除 "))
+        .title(title)
         .border_set(border::ROUNDED)
         .border_style(Style::default().fg(Color::Yellow));
     let inner = block.inner(box_area);
@@ -9757,16 +11584,29 @@ fn render_filter_prompt(f: &mut Frame, area: Rect, app: &mut App) {
         f.render_widget(&*ta, ta_area);
     }
     if hint_h > 0 {
-        let hints = vec![
-            Line::from(Span::styled(
-                t("语法: = != <> > < >= <= LIKE IN BETWEEN IS NULL · AND/OR · 字符串单引号"),
-                Style::default().fg(Color::DarkGray),
-            )),
-            Line::from(Span::styled(
-                t("MySQL 反引号 `col` · PG 双引号 \"col\"（区分大小写）"),
-                Style::default().fg(Color::DarkGray),
-            )),
-        ];
+        let hints = if app.grid_kind == GridKind::MongoDocs {
+            vec![
+                Line::from(Span::styled(
+                    t("JSON: {\"age\": {\"$gt\": 30}} · {\"name\": \"Ada\"}"),
+                    Style::default().fg(Color::DarkGray),
+                )),
+                Line::from(Span::styled(
+                    t("运算符: $eq $gt $lt $in $regex $exists · 留空 = 全部"),
+                    Style::default().fg(Color::DarkGray),
+                )),
+            ]
+        } else {
+            vec![
+                Line::from(Span::styled(
+                    t("语法: = != <> > < >= <= LIKE IN BETWEEN IS NULL · AND/OR · 字符串单引号"),
+                    Style::default().fg(Color::DarkGray),
+                )),
+                Line::from(Span::styled(
+                    t("MySQL 反引号 `col` · PG 双引号 \"col\"（区分大小写）"),
+                    Style::default().fg(Color::DarkGray),
+                )),
+            ]
+        };
         f.render_widget(Paragraph::new(hints), hint_area);
     }
 }
@@ -9863,6 +11703,20 @@ const HELP_ROWS: &[(&str, &str)] = &[
     ("Esc", "回到侧栏"),
     ("[ ]", "Redis 逻辑库"),
     ("use <db>", "MongoDB 切库"),
+    ("— Redis key 浏览器 —", ""),
+    ("↑ ↓ / Enter", "选择 key / 查看 value"),
+    ("/", "编辑 SCAN MATCH 模式（留空 = 全部）"),
+    ("n / End", "加载下一 SCAN 页"),
+    ("r", "以当前模式重扫"),
+    ("[ ]", "切换逻辑 db"),
+    ("e / x / m / Del", "编辑 string·hash 字段 / TTL / 重命名 / 删除 key（均确认）"),
+    ("value 内 n", "大集合继续加载 200 项"),
+    ("y", "复制当前行为 TSV"),
+    ("— MongoDB 文档浏览器 —", ""),
+    ("Enter", "浏览 collection 文档（JSON 网格）"),
+    ("n / p", "文档翻页"),
+    ("f", "JSON 过滤（如 {\"age\": {\"$gt\": 30}}，留空清除）"),
+    ("r", "查看 collection 索引"),
     ("— 危险操作 / 删除确认 —", ""),
     ("Enter / y", "执行（SQL 全文可见）"),
     ("Esc / n", "取消"),
@@ -11534,5 +13388,189 @@ mod tests {
             ),
             "stdout is not a terminal, cannot start the TUI (--help / --version work over a pipe)"
         );
+    }
+
+    // ─── Redis / Mongo helpers ───────────────────────────────────────────────
+
+    fn blob(s: &str) -> RedisBlob {
+        RedisBlob {
+            raw_base64: base64_encode(s.as_bytes()),
+            encoding: RedisBlobEncoding::Utf8,
+        }
+    }
+
+    #[test]
+    fn b64_decode_roundtrips_and_rejects_garbage() {
+        assert_eq!(b64_decode("YXBwOnVzZXI=").unwrap(), b"app:user");
+        assert_eq!(b64_decode("QWRh").unwrap(), b"Ada");
+        // Whitespace is tolerated, padding may be omitted.
+        assert_eq!(b64_decode(" QW Rh ").unwrap(), b"Ada");
+        // A stray character is not silently dropped.
+        assert!(b64_decode("!!!!").is_none());
+        assert!(b64_decode("").unwrap().is_empty());
+    }
+
+    #[test]
+    fn redis_blob_text_decodes_utf8_and_hexes_binary() {
+        assert_eq!(redis_blob_text(&blob("hello world")), "hello world");
+        let binary = RedisBlob {
+            raw_base64: base64_encode(&[0x00, 0xff, 0x10]),
+            encoding: RedisBlobEncoding::Binary,
+        };
+        assert_eq!(redis_blob_text(&binary), "0x00ff10");
+        // A UTF-8 blob that is not valid UTF-8 must not panic.
+        let broken = RedisBlob {
+            raw_base64: base64_encode(&[0xff, 0xfe]),
+            encoding: RedisBlobEncoding::Utf8,
+        };
+        assert!(redis_blob_text(&broken).starts_with("<binary"));
+    }
+
+    #[test]
+    fn redis_value_view_renders_each_type() {
+        let hash = RedisValue {
+            key_display: "app:user".into(),
+            key_raw: "YXBwOnVzZXI=".into(),
+            ttl: -1,
+            redis_type: "hash".into(),
+            data: RedisValueData::Hash {
+                items: vec![
+                    dbx_core::db::redis_driver::RedisHashItem {
+                        field: blob("name"),
+                        value: blob("Ada"),
+                        field_ttl: Some(-1),
+                    },
+                    dbx_core::db::redis_driver::RedisHashItem {
+                        field: blob("role"),
+                        value: blob("admin"),
+                        field_ttl: Some(60),
+                    },
+                ],
+                total: 2,
+                scan_cursor: None,
+            },
+        };
+        let view = redis_value_view(hash);
+        assert_eq!(view.grid.columns, vec!["field", "value", "TTL"]);
+        assert_eq!(view.grid.rows.len(), 2);
+        assert_eq!(view.grid.rows[0][0].text(), "name");
+        assert_eq!(view.grid.rows[0][1].text(), "Ada");
+        assert!(view.grid.rows[0][2].is_null());
+        assert_eq!(view.grid.rows[1][2].text(), "60s");
+        assert_eq!(view.row_keys, vec!["name", "role"]);
+
+        let string = RedisValue {
+            key_display: "k".into(),
+            key_raw: "aw==".into(),
+            ttl: 120,
+            redis_type: "string".into(),
+            data: RedisValueData::String {
+                content: blob("hello world"),
+                total_bytes: Some(11),
+                truncated: false,
+            },
+        };
+        let view = redis_value_view(string);
+        assert_eq!(view.grid.columns, vec!["value"]);
+        assert_eq!(view.grid.rows[0][0].text(), "hello world");
+        assert!(view.grid.note.contains("11"));
+
+        let zset = RedisValue {
+            key_display: "z".into(),
+            key_raw: "eg==".into(),
+            ttl: -1,
+            redis_type: "zset".into(),
+            data: RedisValueData::Zset {
+                items: vec![dbx_core::db::redis_driver::RedisZsetItem {
+                    score: "1.5".into(),
+                    member: blob("alice"),
+                }],
+                total: 1,
+                scan_cursor: None,
+            },
+        };
+        let view = redis_value_view(zset);
+        assert_eq!(view.grid.columns, vec!["score", "member"]);
+        assert_eq!(view.grid.rows[0][0].text(), "1.5");
+        assert_eq!(view.grid.rows[0][1].text(), "alice");
+    }
+
+    #[test]
+    fn redis_prompt_commands_quote_and_shape() {
+        assert_eq!(
+            redis_prompt_command(RedisPromptKind::Ttl, "app:user", "", "120"),
+            "EXPIRE \"app:user\" 120"
+        );
+        assert_eq!(
+            redis_prompt_command(RedisPromptKind::Rename, "a", "", "b"),
+            "RENAME \"a\" \"b\""
+        );
+        assert_eq!(
+            redis_prompt_command(RedisPromptKind::StringValue, "k", "", "hi there"),
+            "SET \"k\" \"hi there\""
+        );
+        assert_eq!(
+            redis_prompt_command(RedisPromptKind::HashField, "k", "name", "Ada"),
+            "HSET \"k\" \"name\" \"Ada\""
+        );
+        // Quotes and backslashes are escaped so the tokenizer sees one argument.
+        assert_eq!(
+            redis_prompt_command(RedisPromptKind::StringValue, "k", "", "a\"b\\c"),
+            "SET \"k\" \"a\\\"b\\\\c\""
+        );
+        assert!(redis_prompt_command(RedisPromptKind::Pattern, "", "", "*").is_empty());
+    }
+
+    #[test]
+    fn mongo_docs_grid_unions_keys_with_id_first() {
+        let docs = vec![
+            serde_json::json!({"name": "Ada", "age": 36}),
+            serde_json::json!({"_id": "x", "name": "Bob", "city": "Paris"}),
+        ];
+        let grid = mongo_docs_grid(&docs);
+        assert_eq!(grid.columns[0], "_id");
+        assert!(grid.columns.contains(&"name".to_string()));
+        assert!(grid.columns.contains(&"city".to_string()));
+        // A missing field is NULL, not the empty string.
+        let row0 = &grid.rows[0];
+        let id_idx = grid.columns.iter().position(|c| c == "_id").unwrap();
+        assert!(row0[id_idx].is_null());
+        assert_eq!(grid.rows.len(), 2);
+    }
+
+    #[test]
+    fn backend_kind_is_inferred_from_the_connection_type() {
+        let mk = |t: &str| {
+            new_connection_config(
+                "id".to_string(),
+                t.to_string(),
+                parse_database_type(t).unwrap(),
+                "h".to_string(),
+                1,
+                "u".to_string(),
+                String::new(),
+                None,
+                false,
+                None,
+            )
+            .unwrap()
+        };
+        assert_eq!(backend_for_connection(&mk("redis")), Backend::Redis);
+        assert_eq!(backend_for_connection(&mk("mongodb")), Backend::Mongo);
+        assert_eq!(backend_for_connection(&mk("mysql")), Backend::Sql);
+        assert_eq!(backend_for_connection(&mk("postgres")), Backend::Sql);
+    }
+
+    #[test]
+    fn redis_ttl_and_type_badges() {
+        assert_eq!(redis_ttl_label(-1), "永不过期");
+        assert_eq!(redis_ttl_label(-2), "不存在");
+        assert_eq!(redis_ttl_label(90), "90s");
+        assert_eq!(redis_type_badge("string").0, "S");
+        assert_eq!(redis_type_badge("hash").0, "H");
+        assert_eq!(redis_type_badge("list").0, "L");
+        assert_eq!(redis_type_badge("zset").0, "Z");
+        assert_eq!(redis_type_badge("stream").0, "X");
+        assert_eq!(redis_type_badge("weird").0, "?");
     }
 }

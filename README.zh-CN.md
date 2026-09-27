@@ -35,10 +35,18 @@
 - ✅ **SQL 编辑器**：多行编辑，shell 风格 `↑`/`↓` 历史（从 DBX 共享查询历史初始化），执行后焦点自动到结果区
 - ✅ MySQL 服务端错误原样回显在状态栏
 - ✅ **自适应布局**：`Ctrl-A` 是自动折叠的唯一总开关 —— 默认关闭（所有栏保持展开）；开启后非焦点的侧栏 / 编辑器**收缩为单行条**，把空间让给焦点区。低于 50 列时各栏**纵向堆叠**（侧栏条 → 编辑器 → 结果）。`Ctrl-W` 只收起/展开当前焦点栏（手动覆盖优先于总开关），`Tab`/`Shift-Tab` 循环切换区域，`Alt-1`/`Alt-2`/`Alt-3` 直接聚焦，点击收起条即展开并聚焦。状态栏与帮助浮层常显当前自动折叠状态
-- ✅ Redis：连接、`SET`/`GET`/`KEYS`/`DBSIZE`、带引号参数、`[` `]` 切换 db 均已端到端实测
-- ✅ MongoDB：`db.col.find({})`、`use <db>` 切库、多行输出均已端到端实测
+- ✅ **Redis key 浏览器**：连接 Redis 后侧栏自动变为分页 `SCAN` key 列表（绝不阻塞式 `KEYS *`），每行带类型徽标与 TTL；`/` 编辑服务端 `MATCH` 模式，`n` 加载更多，`d` / `[` `]` 切换 16 个逻辑 db。选中 key 后按类型渲染 value —— string（字节数/截断）、hash（`field`/`value`/TTL）、list（`index`/`value`）、set、zset（`score`/`member`）、stream（`id`/`fields`）、RedisJSON；集合超过 200 项可 `n` 继续加载。`e` 编辑 string 或 hash 字段，`x` 设置 TTL，`m` 重命名，`Del` 删除 key，`y` 复制当前行；所有写操作都走与 SQL 编辑相同的红色确认层。原生 `redis-cli` 命令台（`Ctrl-L` 后 `Tab`）保留
+- ✅ **MongoDB 文档浏览器**：连接 MongoDB 后列出 collection，`Enter` 以网格浏览文档（顶层字段并集，`_id` 优先），`n`/`p` 翻页，`f` 过滤 JSON（如 `{"age": {"$gt": 30}}`），`r` 查看 collection 索引。`db.col.find({})`、`use <db>` 与多行输出仍在 Mongo shell 命令台中可用
 - ✅ `dbxt --version` / `dbxt --help` 不启动 TUI 即可输出版本与用法
 - ⚠️ 发布工作流会产出 Linux（x86_64 / ARM64，glibc + 静态 musl）、macOS（Intel / Apple Silicon）与 Windows（x86_64）预编译包；目前只有 Linux x86_64 在本机实测过，其余产物未验证。Android/Termux 无专用构建 —— 见《安装》
+
+### Redis
+
+连接 Redis（按类型自动识别）后，侧栏不再是表列表，而是 **key 浏览器**。key 用 `SCAN` 分页获取 —— 绝不发送 `KEYS *`，因此大 keyspace 不会阻塞服务器 —— 每行显示一个字母的类型徽标（`S`tring、`H`ash、`L`ist、s`E`t、`Z`set、stream、`J`son）以及过期 key 的 TTL。`/` 编辑服务端 `MATCH` 模式，`n`（或滚到底部）加载下一页，`r` 从头重扫，`d` / `←` / `→` 切换 16 个逻辑 db。`Enter` 打开 key：结果区按类型渲染 value（string、hash、list、set、zset、stream、RedisJSON 各自合适的列），集合超过 200 项时 `n` 继续加载。`e` 编辑 string 内容或当前 hash 字段，`x` 设置 TTL 秒数（`-1` 持久化，`0` 立即删除），`m` 重命名，`Del` 删除 key，`y` 复制当前行为 TSV。每个写操作都显示在与 SQL 编辑相同的红色确认层中，只有 `Enter` 才执行。浏览器未覆盖的功能仍可用 `Ctrl-L`（再 `Tab` 切到命令台）的原生 `redis-cli` 命令行完成，支持带引号参数与 `[` `]` 切库。
+
+### MongoDB
+
+连接 MongoDB 后侧栏列出 collection。`Enter` 以网格浏览该 collection：列是文档顶层字段的并集（`_id` 优先，嵌套值以 JSON 显示），`n`/`p` 翻页，`f` 应用 JSON 过滤（`{"age": {"$gt": 30}}`），留空回车即清除。`r` 显示 collection 的索引（名称 / 列 / 唯一 / 主键 / 类型 / 过滤 / TTL），作为表结构的 Mongo 类比。Mongo shell 命令台（`Ctrl-L` 后 `Tab`）仍可执行 `db.col.find({})`、`use <db>`、计数等，`d` 切换数据库。
 
 ## 与 DBX 的关系
 
@@ -261,6 +269,19 @@ DBX_DATA_DIR=/path/to/dir dbxt
 | 编辑器 | `↑` / `↓` | 历史命令（光标在首行 / 末行时） |
 | 编辑器 | `Esc` | 回到侧栏 |
 | Redis 输入行 | `[` `]` | 切换 Redis db（0/1/2…） |
+| Redis key 浏览器 | `↑` `↓` | 在 key 列表移动 |
+| Redis key 浏览器 | `/` | 编辑服务端 `MATCH` 模式（`Enter` 应用，留空 = `*`） |
+| Redis key 浏览器 | `n` / `End` | 加载下一 `SCAN` 页 |
+| Redis key 浏览器 | `r` | 以当前模式从头重扫 |
+| Redis key 浏览器 | `←` `→`（`h` `l`） | 切换逻辑 db（0/1/2…） |
+| Redis key 浏览器 | `Enter` | 按类型打开 key 的 value |
+| Redis value | `e` / `x` / `m` / `Del` | 编辑 string 或 hash 字段 / 设置 TTL / 重命名 / 删除 key（均有确认） |
+| Redis value | `n` | 加载大 hash / list / set / zset 的下一 200 项 |
+| Redis value | `y` | 复制当前行为 TSV |
+| Mongo collection | `r` | collection 索引（表结构的 Mongo 类比） |
+| Mongo 文档 | `n` / `p` | 下一页 / 上一页文档 |
+| Mongo 文档 | `f` | JSON 过滤（`Enter` 应用，留空清除） |
+| Mongo 文档 | `y` | 复制当前文档行为 TSV |
 | MongoDB 输入行 | `use dbname` + `Enter` | 切换数据库 |
 | 结果区 | `↑` `↓` `j` `k` | 移动行光标（到边自动翻页） |
 | 结果区 | `PgUp` / `PgDn` | 整屏滚动，跨页时自动衔接 |
