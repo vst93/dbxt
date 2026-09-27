@@ -1711,6 +1711,332 @@ fn wrap_sql_lines(sql: &str, width: usize) -> Vec<String> {
         .collect()
 }
 
+// ─── SQL formatter (pure text state machine, no extra dependency) ────────────
+
+/// One lexical piece of a SQL statement. Whitespace is dropped by the
+/// tokenizer; a [`SqlTok::Word`] remembers whether it was *immediately* followed
+/// by `(`, so a function call (`count(`) can be told from a keyword (`IN (`).
+#[derive(Debug, Clone, PartialEq)]
+enum SqlTok {
+    Word { text: String, call: bool },
+    /// A string literal or quoted identifier, kept verbatim (quotes included).
+    Quoted(String),
+    /// A `-- …` or `/* … */` comment, kept verbatim.
+    Comment(String),
+    Punct(char),
+}
+
+/// Split SQL into words, quoted regions, comments and punctuation. String
+/// literals (`'…'`), quoted identifiers (`` `…` `` / `"…"`) and both comment
+/// forms are captured verbatim, so the formatter can never rewrite their
+/// contents (a `FROM` inside a literal or a comment is not a clause).
+fn sql_tokenize(sql: &str) -> Vec<SqlTok> {
+    let chars: Vec<char> = sql.chars().collect();
+    let mut out = Vec::new();
+    let mut i = 0usize;
+    while i < chars.len() {
+        let c = chars[i];
+        if c.is_whitespace() {
+            i += 1;
+            continue;
+        }
+        // `-- …` line comment (up to, but not including, the newline).
+        if c == '-' && chars.get(i + 1) == Some(&'-') {
+            let start = i;
+            while i < chars.len() && chars[i] != '\n' {
+                i += 1;
+            }
+            out.push(SqlTok::Comment(chars[start..i].iter().collect()));
+            continue;
+        }
+        // `/* … */` block comment.
+        if c == '/' && chars.get(i + 1) == Some(&'*') {
+            let start = i;
+            i += 2;
+            while i < chars.len() && !(chars[i] == '*' && chars.get(i + 1) == Some(&'/')) {
+                i += 1;
+            }
+            if i < chars.len() {
+                i += 2;
+            }
+            out.push(SqlTok::Comment(chars[start..i].iter().collect()));
+            continue;
+        }
+        // Quoted literal / identifier: consume through the matching quote,
+        // honouring doubled quotes and backslash escapes inside a string.
+        if c == '\'' || c == '"' || c == '`' {
+            let quote = c;
+            let start = i;
+            i += 1;
+            while i < chars.len() {
+                if chars[i] == '\\' && quote == '\'' && i + 1 < chars.len() {
+                    i += 2;
+                    continue;
+                }
+                if chars[i] == quote {
+                    if chars.get(i + 1) == Some(&quote) {
+                        i += 2;
+                        continue;
+                    }
+                    i += 1;
+                    break;
+                }
+                i += 1;
+            }
+            out.push(SqlTok::Quoted(chars[start..i].iter().collect()));
+            continue;
+        }
+        // Bare word (keyword / identifier / function name).
+        if c.is_alphanumeric() || c == '_' || c == '$' {
+            let start = i;
+            while i < chars.len()
+                && (chars[i].is_alphanumeric() || chars[i] == '_' || chars[i] == '$')
+            {
+                i += 1;
+            }
+            let call = chars.get(i) == Some(&'(');
+            out.push(SqlTok::Word {
+                text: chars[start..i].iter().collect(),
+                call,
+            });
+            continue;
+        }
+        out.push(SqlTok::Punct(c));
+        i += 1;
+    }
+    out
+}
+
+/// Words the formatter upper-cases. Function names are exempted separately via
+/// the tokenizer's `call` flag, so `count(` keeps whatever case the user typed.
+const SQL_FORMAT_KEYWORDS: &[&str] = &[
+    "ALL", "ALTER", "ANALYZE", "AND", "ANY", "ARRAY", "AS", "ASC", "BEGIN", "BETWEEN",
+    "BY", "CASCADE", "CASE", "CAST", "CHECK", "COLUMN", "COMMIT", "CONFLICT", "CONSTRAINT",
+    "CREATE", "CROSS", "DEFAULT", "DELETE", "DESC", "DISTINCT", "DO", "DROP", "ELSE", "END",
+    "EXCEPT", "EXISTS", "EXPLAIN", "FETCH", "FILTER", "FOREIGN", "FROM", "FULL", "GRANT",
+    "GROUP", "HAVING", "IF", "ILIKE", "IN", "INDEX", "INNER", "INSERT", "INTERSECT", "INTO",
+    "IS", "JOIN", "KEY", "LATERAL", "LEFT", "LIKE", "LIMIT", "NATURAL", "NEXT", "NOT",
+    "NOTHING", "NULL", "OFFSET", "ON", "ONLY", "OR", "ORDER", "OUTER", "OVER", "PARTITION",
+    "PRIMARY", "RECURSIVE", "REFERENCES", "RESTRICT", "RETURNING", "REVOKE", "RIGHT",
+    "ROLLBACK", "ROWS", "SELECT", "SET", "SIMILAR", "SOME", "TABLE", "THEN", "TOP",
+    "TRANSACTION", "TRUNCATE", "UNION", "UNIQUE", "UPDATE", "USING", "VALUES", "VIEW", "WHEN",
+    "WHERE", "WINDOW", "WITH",
+];
+
+/// Break kind for a clause: `0` none, `1` top-level clause (column 0), `2` JOIN
+/// (column 0), `3` sub-clause (indent 2).
+const BRK_NONE: u8 = 0;
+const BRK_TOP: u8 = 1;
+const BRK_JOIN: u8 = 2;
+const BRK_SUB: u8 = 3;
+
+/// Multi-word clauses, matched before the single-word rules so `GROUP BY`,
+/// `ORDER BY`, `INSERT INTO` and the JOIN family stay together on one line.
+const SQL_PHRASES: &[(&[&str], u8)] = &[
+    (&["GROUP", "BY"], BRK_TOP),
+    (&["ORDER", "BY"], BRK_TOP),
+    (&["UNION", "ALL"], BRK_TOP),
+    (&["INSERT", "INTO"], BRK_TOP),
+    (&["DELETE", "FROM"], BRK_TOP),
+    (&["CREATE", "TABLE"], BRK_TOP),
+    (&["CREATE", "VIEW"], BRK_TOP),
+    (&["CREATE", "INDEX"], BRK_TOP),
+    (&["ALTER", "TABLE"], BRK_TOP),
+    (&["DROP", "TABLE"], BRK_TOP),
+    (&["DROP", "VIEW"], BRK_TOP),
+    (&["DROP", "INDEX"], BRK_TOP),
+    (&["LEFT", "JOIN"], BRK_JOIN),
+    (&["RIGHT", "JOIN"], BRK_JOIN),
+    (&["INNER", "JOIN"], BRK_JOIN),
+    (&["OUTER", "JOIN"], BRK_JOIN),
+    (&["FULL", "JOIN"], BRK_JOIN),
+    (&["CROSS", "JOIN"], BRK_JOIN),
+    (&["NATURAL", "JOIN"], BRK_JOIN),
+    (&["LEFT", "OUTER", "JOIN"], BRK_JOIN),
+    (&["RIGHT", "OUTER", "JOIN"], BRK_JOIN),
+    (&["FULL", "OUTER", "JOIN"], BRK_JOIN),
+    (&["IS", "NOT"], BRK_NONE),
+    (&["IS", "NULL"], BRK_NONE),
+    (&["NOT", "NULL"], BRK_NONE),
+    (&["NOT", "IN"], BRK_NONE),
+    (&["NOT", "LIKE"], BRK_NONE),
+    (&["PRIMARY", "KEY"], BRK_NONE),
+    (&["FOREIGN", "KEY"], BRK_NONE),
+];
+
+fn sql_break_for_word(word_upper: &str) -> u8 {
+    match word_upper {
+        "SELECT" | "FROM" | "WHERE" | "HAVING" | "LIMIT" | "OFFSET" | "VALUES" | "SET"
+        | "UPDATE" | "INSERT" | "DELETE" | "CREATE" | "ALTER" | "DROP" | "WITH"
+        | "RETURNING" | "UNION" | "EXPLAIN" => BRK_TOP,
+        "JOIN" => BRK_JOIN,
+        "ON" | "AND" | "OR" | "WHEN" | "ELSE" | "END" => BRK_SUB,
+        _ => BRK_NONE,
+    }
+}
+
+/// Append one piece to a line, choosing whether a separating space is needed.
+/// `prev_was_call` is true when the previous piece was a function name, so the
+/// `(` sticks to it (`count(` rather than `count (`).
+fn push_sql_piece(out: &mut String, piece: &str, prev_was_call: bool, indent: usize) {
+    if out.is_empty() {
+        out.push_str(&" ".repeat(indent));
+        out.push_str(piece);
+        return;
+    }
+    if out.ends_with('\n') {
+        out.push_str(piece);
+        return;
+    }
+    let prev = out.chars().last().unwrap_or(' ');
+    let first = piece.chars().next().unwrap_or(' ');
+    let no_space = matches!(prev, '(' | '.' | ':' | '[')
+        || matches!(first, ',' | ')' | ';' | '.' | ':')
+        || (piece == "(" && prev_was_call);
+    if !no_space {
+        out.push(' ');
+    }
+    out.push_str(piece);
+}
+
+fn sql_flush(lines: &mut Vec<String>, cur: &mut String) {
+    let trimmed = cur.trim_end().to_string();
+    if !trimmed.trim().is_empty() {
+        lines.push(trimmed);
+    }
+    cur.clear();
+}
+
+/// Pretty-print a SQL statement: keywords upper-cased, main clauses on their own
+/// line, JOIN on its own line, sub-clauses indented two spaces, runs of
+/// whitespace collapsed. Literals, quoted identifiers and comments are copied
+/// verbatim. The result is a fixed point (`format_sql(format_sql(x)) ==
+/// format_sql(x)`).
+fn format_sql(sql: &str) -> String {
+    let toks = sql_tokenize(sql);
+    let mut lines: Vec<String> = Vec::new();
+    let mut cur = String::new();
+    let mut indent = 0usize;
+    let mut last_call = false;
+    let mut i = 0usize;
+    while i < toks.len() {
+        // A multi-word clause wins over the single-word rule.
+        let mut matched_phrase: Option<usize> = None;
+        if matches!(toks[i], SqlTok::Word { .. }) {
+            for (phrase, brk) in SQL_PHRASES {
+                if i + phrase.len() <= toks.len()
+                    && phrase.iter().enumerate().all(|(k, w)| match &toks[i + k] {
+                        SqlTok::Word { text, .. } => text.eq_ignore_ascii_case(w),
+                        _ => false,
+                    })
+                {
+                    if *brk != BRK_NONE {
+                        sql_flush(&mut lines, &mut cur);
+                        indent = if *brk == BRK_SUB { 2 } else { 0 };
+                    }
+                    for w in phrase.iter() {
+                        push_sql_piece(&mut cur, w, false, indent);
+                    }
+                    last_call = false;
+                    matched_phrase = Some(phrase.len());
+                    break;
+                }
+            }
+        }
+        if let Some(n) = matched_phrase {
+            i += n;
+            continue;
+        }
+        match &toks[i] {
+            SqlTok::Word { text, call } => {
+                let upper = text.to_ascii_uppercase();
+                let brk = sql_break_for_word(&upper);
+                if brk != BRK_NONE {
+                    sql_flush(&mut lines, &mut cur);
+                    indent = if brk == BRK_SUB { 2 } else { 0 };
+                }
+                // A known keyword keeps upper-casing even when it is immediately
+                // followed by `(` (`IN(`, `VALUES(`); only a real *function* name
+                // (a word that is not a keyword) keeps the user's case.
+                let is_keyword = SQL_FORMAT_KEYWORDS.contains(&upper.as_str());
+                let piece = if is_keyword { upper.as_str() } else { text.as_str() };
+                push_sql_piece(&mut cur, piece, false, indent);
+                last_call = *call;
+                i += 1;
+            }
+            SqlTok::Quoted(q) => {
+                push_sql_piece(&mut cur, q, false, indent);
+                last_call = false;
+                i += 1;
+            }
+            SqlTok::Comment(c) => {
+                push_sql_piece(&mut cur, c, false, indent);
+                last_call = false;
+                // A `--` comment runs to end of line, so force a newline after it.
+                if c.starts_with("--") {
+                    sql_flush(&mut lines, &mut cur);
+                }
+                i += 1;
+            }
+            SqlTok::Punct(p) => {
+                let mut buf = [0u8; 4];
+                let s = p.encode_utf8(&mut buf);
+                push_sql_piece(&mut cur, s, last_call, indent);
+                last_call = false;
+                if *p == ';' {
+                    sql_flush(&mut lines, &mut cur);
+                    indent = 0;
+                }
+                i += 1;
+            }
+        }
+    }
+    sql_flush(&mut lines, &mut cur);
+    lines.join("\n")
+}
+
+/// Collapse a statement back to a single line (the inverse of [`format_sql`]).
+/// A `--` line comment keeps its terminating newline so the rest of the
+/// statement is never swallowed by the comment.
+fn compress_sql(sql: &str) -> String {
+    let toks = sql_tokenize(sql);
+    let mut out = String::new();
+    let mut last_call = false;
+    for t in &toks {
+        match t {
+            SqlTok::Word { text, call } => {
+                push_sql_piece(&mut out, text, last_call, 0);
+                last_call = *call;
+            }
+            SqlTok::Quoted(q) => {
+                push_sql_piece(&mut out, q, last_call, 0);
+                last_call = false;
+            }
+            SqlTok::Comment(c) => {
+                push_sql_piece(&mut out, c, last_call, 0);
+                last_call = false;
+                if c.starts_with("--") {
+                    out.push('\n');
+                }
+            }
+            SqlTok::Punct(p) => {
+                let mut buf = [0u8; 4];
+                let s = p.encode_utf8(&mut buf);
+                push_sql_piece(&mut out, s, last_call, 0);
+                last_call = false;
+            }
+        }
+    }
+    out.trim_end().to_string()
+}
+
+/// True when `sql` is already in canonical formatted form (so the next `Alt-F`
+/// should compress it rather than format it again).
+fn is_sql_formatted(sql: &str) -> bool {
+    let trimmed = sql.trim();
+    !trimmed.is_empty() && format_sql(trimmed) == trimmed
+}
+
 // ─── dangerous-statement detection ───────────────────────────────────────────
 
 /// Strip SQL string literals and comments so keyword scans cannot be fooled by
@@ -1895,6 +2221,17 @@ enum Op {
     },
     Mongo(Box<ConnectionConfig>, String, String),
     History(Box<ConnectionConfig>),
+    /// Load the query-history panel: recent entries (newest first, unique SQL)
+    /// plus the SQL texts already saved as favourites, in one round trip.
+    HistoryPanel(Box<ConnectionConfig>),
+    /// Delete one history entry by id (config-store only; never the database).
+    HistoryDelete { id: String },
+    /// Toggle a statement in / out of DBX's `saved_sql_files` favourites.
+    HistoryFavorite {
+        cfg: Box<ConnectionConfig>,
+        sql: String,
+        name: String,
+    },
     Snippets(Box<ConnectionConfig>),
     /// Save the editor's SQL into DBX's `saved_sql_files` (query favourites).
     SaveSnippet(Box<ConnectionConfig>, String, String),
@@ -2036,6 +2373,20 @@ enum OpResult {
         summary: String,
     },
     History(Vec<String>),
+    /// The history panel's data: rows newest-first plus favourited SQL texts.
+    HistoryPanel {
+        rows: Vec<HistoryRow>,
+        favorites: Vec<String>,
+    },
+    HistoryDeleted {
+        id: String,
+        error: Option<String>,
+    },
+    HistoryFavorite {
+        sql: String,
+        favorited: bool,
+        error: Option<String>,
+    },
     Snippets(Vec<(String, String)>),
     SnippetSaved(String),
     DatabasesRefresh(Vec<String>),
@@ -2055,6 +2406,39 @@ enum OpResult {
     /// A best-effort host-key notice (changed / rejected / learn failed).
     SshNotice(Box<SshHostKeyNotice>),
     Error(String),
+}
+
+/// Persist one executed statement into DBX's shared query history so the
+/// editor's `↑`/`↓` recall and the `Alt-H` panel see dbxt's own runs, not just
+/// the ones the desktop app recorded. Best-effort: a storage hiccup must never
+/// turn a successful query into a failure.
+async fn record_history(
+    backend: &LocalBackend,
+    cfg: &ConnectionConfig,
+    db: &str,
+    sql: &str,
+    success: bool,
+    error: Option<String>,
+    elapsed_ms: u64,
+) {
+    let entry = dbx_core::history::HistoryEntry {
+        id: Uuid::new_v4().to_string(),
+        connection_id: cfg.id.clone(),
+        connection_name: cfg.name.clone(),
+        database: db.to_string(),
+        sql: sql.to_string(),
+        executed_at: now_iso8601(),
+        execution_time_ms: elapsed_ms as u128,
+        success,
+        error,
+        activity_kind: "query".to_string(),
+        operation: String::new(),
+        target: String::new(),
+        affected_rows: None,
+        rollback_sql: None,
+        details_json: None,
+    };
+    let _ = backend.state().storage.save_history_entry(&entry).await;
 }
 
 fn note_of(r: &dbx_core::db::QueryResult) -> String {
@@ -2364,6 +2748,9 @@ async fn run_op(backend: &LocalBackend, op: Op, tx: &Tx) -> OpResult {
         }
         Op::Query(cfg, db, sql, cap) => {
             let cap = cap.max(1);
+            // Record only a fresh run, never a `Ctrl-N` load-more (which re-runs
+            // the same statement with a higher cap and would duplicate it).
+            let record = cap <= QUERY_MAX_ROWS;
             let statements = dbx_core::sql::split_sql_statements_for_database(&sql, cfg.db_type);
             if statements.len() > 1 {
                 let options = QueryExecutionOptions {
@@ -2381,17 +2768,44 @@ async fn run_op(backend: &LocalBackend, op: Op, tx: &Tx) -> OpResult {
                                 .unwrap_or_else(|| format!("-- statement {}",  idx + 1));
                             outcomes.push(stmt_outcome(text, r));
                         }
+                        if record {
+                            record_history(backend, &cfg, &db, &sql, true, None, 0).await;
+                        }
                         OpResult::Script(outcomes)
                     }
-                    Err(e) => OpResult::Error(format!("script: {e}")),
+                    Err(e) => {
+                        if record {
+                            record_history(backend, &cfg, &db, &sql, false, Some(e.clone()), 0).await;
+                        }
+                        OpResult::Error(format!("script: {e}"))
+                    }
                 }
             } else {
                 match backend
                     .execute_query(&cfg, &db, &sql, Some(cap), Some(60))
                     .await
                 {
-                    Ok(r) => OpResult::Query(Box::new(r), sql, cap),
-                    Err(e) => OpResult::Error(format!("query: {e}")),
+                    Ok(r) => {
+                        if record {
+                            record_history(
+                                backend,
+                                &cfg,
+                                &db,
+                                &sql,
+                                true,
+                                None,
+                                r.execution_time_ms as u64,
+                            )
+                            .await;
+                        }
+                        OpResult::Query(Box::new(r), sql, cap)
+                    }
+                    Err(e) => {
+                        if record {
+                            record_history(backend, &cfg, &db, &sql, false, Some(e.clone()), 0).await;
+                        }
+                        OpResult::Error(format!("query: {e}"))
+                    }
                 }
             }
         }
@@ -2707,6 +3121,121 @@ async fn run_op(backend: &LocalBackend, op: Op, tx: &Tx) -> OpResult {
                     OpResult::History(seen)
                 }
                 Err(_) => OpResult::History(Vec::new()),
+            }
+        }
+        Op::HistoryPanel(cfg) => {
+            match backend
+                .state()
+                .storage
+                .load_history_entries(300, 0, Some("query".to_string()))
+                .await
+            {
+                Ok(entries) => {
+                    // Newest first (DBX returns descending order); unique SQL so
+                    // one statement run repeatedly does not flood the list.
+                    let mut rows: Vec<HistoryRow> = Vec::new();
+                    let mut seen: HashSet<String> = HashSet::new();
+                    for e in entries {
+                        let sql = e.sql.trim().to_string();
+                        if sql.is_empty() || !seen.insert(sql.clone()) {
+                            continue;
+                        }
+                        rows.push(HistoryRow {
+                            id: e.id,
+                            sql,
+                            executed_at: e.executed_at,
+                            connection_name: e.connection_name,
+                            success: e.success,
+                        });
+                        if rows.len() >= 300 {
+                            break;
+                        }
+                    }
+                    let favorites = match backend.state().storage.load_saved_sql_library().await {
+                        Ok(lib) => lib
+                            .files
+                            .into_iter()
+                            // Only this connection's snippets, plus unscoped ones.
+                            .filter(|f| f.connection_id.is_empty() || f.connection_id == cfg.id)
+                            .map(|f| f.sql)
+                            .collect(),
+                        Err(_) => Vec::new(),
+                    };
+                    OpResult::HistoryPanel { rows, favorites }
+                }
+                Err(e) => OpResult::Error(format!("history: {e}")),
+            }
+        }
+        Op::HistoryDelete { id } => {
+            match backend.state().storage.delete_history_entry(&id).await {
+                Ok(()) => OpResult::HistoryDeleted { id, error: None },
+                Err(e) => OpResult::HistoryDeleted {
+                    id,
+                    error: Some(e),
+                },
+            }
+        }
+        Op::HistoryFavorite { cfg, sql, name } => {
+            match backend.state().storage.load_saved_sql_library().await {
+                Ok(lib) => {
+                    let existing: Vec<String> = lib
+                        .files
+                        .iter()
+                        .filter(|f| {
+                            f.sql == sql && (f.connection_id.is_empty() || f.connection_id == cfg.id)
+                        })
+                        .map(|f| f.id.clone())
+                        .collect();
+                    if !existing.is_empty() {
+                        // Already a favourite: remove every matching copy.
+                        let mut err = None;
+                        for id in &existing {
+                            if let Err(e) = backend.state().storage.delete_saved_sql_file(id).await {
+                                err = Some(e);
+                            }
+                        }
+                        OpResult::HistoryFavorite {
+                            sql,
+                            favorited: err.is_some(),
+                            error: err,
+                        }
+                    } else {
+                        let now = now_iso8601();
+                        let file = dbx_core::saved_sql::SavedSqlFile {
+                            id: Uuid::new_v4().to_string(),
+                            connection_id: cfg.id.clone(),
+                            folder_id: None,
+                            name,
+                            database: cfg.database.clone().unwrap_or_default(),
+                            catalog: None,
+                            schema: None,
+                            sql,
+                            sql_loaded: true,
+                            order_index: 0,
+                            open_count: 0,
+                            opened_at: None,
+                            created_at: now.clone(),
+                            updated_at: now,
+                        };
+                        match backend.state().storage.save_saved_sql_file(&file).await {
+                            Ok(()) => OpResult::HistoryFavorite {
+                                sql: file.sql,
+                                favorited: true,
+                                error: None,
+                            },
+                            Err(e) => OpResult::HistoryFavorite {
+                                sql: file.sql,
+                                favorited: false,
+                                error: Some(e),
+                            },
+                        }
+                    }
+                }
+                Err(e) => OpResult::HistoryFavorite {
+                    sql,
+                    favorited: false,
+                    error: Some(e),
+                },
             }
         }
         Op::Snippets(cfg) => match backend.state().storage.load_saved_sql_library().await {
@@ -3515,6 +4044,27 @@ struct SshPromptState {
     input: String,
 }
 
+/// One row of the query-history browser (`Alt-H`): the statement plus the
+/// metadata DBX stores next to it, so the panel can show when and where it ran.
+#[derive(Clone, Debug, PartialEq)]
+struct HistoryRow {
+    id: String,
+    sql: String,
+    /// RFC3339 timestamp as DBX writes it (`2026-06-27T00:00:00Z`).
+    executed_at: String,
+    connection_name: String,
+    /// Whether the statement succeeded, shown as a subtle marker.
+    success: bool,
+}
+
+/// The red confirmation for deleting a single history entry. Deleting the
+/// history row never touches the database's data.
+#[derive(Clone)]
+struct HistoryConfirm {
+    id: String,
+    sql: String,
+}
+
 struct App {
     backend: Arc<LocalBackend>,
     page: Page,
@@ -3558,6 +4108,29 @@ struct App {
     history: Vec<String>,
     history_idx: Option<usize>,
     history_draft: String,
+    /// One-shot snapshot of the editor text before the last `Alt-F` reformat, so
+    /// a single `Ctrl-U` can undo it (tui-textarea's own undo needs two steps
+    /// for a whole-buffer replace).
+    editor_undo: Option<String>,
+
+    // ── query-history panel (Alt-H) ──
+    /// The overlay is open (it owns the keyboard until Esc / Enter).
+    history_open: bool,
+    /// Cursor inside the *filtered* view (`history_view`), not `history_rows`.
+    history_list: ListState,
+    /// Recent entries loaded from DBX's shared history (newest first, unique SQL).
+    history_rows: Vec<HistoryRow>,
+    /// SQL texts already saved as DBX favourites, for the `★` marker and the `f`
+    /// toggle.
+    history_favorites: HashSet<String>,
+    /// Active `/` filter needle (case-insensitive substring of the statement).
+    history_needle: String,
+    /// The `/` input while it is being typed (modal on top of the panel).
+    history_filter: Option<TextArea<'static>>,
+    /// Indices into `history_rows` that pass the needle: the list is the view.
+    history_view: Vec<usize>,
+    /// The red layer for deleting one history entry.
+    history_confirm: Option<HistoryConfirm>,
 
     // results
     grid: Option<Grid>,
@@ -4058,6 +4631,15 @@ impl App {
             history: Vec::new(),
             history_idx: None,
             history_draft: String::new(),
+            editor_undo: None,
+            history_open: false,
+            history_list: ListState::default(),
+            history_rows: Vec::new(),
+            history_favorites: HashSet::new(),
+            history_needle: String::new(),
+            history_filter: None,
+            history_view: Vec::new(),
+            history_confirm: None,
             grid: None,
             grid_kind: GridKind::Query,
             page_state: None,
@@ -4877,6 +5459,46 @@ fn apply_op_result(app: &mut App, res: OpResult, tx: &Tx) {
             }
             app.history_idx = None;
         }
+        OpResult::HistoryPanel { rows, favorites } => {
+            app.history_rows = rows;
+            app.history_favorites = favorites.into_iter().collect();
+            // The panel may have been closed before the reply landed; only
+            // refresh the visible state when it is still open. The needle is
+            // *not* cleared here: the user may already be typing a `/` filter.
+            if app.history_open {
+                recompute_history_view(app);
+                let n = app.history_rows.len();
+                app.status = if n == 0 {
+                    t("没有查询历史（执行一条 SQL 后再按 Alt-H）").into()
+                } else {
+                    tf("查询历史 · {} 条 · Enter 回填 · f 收藏 · Del 删除 · y 复制 · / 搜索", &[&n])
+                };
+            }
+        }
+        OpResult::HistoryDeleted { id, error } => {
+            if let Some(e) = error {
+                app.status = tf("✗ 删除历史失败: {}", &[&e]);
+            } else {
+                app.history_rows.retain(|r| r.id != id);
+                recompute_history_view(app);
+                app.status = t("✓ 已删除该条历史（数据库数据未受影响）").into();
+            }
+        }
+        OpResult::HistoryFavorite {
+            sql,
+            favorited,
+            error,
+        } => {
+            if let Some(e) = error {
+                app.status = tf("✗ 收藏操作失败: {}", &[&e]);
+            } else if favorited {
+                app.history_favorites.insert(sql);
+                app.status = t("✓ 已收藏该条 SQL（DBX saved_sql_files）").into();
+            } else {
+                app.history_favorites.remove(&sql);
+                app.status = t("已取消收藏").into();
+            }
+        }
         OpResult::Snippets(items) => {
             let n = items.len();
             app.snippets = items;
@@ -5128,6 +5750,12 @@ fn key(app: &mut App, tx: &Tx, k: KeyEvent) {
         return;
     }
 
+    // deleting a single history entry is confirmed in its own red layer
+    if app.history_confirm.is_some() {
+        history_confirm_key(app, tx, k);
+        return;
+    }
+
     // global: cycle backend line sql → redis → mongo
     if k.modifiers.contains(KeyModifiers::CONTROL) && k.code == KeyCode::Char('l') {
         app.backend_kind = match app.backend_kind {
@@ -5148,6 +5776,8 @@ fn key(app: &mut App, tx: &Tx, k: KeyEvent) {
         app.filter_prompt = None;
         app.help_open = false;
         app.db_picker_open = false;
+        app.history_open = false;
+        app.history_filter = None;
         app.set_placeholder();
         return;
     }
@@ -5352,6 +5982,16 @@ fn browse_key(app: &mut App, tx: &Tx, k: KeyEvent) {
         return;
     }
 
+    // Query-history overlay (Alt-H): the `/` filter input sits on top of it.
+    if app.history_filter.is_some() {
+        history_filter_key(app, k);
+        return;
+    }
+    if app.history_open {
+        history_key(app, tx, k);
+        return;
+    }
+
     // Recent-table overlay (Ctrl-Shift-R) is modal.
     if app.recent_open {
         recent_key(app, tx, k);
@@ -5463,10 +6103,10 @@ fn browse_key(app: &mut App, tx: &Tx, k: KeyEvent) {
     }
 
     // responsive layout: Alt-1/2/3 focus a pane and reset the collapse overrides.
-    // Alt-C / Alt-H / Alt-R are the mobile-efficiency view commands (compact
-    // columns / column visibility / recent tables): an Alt combo is reported
-    // distinctly by every terminal, unlike Ctrl-Shift-X which tmux and legacy
-    // terminals fold back into Ctrl-X.
+    // Alt-C / Alt-V / Alt-R / Alt-H are the mobile-efficiency view commands
+    // (compact columns / column visibility / recent tables / query history): an
+    // Alt combo is reported distinctly by every terminal, unlike Ctrl-Shift-X
+    // which tmux and legacy terminals fold back into Ctrl-X.
     if k.modifiers.contains(KeyModifiers::ALT) {
         match k.code {
             KeyCode::Char('1') => {
@@ -5488,12 +6128,18 @@ fn browse_key(app: &mut App, tx: &Tx, k: KeyEvent) {
                 toggle_compact(app);
                 return;
             }
-            KeyCode::Char('h') | KeyCode::Char('H') => {
+            // Alt-H is the query-history panel; column visibility keeps its
+            // `c` (results pane) and `Ctrl-Shift-H` bindings plus Alt-V here.
+            KeyCode::Char('v') | KeyCode::Char('V') => {
                 open_col_picker(app);
                 return;
             }
             KeyCode::Char('r') | KeyCode::Char('R') => {
                 open_recent_tables(app);
+                return;
+            }
+            KeyCode::Char('h') | KeyCode::Char('H') => {
+                open_history(app, tx);
                 return;
             }
             _ => {}
@@ -7702,6 +8348,38 @@ fn sidebar_db_label(app: &App) -> String {
 
 // ── editor / cmd input / preview ──
 
+/// `Alt-F`: format the editor's SQL, or compress an already-formatted statement
+/// back to one line. The previous text is snapshotted so a single `Ctrl-U` can
+/// undo the whole reformat.
+fn toggle_format_editor(app: &mut App) {
+    let text = app.editor_sql();
+    if text.trim().is_empty() {
+        app.status = t("编辑器为空，无需格式化").into();
+        return;
+    }
+    let next = if is_sql_formatted(&text) {
+        compress_sql(&text)
+    } else {
+        format_sql(&text)
+    };
+    if next == text {
+        app.status = t("已是最简形式").into();
+        return;
+    }
+    let formatted = is_sql_formatted(&next);
+    let lines = next.lines().count();
+    app.editor_undo = Some(text);
+    // Replace the whole buffer in one gesture; tui-textarea records it on its
+    // own undo stack as well.
+    app.editor.select_all();
+    app.editor.insert_str(&next);
+    app.status = if formatted {
+        tf("已格式化 · {} 行 · Ctrl-U 撤销", &[&lines])
+    } else {
+        t("已压缩为单行 · Ctrl-U 撤销").into()
+    };
+}
+
 fn editor_key(app: &mut App, tx: &Tx, k: KeyEvent) {
     // The completion popup owns the keyboard while it is open: Tab / Enter
     // accept, Esc cancels, arrows move, anything else keeps typing (and refines
@@ -7717,6 +8395,22 @@ fn editor_key(app: &mut App, tx: &Tx, k: KeyEvent) {
         (m, KeyCode::Char(' ')) if m.contains(KeyModifiers::CONTROL) => open_completion(app),
         (m, KeyCode::Null) if m.contains(KeyModifiers::CONTROL) || m.is_empty() => {
             open_completion(app)
+        }
+        // Alt-F: format the editor's SQL, or compress it back to one line when
+        // it is already in canonical form (idempotent toggle).
+        (KeyModifiers::ALT, KeyCode::Char('f')) | (KeyModifiers::ALT, KeyCode::Char('F')) => {
+            toggle_format_editor(app)
+        }
+        // Ctrl-U: undo the last Alt-F reformat in one step; with no reformat to
+        // undo it falls back to the editor's own undo history (tui-textarea),
+        // which has no default key binding of its own.
+        (m, KeyCode::Char('u')) if m.contains(KeyModifiers::CONTROL) => {
+            if let Some(prev) = app.editor_undo.take() {
+                app.set_editor_text(&prev);
+                app.status = t("已撤销格式化").into();
+            } else {
+                app.editor.undo();
+            }
         }
         (KeyModifiers::NONE, KeyCode::F(5)) => run_current(app, tx),
         (KeyModifiers::NONE, KeyCode::Tab) => {
@@ -9186,6 +9880,236 @@ fn open_recent(app: &mut App, tx: &Tx, idx: usize) {
         &[&(fix_double_encoding(&db)), &(fix_double_encoding(&qualified_display(&schema, &table)))],
     );
     reload_tables(app, tx);
+}
+
+// ── query-history panel (Alt-H) ──
+
+/// Open the history overlay: show what is already loaded, then refresh from
+/// DBX's shared store (recent 300, newest first, unique SQL).
+fn open_history(app: &mut App, tx: &Tx) {
+    if app.backend_kind != Backend::Sql {
+        app.status = t("查询历史仅用于 SQL 编辑器").into();
+        return;
+    }
+    let Some(cfg) = app.selected.clone() else {
+        app.status = t("✗ 未选择连接").into();
+        return;
+    };
+    app.history_open = true;
+    app.history_needle.clear();
+    app.history_filter = None;
+    app.history_confirm = None;
+    // Start at the newest entry, then clamp to the (possibly empty) view.
+    app.history_list.select(Some(0));
+    recompute_history_view(app);
+    app.status = t("加载查询历史…").into();
+    app.spawn(tx, Op::HistoryPanel(Box::new(cfg)));
+}
+
+/// Rebuild the filtered view (`history_view`) from the needle, keeping the
+/// cursor on a valid row.
+fn recompute_history_view(app: &mut App) {
+    let needle = app.history_needle.trim().to_lowercase();
+    app.history_view = app
+        .history_rows
+        .iter()
+        .enumerate()
+        .filter(|(_, r)| needle.is_empty() || r.sql.to_lowercase().contains(&needle))
+        .map(|(i, _)| i)
+        .collect();
+    let n = app.history_view.len();
+    if n == 0 {
+        app.history_list.select(None);
+    } else {
+        let sel = app.history_list.selected().unwrap_or(0).min(n - 1);
+        app.history_list.select(Some(sel));
+    }
+}
+
+/// The row under the panel cursor.
+fn history_selected_row(app: &App) -> Option<&HistoryRow> {
+    let sel = app.history_list.selected()?;
+    let idx = *app.history_view.get(sel)?;
+    app.history_rows.get(idx)
+}
+
+/// `2000-01-01T00:00:00Z` → `01-01 00:00`, so the list stays narrow.
+fn history_time_label(executed_at: &str) -> String {
+    let b = executed_at.as_bytes();
+    // Require an all-ASCII prefix so the byte slices below can never split a
+    // multi-byte character (real DBX timestamps are always RFC3339 ASCII).
+    if b.len() >= 16 && b[..16].is_ascii() && b.get(10) == Some(&b'T') {
+        format!("{}-{} {}", &executed_at[5..7], &executed_at[8..10], &executed_at[11..16])
+    } else {
+        truncate_disp(executed_at, 11)
+    }
+}
+
+/// First non-empty line of a statement, whitespace-collapsed, for the list.
+fn history_summary(sql: &str) -> String {
+    let first = sql
+        .lines()
+        .map(str::trim)
+        .find(|l| !l.is_empty())
+        .unwrap_or("");
+    one_line(first)
+}
+
+fn history_key(app: &mut App, tx: &Tx, k: KeyEvent) {
+    // The `/` input is modal on top of the panel.
+    if app.history_filter.is_some() {
+        history_filter_key(app, k);
+        return;
+    }
+    let n = app.history_view.len();
+    let step = |app: &mut App, delta: i32| {
+        if n == 0 {
+            return;
+        }
+        let cur = app.history_list.selected().unwrap_or(0) as i32;
+        let next = (cur + delta).clamp(0, n as i32 - 1) as usize;
+        app.history_list.select(Some(next));
+    };
+    match k.code {
+        KeyCode::Esc | KeyCode::Char('q') => {
+            app.history_open = false;
+            app.history_filter = None;
+            app.status = t("已关闭查询历史").into();
+        }
+        KeyCode::Up | KeyCode::Char('k') => step(app, -1),
+        KeyCode::Down | KeyCode::Char('j') => step(app, 1),
+        KeyCode::PageUp => step(app, -10),
+        KeyCode::PageDown => step(app, 10),
+        KeyCode::Home => {
+            if n > 0 {
+                app.history_list.select(Some(0));
+            }
+        }
+        KeyCode::End => {
+            if n > 0 {
+                app.history_list.select(Some(n - 1));
+            }
+        }
+        KeyCode::Char('/') => {
+            let mut ta = TextArea::from([app.history_needle.clone()]);
+            ta.move_cursor(CursorMove::End);
+            app.history_filter = Some(ta);
+            app.status = t("按语句内容过滤 · Enter 保留 · Esc 清除").into();
+        }
+        KeyCode::Enter => {
+            let Some(row) = history_selected_row(app) else {
+                app.status = t("没有可回填的历史").into();
+                return;
+            };
+            let sql = row.sql.clone();
+            app.history_open = false;
+            app.history_filter = None;
+            app.set_editor_text(&sql);
+            app.focus = Focus::Editor;
+            app.status = tf("已回填历史语句（{} 字符）", &[&(sql.chars().count())]);
+        }
+        KeyCode::Char('f') => history_toggle_favorite(app, tx),
+        KeyCode::Char('y') => {
+            let Some(row) = history_selected_row(app) else {
+                app.status = t("没有可复制的历史").into();
+                return;
+            };
+            let sql = row.sql.clone();
+            let n = sql.chars().count();
+            match clipboard_copy(&sql) {
+                Some(p) => {
+                    app.status = tf("✓ 已复制整条语句（{} 字符）· 兜底 {}", &[&n, &(p.display())])
+                }
+                None => app.status = tf("✓ 已复制整条语句（{} 字符）· OSC52 剪贴板", &[&n]),
+            }
+        }
+        KeyCode::Delete | KeyCode::Char('x') => {
+            let Some(row) = history_selected_row(app) else {
+                app.status = t("没有可删除的历史").into();
+                return;
+            };
+            app.history_confirm = Some(HistoryConfirm {
+                id: row.id.clone(),
+                sql: row.sql.clone(),
+            });
+            app.status = t("删除历史确认 · Enter 执行 · Esc 取消").into();
+        }
+        _ => {}
+    }
+}
+
+fn history_filter_key(app: &mut App, k: KeyEvent) {
+    match k.code {
+        KeyCode::Enter => {
+            app.history_filter = None;
+            app.status = tf("历史过滤「{}」· 命中 {}", &[&(app.history_needle), &(app.history_view.len())]);
+        }
+        KeyCode::Esc => {
+            app.history_filter = None;
+            app.history_needle.clear();
+            recompute_history_view(app);
+            app.status = t("已清除历史过滤").into();
+        }
+        _ => {
+            if let Some(ta) = app.history_filter.as_mut() {
+                ta.input(k);
+            }
+            app.history_needle = app
+                .history_filter
+                .as_ref()
+                .and_then(|ta| ta.lines().first().cloned())
+                .unwrap_or_default();
+            recompute_history_view(app);
+            app.history_list.select(Some(0));
+        }
+    }
+}
+
+/// Toggle the focused statement in / out of DBX's `saved_sql_files` favourites.
+fn history_toggle_favorite(app: &mut App, tx: &Tx) {
+    let Some(cfg) = app.selected.clone() else {
+        app.status = t("✗ 未选择连接").into();
+        return;
+    };
+    let Some(row) = history_selected_row(app) else {
+        app.status = t("没有可收藏的历史").into();
+        return;
+    };
+    let sql = row.sql.clone();
+    let name = {
+        let s = history_summary(&sql);
+        if s.trim().is_empty() {
+            "query".to_string()
+        } else {
+            truncate_disp(&s, 60)
+        }
+    };
+    app.status = t("更新收藏…").into();
+    app.spawn(
+        tx,
+        Op::HistoryFavorite {
+            cfg: Box::new(cfg),
+            sql,
+            name,
+        },
+    );
+}
+
+fn history_confirm_key(app: &mut App, tx: &Tx, k: KeyEvent) {
+    match k.code {
+        KeyCode::Enter | KeyCode::Char('y') | KeyCode::Char('Y') => {
+            let Some(c) = app.history_confirm.take() else {
+                return;
+            };
+            app.status = t("删除该条历史…").into();
+            app.spawn(tx, Op::HistoryDelete { id: c.id });
+        }
+        KeyCode::Esc | KeyCode::Char('n') | KeyCode::Char('N') => {
+            app.history_confirm = None;
+            app.status = t("已取消").into();
+        }
+        _ => {}
+    }
 }
 
 // ── sidebar table filter (`/`, filter-as-you-type) ──
@@ -12828,6 +13752,11 @@ fn ui(f: &mut Frame, app: &mut App) {
     if app.recent_open {
         render_recent_tables(f, f.area(), app);
     }
+    if app.history_open {
+        // Confine the panel to the content area so the header, status line and
+        // footer stay visible — `y`/`f`/`Del` feedback lands on the status line.
+        render_history_panel(f, chunks[1], app);
+    }
     if app.table_prompt.is_some() {
         render_table_filter(f, f.area(), app);
     }
@@ -12885,6 +13814,9 @@ fn ui(f: &mut Frame, app: &mut App) {
     }
     if let Some(confirm) = app.confirm.clone() {
         render_confirm(f, f.area(), &confirm);
+    }
+    if let Some(hc) = app.history_confirm.clone() {
+        render_history_confirm(f, f.area(), &hc);
     }
     if app.ssh_prompt.is_some() {
         render_ssh_prompt(f, f.area(), app);
@@ -13212,6 +14144,8 @@ enum FooterView {
     RedisPrompt,
     MongoDoc,
     TablePrompt,
+    HistoryFilter,
+    History,
     Recent,
     ColPicker,
     ConnPicker,
@@ -13242,6 +14176,8 @@ fn footer_ctx(app: &App) -> FooterCtx {
         FooterView::SshPrompt
     } else if app.edit_dialog.is_some() {
         FooterView::EditDialog
+    } else if app.history_confirm.is_some() {
+        FooterView::Confirm
     } else if app.help_open {
         FooterView::Help
     } else if app.import_report.is_some() {
@@ -13274,6 +14210,10 @@ fn footer_ctx(app: &App) -> FooterCtx {
         FooterView::MongoDoc
     } else if app.table_prompt.is_some() {
         FooterView::TablePrompt
+    } else if app.history_filter.is_some() {
+        FooterView::HistoryFilter
+    } else if app.history_open {
+        FooterView::History
     } else if app.recent_open {
         FooterView::Recent
     } else if app.col_picker_open {
@@ -13327,6 +14267,16 @@ fn footer_hints_ctx(ctx: FooterCtx) -> Vec<Hint> {
         FooterView::TablePrompt | FooterView::ResultFilter => {
             vec![("Enter", t("保留")), ("Esc", t("清除"))]
         }
+        FooterView::HistoryFilter => vec![("Enter", t("保留")), ("Esc", t("清除"))],
+        FooterView::History => vec![
+            ("↑↓", t("选择")),
+            ("Enter", t("回填编辑器")),
+            ("f", t("收藏")),
+            ("y", t("复制语句")),
+            ("Del", t("删除")),
+            ("/", t("搜索")),
+            ("Esc", t("关闭")),
+        ],
         FooterView::Recent => vec![
             ("↑↓", t("选择")),
             ("Enter", t("直达")),
@@ -15362,6 +16312,188 @@ fn render_recent_tables(f: &mut Frame, area: Rect, app: &mut App) {
     f.render_stateful_widget(list, box_area, &mut app.recent_list);
 }
 
+/// The query-history overlay (`Alt-H`): a list of recent statements on top and a
+/// wrapped preview of the focused statement below. The `/` filter input takes
+/// the bottom slot while it is being typed.
+fn render_history_panel(f: &mut Frame, area: Rect, app: &mut App) {
+    if area.width < 10 || area.height < 5 {
+        return;
+    }
+    let w = if area.width > 108 {
+        104
+    } else {
+        area.width.saturating_sub(2).max(8)
+    };
+    let h = area.height.saturating_sub(1).max(3);
+    let box_area = centered_overlay(area, w, h);
+    f.render_widget(Clear, box_area);
+
+    let total = app.history_rows.len();
+    let shown = app.history_view.len();
+    let title = if app.history_needle.trim().is_empty() {
+        tf(
+            " 查询历史 · {} 条 · Enter 回填 · f 收藏 · Del 删除 · y 复制 · / 搜索 · Esc 关 ",
+            &[&total],
+        )
+    } else {
+        tf(
+            " 查询历史 · 过滤「{}」 {}/{} · Esc 关 ",
+            &[&(app.history_needle), &shown, &total],
+        )
+    };
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_set(border::ROUNDED)
+        .border_style(Style::default().fg(Color::Cyan))
+        .title(Span::styled(title, Style::default().fg(Color::Cyan)));
+    let inner = block.inner(box_area);
+    f.render_widget(block, box_area);
+    if inner.width < 4 || inner.height < 2 {
+        return;
+    }
+
+    let list_w = inner.width as usize;
+    let items: Vec<ListItem> = if app.history_view.is_empty() {
+        vec![ListItem::new(Line::from(Span::styled(
+            t("（没有匹配的历史记录）"),
+            Style::default().fg(Color::DarkGray),
+        )))]
+    } else {
+        app.history_view
+            .iter()
+            .map(|&ri| {
+                let r = &app.history_rows[ri];
+                let fav = app.history_favorites.contains(&r.sql);
+                let time = history_time_label(&r.executed_at);
+                // On a narrow pane the source connection is dropped entirely so
+                // the statement summary keeps a usable width; a wide pane keeps
+                // the full time / favourite / summary / source row.
+                let src = if list_w >= 56 {
+                    truncate_disp(&r.connection_name, 18)
+                } else {
+                    String::new()
+                };
+                let reserved = disp_width(&time) + 4 + disp_width(&src) + 2;
+                let summary = truncate_disp(&history_summary(&r.sql), list_w.saturating_sub(reserved).max(8));
+                let sum_style = if r.success {
+                    Style::default().add_modifier(Modifier::BOLD)
+                } else {
+                    Style::default().fg(Color::Red)
+                };
+                let mut spans = vec![
+                    Span::styled(time, Style::default().fg(Color::DarkGray)),
+                    Span::raw(" "),
+                    Span::styled(if fav { "★" } else { " " }, Style::default().fg(Color::Yellow)),
+                    Span::raw(" "),
+                    Span::styled(summary, sum_style),
+                ];
+                if !src.is_empty() {
+                    spans.push(Span::styled(format!("  {src}"), Style::default().fg(Color::Cyan)));
+                }
+                ListItem::new(Line::from(spans))
+            })
+            .collect()
+    };
+    let list = List::new(items).highlight_style(
+        Style::default()
+            .bg(Color::DarkGray)
+            .add_modifier(Modifier::BOLD),
+    );
+
+    // Too short to split: show the list alone rather than squeezing three panes.
+    if inner.height < 6 {
+        f.render_stateful_widget(list, inner, &mut app.history_list);
+        return;
+    }
+
+    let filter_h = if app.history_filter.is_some() { 3 } else { 0 };
+    let region = inner.height.saturating_sub(1 + filter_h);
+    let list_h = ((region as u32 * 45 / 100) as u16).clamp(1, region.max(1));
+    let preview_h = region.saturating_sub(list_h).max(1);
+    let chunks = Layout::vertical([
+        Constraint::Length(list_h),
+        Constraint::Length(preview_h),
+        Constraint::Length(1),
+        Constraint::Length(filter_h),
+    ])
+    .split(inner);
+    f.render_stateful_widget(list, chunks[0], &mut app.history_list);
+    f.render_widget(
+        Paragraph::new(Line::from(Span::styled(
+            "─".repeat(chunks[2].width as usize),
+            Style::default().fg(Color::DarkGray),
+        ))),
+        chunks[2],
+    );
+
+    if let Some(ta) = app.history_filter.as_mut() {
+        ta.set_block(Block::default());
+        f.render_widget(&*ta, chunks[3]);
+        return;
+    }
+
+    let sel_sql = history_selected_row(app)
+        .map(|r| r.sql.clone())
+        .unwrap_or_default();
+    let lines = wrap_text(&sel_sql, chunks[1].width.max(1) as usize);
+    let truncated = lines.len() > 40;
+    let mut shown: Vec<Line> = lines
+        .iter()
+        .take(40)
+        .map(|l| Line::from(Span::styled(l.clone(), Style::default().fg(Color::White))))
+        .collect();
+    if truncated {
+        shown.push(Line::from(Span::styled(
+            tf("…（预览截断，共 {} 行）", &[&(lines.len())]),
+            Style::default().fg(Color::DarkGray),
+        )));
+    }
+    f.render_widget(Paragraph::new(shown), chunks[1]);
+}
+
+/// The red confirmation layer for deleting one query-history entry.
+fn render_history_confirm(f: &mut Frame, area: Rect, hc: &HistoryConfirm) {
+    let w = if area.width < 30 {
+        area.width
+    } else {
+        area.width.saturating_sub(4).min(72)
+    };
+    let inner_w = w.saturating_sub(4) as usize;
+    let sql_lines = wrap_sql_lines(&hc.sql, inner_w.max(1));
+    let max_h = area.height.saturating_sub(2) as usize;
+    let h = (sql_lines.len() + 5).min(max_h).max(3) as u16;
+    let box_area = centered_overlay(area, w, h);
+    f.render_widget(Clear, box_area);
+    let mut lines: Vec<Line> = vec![
+        Line::from(Span::styled(
+            t("⚠ 将删除这条查询历史（不可撤销；不影响数据库数据）"),
+            Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
+        )),
+        Line::from(""),
+    ];
+    let room = (box_area.height as usize).saturating_sub(4);
+    for l in sql_lines.iter().take(room) {
+        lines.push(Line::from(Span::styled(
+            l.clone(),
+            Style::default().fg(Color::White),
+        )));
+    }
+    lines.push(Line::from(""));
+    lines.push(Line::from(Span::styled(
+        t("Enter/y 执行   Esc/n 取消"),
+        Style::default().fg(Color::Yellow),
+    )));
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .title(Span::styled(
+            t(" ⚠ 删除历史确认 "),
+            Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
+        ))
+        .border_set(border::THICK)
+        .border_style(Style::default().fg(Color::Red));
+    f.render_widget(Paragraph::new(lines).block(block), box_area);
+}
+
 /// The `/` table-name filter prompt, drawn as a one-line box at the bottom.
 fn render_table_filter(f: &mut Frame, area: Rect, app: &mut App) {
     let w = area.width.saturating_sub(4).max(20).min(area.width);
@@ -15985,7 +17117,7 @@ const HELP_ROWS: &[(&str, &str)] = &[
     ("Ctrl-W", "收起 / 展开当前焦点区域"),
     ("Ctrl-G", "横滚模式（触屏兜底：滚轮/上下滑 = 横滚列）"),
     ("Alt-C / w", "紧凑列宽：窄屏自动共享列宽，宽表尽量一屏放下"),
-    ("Alt-H / c", "列显隐：空格勾选显示的列（按 库.表 记住，跨会话）"),
+    ("Alt-V / c", "列显隐：空格勾选显示的列（按 库.表 记住，跨会话）"),
     ("Alt-R / t", "最近浏览的 5 张表，Enter 直达（侧栏 t）"),
     ("Shift+← →", "列窗口横滚一列（任意区域，按住连滚）"),
     ("Ctrl-O", "SQL 片段收藏（DBX saved_sql_files）"),
@@ -16060,7 +17192,7 @@ const HELP_ROWS: &[(&str, &str)] = &[
     ("Ctrl-K", "附加排序键（多列排序）"),
     ("z", "钉住 / 取消首列"),
     ("w / Alt-C", "紧凑列宽 开 / 关（窄屏默认自动开，按 库.表 记住）"),
-    ("c / Alt-H", "列显隐浮层（空格勾选 / a 全选 / x 仅首列，按 库.表 记住）"),
+    ("c / Alt-V", "列显隐浮层（空格勾选 / a 全选 / x 仅首列，按 库.表 记住）"),
     ("Alt-R", "最近表直达浮层"),
     ("t", "字段 ↔ DDL（表结构）"),
     ("Esc", "收起结果 / 关闭浮层"),
@@ -16072,6 +17204,9 @@ const HELP_ROWS: &[(&str, &str)] = &[
     ("插入层 v / b", "转编辑器 / 加入批量（等价 Ctrl-V / Ctrl-T）"),
     ("Ctrl-S / Ctrl-X", "提交 / 清空批量队列"),
     ("— 编辑器 / 命令 —", ""),
+    ("Alt-H", "查询历史面板（最近 300 条：时间 / 摘要 / 来源连接）"),
+    ("Alt-F", "格式化当前 SQL（关键字大写 / 子句换行）；再按压缩为单行"),
+    ("Ctrl-U", "撤销上一次 Alt-F 格式化"),
     ("Ctrl-Space", "SQL 前缀补全（表名 T / 列名 C / 关键字 K，Tab 上屏）"),
     ("补全上下文", "表名. 后只补该表列名；FROM/JOIN 后优先表名；WHERE/ON 后优先列名"),
     ("↑ ↓", "历史（首行 / 末行）"),
@@ -16102,6 +17237,13 @@ const HELP_ROWS: &[(&str, &str)] = &[
     ("↑ ↓ / Enter", "选择 / 插入到编辑器"),
     ("s", "把编辑器里的 SQL 收藏为片段（写入 DBX saved_sql_files）"),
     ("r / Esc", "刷新 / 关闭"),
+    ("— 查询历史（Alt-H）—", ""),
+    ("↑ ↓ / PgUp PgDn", "移动光标（列表即过滤视图）"),
+    ("Enter", "回填到编辑器（关面板，光标到末尾）"),
+    ("f", "收藏 / 取消收藏该条（同一 DBX saved_sql_files 存储）"),
+    ("y", "复制整条语句"),
+    ("Del", "删除单条历史（红色确认，不影响数据库数据）"),
+    ("/", "按语句内容过滤（大小写不敏感子串）"),
 ];
 
 fn render_help(f: &mut Frame, area: Rect, app: &mut App) {
@@ -17068,6 +18210,9 @@ mod tests {
             app.db_picker_open = false;
             app.col_picker_open = false;
             app.recent_open = false;
+            app.history_open = false;
+            app.history_filter = None;
+            app.history_confirm = None;
             app.snippet_open = false;
             app.snippet_name = None;
             app.table_prompt = None;
@@ -17247,6 +18392,49 @@ mod tests {
             ("db-picker", Box::new(|a| a.db_picker_open = true)),
             ("col-picker", Box::new(|a| a.col_picker_open = true)),
             ("recent", Box::new(|a| a.recent_open = true)),
+            (
+                "history",
+                Box::new(|a| {
+                    a.history_rows = (0..40)
+                        .map(|i| HistoryRow {
+                            id: format!("h{i}"),
+                            sql: format!("SELECT column_{i} FROM a_very_long_table_name_{i} WHERE id = {i} AND ok = 1"),
+                            executed_at: "2026-06-27T12:34:56Z".into(),
+                            connection_name: "prod-mysql".into(),
+                            success: i % 5 != 0,
+                        })
+                        .collect();
+                    a.history_view = (0..a.history_rows.len()).collect();
+                    a.history_list.select(Some(0));
+                    a.history_open = true;
+                }),
+            ),
+            (
+                "history-filter",
+                Box::new(|a| {
+                    a.history_rows = vec![HistoryRow {
+                        id: "h0".into(),
+                        sql: "SELECT 1".into(),
+                        executed_at: "2026-06-27T12:34:56Z".into(),
+                        connection_name: "prod".into(),
+                        success: true,
+                    }];
+                    a.history_view = vec![0];
+                    a.history_list.select(Some(0));
+                    a.history_open = true;
+                    a.history_filter = Some(TextArea::from(["sel"]));
+                }),
+            ),
+            (
+                "history-confirm",
+                Box::new(|a| {
+                    a.history_open = true;
+                    a.history_confirm = Some(HistoryConfirm {
+                        id: "h0".into(),
+                        sql: "DELETE FROM users WHERE id = 1".into(),
+                    });
+                }),
+            ),
             ("snippets", Box::new(|a| a.snippet_open = true)),
             ("snippet-name", Box::new(|a| a.snippet_name = Some(TextArea::default()))),
             ("table-prompt", Box::new(|a| a.table_prompt = Some(TextArea::default()))),
@@ -18306,6 +19494,232 @@ mod tests {
         assert_eq!(lines, vec!["UPDATE t", "SET a = 1", "WHERE id = 2;"]);
         // blank lines are dropped so the preview stays compact
         assert_eq!(wrap_sql_lines("A\n\nB", 10), vec!["A", "B"]);
+    }
+
+    // ── SQL formatter (Alt-F) ──
+
+    #[test]
+    fn format_sql_splits_clauses_and_uppercases_keywords() {
+        let out = format_sql("select id, name from users where age > 30 and city = 'NY' order by name limit 10");
+        assert_eq!(
+            out,
+            "SELECT id, name\nFROM users\nWHERE age > 30\n  AND city = 'NY'\nORDER BY name\nLIMIT 10"
+        );
+        // JOIN gets its own line, ON is indented under it.
+        let joined = format_sql("select a.x from a left join b on a.id = b.id where a.ok = 1");
+        assert_eq!(
+            joined,
+            "SELECT a.x\nFROM a\nLEFT JOIN b\n  ON a.id = b.id\nWHERE a.ok = 1"
+        );
+    }
+
+    #[test]
+    fn format_sql_protects_literals_and_quoted_identifiers() {
+        // A `FROM` / keyword inside a literal or quoted identifier is untouched.
+        let out = format_sql("select 'from where select' as `from`, \"where\" from t where x = 'a''b'");
+        assert!(out.contains("'from where select'"), "{out}");
+        assert!(out.contains("`from`"), "{out}");
+        assert!(out.contains("\"where\""), "{out}");
+        assert!(out.contains("'a''b'"), "{out}");
+        // The literal must not have introduced a clause break.
+        assert_eq!(out.lines().filter(|l| l.contains("FROM")).count(), 1, "{out}");
+    }
+
+    #[test]
+    fn format_sql_protects_comments() {
+        let out = format_sql("select 1 -- from x where y\nfrom t /* where z */ where a = 1");
+        assert_eq!(
+            out,
+            "SELECT 1 -- from x where y\nFROM t /* where z */\nWHERE a = 1"
+        );
+    }
+
+    #[test]
+    fn format_sql_keeps_function_names() {
+        let out = format_sql("select count(*), max(price) from t");
+        // `count(` / `max(` are function calls: case is preserved, no break.
+        assert_eq!(out, "SELECT count(*), max(price)\nFROM t");
+        let mixed = format_sql("SELECT COUNT(*) FROM t");
+        assert_eq!(mixed, "SELECT COUNT(*)\nFROM t");
+    }
+
+    #[test]
+    fn format_sql_uppercases_keywords_before_parens() {
+        // `in(` / `values(` are keywords, not function names, so they are still
+        // upper-cased even without a separating space.
+        assert_eq!(
+            format_sql("select 1 where id in(1, 2)"),
+            "SELECT 1\nWHERE id IN(1, 2)"
+        );
+        assert_eq!(
+            format_sql("insert into t values(1)"),
+            "INSERT INTO t\nVALUES(1)"
+        );
+        // A keyword used as a function (`cast(`) follows the keyword rule too…
+        assert_eq!(
+            format_sql("select cast(x as int) from t"),
+            "SELECT CAST(x AS int)\nFROM t"
+        );
+        // …while a plain function name keeps the user's case.
+        assert_eq!(format_sql("select count(*) from t"), "SELECT count(*)\nFROM t");
+    }
+
+    #[test]
+    fn format_sql_is_idempotent_and_toggle_round_trips() {
+        let src = "select a,b from t where x=1 and y=2";
+        let once = format_sql(src);
+        assert_eq!(format_sql(&once), once, "format must be a fixed point");
+        assert!(is_sql_formatted(&once));
+        assert!(!is_sql_formatted(src));
+        // Compressing the formatted form and formatting again returns to it.
+        let flat = compress_sql(&once);
+        assert_eq!(flat, "SELECT a, b FROM t WHERE x = 1 AND y = 2");
+        assert_eq!(format_sql(&flat), once);
+    }
+
+    #[test]
+    fn compress_sql_keeps_line_comment_from_eating_the_rest() {
+        // compress only collapses whitespace; it does not change keyword case.
+        let out = compress_sql("select 1 -- note\nfrom t");
+        assert_eq!(out, "select 1 -- note\nfrom t");
+    }
+
+    #[test]
+    fn format_sql_handles_empty_and_punctuation_only() {
+        assert_eq!(format_sql(""), "");
+        assert_eq!(format_sql("   \n  "), "");
+        assert_eq!(compress_sql(""), "");
+        assert!(!is_sql_formatted(""));
+    }
+
+    #[test]
+    fn editor_format_toggle_and_undo_snapshot() {
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel::<OpResult>();
+        let mut app = test_app();
+        app.set_editor_text("select a from t where x=1");
+        toggle_format_editor(&mut app);
+        let formatted = app.editor_sql();
+        assert_eq!(formatted, "SELECT a\nFROM t\nWHERE x = 1");
+        assert!(app.editor_undo.is_some());
+        // A second Alt-F compresses the (now canonical) statement to one line.
+        toggle_format_editor(&mut app);
+        assert_eq!(app.editor_sql(), "SELECT a FROM t WHERE x = 1");
+        // Ctrl-U undoes the last reformat in one step.
+        editor_key(
+            &mut app,
+            &tx,
+            KeyEvent::new(KeyCode::Char('u'), KeyModifiers::CONTROL),
+        );
+        assert_eq!(app.editor_sql(), formatted);
+        assert!(app.editor_undo.is_none());
+    }
+
+    fn history_row(id: &str, sql: &str) -> HistoryRow {
+        HistoryRow {
+            id: id.into(),
+            sql: sql.into(),
+            executed_at: "2026-06-27T12:34:56Z".into(),
+            connection_name: "prod".into(),
+            success: true,
+        }
+    }
+
+    #[test]
+    fn history_filter_is_case_insensitive_substring() {
+        let mut app = test_app();
+        app.history_rows = vec![
+            history_row("1", "SELECT * FROM users"),
+            history_row("2", "delete from orders where id = 1"),
+        ];
+        app.history_needle = "FROM".into();
+        recompute_history_view(&mut app);
+        assert_eq!(app.history_view, vec![0, 1]);
+        app.history_needle = "orders".into();
+        recompute_history_view(&mut app);
+        assert_eq!(app.history_view, vec![1]);
+        app.history_needle = "nomatch".into();
+        recompute_history_view(&mut app);
+        assert!(app.history_view.is_empty());
+        assert_eq!(app.history_list.selected(), None);
+        // The list *is* the filter view: clearing the needle restores all rows.
+        app.history_needle.clear();
+        recompute_history_view(&mut app);
+        assert_eq!(app.history_view, vec![0, 1]);
+    }
+
+    #[test]
+    fn history_enter_recalls_into_editor_and_closes() {
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel::<OpResult>();
+        let mut app = test_app();
+        app.history_rows = vec![history_row("1", "SELECT 42")];
+        app.history_view = vec![0];
+        app.history_list.select(Some(0));
+        app.history_open = true;
+        app.focus = Focus::Sidebar;
+        history_key(
+            &mut app,
+            &tx,
+            KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+        );
+        assert!(!app.history_open);
+        assert_eq!(app.editor_sql(), "SELECT 42");
+        assert!(matches!(app.focus, Focus::Editor));
+    }
+
+    #[test]
+    fn history_time_label_and_summary_are_compact() {
+        assert_eq!(history_time_label("2026-06-27T12:34:56Z"), "06-27 12:34");
+        assert_eq!(history_time_label("nope"), "nope");
+        assert_eq!(history_summary("\n   SELECT a\nFROM t"), "SELECT a");
+    }
+
+    #[test]
+    fn history_delete_and_favorite_results_update_state() {
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel::<OpResult>();
+        let mut app = test_app();
+        app.history_rows = vec![history_row("1", "SELECT 1"), history_row("2", "SELECT 2")];
+        app.history_view = vec![0, 1];
+        apply_op_result(
+            &mut app,
+            OpResult::HistoryDeleted {
+                id: "1".into(),
+                error: None,
+            },
+            &tx,
+        );
+        assert_eq!(app.history_rows.len(), 1);
+        assert_eq!(app.history_rows[0].id, "2");
+        // A failed delete keeps the row.
+        apply_op_result(
+            &mut app,
+            OpResult::HistoryDeleted {
+                id: "2".into(),
+                error: Some("boom".into()),
+            },
+            &tx,
+        );
+        assert_eq!(app.history_rows.len(), 1);
+        // Favorite toggle tracks the SQL text.
+        apply_op_result(
+            &mut app,
+            OpResult::HistoryFavorite {
+                sql: "SELECT 2".into(),
+                favorited: true,
+                error: None,
+            },
+            &tx,
+        );
+        assert!(app.history_favorites.contains("SELECT 2"));
+        apply_op_result(
+            &mut app,
+            OpResult::HistoryFavorite {
+                sql: "SELECT 2".into(),
+                favorited: false,
+                error: None,
+            },
+            &tx,
+        );
+        assert!(!app.history_favorites.contains("SELECT 2"));
     }
 
     #[test]

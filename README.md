@@ -23,8 +23,10 @@ A keyboard-first terminal UI for databases, built on the [DBX](https://github.co
 - Tunnel failures are reported by stage: **SSH authentication failed**, **SSH host unreachable**, or **tunnel up but remote database unreachable** — so a wrong password, a wrong bastion address and a closed far-side port are told apart.
 
 **SQL editor & results**
-- Multi-line editor with shell-style `↑`/`↓` history (seeded from DBX's shared query history); `F5` / `Ctrl-J` runs.
+- Multi-line editor with shell-style `↑`/`↓` history (seeded from DBX's shared query history); `F5` / `Ctrl-J` runs. Every run is written back into that shared history (connection, database, timing, success flag), so the recall list and the `Alt-H` panel also cover the statements you ran here.
 - `Ctrl-Space` completes identifiers from context (tables / columns / keywords, tagged `T`/`C`/`K`); `Tab` accepts.
+- `Alt-H` opens the **query-history panel** (latest 300 statements, newest first, unique SQL): each row shows the time, the statement's first line and the source connection. `↑`/`↓`/`PgUp`/`PgDn` move, `Enter` recalls the statement into the editor (cursor at the end), `f` favourites / unfavourites it in DBX's `saved_sql_files`, `y` copies the whole statement, `Del` deletes one entry behind a red confirmation (history only — never database data), and `/` filters by statement text (case-insensitive substring). The focused statement is previewed, wrapped, below the list.
+- `Alt-F` formats the editor's SQL — keywords upper-cased, main clauses on their own line, `JOIN` on its own line, two-space indent, whitespace collapsed — while leaving string literals, quoted identifiers, comments and function names (`count(`) untouched. Pressing it again compresses a formatted statement back to one line (idempotent toggle); `Ctrl-U` undoes the reformat.
 - Every run keeps its own result tab (`[` / `]`); execution time and affected rows are shown.
 - `Ctrl-P` runs `EXPLAIN`, `Ctrl-Y` exports the result set (CSV / JSON / NDJSON / Markdown / INSERT), `Ctrl-N` loads more when a result hit the row cap.
 - `Ctrl-O` inserts a DBX saved snippet; `s` saves the editor's SQL back into that shared store.
@@ -62,7 +64,7 @@ A keyboard-first terminal UI for databases, built on the [DBX](https://github.co
 **Efficiency & experience**
 - `?` opens a keyboard cheat-sheet from anywhere; every overlay closes with `Esc`.
 - `Ctrl-A` auto-collapses unfocused panes and `Ctrl-W` pins one; below 50 columns the panes stack vertically.
-- `Alt-C` compacts column widths, `Alt-H` hides columns, `Alt-R` jumps to a recent table — choices persist per `database.table`.
+- `Alt-C` compacts column widths, `Alt-V` hides columns, `Alt-R` jumps to a recent table, `Alt-H` opens the query history — choices persist per `database.table`.
 - Mouse and touch work: click to select, click again to confirm; the wheel scrolls, `Shift`/`Alt`/`Ctrl`+wheel pans columns.
 - Failures are visible: a watchdog turns a dead backend into an error, a spinner with elapsed seconds shows work in flight, and server errors echo verbatim.
 - All UI strings come from one table (`src/ui_text.rs`); Chinese is the default, `DBXT_LANG=en` switches to English.
@@ -125,6 +127,7 @@ The TUI's `?` overlay and `dbxt --help` carry the complete list; this is the sho
 | Connection form | `↑` `↓`/`Tab` fields · `Enter` edit/toggle/save · `Space` toggle `ssh_tunnel`/`ssl`/`ssh_auth`, cycle the `color` palette · `Esc` back |
 | SSH host key | `y`/`Enter` accept & remember · `s` this session only · `n`/`Esc` reject |
 | Sidebar | `↑` `↓` tables · `/` filter · `Enter` browse · `r` structure · `I` import CSV · `t` recent |
+| Editor | `Alt-H` history panel · `Alt-F` format/compress · `Ctrl-U` undo format · `Ctrl-Space` complete · `F5`/`Ctrl-J` run · `↑` `↓` history |
 | Results | `↑` `↓` rows · `←` `→` columns · `n`/`p` pages · `Enter`/`v` cell · `e` edit · `i` insert · `Delete` delete |
 | Results (more) | `f` filter · `s` sort · `Ctrl-K` extra sort · `Ctrl-R` clear · `y` copy row · `/` search · `Ctrl-Y` export · `[` `]` tabs |
 | Redis | `Space` select · `a` all · `Del`/`x`/`m` batch delete/TTL/rename · `/` MATCH · `n` more · `e` edit · `Enter` value |
