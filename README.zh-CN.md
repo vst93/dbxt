@@ -9,7 +9,7 @@
 **连接管理** —— 与 DBX 桌面端共享
 - 连接存放在 DBX 自己的 SQLite 存储（`dbx.db`）里，你在桌面端配置过的连接自动可见。
 - `c` 在 TUI 内新建连接，`p` 复制到表单，`Enter` 连接；连接按数据库家族着色。
-- `d` 弹出数据库列表并切换 —— MySQL/PostgreSQL 库、MongoDB 库、Redis 逻辑 db 同一套手势。
+- `d` 弹出切换层 —— MySQL 库、PostgreSQL（及其他支持 schema 的引擎）先 schema 后库、MongoDB 库、Redis 逻辑 db 同一套手势。
 - `o` 返回连接选择，`r` 原地刷新列表。
 
 **SQL 编辑与结果**
@@ -109,7 +109,7 @@ cargo install --git https://github.com/vst93/dbxt
 | 场景 | 按键 |
 | --- | --- |
 | 全局 | `?` 帮助 · `Tab`/`Shift-Tab` 切栏 · `Alt-1/2/3` 聚焦 · `F5`/`Ctrl-J` 执行 · `Ctrl-C` 退出 |
-| 连接 | `↑` `↓` 移动 · `Enter` 连接 · `c` 新建 · `p` 复制 · `d` 数据库列表 · `o` 返回选择 |
+| 连接 | `↑` `↓` 移动 · `Enter` 连接 · `c` 新建 · `p` 复制 · `d` 数据库/schema 切换 · `o` 返回选择 |
 | 侧栏 | `↑` `↓` 表 · `/` 过滤 · `Enter` 浏览 · `r` 表结构 · `I` 导入 CSV · `t` 最近表 |
 | 结果区 | `↑` `↓` 行 · `←` `→` 列 · `n`/`p` 翻页 · `Enter`/`v` 单元格 · `e` 编辑 · `i` 插入 · `Delete` 删除 |
 | 结果区（续） | `f` 过滤 · `s` 排序 · `Ctrl-K` 追加排序 · `Ctrl-R` 清除 · `y` 复制行 · `/` 搜索 · `Ctrl-Y` 导出 · `[` `]` 标签 |
@@ -125,7 +125,7 @@ cargo install --git https://github.com/vst93/dbxt
 
 早期但已可用。已对真实 MySQL 8.4、PostgreSQL 16、Redis 和 MongoDB 端到端实测。
 
-**PostgreSQL** —— SQL 后端全程按 PostgreSQL 方言工作。标识符用双引号（`"schema"."table"`，含保留字）；`bytea`（`0x…` 单元格可回写为 `'\x…'::bytea`）、`uuid`、`jsonb`、数组（`ARRAY[…]`）与枚举均完整显示，复制/导出为合法 SQL；插入模板跳过 `serial`/identity 列，让序列保持权威；`Ctrl-P` 走普通 `EXPLAIN`（绝不用 `EXPLAIN ANALYZE`），写语句只生成计划、不实际执行。表结构与 DDL 读取 `pg_catalog`（`information_schema` 兜底），DDL 会解析关系的可见 schema（`CREATE TABLE "public"."accounts"`，含索引、约束与注释）。浏览范围是连接的 `public` schema；其他 schema（如 `inv.items`）暂不列出。
+**PostgreSQL** —— SQL 后端全程按 PostgreSQL 方言工作。标识符用双引号（`"schema"."table"`，含保留字）；`bytea`（`0x…` 单元格可回写为 `'\x…'::bytea`）、`uuid`、`jsonb`、数组（`ARRAY[…]`）与枚举均完整显示，复制/导出为合法 SQL；插入模板跳过 `serial`/identity 列，让序列保持权威；`Ctrl-P` 走普通 `EXPLAIN`（绝不用 `EXPLAIN ANALYZE`），写语句只生成计划、不实际执行。表结构与 DDL 读取 `pg_catalog`（`information_schema` 兜底），DDL 会解析关系的可见 schema（`CREATE TABLE "public"."accounts"`，含索引、约束与注释）。浏览全程感知 schema：`d` 列出当前库的 schema（schema 在前、库在后），侧栏显示 `inv.items` 式全限定名，表格数据、表结构、DDL、单元格编辑、插入、删除、过滤、排序、CSV 导入/导出与 INSERT 导出都会带上所选 schema —— `public.orders` 与 `inv.orders` 不会串。列显隐、排序与 `COUNT(*)` 缓存均按 `database.schema.table` 分键。
 
 - [x] SQL 浏览、编辑、事务、过滤 / 排序、补全、CSV 导入 / 导出与结果标签
 - [x] Redis key 浏览器与批量 key 操作

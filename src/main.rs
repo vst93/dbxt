@@ -21,11 +21,11 @@ use crossterm::execute;
 use dbx_core::db::redis_driver::{
     RedisBlob, RedisBlobEncoding, RedisCollectionPage, RedisKeyInfo, RedisValue, RedisValueData,
 };
-use dbx_core::models::connection::ConnectionConfig;
+use dbx_core::models::connection::{ConnectionConfig, DatabaseType};
 use dbx_core::query::QueryExecutionOptions;
 use dbx_core::sql_dialect::{
-    build_count_table_sql, build_table_data_select_sql_with_database, normalize_where_input,
-    quote_table_identifier, TableDataSelectSqlOptions,
+    build_count_table_sql, build_table_data_select_sql_with_database, is_schema_aware,
+    normalize_where_input, qualified_table_name, quote_table_identifier, TableDataSelectSqlOptions,
 };
 use dbx_core::types::{ColumnInfo, TableInfo};
 use dbx_mcp::backend::{
@@ -864,6 +864,8 @@ struct ResultTab {
 #[derive(Clone)]
 struct PageState {
     table: String,
+    /// Schema the table lives in (empty for engines without one, e.g. MySQL).
+    schema: String,
     table_type: Option<String>,
     page: usize,
     page_size: usize,
@@ -880,6 +882,9 @@ struct PageState {
 #[derive(Clone)]
 struct TableMeta {
     table: String,
+    /// Schema the metadata was read from; matched alongside the table name so
+    /// `public.orders` and `inv.orders` never swap column metadata.
+    schema: String,
     columns: Vec<ColumnInfo>,
 }
 
@@ -887,6 +892,7 @@ struct TableMeta {
 struct TableDataReq {
     cfg: Box<ConnectionConfig>,
     db: String,
+    schema: String,
     table: String,
     table_type: Option<String>,
     page: usize,
@@ -971,8 +977,9 @@ struct ImportPlan {
     headers: Vec<String>,
     /// Every data row (raw field strings, empty = NULL).
     rows: Vec<Vec<String>>,
-    /// Target table and database.
+    /// Target table, database and schema.
     table: String,
+    schema: String,
     db: String,
     /// Target columns with their CSV source index and inferred type.
     columns: Vec<ImportCol>,
@@ -997,6 +1004,7 @@ impl ImportPlan {
 struct ImportPrompt {
     input: TextArea<'static>,
     table: String,
+    schema: String,
     db: String,
     /// Inline error from the previous attempt (file missing, bad header …).
     error: Option<String>,
@@ -1006,6 +1014,7 @@ struct ImportPrompt {
 #[derive(Clone)]
 struct ImportReport {
     table: String,
+    schema: String,
     mode: ImportMode,
     total: usize,
     inserted: usize,
@@ -1026,6 +1035,7 @@ impl ImportReport {
 struct ImportJob {
     cfg: Box<ConnectionConfig>,
     db: String,
+    schema: String,
     table: String,
     /// Present columns only (src is Some), in target order.
     columns: Vec<ImportCol>,
@@ -1083,8 +1093,9 @@ const EXPORT_FORMATS: &[ExportFormat] = &[
 /// A generated export waiting for the destination (clipboard or file) step.
 struct ExportPending {
     format: ExportFormat,
-    /// The table name guessed for INSERT exports (`None` for the other formats).
-    table: Option<String>,
+    /// `(schema, table)` guessed for INSERT exports (`None` for the other
+    /// formats).
+    table: Option<(String, String)>,
 }
 
 #[derive(Clone)]
@@ -1175,6 +1186,7 @@ struct EditDialog {
     kind: EditKind,
     cfg: Box<ConnectionConfig>,
     db: String,
+    schema: String,
     table: String,
     // UPDATE fields
     column: String,
@@ -1499,13 +1511,14 @@ impl TuiConfig {
         }
     }
 
-    fn table(&self, db: &str, table: &str) -> Option<&TablePrefs> {
-        self.tables.get(&(db.to_string(), table.to_string()))
+    fn table(&self, db: &str, schema: &str, table: &str) -> Option<&TablePrefs> {
+        self.tables
+            .get(&(db.to_string(), table_pref_key(schema, table)))
     }
 
     /// Mutable access that records the entry as changed by this session.
-    fn entry(&mut self, db: &str, table: &str) -> &mut TablePrefs {
-        let key = (db.to_string(), table.to_string());
+    fn entry(&mut self, db: &str, schema: &str, table: &str) -> &mut TablePrefs {
+        let key = (db.to_string(), table_pref_key(schema, table));
         self.dirty.insert(key.clone());
         self.tables.entry(key).or_default()
     }
@@ -1773,11 +1786,14 @@ fn detect_danger(statement: &str) -> Option<String> {
 enum Op {
     ListConnections,
     Databases(Box<ConnectionConfig>),
-    ListTables(Box<ConnectionConfig>, String),
-    Columns(Box<ConnectionConfig>, String, String),
-    Ddl(Box<ConnectionConfig>, String, String),
+    /// Enumerate the schemas of one database (PostgreSQL and other
+    /// schema-aware engines).
+    ListSchemas(Box<ConnectionConfig>, String),
+    ListTables(Box<ConnectionConfig>, String, String, u64),
+    Columns(Box<ConnectionConfig>, String, String, String),
+    Ddl(Box<ConnectionConfig>, String, String, String),
     TableData(Box<TableDataReq>),
-    TableColumns(Box<ConnectionConfig>, String, String),
+    TableColumns(Box<ConnectionConfig>, String, String, String),
     Query(Box<ConnectionConfig>, String, String, usize),
     Redis(Box<ConnectionConfig>, u32, String),
     /// Paginated `SCAN` of the key browser.
@@ -1872,6 +1888,7 @@ enum Op {
     ImportPlan {
         cfg: Box<ConnectionConfig>,
         db: String,
+        schema: String,
         table: String,
         path: PathBuf,
         /// Request id; a stale plan (cancelled or superseded) is discarded.
@@ -1904,13 +1921,27 @@ enum OpResult {
         /// failure is never silent.
         warning: Option<String>,
     },
-    Tables(Vec<TableInfo>),
+    /// A table list plus the request id it answers, so a slow reply for a
+    /// database / schema the user already left cannot overwrite the current one.
+    TablesFor {
+        tables: Vec<TableInfo>,
+        gen: u64,
+    },
+    /// Schemas of `db`, in server order. A failed enumeration degrades to an
+    /// empty list (plus `warning`) so the flat table list still loads.
+    Schemas {
+        db: String,
+        schemas: Vec<String>,
+        warning: Option<String>,
+    },
     Columns {
         table: String,
+        schema: String,
         columns: Vec<ColumnInfo>,
     },
     Ddl {
         table: String,
+        schema: String,
         text: String,
     },
     TableData {
@@ -1919,6 +1950,7 @@ enum OpResult {
         has_next: bool,
         page: usize,
         table: String,
+        schema: String,
         table_type: Option<String>,
         filter: String,
         order_by: Option<String>,
@@ -1926,6 +1958,7 @@ enum OpResult {
     },
     TableColumns {
         table: String,
+        schema: String,
         columns: Vec<ColumnInfo>,
     },
     Query(Box<dbx_core::db::QueryResult>, String, usize),
@@ -2128,33 +2161,67 @@ async fn run_op(backend: &LocalBackend, op: Op, tx: &Tx) -> OpResult {
                 }),
             },
         },
-        Op::ListTables(cfg, db) => match backend.list_tables(&cfg, &db, "").await {
-            Ok(t) => OpResult::Tables(t),
+        Op::ListSchemas(cfg, db) => {
+            // `list_schemas_core` is the kernel's schema enumerator; it hides
+            // system schemas unless the connection opts in (`show_system_schemas`).
+            match dbx_core::schema::list_schemas_core(backend.state().as_ref(), &cfg.id, &db).await {
+                Ok(schemas) => OpResult::Schemas {
+                    db,
+                    schemas,
+                    warning: None,
+                },
+                // Not fatal: an engine whose schema list is unavailable (or
+                // denied) still browses its default namespace.
+                Err(e) => OpResult::Schemas {
+                    db,
+                    schemas: Vec::new(),
+                    warning: Some(tf("无法列举 schema（{}），按默认命名空间浏览", &[&(e)])),
+                },
+            }
+        }
+        Op::ListTables(cfg, db, schema, gen) => match backend.list_tables(&cfg, &db, &schema).await {
+            Ok(t) => OpResult::TablesFor { tables: t, gen },
             Err(e) => OpResult::Error(format!("list tables: {e}")),
         },
-        Op::Columns(cfg, db, table) => match backend.get_columns(&cfg, &db, "", &table).await {
-            Ok(c) => OpResult::Columns { table, columns: c },
+        Op::Columns(cfg, db, schema, table) => match backend.get_columns(&cfg, &db, &schema, &table).await {
+            Ok(c) => OpResult::Columns {
+                table,
+                schema,
+                columns: c,
+            },
             Err(e) => OpResult::Error(format!("columns: {e}")),
         },
-        Op::Ddl(cfg, db, table) => {
-            // PostgreSQL needs the real schema: the kernel renders
-            // `"schema"."table"`, so an empty schema becomes the invalid
-            // `""."table"`. Resolve the table's visible schema first (MySQL and
-            // friends leave it empty, where the database *is* the schema).
-            let schema = resolve_ddl_schema(backend, &cfg, &db, &table).await;
+        Op::Ddl(cfg, db, schema, table) => {
+            // PostgreSQL renders `"schema"."table"`; when the schema layer did
+            // not produce one (a failed `list_schemas`, an engine we do not
+            // browse schemas for) resolve the relation's visible schema first,
+            // because an empty schema yields the unusable `""."table"`. The
+            // *requested* schema is what the reply carries back, so the result
+            // guard keeps working even when the fallback resolved a different
+            // name.
+            let effective = if schema.trim().is_empty() && is_postgres_family(cfg.db_type.as_str()) {
+                resolve_ddl_schema(backend, &cfg, &db, &table).await
+            } else {
+                schema.clone()
+            };
             match dbx_core::schema::get_table_ddl_core(
                 backend.state().as_ref(),
                 &cfg.id,
                 &db,
-                &schema,
+                &effective,
                 &table,
                 None,
             )
             .await
             {
-                Ok(ddl) => OpResult::Ddl { table, text: ddl },
+                Ok(ddl) => OpResult::Ddl {
+                    table,
+                    schema,
+                    text: ddl,
+                },
                 Err(e) => OpResult::Ddl {
                     table,
+                    schema,
                     text: tf("-- 无法获取 DDL: {}", &[&(e)]),
                 },
             }
@@ -2163,6 +2230,7 @@ async fn run_op(backend: &LocalBackend, op: Op, tx: &Tx) -> OpResult {
             let TableDataReq {
                 cfg,
                 db,
+                schema,
                 table,
                 table_type,
                 page,
@@ -2177,6 +2245,7 @@ async fn run_op(backend: &LocalBackend, op: Op, tx: &Tx) -> OpResult {
             let filter = normalize_where_input(Some(&filter));
             let options = TableDataSelectSqlOptions {
                 database_type: Some(cfg.db_type),
+                schema: (!schema.trim().is_empty()).then(|| schema.clone()),
                 table_name: table.clone(),
                 table_type: table_type.clone(),
                 limit: Some(page_size + 1),
@@ -2202,7 +2271,11 @@ async fn run_op(backend: &LocalBackend, op: Op, tx: &Tx) -> OpResult {
                     let total = match known_total {
                         Some(t) => Some(t),
                         None => {
-                            let base = build_count_table_sql(Some(cfg.db_type), None, &table);
+                            let base = build_count_table_sql(
+                                Some(cfg.db_type),
+                                (!schema.trim().is_empty()).then_some(schema.as_str()),
+                                &table,
+                            );
                             let count_sql = if filter.is_empty() {
                                 base
                             } else {
@@ -2231,6 +2304,7 @@ async fn run_op(backend: &LocalBackend, op: Op, tx: &Tx) -> OpResult {
                         has_next,
                         page,
                         table,
+                        schema,
                         table_type,
                         filter,
                         order_by,
@@ -2240,10 +2314,16 @@ async fn run_op(backend: &LocalBackend, op: Op, tx: &Tx) -> OpResult {
                 Err(e) => OpResult::Error(format!("table data: {e}")),
             }
         }
-        Op::TableColumns(cfg, db, table) => match backend.get_columns(&cfg, &db, "", &table).await {
-            Ok(columns) => OpResult::TableColumns { table, columns },
-            Err(e) => OpResult::Error(format!("table columns: {e}")),
-        },
+        Op::TableColumns(cfg, db, schema, table) => {
+            match backend.get_columns(&cfg, &db, &schema, &table).await {
+                Ok(columns) => OpResult::TableColumns {
+                    table,
+                    schema,
+                    columns,
+                },
+                Err(e) => OpResult::Error(format!("table columns: {e}")),
+            }
+        }
         Op::Query(cfg, db, sql, cap) => {
             let cap = cap.max(1);
             let statements = dbx_core::sql::split_sql_statements_for_database(&sql, cfg.db_type);
@@ -2638,7 +2718,7 @@ async fn run_op(backend: &LocalBackend, op: Op, tx: &Tx) -> OpResult {
             Ok(saved) => OpResult::Added(tf("已保存: {} ({})", &[&(saved.name), &(saved.db_type.as_str())])),
             Err(e) => OpResult::Error(format!("save: {e}")),
         },
-        Op::ImportPlan { cfg, db, table, path, gen } => {
+        Op::ImportPlan { cfg, db, schema, table, path, gen } => {
             let expanded = expand_home(&path.to_string_lossy());
             let bytes = match std::fs::read(&expanded) {
                 Ok(b) => b,
@@ -2654,7 +2734,7 @@ async fn run_op(backend: &LocalBackend, op: Op, tx: &Tx) -> OpResult {
             if rows.is_empty() {
                 return OpResult::ImportFailed { gen, msg: t("CSV 没有数据行").into() };
             }
-            let table_columns = match backend.get_columns(&cfg, &db, "", &table).await {
+            let table_columns = match backend.get_columns(&cfg, &db, &schema, &table).await {
                 Ok(c) => c,
                 Err(e) => return OpResult::ImportFailed { gen, msg: tf("读取表结构失败: {}", &[&(e)]) },
             };
@@ -2679,6 +2759,7 @@ async fn run_op(backend: &LocalBackend, op: Op, tx: &Tx) -> OpResult {
                     headers,
                     rows,
                     table,
+                    schema,
                     db,
                     columns,
                     extra,
@@ -2693,6 +2774,7 @@ async fn run_op(backend: &LocalBackend, op: Op, tx: &Tx) -> OpResult {
             let ImportJob {
                 cfg,
                 db,
+                schema,
                 table,
                 columns,
                 rows,
@@ -2705,13 +2787,11 @@ async fn run_op(backend: &LocalBackend, op: Op, tx: &Tx) -> OpResult {
             // insert chunks, so a later failure leaves an empty (or partially
             // filled) table — that is what an overwrite means.
             if mode == ImportMode::Overwrite {
-                let del = format!(
-                    "DELETE FROM {};",
-                    quote_table_identifier(Some(cfg.db_type), &table)
-                );
+                let del = format!("DELETE FROM {};", table_ref(cfg.db_type, &schema, &table));
                 if let Err(e) = backend.execute_query(&cfg, &db, &del, Some(1), Some(60)).await {
                     return OpResult::ImportDone(Box::new(ImportReport {
                         table,
+                        schema,
                         mode,
                         total,
                         inserted: 0,
@@ -2728,7 +2808,7 @@ async fn run_op(backend: &LocalBackend, op: Op, tx: &Tx) -> OpResult {
                 let base = ci * IMPORT_CHUNK;
                 let script = chunk
                     .iter()
-                    .map(|row| import_insert_sql(&cfg, &table, &columns, row))
+                    .map(|row| import_insert_sql(&cfg, &schema, &table, &columns, row))
                     .collect::<Vec<_>>()
                     .join("\n");
                 match on_error {
@@ -2797,6 +2877,7 @@ async fn run_op(backend: &LocalBackend, op: Op, tx: &Tx) -> OpResult {
             }
             OpResult::ImportDone(Box::new(ImportReport {
                 table,
+                schema,
                 mode,
                 total,
                 inserted,
@@ -3052,6 +3133,15 @@ struct App {
     selected: Option<ConnectionConfig>,
     databases: Vec<String>,
     db_index: usize,
+    /// Schemas of the current database (empty for engines without a schema
+    /// layer, e.g. MySQL). Fetched once per database.
+    schemas: Vec<String>,
+    /// Currently browsed schema; empty when the engine has no schema layer.
+    schema: String,
+    /// Which database `schemas` belongs to, so a database switch refetches.
+    schemas_db: String,
+    /// Monotonic id of the latest table-list request; a stale reply is discarded.
+    tables_gen: u64,
 
     tables: Vec<TableInfo>,
     table_list: ListState,
@@ -3097,12 +3187,12 @@ struct App {
     /// The unfiltered grid backing the filtered `grid` (needed to re-show a
     /// hidden column without re-querying).
     grid_full: Option<Grid>,
-    /// The five most recently browsed `(database, table)` pairs.
-    recent_tables: Vec<(String, String)>,
+    /// The five most recently browsed `(database, schema, table)` triples.
+    recent_tables: Vec<(String, String, String)>,
     recent_open: bool,
     recent_list: ListState,
-    /// A table to open as soon as the (new) table list arrives.
-    pending_open_table: Option<String>,
+    /// A `(schema, table)` to open as soon as the (new) table list arrives.
+    pending_open_table: Option<(String, String)>,
     /// SQL prefix-completion popup in the editor (Ctrl-Space).
     completion: Option<Completion>,
 
@@ -3548,6 +3638,10 @@ impl App {
             selected: None,
             databases: Vec::new(),
             db_index: 0,
+            schemas: Vec::new(),
+            schema: String::new(),
+            schemas_db: String::new(),
+            tables_gen: 0,
             tables: Vec::new(),
             table_list: ListState::default(),
             tables_all: Vec::new(),
@@ -3763,6 +3857,10 @@ fn apply_op_result(app: &mut App, res: OpResult, tx: &Tx) {
                 .as_deref()
                 .and_then(|db| app.databases.iter().position(|d| d == db))
                 .unwrap_or(0);
+            // A fresh database list invalidates the cached schema list.
+            app.schemas.clear();
+            app.schemas_db.clear();
+            app.schema.clear();
             app.clear_grid();
             app.script = None;
             app.ddl = None;
@@ -3790,7 +3888,7 @@ fn apply_op_result(app: &mut App, res: OpResult, tx: &Tx) {
                     } else {
                         tf("加载 {} 表…", &[&(fix_double_encoding(&db))])
                     };
-                    app.spawn(tx, Op::ListTables(Box::new(cfg.clone()), db));
+                    spawn_table_list(app, tx);
                     app.spawn(tx, Op::History(Box::new(cfg)));
                 }
             }
@@ -3800,7 +3898,34 @@ fn apply_op_result(app: &mut App, res: OpResult, tx: &Tx) {
                 app.status = format!("⚠ {w}");
             }
         }
-        OpResult::Tables(ts) => {
+        OpResult::Schemas { db, schemas, warning } => {
+            // A reply for a database the user already left must not resurrect a
+            // stale schema list.
+            if db != app.current_db() {
+                return;
+            }
+            app.schemas = schemas;
+            app.schemas_db = db.clone();
+            // Keep the current schema across a refresh when it still exists;
+            // otherwise fall back to `public` (PostgreSQL's default) or the
+            // first schema the server listed.
+            if !app.schemas.contains(&app.schema) {
+                app.schema = default_schema(&app.schemas);
+            }
+            if let Some(cfg) = app.selected.clone() {
+                let schema = app.schema.clone();
+                spawn_list_tables(app, tx, Box::new(cfg), db, schema);
+            }
+            if let Some(w) = warning {
+                app.status = format!("⚠ {w}");
+            }
+        }
+        OpResult::TablesFor { tables: ts, gen } => {
+            // A slow list for a database / schema the user already left must not
+            // clobber the current one (`public.orders` ≠ `inv.orders`).
+            if gen != app.tables_gen {
+                return;
+            }
             app.tables_all = ts;
             apply_table_filter(app);
             let n = app.tables_all.len();
@@ -3816,11 +3941,14 @@ fn apply_op_result(app: &mut App, res: OpResult, tx: &Tx) {
             app.ddl = None;
             // The browsed table's column metadata may belong to another database.
             app.table_meta = None;
-            // A recent-table jump that had to switch database first: open the
-            // requested table now that the list has arrived.
-            if let Some(name) = app.pending_open_table.take() {
+            // A recent-table jump that had to switch database / schema first:
+            // open the requested table now that the list has arrived.
+            if let Some((schema, name)) = app.pending_open_table.take() {
                 if let Some(pos) = app.tables.iter().position(|t| t.name == name) {
                     app.table_list.select(Some(pos));
+                    if app.schema != schema {
+                        app.schema = schema;
+                    }
                     open_table_data(app, tx);
                     return;
                 }
@@ -3833,9 +3961,11 @@ fn apply_op_result(app: &mut App, res: OpResult, tx: &Tx) {
                 tf("过滤「{}」· {}/{} 个表 · Esc 清除", &[&(app.table_filter), &(app.tables.len()), &(n)])
             };
         }
-        OpResult::Columns { table, columns: cols } => {
+        OpResult::Columns { table, schema, columns: cols } => {
             // Ignore a late result for a table the user has already navigated away from.
-            if app.selected_table().map(|t| t.name.clone()).as_deref() != Some(table.as_str()) {
+            if app.selected_table().map(|t| t.name.clone()).as_deref() != Some(table.as_str())
+                || app.schema != schema
+            {
                 return;
             }
             let n = cols.len();
@@ -3853,8 +3983,10 @@ fn apply_op_result(app: &mut App, res: OpResult, tx: &Tx) {
             app.focus = Focus::Preview;
             app.status = tf("{} 结构 · {} 字段 · t 切换 DDL · Esc 返回", &[&(fix_double_encoding(&table)), &(n)]);
         }
-        OpResult::Ddl { table, text } => {
-            if app.selected_table().map(|t| t.name.clone()).as_deref() == Some(table.as_str()) {
+        OpResult::Ddl { table, schema, text } => {
+            if app.selected_table().map(|t| t.name.clone()).as_deref() == Some(table.as_str())
+                && app.schema == schema
+            {
                 app.ddl = Some(text);
                 app.ddl_scroll = 0;
             }
@@ -3865,6 +3997,7 @@ fn apply_op_result(app: &mut App, res: OpResult, tx: &Tx) {
             has_next,
             page,
             table,
+            schema,
             table_type,
             filter,
             order_by,
@@ -3879,12 +4012,16 @@ fn apply_op_result(app: &mut App, res: OpResult, tx: &Tx) {
             let rows = grid.rows.len();
             if let Some(t) = total {
                 app.count_cache
-                    .insert(count_cache_key(&app.current_db(), &table, &filter), t);
+                    .insert(count_cache_key(&app.current_db(), &schema, &table, &filter), t);
             }
             app.grid_kind = GridKind::TableData;
             app.set_grid(*grid);
+            // The status line below needs the qualified name after `schema` has
+            // moved into `PageState`.
+            let schema_label = qualified_display(&schema, &table);
             app.page_state = Some(PageState {
                 table: table.clone(),
+                schema,
                 table_type,
                 page,
                 page_size: PAGE_SIZE,
@@ -3923,17 +4060,26 @@ fn apply_op_result(app: &mut App, res: OpResult, tx: &Tx) {
                 .unwrap_or_else(|| t("总数未知").into());
             let ps = app.page_state.as_ref().unwrap();
             let extra = page_state_extra(ps);
-            app.status = tf("{}.{} · 第 {} 页 · {} 行 · {}{}", &[&(fix_double_encoding(&app.current_db())), &(fix_double_encoding(&table)), &(page + 1), &(rows), &(total_txt), &(extra)]);
+            app.status = tf("{}.{} · 第 {} 页 · {} 行 · {}{}", &[&(fix_double_encoding(&app.current_db())), &(fix_double_encoding(&schema_label)), &(page + 1), &(rows), &(total_txt), &(extra)]);
             if let Some(msg) = app.pending_write_msg.take() {
                 app.status = tf("{} · 已刷新（第 {} 页）", &[&(msg), &(page + 1)]);
             }
         }
-        OpResult::TableColumns { table, columns } => {
-            // Only keep metadata that belongs to the table on screen.
-            let active = app.page_state.as_ref().map(|p| p.table.as_str()) == Some(table.as_str())
-                || app.selected_table().map(|t| t.name.as_str()) == Some(table.as_str());
+        OpResult::TableColumns { table, schema, columns } => {
+            // Only keep metadata that belongs to the table on screen (same
+            // database *and* schema: `public.orders` ≠ `inv.orders`).
+            let active = app
+                .page_state
+                .as_ref()
+                .is_some_and(|p| p.table == table && p.schema == schema)
+                || (app.selected_table().map(|t| t.name.as_str()) == Some(table.as_str())
+                    && app.schema == schema);
             if active {
-                app.table_meta = Some(TableMeta { table, columns });
+                app.table_meta = Some(TableMeta {
+                    table,
+                    schema,
+                    columns,
+                });
             }
         }
         OpResult::Query(r, sql, cap) => {
@@ -4198,6 +4344,7 @@ fn apply_op_result(app: &mut App, res: OpResult, tx: &Tx) {
             app.mongo_docs = docs;
             app.page_state = Some(PageState {
                 table: collection.clone(),
+                schema: String::new(),
                 table_type: None,
                 page,
                 page_size: MONGO_PAGE,
@@ -4318,7 +4465,11 @@ fn apply_op_result(app: &mut App, res: OpResult, tx: &Tx) {
             } else {
                 tf(
                     "CSV 预览：{} 行 → {}.{} · Enter 导入",
-                    &[&plan.rows.len(), &plan.db, &plan.table],
+                    &[
+                        &plan.rows.len(),
+                        &plan.db,
+                        &qualified_display(&plan.schema, &plan.table),
+                    ],
                 )
             };
             app.import_plan = Some(plan);
@@ -4334,6 +4485,7 @@ fn apply_op_result(app: &mut App, res: OpResult, tx: &Tx) {
         }
         OpResult::ImportDone(rep) => {
             let table = rep.table.clone();
+            let schema = rep.schema.clone();
             app.import_progress = None;
             // An import writes rows, so every cached COUNT(*) is now suspect —
             // including the target table's own entry when the import came from
@@ -4354,13 +4506,14 @@ fn apply_op_result(app: &mut App, res: OpResult, tx: &Tx) {
                     .unwrap_or((0, String::new()));
                 tf("✗ 导入中止于第 {} 行: {}", &[&row, &err])
             };
-            // Refresh the browsed table when it is the import target.
+            // Refresh the browsed table when it is the import target (same
+            // database schema too, so an import into `inv.items` does not
+            // reload `public.items`).
             let refresh = rep.ok()
                 && app
                     .page_state
                     .as_ref()
-                    .map(|p| p.table.as_str())
-                    .is_some_and(|t| t == table);
+                    .is_some_and(|p| p.table == table && p.schema == schema);
             if refresh {
                 let (filter, order_by, page) = app
                     .page_state
@@ -4395,8 +4548,10 @@ fn trim_output(v: &mut Vec<String>) {
 
 /// Session cache key for a COUNT(*) total. Sorting does not affect the count, so
 /// it is intentionally not part of the key; the WHERE filter is.
-fn count_cache_key(db: &str, table: &str, filter: &str) -> String {
-    format!("{db}\u{1}{table}\u{1}{filter}")
+/// Cache key for a table's `COUNT(*)`. The schema is part of the key so
+/// `public.orders` and `inv.orders` never share a total.
+fn count_cache_key(db: &str, schema: &str, table: &str, filter: &str) -> String {
+    format!("{db}\u{1}{schema}\u{1}{table}\u{1}{filter}")
 }
 
 /// Human-readable `· 过滤: … · 排序: …` suffix for the status line and grid title.
@@ -4921,24 +5076,64 @@ fn browse_key(app: &mut App, tx: &Tx, k: KeyEvent) {
     }
 }
 
-// ── database switcher overlay ──
+// ── database / schema switcher overlay ──
+
+/// What a `d`-overlay row selects.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum PickerKind {
+    Schema,
+    Database,
+}
 
 /// Entries shown by the `d` overlay. Redis exposes its 16 logical databases;
-/// everything else lists the server's schemas/databases.
-fn db_entries(app: &App) -> Vec<String> {
+/// schema-aware SQL engines list the current database's schemas first and then
+/// the server's databases; everything else lists databases only.
+fn picker_entries(app: &App) -> Vec<(PickerKind, String)> {
     if app.backend_kind == Backend::Redis {
-        (0..16).map(|i| format!("db{i}")).collect()
-    } else {
-        app.databases.clone()
+        return (0..16)
+            .map(|i| (PickerKind::Database, format!("db{i}")))
+            .collect();
     }
+    let mut out = Vec::with_capacity(app.schemas.len() + app.databases.len());
+    for s in &app.schemas {
+        out.push((PickerKind::Schema, s.clone()));
+    }
+    for d in &app.databases {
+        out.push((PickerKind::Database, d.clone()));
+    }
+    out
+}
+
+/// Row label. When the schema layer is active the two kinds are prefixed so the
+/// single list still reads as "schemas first, then databases".
+fn picker_label(app: &App, kind: PickerKind, name: &str) -> String {
+    if app.schemas.is_empty() {
+        return name.to_string();
+    }
+    match kind {
+        PickerKind::Schema => format!("{} · {}", t("模式"), name),
+        PickerKind::Database => format!("{} · {}", t("数据库"), name),
+    }
+}
+
+fn db_entries(app: &App) -> Vec<String> {
+    picker_entries(app)
+        .iter()
+        .map(|(kind, name)| picker_label(app, *kind, name))
+        .collect()
 }
 
 fn db_current_index(app: &App) -> usize {
     if app.backend_kind == Backend::Redis {
-        app.redis_db as usize
-    } else {
-        app.db_index
+        return app.redis_db as usize;
     }
+    picker_entries(app)
+        .iter()
+        .position(|(kind, name)| match kind {
+            PickerKind::Schema => *name == app.schema,
+            PickerKind::Database => *name == app.current_db(),
+        })
+        .unwrap_or(0)
 }
 
 fn open_db_picker(app: &mut App) {
@@ -4967,7 +5162,14 @@ fn db_picker_key(app: &mut App, tx: &Tx, k: KeyEvent) {
                 app.status = t("Redis 固定 16 个逻辑库").into();
             } else if let Some(cfg) = app.selected.clone() {
                 app.status = t("刷新数据库列表…").into();
-                app.spawn(tx, Op::DatabasesRefresh(Box::new(cfg)));
+                app.spawn(tx, Op::DatabasesRefresh(Box::new(cfg.clone())));
+                // Schemas are cached per database; a refresh is the moment to
+                // pick up a schema created outside dbxt.
+                if schema_picker_engine(cfg.db_type) {
+                    app.schemas.clear();
+                    app.schemas_db.clear();
+                    app.spawn(tx, Op::ListSchemas(Box::new(cfg), app.current_db()));
+                }
             }
         }
         KeyCode::Up | KeyCode::Char('k') => {
@@ -5007,22 +5209,34 @@ fn db_picker_key(app: &mut App, tx: &Tx, k: KeyEvent) {
 
 fn db_picker_apply(app: &mut App, tx: &Tx, idx: usize) {
     app.db_picker_open = false;
-    match app.backend_kind {
-        Backend::Redis => {
-            app.redis_db = idx as u32;
-            app.redis_value = None;
-            app.clear_grid();
-            app.set_placeholder();
-            app.status = format!("redis db → {idx}");
-            start_redis_scan(app, tx, true);
+    if app.backend_kind == Backend::Redis {
+        app.redis_db = idx as u32;
+        app.redis_value = None;
+        app.clear_grid();
+        app.set_placeholder();
+        app.status = format!("redis db → {idx}");
+        start_redis_scan(app, tx, true);
+        return;
+    }
+    let Some((kind, name)) = picker_entries(app).into_iter().nth(idx) else {
+        return;
+    };
+    match kind {
+        PickerKind::Schema => {
+            app.schema = name.clone();
+            app.status = tf("切换 schema → {}", &[&(fix_double_encoding(&name))]);
+            reload_tables(app, tx);
         }
-        _ => {
-            if idx < app.databases.len() {
-                app.db_index = idx;
-                let db = app.current_db();
-                app.status = tf("切换数据库 → {}", &[&(db)]);
-                reload_tables(app, tx);
-            }
+        PickerKind::Database => {
+            let Some(pos) = app.databases.iter().position(|d| *d == name) else {
+                return;
+            };
+            app.db_index = pos;
+            // The cached schema list belongs to the old database.
+            app.schemas.clear();
+            app.schemas_db.clear();
+            app.status = tf("切换数据库 → {}", &[&(fix_double_encoding(&name))]);
+            reload_tables(app, tx);
         }
     }
 }
@@ -5265,11 +5479,12 @@ fn load_structure(app: &mut App, tx: &Tx) {
     app.loading = true;
     app.status = tf("加载 {} 结构…", &[&(fix_double_encoding(&table))]);
     let db = app.current_db();
+    let schema = app.schema.clone();
     app.spawn(
         tx,
-        Op::Columns(Box::new(cfg.clone()), db.clone(), table.clone()),
+        Op::Columns(Box::new(cfg.clone()), db.clone(), schema.clone(), table.clone()),
     );
-    app.spawn(tx, Op::Ddl(Box::new(cfg), db, table));
+    app.spawn(tx, Op::Ddl(Box::new(cfg), db, schema, table));
 }
 
 fn open_table_data(app: &mut App, tx: &Tx) {
@@ -5293,7 +5508,7 @@ fn open_table_data(app: &mut App, tx: &Tx) {
         app.pending_focus = Some(Focus::Preview);
         app.result_needle.clear();
         app.result_filter = None;
-        remember_recent_table(app, &app.current_db(), &table.0);
+        remember_recent_table(app, &app.current_db(), "", &table.0);
         open_mongo_collection(app, tx);
         return;
     }
@@ -5312,10 +5527,17 @@ fn open_table_data(app: &mut App, tx: &Tx) {
     app.table_meta = None;
     app.result_needle.clear();
     app.result_filter = None;
-    remember_recent_table(app, &app.current_db(), &table.0);
-    // Restore this table's persisted preferences (db.table granularity).
+    let cur_db = app.current_db();
+    let cur_schema = app.schema.clone();
+    remember_recent_table(app, &cur_db, &cur_schema, &table.0);
+    // Restore this table's persisted preferences (db.schema.table granularity).
     let db = app.current_db();
-    let prefs = app.config.table(&db, &table.0).cloned().unwrap_or_default();
+    let schema = app.schema.clone();
+    let prefs = app
+        .config
+        .table(&db, &schema, &table.0)
+        .cloned()
+        .unwrap_or_default();
     app.col_hidden = prefs.hidden;
     // Fall back to the *global* default (not whatever the previously opened table
     // happened to use), so a table with no stored choice is not contaminated.
@@ -5323,6 +5545,7 @@ fn open_table_data(app: &mut App, tx: &Tx) {
     let order_by = prefs.order_by;
     app.page_state = Some(PageState {
         table: table.0.clone(),
+        schema: schema.clone(),
         table_type: Some(table.1.clone()),
         page: 0,
         page_size: PAGE_SIZE,
@@ -5332,15 +5555,23 @@ fn open_table_data(app: &mut App, tx: &Tx) {
         order_by: order_by.clone(),
     });
     app.loading = true;
-    app.status = tf("加载 {}.{} 数据…", &[&(fix_double_encoding(&app.current_db())), &(fix_double_encoding(&table.0))]);
+    app.status = tf(
+        "加载 {} 数据…",
+        &[&(qualified_display(&fix_double_encoding(&schema), &fix_double_encoding(&table.0)))],
+    );
     // Column metadata powers the `e`/`i` templates (primary-key detection).
     app.spawn(
         tx,
-        Op::TableColumns(Box::new(cfg.clone()), app.current_db(), table.0.clone()),
+        Op::TableColumns(
+            Box::new(cfg.clone()),
+            app.current_db(),
+            schema.clone(),
+            table.0.clone(),
+        ),
     );
     let known = app
         .count_cache
-        .get(&count_cache_key(&app.current_db(), &table.0, ""))
+        .get(&count_cache_key(&app.current_db(), &schema, &table.0, ""))
         .copied();
     app.page_gen += 1;
     let gen = app.page_gen;
@@ -5349,6 +5580,7 @@ fn open_table_data(app: &mut App, tx: &Tx) {
         Op::TableData(Box::new(TableDataReq {
             cfg: Box::new(cfg),
             db: app.current_db(),
+            schema,
             table: table.0,
             table_type: Some(table.1),
             page: 0,
@@ -5387,7 +5619,7 @@ fn goto_page(app: &mut App, tx: &Tx, page: usize, pending_sel: Option<usize>) ->
     app.status = tf("加载 {} 第 {} 页…", &[&(fix_double_encoding(&ps.table)), &(page + 1)]);
     let known = app
         .count_cache
-        .get(&count_cache_key(&app.current_db(), &ps.table, &ps.filter))
+        .get(&count_cache_key(&app.current_db(), &ps.schema, &ps.table, &ps.filter))
         .copied();
     app.page_gen += 1;
     let gen = app.page_gen;
@@ -5396,6 +5628,7 @@ fn goto_page(app: &mut App, tx: &Tx, page: usize, pending_sel: Option<usize>) ->
         Op::TableData(Box::new(TableDataReq {
             cfg: Box::new(cfg),
             db: app.current_db(),
+            schema: ps.schema.clone(),
             table: ps.table.clone(),
             table_type: ps.table_type.clone(),
             page,
@@ -5432,7 +5665,7 @@ fn reload_table_view(app: &mut App, tx: &Tx, filter: String, order_by: Option<St
     app.status = tf("加载 {} 第 {} 页…", &[&(fix_double_encoding(&ps.table)), &(page + 1)]);
     let known = app
         .count_cache
-        .get(&count_cache_key(&app.current_db(), &ps.table, &filter))
+        .get(&count_cache_key(&app.current_db(), &ps.schema, &ps.table, &filter))
         .copied();
     app.page_gen += 1;
     let gen = app.page_gen;
@@ -5441,6 +5674,7 @@ fn reload_table_view(app: &mut App, tx: &Tx, filter: String, order_by: Option<St
         Op::TableData(Box::new(TableDataReq {
             cfg: Box::new(cfg),
             db: app.current_db(),
+            schema: ps.schema,
             table: ps.table,
             table_type: ps.table_type,
             page,
@@ -5587,7 +5821,7 @@ fn page_turn(app: &mut App, tx: &Tx, forward: bool) {
 }
 
 fn reload_tables(app: &mut App, tx: &Tx) {
-    if let Some(cfg) = app.selected.clone() {
+    if app.selected.is_some() {
         // Remember the current table so a same-named table can be re-selected in
         // the new database.
         app.pending_table = app.selected_table().map(|t| t.name.clone());
@@ -5611,8 +5845,49 @@ fn reload_tables(app: &mut App, tx: &Tx) {
         let db = app.current_db();
         app.status = tf("切换到 {} …", &[&(fix_double_encoding(&db))]);
         app.set_placeholder();
-        app.spawn(tx, Op::ListTables(Box::new(cfg), db));
+        spawn_table_list(app, tx);
     }
+}
+
+/// Queue the table list for the current database. Schema-aware engines fetch the
+/// schema list first (once per database), then reload the tables for the current
+/// schema; everything else goes straight to the flat table list.
+fn spawn_table_list(app: &mut App, tx: &Tx) {
+    let Some(cfg) = app.selected.clone() else {
+        return;
+    };
+    let db = app.current_db();
+    if schema_picker_engine(cfg.db_type) && app.schemas_db != db {
+        app.spawn(tx, Op::ListSchemas(Box::new(cfg), db));
+    } else {
+        let schema = app.schema.clone();
+        spawn_list_tables(app, tx, Box::new(cfg), db, schema);
+    }
+}
+
+/// Queue one table-list request, bumping the generation so an earlier reply can
+/// be recognised and dropped.
+fn spawn_list_tables(
+    app: &mut App,
+    tx: &Tx,
+    cfg: Box<ConnectionConfig>,
+    db: String,
+    schema: String,
+) {
+    app.tables_gen = app.tables_gen.wrapping_add(1);
+    let gen = app.tables_gen;
+    app.spawn(tx, Op::ListTables(cfg, db, schema, gen));
+}
+
+/// Default schema to browse when nothing is remembered: PostgreSQL's `public`
+/// when present, else the first schema the server listed.
+fn default_schema(schemas: &[String]) -> String {
+    schemas
+        .iter()
+        .find(|s| s.eq_ignore_ascii_case("public"))
+        .or_else(|| schemas.first())
+        .cloned()
+        .unwrap_or_default()
 }
 
 fn cycle_db(app: &mut App, tx: &Tx, forward: bool) {
@@ -5937,6 +6212,9 @@ fn connect_selected(app: &mut App, tx: &Tx) {
             app.selected = Some(cfg.clone());
             app.picker_open = false;
             app.backend_kind = backend_for_connection(&cfg);
+            app.schemas.clear();
+            app.schema.clear();
+            app.schemas_db.clear();
             app.clear_grid();
             app.script = None;
             app.ddl = None;
@@ -6119,6 +6397,9 @@ fn back_to_picker(app: &mut App) {
     app.table_filter.clear();
     app.columns.clear();
     app.databases.clear();
+    app.schemas.clear();
+    app.schema.clear();
+    app.schemas_db.clear();
     app.clear_grid();
     app.script = None;
     app.ddl = None;
@@ -6731,6 +7012,14 @@ fn sidebar_db_row(app: &App) -> bool {
 fn sidebar_db_label(app: &App) -> String {
     if app.backend_kind == Backend::Redis {
         tf("redis db {} · {} keys · d 切换", &[&(app.redis_db), &(app.redis_scan.keys.len())])
+    } else if !app.schemas.is_empty() {
+        tf(
+            "{} · schema {} · d 切换",
+            &[
+                &(fix_double_encoding(&app.current_db())),
+                &(fix_double_encoding(&app.schema)),
+            ],
+        )
     } else {
         tf("{} · d 切换", &[&(fix_double_encoding(&app.current_db()))])
     }
@@ -8027,11 +8316,11 @@ fn toggle_compact(app: &mut App) {
         tf("{} · 列宽按内容（Alt-C / w 开启）", &[&(compact_label(app))])
     };
     // Persist the choice: as the global default and, when a table is open, for
-    // that exact `database.table` so reopening it restores the mode.
+    // that exact `database.schema.table` so reopening it restores the mode.
     app.config.set_compact(app.compact);
     if let Some(ps) = app.page_state.clone() {
         let db = app.current_db();
-        app.config.entry(&db, &ps.table).compact = app.compact;
+        app.config.entry(&db, &ps.schema, &ps.table).compact = app.compact;
     }
     app.persist();
 }
@@ -8177,37 +8466,45 @@ fn recent_key(app: &mut App, tx: &Tx, k: KeyEvent) {
 }
 
 /// Remember a table at the head of the recents list (max 5, unique).
-fn remember_recent_table(app: &mut App, db: &str, table: &str) {
-    let entry = (db.to_string(), table.to_string());
+fn remember_recent_table(app: &mut App, db: &str, schema: &str, table: &str) {
+    let entry = (db.to_string(), schema.to_string(), table.to_string());
     app.recent_tables.retain(|e| e != &entry);
     app.recent_tables.insert(0, entry);
     app.recent_tables.truncate(5);
 }
 
 fn open_recent(app: &mut App, tx: &Tx, idx: usize) {
-    let Some((db, table)) = app.recent_tables.get(idx).cloned() else {
+    let Some((db, schema, table)) = app.recent_tables.get(idx).cloned() else {
         return;
     };
     app.recent_open = false;
-    // Another database: switch first and let the table-list reply open the table.
-    if db != app.current_db() {
+    let db_changed = db != app.current_db();
+    // Same database and schema: the table is already listed, jump straight to it.
+    if !db_changed && schema == app.schema {
+        if let Some(pos) = app.tables.iter().position(|t| t.name == table) {
+            app.table_list.select(Some(pos));
+            open_table_data(app, tx);
+            return;
+        }
+    }
+    if db_changed {
         let Some(pos) = app.databases.iter().position(|d| *d == db) else {
             app.status = tf("✗ 数据库 {} 不在当前连接中", &[&(fix_double_encoding(&db))]);
             return;
         };
         app.db_index = pos;
-        app.pending_open_table = Some(table.clone());
-        app.pending_table = None;
-        app.status = tf("切换到 {} 并打开 {} …", &[&(fix_double_encoding(&db)), &(fix_double_encoding(&table))]);
-        reload_tables(app, tx);
-        return;
+        // The schema list belongs to the old database; refetch it.
+        app.schemas.clear();
+        app.schemas_db.clear();
     }
-    if let Some(pos) = app.tables.iter().position(|t| t.name == table) {
-        app.table_list.select(Some(pos));
-        open_table_data(app, tx);
-    } else {
-        app.status = tf("✗ 未找到表 {}（可能被过滤或已删除）", &[&(fix_double_encoding(&table))]);
-    }
+    app.schema = schema.clone();
+    app.pending_open_table = Some((schema.clone(), table.clone()));
+    app.pending_table = None;
+    app.status = tf(
+        "切换到 {} 并打开 {} …",
+        &[&(fix_double_encoding(&db)), &(fix_double_encoding(&qualified_display(&schema, &table)))],
+    );
+    reload_tables(app, tx);
 }
 
 // ── sidebar table filter (`/`, filter-as-you-type) ──
@@ -8217,12 +8514,19 @@ fn open_recent(app: &mut App, tx: &Tx, idx: usize) {
 fn apply_table_filter(app: &mut App) {
     let prev = app.selected_table().map(|t| t.name.clone());
     let needle = app.table_filter.trim().to_lowercase();
+    // Match the qualified `schema.table` the sidebar draws, so `/inv` finds
+    // every table in the `inv` schema.
+    let schema = app.schema.clone();
     app.tables = if needle.is_empty() {
         app.tables_all.clone()
     } else {
         app.tables_all
             .iter()
-            .filter(|t| t.name.to_lowercase().contains(&needle))
+            .filter(|t| {
+                qualified_display(&schema, &t.name)
+                    .to_lowercase()
+                    .contains(&needle)
+            })
             .cloned()
             .collect()
     };
@@ -8690,10 +8994,12 @@ fn is_numeric_type(t: &str) -> bool {
     )
 }
 
-/// Column type from the browsed table's metadata, when available.
-fn column_type(app: &App, table: &str, col: &str) -> Option<String> {
+/// Column type from the browsed table's metadata, when available. The schema is
+/// matched too, so a `public.orders` metadata set is never applied to
+/// `inv.orders`.
+fn column_type(app: &App, schema: &str, table: &str, col: &str) -> Option<String> {
     let meta = app.table_meta.as_ref()?;
-    if meta.table != table {
+    if meta.table != table || meta.schema != schema {
         return None;
     }
     meta.columns
@@ -8819,6 +9125,54 @@ fn is_postgres_family(db_type: &str) -> bool {
     )
 }
 
+/// Engines whose sidebar gets a schema layer.
+///
+/// The kernel reports schema awareness for a wide set, including embedded
+/// engines (SQLite, DuckDB) where a `main`-only picker is noise and an extra
+/// `list_schemas` round-trip buys nothing. Those are filtered out here; a
+/// server that still reports no schemas falls back to the flat list, so a
+/// mis-guess degrades to the pre-R26 behaviour instead of breaking.
+fn schema_picker_engine(db_type: DatabaseType) -> bool {
+    is_schema_aware(db_type)
+        && !matches!(
+            db_type,
+            DatabaseType::Sqlite
+                | DatabaseType::Rqlite
+                | DatabaseType::Turso
+                | DatabaseType::CloudflareD1
+                | DatabaseType::DuckDb
+                | DatabaseType::Tdengine
+                | DatabaseType::Iris
+                | DatabaseType::Informix
+                | DatabaseType::Access
+                | DatabaseType::Jdbc
+        )
+}
+
+/// `schema.table` for display, or just `table` when there is no schema (MySQL,
+/// Redis-less SQL engines, SQL results whose table was guessed from SQL).
+fn qualified_display(schema: &str, table: &str) -> String {
+    if schema.trim().is_empty() {
+        table.to_string()
+    } else {
+        format!("{schema}.{table}")
+    }
+}
+
+/// The per-table persistence key used by the count cache and `tui.json`. The
+/// schema is folded in so `public.orders` and `inv.orders` never share a row
+/// count, a column-visibility set or a saved sort. An empty schema keeps the
+/// bare table name, so pre-R26 MySQL configs still match.
+fn table_pref_key(schema: &str, table: &str) -> String {
+    qualified_display(schema, table)
+}
+
+/// Quoted, schema-qualified relation name for SQL. An empty schema yields the
+/// unqualified `"table"` the pre-R26 code produced.
+fn table_ref(db_type: DatabaseType, schema: &str, table: &str) -> String {
+    qualified_table_name(Some(db_type), Some(schema), table)
+}
+
 /// Uppercase hex for the bytes of `s` (the fallback when a binary cell is not
 /// already in the kernel's `0x…` form).
 fn hex_of_bytes(s: &str) -> String {
@@ -8903,6 +9257,7 @@ fn insert_literal(v: &Val, data_type: Option<&str>, db_type: Option<&str>) -> St
 /// Build `INSERT INTO t (cols…) VALUES (vals…)` for one row of `grid`.
 fn build_insert_sql(
     cfg: &ConnectionConfig,
+    schema: &str,
     table: &str,
     grid: &Grid,
     row: &[Val],
@@ -8921,11 +9276,20 @@ fn build_insert_sql(
         .enumerate()
         .map(|(ci, c)| {
             let v = row.get(ci).cloned().unwrap_or(Val::Null);
-            insert_literal(&v, column_type(app, table, c).as_deref(), Some(cfg.db_type.as_str()))
+            insert_literal(
+                &v,
+                column_type(app, schema, table, c).as_deref(),
+                Some(cfg.db_type.as_str()),
+            )
         })
         .collect::<Vec<_>>()
         .join(", ");
-    format!("INSERT INTO {} ({})\nVALUES ({});",  q(table),  cols,  vals)
+    format!(
+        "INSERT INTO {} ({})\nVALUES ({});",
+        table_ref(cfg.db_type, schema, table),
+        cols,
+        vals
+    )
 }
 
 fn is_ident_byte(b: u8) -> bool {
@@ -9112,20 +9476,24 @@ fn copy_row_sql(app: &mut App) {
         app.status = t("没有可复制的行").into();
         return;
     };
-    let table = if let Some(ps) = &app.page_state {
-        Some(ps.table.clone())
+    let target = if let Some(ps) = &app.page_state {
+        Some((ps.schema.clone(), ps.table.clone()))
     } else if let Some(s) = &app.script {
         s.drilled
             .and_then(|i| s.outcomes.get(i))
             .and_then(|o| guess_table_from_sql(&o.sql))
+            .map(|t| (String::new(), t))
     } else {
-        app.last_sql.as_deref().and_then(guess_table_from_sql)
+        app.last_sql
+            .as_deref()
+            .and_then(guess_table_from_sql)
+            .map(|t| (String::new(), t))
     };
-    let Some(table) = table else {
+    let Some((schema, table)) = target else {
         app.status = t("无法从当前结果确定表名（仅表格浏览与含 FROM 的查询支持 y）").into();
         return;
     };
-    let sql = build_insert_sql(&cfg, &table, &full, &row, app);
+    let sql = build_insert_sql(&cfg, &schema, &table, &full, &row, app);
     let n = sql.chars().count();
     match clipboard_copy(&sql) {
         Some(p) => {
@@ -9181,6 +9549,7 @@ fn edit_prefill(v: &Val) -> String {
 
 fn build_update_sql(
     cfg: &ConnectionConfig,
+    schema: &str,
     table: &str,
     column: &str,
     data_type: Option<&str>,
@@ -9189,10 +9558,10 @@ fn build_update_sql(
 ) -> String {
     let q = |name: &str| quote_table_identifier(Some(cfg.db_type), name);
     format!(
-        "UPDATE {}\nSET {} = {}\nWHERE {};", 
-        q(table), 
-        q(column), 
-        new_value_literal(input, data_type), 
+        "UPDATE {}\nSET {} = {}\nWHERE {};",
+        table_ref(cfg.db_type, schema, table),
+        q(column),
+        new_value_literal(input, data_type),
         where_clause
     )
 }
@@ -9201,6 +9570,7 @@ impl EditDialog {
     fn update_sql(&self) -> String {
         build_update_sql(
             &self.cfg,
+            &self.schema,
             &self.table,
             &self.column,
             self.data_type.as_deref(),
@@ -9224,9 +9594,14 @@ fn row_where_clause(
     app: &App,
     grid: &Grid,
     row: &[Val],
+    schema: &str,
     table: &str,
 ) -> (String, Vec<String>, bool) {
-    let (keys, no_pk) = match app.table_meta.as_ref().filter(|m| m.table == table) {
+    let (keys, no_pk) = match app
+        .table_meta
+        .as_ref()
+        .filter(|m| m.table == table && m.schema == schema)
+    {
         Some(meta) => {
             let pks: Vec<String> = meta
                 .columns
@@ -9255,7 +9630,7 @@ fn row_where_clause(
         conds.push(format!(
             "{} = {}", 
             q(k), 
-            val_literal(v, column_type(app, table, k).as_deref())
+            val_literal(v, column_type(app, schema, table, k).as_deref())
         ));
     }
     let clause = if conds.is_empty() {
@@ -9287,9 +9662,12 @@ fn delete_row(app: &mut App) {
         app.status = t("没有可删除的行").into();
         return;
     };
-    let (where_clause, keys, no_pk) = row_where_clause(app, &grid, &row, &ps.table);
-    let q = |name: &str| quote_table_identifier(Some(cfg.db_type), name);
-    let sql = format!("DELETE FROM {}\nWHERE {};",  q(&ps.table),  where_clause);
+    let (where_clause, keys, no_pk) = row_where_clause(app, &grid, &row, &ps.schema, &ps.table);
+    let sql = format!(
+        "DELETE FROM {}\nWHERE {};",
+        table_ref(cfg.db_type, &ps.schema, &ps.table),
+        where_clause
+    );
     let mut reasons: Vec<String> = Vec::new();
     if no_pk {
         reasons.push(t("⚠ 未检测到主键：将按全部列匹配删除，请确认只命中这一行").into());
@@ -9339,9 +9717,9 @@ fn edit_cell(app: &mut App) {
 
     // Primary keys drive the WHERE clause; fall back to every column (with a
     // warning) when the table has none or its metadata is not loaded yet.
-    let (where_clause, keys, no_pk) = row_where_clause(app, &grid, &row, &ps.table);
+    let (where_clause, keys, no_pk) = row_where_clause(app, &grid, &row, &ps.schema, &ps.table);
 
-    let dt = column_type(app, &ps.table, &col);
+    let dt = column_type(app, &ps.schema, &ps.table, &col);
     // A NULL cell opens with an empty box (the old value is shown above), so
     // there is no chance of the literal text "NULL" sneaking into the input.
     let initial = edit_prefill(&val);
@@ -9352,6 +9730,7 @@ fn edit_cell(app: &mut App) {
         kind: EditKind::Update,
         cfg: Box::new(cfg),
         db: app.current_db(),
+        schema: ps.schema.clone(),
         table: ps.table.clone(),
         column: col.clone(),
         data_type: dt,
@@ -9379,7 +9758,12 @@ fn quick_insert(app: &mut App) {
     let Some(cfg) = app.selected.clone() else {
         return;
     };
-    let Some(meta) = app.table_meta.as_ref().filter(|m| m.table == ps.table).cloned() else {
+    let Some(meta) = app
+        .table_meta
+        .as_ref()
+        .filter(|m| m.table == ps.table && m.schema == ps.schema)
+        .cloned()
+    else {
         app.status = t("表结构尚未加载，稍后重试").into();
         return;
     };
@@ -9403,7 +9787,7 @@ fn quick_insert(app: &mut App) {
     }
     let sql = format!(
         "INSERT INTO {} ({})\nVALUES ({});", 
-        q(&ps.table), 
+        table_ref(cfg.db_type, &ps.schema, &ps.table), 
         col_list, 
         vals.join(", ")
     );
@@ -9411,6 +9795,7 @@ fn quick_insert(app: &mut App) {
         kind: EditKind::Insert,
         cfg: Box::new(cfg),
         db: app.current_db(),
+        schema: ps.schema.clone(),
         table: ps.table.clone(),
         column: String::new(),
         data_type: None,
@@ -9653,7 +10038,7 @@ fn sort_column(app: &mut App, tx: &Tx, append: bool) {
     };
     // Persist the sort for this table so reopening it restores the order.
     let db = app.current_db();
-    app.config.entry(&db, &ps.table).order_by = next.clone();
+    app.config.entry(&db, &ps.schema, &ps.table).order_by = next.clone();
     app.persist();
     reload_table_view(app, tx, ps.filter.clone(), next, 0);
     app.status = tf("按 {} {}{}", &[&(col), &(dir), &(if append { t("（附加排序键）") } else { "" })]);
@@ -10295,6 +10680,7 @@ fn import_literal(raw: &str, ty: ColType, data_type: &str) -> String {
 /// `INSERT INTO t (cols…) VALUES (vals…);` for one import row.
 fn import_insert_sql(
     cfg: &ConnectionConfig,
+    schema: &str,
     table: &str,
     columns: &[ImportCol],
     row: &[String],
@@ -10318,7 +10704,12 @@ fn import_insert_sql(
         })
         .collect::<Vec<_>>()
         .join(", ");
-    format!("INSERT INTO {} ({}) VALUES ({});", q(table), cols, vals)
+    format!(
+        "INSERT INTO {} ({}) VALUES ({});",
+        table_ref(cfg.db_type, schema, table),
+        cols,
+        vals
+    )
 }
 
 /// Split rows into transaction-sized chunks (the last one may be short).
@@ -10515,10 +10906,11 @@ fn grid_to_markdown(grid: &Grid) -> String {
     out
 }
 
-/// Table name for an INSERT export, or `None` when it cannot be determined.
-fn export_insert_table(app: &App) -> Option<String> {
+/// `(schema, table)` for an INSERT export, or `None` when it cannot be
+/// determined.
+fn export_insert_table(app: &App) -> Option<(String, String)> {
     if let Some(ps) = &app.page_state {
-        return Some(ps.table.clone());
+        return Some((ps.schema.clone(), ps.table.clone()));
     }
     if let Some(s) = &app.script {
         if let Some(t) = s
@@ -10526,17 +10918,26 @@ fn export_insert_table(app: &App) -> Option<String> {
             .and_then(|i| s.outcomes.get(i))
             .and_then(|o| guess_table_from_sql(&o.sql))
         {
-            return Some(t);
+            return Some((String::new(), t));
         }
     }
-    app.last_sql.as_deref().and_then(guess_table_from_sql)
+    app.last_sql
+        .as_deref()
+        .and_then(guess_table_from_sql)
+        .map(|t| (String::new(), t))
 }
 
 /// One `INSERT` per row, reusing the R13 row→INSERT generator.
-fn grid_to_inserts(cfg: &ConnectionConfig, table: &str, grid: &Grid, app: &App) -> String {
+fn grid_to_inserts(
+    cfg: &ConnectionConfig,
+    schema: &str,
+    table: &str,
+    grid: &Grid,
+    app: &App,
+) -> String {
     grid.rows
         .iter()
-        .map(|row| build_insert_sql(cfg, table, grid, row, app))
+        .map(|row| build_insert_sql(cfg, schema, table, grid, row, app))
         .collect::<Vec<_>>()
         .join("\n")
 }
@@ -10544,6 +10945,7 @@ fn grid_to_inserts(cfg: &ConnectionConfig, table: &str, grid: &Grid, app: &App) 
 /// Grouped multi-row `INSERT … VALUES (…),(…);` statements, `batch` rows each.
 fn grid_to_batch_inserts(
     cfg: &ConnectionConfig,
+    schema: &str,
     table: &str,
     grid: &Grid,
     app: &App,
@@ -10552,15 +10954,16 @@ fn grid_to_batch_inserts(
     let types: Vec<Option<String>> = grid
         .columns
         .iter()
-        .map(|c| column_type(app, table, c))
+        .map(|c| column_type(app, schema, table, c))
         .collect();
-    batch_insert_sql(cfg, table, &grid.columns, &grid.rows, &types, batch)
+    batch_insert_sql(cfg, schema, table, &grid.columns, &grid.rows, &types, batch)
 }
 
 /// Pure multi-row INSERT generator (split out so it can be tested without an
 /// `App`). `types` is one declared column type per column, if known.
 fn batch_insert_sql(
     cfg: &ConnectionConfig,
+    schema: &str,
     table: &str,
     columns: &[String],
     rows: &[Vec<Val>],
@@ -10588,7 +10991,12 @@ fn batch_insert_sql(
             })
             .collect::<Vec<_>>()
             .join(",\n");
-        out.push_str(&format!("INSERT INTO {} ({}) VALUES\n{};\n", q(table), cols, groups));
+        out.push_str(&format!(
+            "INSERT INTO {} ({}) VALUES\n{};\n",
+            table_ref(cfg.db_type, schema, table),
+            cols,
+            groups
+        ));
     }
     out
 }
@@ -10598,7 +11006,7 @@ fn render_export_content(
     app: &App,
     grid: &Grid,
     format: ExportFormat,
-    table: Option<&str>,
+    table: Option<&(String, String)>,
 ) -> String {
     match format {
         ExportFormat::Csv => grid_to_csv(grid),
@@ -10606,11 +11014,13 @@ fn render_export_content(
         ExportFormat::JsonNdjson => grid_to_json_ndjson(grid),
         ExportFormat::Markdown => grid_to_markdown(grid),
         ExportFormat::Insert => match (app.selected.as_ref(), table) {
-            (Some(cfg), Some(t)) => grid_to_inserts(cfg, t, grid, app),
+            (Some(cfg), Some((schema, t))) => grid_to_inserts(cfg, schema, t, grid, app),
             _ => String::new(),
         },
         ExportFormat::InsertBatch => match (app.selected.as_ref(), table) {
-            (Some(cfg), Some(t)) => grid_to_batch_inserts(cfg, t, grid, app, EXPORT_INSERT_BATCH),
+            (Some(cfg), Some((schema, t))) => {
+                grid_to_batch_inserts(cfg, schema, t, grid, app, EXPORT_INSERT_BATCH)
+            }
             _ => String::new(),
         },
     }
@@ -10937,13 +11347,16 @@ impl App {
         }
     }
 
-    /// Save the current table's hidden-column set under its `(database, table)`.
+    /// Save the current table's hidden-column set under its
+    /// `(database, schema, table)`.
     fn persist_cols(&mut self) {
         let Some(ps) = self.page_state.clone() else {
             return;
         };
         let db = self.current_db();
-        self.config.entry(&db, &ps.table).hidden = self.col_hidden.clone();
+        self.config
+            .entry(&db, &ps.schema, &ps.table)
+            .hidden = self.col_hidden.clone();
         self.persist();
     }
 
@@ -11209,7 +11622,7 @@ fn export_path_key(app: &mut App, k: KeyEvent) {
         app.status = t("没有可导出的结果").into();
         return;
     };
-    let content = render_export_content(app, &grid, pending.format, pending.table.as_deref());
+    let content = render_export_content(app, &grid, pending.format, pending.table.as_ref());
     let input = ta.lines().join("\n");
     let path = input.trim();
     let label = pending.format.label();
@@ -11243,13 +11656,14 @@ fn export_path_key(app: &mut App, k: KeyEvent) {
 /// (only while the results pane is focused), else the sidebar's highlighted
 /// table. The focus check matters — after browsing a table and returning to the
 /// sidebar, the highlighted table may be a different one.
-fn import_target_table(app: &App) -> Option<String> {
+fn import_target_table(app: &App) -> Option<(String, String)> {
     if app.focus == Focus::Preview && app.grid_kind == GridKind::TableData {
         if let Some(ps) = &app.page_state {
-            return Some(ps.table.clone());
+            return Some((ps.schema.clone(), ps.table.clone()));
         }
     }
-    app.selected_table().map(|t| t.name.clone())
+    app.selected_table()
+        .map(|t| (app.schema.clone(), t.name.clone()))
 }
 
 /// `I`: open the CSV import flow for the current table.
@@ -11258,7 +11672,7 @@ fn open_import_prompt(app: &mut App) {
         app.status = t("仅 SQL 连接支持 CSV 导入").into();
         return;
     }
-    let Some(table) = import_target_table(app) else {
+    let Some((schema, table)) = import_target_table(app) else {
         app.status = t("先选中一张表再按 I 导入").into();
         return;
     };
@@ -11268,6 +11682,7 @@ fn open_import_prompt(app: &mut App) {
     app.import_prompt = Some(ImportPrompt {
         input,
         table,
+        schema,
         db,
         error: None,
     });
@@ -11303,7 +11718,7 @@ fn import_prompt_key(app: &mut App, tx: &Tx, k: KeyEvent) {
         return;
     };
     p.error = None;
-    let (table, db) = (p.table.clone(), p.db.clone());
+    let (table, schema, db) = (p.table.clone(), p.schema.clone(), p.db.clone());
     app.import_prompt = Some(p);
     app.import_gen = app.import_gen.wrapping_add(1);
     let gen = app.import_gen;
@@ -11314,6 +11729,7 @@ fn import_prompt_key(app: &mut App, tx: &Tx, k: KeyEvent) {
         Op::ImportPlan {
             cfg: Box::new(cfg),
             db,
+            schema,
             table,
             path: PathBuf::from(path),
             gen,
@@ -11374,6 +11790,7 @@ fn start_import(app: &mut App, tx: &Tx, plan: &ImportPlan) {
     let job = ImportJob {
         cfg: Box::new(cfg),
         db: plan.db.clone(),
+        schema: plan.schema.clone(),
         table: plan.table.clone(),
         columns,
         rows: plan.rows.clone(),
@@ -11721,7 +12138,12 @@ fn render_header(f: &mut Frame, area: Rect, app: &App) {
         if app.backend_kind == Backend::Redis {
             format!(" · db:{}",  app.redis_db)
         } else if !app.current_db().is_empty() {
-            format!(" · db:{}",  fix_double_encoding(&app.current_db()))
+            let schema = if app.schema.is_empty() {
+                String::new()
+            } else {
+                format!(".{}",  fix_double_encoding(&app.schema))
+            };
+            format!(" · db:{}{schema}",  fix_double_encoding(&app.current_db()))
         } else {
             String::new()
         }
@@ -12393,7 +12815,12 @@ fn render_sidebar_strip(f: &mut Frame, area: Rect, app: &mut App) {
             text.push_str(&tf("▸ {} · {} 表", &[&(truncate_disp(&c.name, 16)), &(app.tables.len())]));
             let db = app.current_db();
             if !db.is_empty() {
-                text.push_str(&format!(" · {}",  fix_double_encoding(&db)));
+                let schema = if app.schema.is_empty() {
+                    String::new()
+                } else {
+                    format!(".{}",  fix_double_encoding(&app.schema))
+                };
+                text.push_str(&format!(" · {db}{schema}",  db = fix_double_encoding(&db)));
             }
             if let Some(t) = app.selected_table() {
                 text.push_str(&format!(" · {}",  fix_double_encoding(&t.name)));
@@ -12550,12 +12977,13 @@ fn grid_title(app: &App) -> String {
                 .map(|t| tf("共 {} 行", &[&(t)]))
                 .unwrap_or_else(|| t("总数未知").into());
             let more = if ps.has_next { t(" · n 下一页") } else { "" };
-            tf(" {}{}.{} · 第 {} 页 · {}–{} / {} · {}{}{} ", &[&(search_marker(app)), &(fix_double_encoding(&app.current_db())), &(fix_double_encoding(&ps.table)), &(ps.page + 1), &(if rows == 0 { 0 } else { offset + 1 }), &(offset + rows), &(total), &(app.grid.as_ref().map(|g| g.note.clone()).unwrap_or_default()), &(more), &(page_state_extra(ps))])
+            let table_label = fix_double_encoding(&qualified_display(&ps.schema, &ps.table));
+            tf(" {}{}.{} · 第 {} 页 · {}–{} / {} · {}{}{} ", &[&(search_marker(app)), &(fix_double_encoding(&app.current_db())), &(table_label), &(ps.page + 1), &(if rows == 0 { 0 } else { offset + 1 }), &(offset + rows), &(total), &(app.grid.as_ref().map(|g| g.note.clone()).unwrap_or_default()), &(more), &(page_state_extra(ps))])
         }
         GridKind::Columns => {
             let table = app
                 .selected_table()
-                .map(|t| fix_double_encoding(&t.name))
+                .map(|t| fix_double_encoding(&qualified_display(&app.schema, &t.name)))
                 .unwrap_or_default();
             tf(" 表结构 · {} · {} · t 查看 DDL ", &[&(table), &(app.grid.as_ref().map(|g| g.note.clone()).unwrap_or_default())])
         }
@@ -12597,7 +13025,7 @@ fn grid_title(app: &App) -> String {
             };
             tf(
                 " {}{}.{} · 第 {} 页 · {}–{} / {} · {}{}{} ",
-                &[&(search_marker(app)), &(fix_double_encoding(&app.current_db())), &(fix_double_encoding(&ps.table)), &(ps.page + 1), &(if rows == 0 { 0 } else { offset + 1 }), &(offset + rows), &(total), &(app.grid.as_ref().map(|g| g.note.clone()).unwrap_or_default()), &(more), &(filt)],
+                &[&(search_marker(app)), &(fix_double_encoding(&app.current_db())), &(fix_double_encoding(&qualified_display(&ps.schema, &ps.table))), &(ps.page + 1), &(if rows == 0 { 0 } else { offset + 1 }), &(offset + rows), &(total), &(app.grid.as_ref().map(|g| g.note.clone()).unwrap_or_default()), &(more), &(filt)],
             )
         }
     }
@@ -13428,7 +13856,10 @@ fn render_sidebar(f: &mut Frame, area: Rect, app: &mut App) {
                 Style::default()
             };
             lines.push(Line::from(Span::styled(
-                format!("{marker}{}{view}",  fix_double_encoding(&t.name)),
+                format!(
+                    "{marker}{}{view}",
+                    fix_double_encoding(&qualified_display(&app.schema, &t.name))
+                ),
                 style,
             )));
         }
@@ -13775,6 +14206,7 @@ fn render_db_picker(f: &mut Frame, area: Rect, app: &mut App) {
         .collect();
     let title = match app.backend_kind {
         Backend::Redis => t(" Redis db · ↑↓ Enter · Esc 关 "),
+        _ if !app.schemas.is_empty() => t(" 模式 / 数据库 · ↑↓ Enter · Esc 关 "),
         _ => t(" 数据库 · ↑↓ Enter · Esc 关 "),
     };
     let list = List::new(items)
@@ -13939,7 +14371,7 @@ fn render_recent_tables(f: &mut Frame, area: Rect, app: &mut App) {
     let items: Vec<ListItem> = app
         .recent_tables
         .iter()
-        .map(|(db, table)| {
+        .map(|(db, schema, table)| {
             let here = *db == cur_db;
             ListItem::new(Line::from(vec![
                 Span::styled(
@@ -13947,7 +14379,7 @@ fn render_recent_tables(f: &mut Frame, area: Rect, app: &mut App) {
                     Style::default().fg(if here { Color::Green } else { Color::DarkGray }),
                 ),
                 Span::styled(
-                    fix_double_encoding(table),
+                    fix_double_encoding(&qualified_display(schema, table)),
                     Style::default().add_modifier(Modifier::BOLD),
                 ),
                 Span::styled(
@@ -14249,7 +14681,7 @@ fn render_edit_dialog(f: &mut Frame, area: Rect, app: &mut App) {
             let block = Block::default()
                 .borders(Borders::ALL)
                 .title(Span::styled(
-                    tf(" ✎ 编辑 {}.{} ", &[&(fix_double_encoding(&d.db)), &(fix_double_encoding(&d.table))]),
+                    tf(" ✎ 编辑 {}.{} ", &[&(fix_double_encoding(&d.db)), &(fix_double_encoding(&qualified_display(&d.schema, &d.table)))]),
                     Style::default()
                         .fg(Color::Yellow)
                         .add_modifier(Modifier::BOLD),
@@ -14313,7 +14745,7 @@ fn render_edit_dialog(f: &mut Frame, area: Rect, app: &mut App) {
         EditKind::Insert => {
             let mut lines: Vec<Line> = Vec::new();
             lines.push(Line::from(Span::styled(
-                tf("新增一行到 {}.{}", &[&(fix_double_encoding(&d.db)), &(fix_double_encoding(&d.table))]),
+                tf("新增一行到 {}.{}", &[&(fix_double_encoding(&d.db)), &(fix_double_encoding(&qualified_display(&d.schema, &d.table)))]),
                 Style::default().fg(Color::Cyan),
             )));
             for (col, val) in d.insert_preview.iter().take(10) {
@@ -14353,7 +14785,7 @@ fn render_edit_dialog(f: &mut Frame, area: Rect, app: &mut App) {
             let block = Block::default()
                 .borders(Borders::ALL)
                 .title(Span::styled(
-                    tf(" ➕ 插入 {}.{} ", &[&(fix_double_encoding(&d.db)), &(fix_double_encoding(&d.table))]),
+                    tf(" ➕ 插入 {}.{} ", &[&(fix_double_encoding(&d.db)), &(fix_double_encoding(&qualified_display(&d.schema, &d.table)))]),
                     Style::default()
                         .fg(Color::Green)
                         .add_modifier(Modifier::BOLD),
@@ -14619,7 +15051,7 @@ const HELP_ROWS: &[(&str, &str)] = &[
     ("Enter", "浏览表数据"),
     ("r", "表结构（字段 + DDL）"),
     ("I", "导入 CSV 到当前表（预览 + 追加/覆盖确认）"),
-    ("d", "数据库列表（浮层内 r 刷新）"),
+    ("d", "数据库 / 模式列表（PG 等支持 schema 的连接；浮层内 r 刷新）"),
     ("← →", "切换数据库（快捷）"),
     ("o", "返回连接选择"),
     ("c", "新建连接"),
@@ -14862,7 +15294,7 @@ fn render_import_prompt(f: &mut Frame, area: Rect, app: &mut App) {
     let target = app
         .import_prompt
         .as_ref()
-        .map(|p| format!("{}.{}", p.db, p.table))
+        .map(|p| format!("{}.{}",  p.db,  qualified_display(&p.schema, &p.table)))
         .unwrap_or_default();
     if let Some(p) = app.import_prompt.as_mut() {
         p.input.set_block(Block::default());
@@ -14896,7 +15328,10 @@ fn import_plan_lines(plan: &ImportPlan) -> Vec<PopupLine> {
     let bad = Style::default().fg(Color::Red).add_modifier(Modifier::BOLD);
     let mut lines: Vec<PopupLine> = Vec::new();
     lines.push(PopupLine {
-        text: tf("目标表: {}.{}", &[&plan.db, &plan.table]),
+        text: tf(
+            "目标表: {}.{}",
+            &[&plan.db, &qualified_display(&plan.schema, &plan.table)],
+        ),
         style: head,
     });
     lines.push(PopupLine {
@@ -15085,7 +15520,10 @@ fn render_import_report(f: &mut Frame, area: Rect, app: &mut App) {
         t("追加")
     };
     lines.push(PopupLine {
-        text: tf("目标表: {}", &[&rep.table]),
+        text: tf(
+            "目标表: {}",
+            &[&qualified_display(&rep.schema, &rep.table)],
+        ),
         style: head,
     });
     lines.push(PopupLine {
@@ -15465,6 +15903,7 @@ mod tests {
         app.mongo_docs = docs;
         app.page_state = Some(PageState {
             table: "coll".into(),
+            schema: String::new(),
             table_type: None,
             page: 0,
             page_size: MONGO_PAGE,
@@ -15539,6 +15978,7 @@ mod tests {
                     a.import_prompt = Some(ImportPrompt {
                         input: TextArea::default(),
                         table: "t".into(),
+                        schema: String::new(),
                         db: "d".into(),
                         error: None,
                     })
@@ -15555,6 +15995,7 @@ mod tests {
                         headers: vec!["a".into(), "b".into()],
                         rows: vec![vec!["1".into(), "2".into()]],
                         table: "t".into(),
+                        schema: String::new(),
                         db: "d".into(),
                         columns: vec![ImportCol {
                             name: "a".into(),
@@ -15575,6 +16016,7 @@ mod tests {
                 Box::new(|a| {
                     a.import_report = Some(Box::new(ImportReport {
                         table: "t".into(),
+                        schema: String::new(),
                         mode: ImportMode::Append,
                         total: 1,
                         inserted: 1,
@@ -15632,6 +16074,7 @@ mod tests {
                         kind: EditKind::Update,
                         cfg: Box::new(test_conn("mysql")),
                         db: "d".into(),
+                        schema: String::new(),
                         table: "t".into(),
                         column: "c".into(),
                         data_type: Some("int".into()),
@@ -15782,6 +16225,7 @@ mod tests {
         app.selected = Some(test_conn("mysql"));
         app.table_meta = Some(TableMeta {
             table: "t".into(),
+            schema: String::new(),
             columns: vec![
                 ColumnInfo {
                     name: "id".into(),
@@ -15811,16 +16255,21 @@ mod tests {
             note: String::new(),
         };
         for format in EXPORT_FORMATS {
-            let out = render_export_content(&app, &grid, *format, Some("t"));
+            let out = render_export_content(&app, &grid, *format, Some(&("".to_string(), "t".to_string())));
             assert!(!out.is_empty(), "{format:?} produced nothing");
         }
         // The blob column is copied as `X'…'`, never as a quoted string.
-        let insert = render_export_content(&app, &grid, ExportFormat::Insert, Some("t"));
+        let insert = render_export_content(
+            &app,
+            &grid,
+            ExportFormat::Insert,
+            Some(&("".to_string(), "t".to_string())),
+        );
         assert!(insert.contains("X'0001726177'"), "{insert}");
         // The 1 MB text cell survives verbatim in CSV and Markdown.
-        let csv = render_export_content(&app, &grid, ExportFormat::Csv, Some("t"));
+        let csv = render_export_content(&app, &grid, ExportFormat::Csv, Some(&("".to_string(), "t".to_string())));
         assert!(csv.contains(&huge));
-        let md = render_export_content(&app, &grid, ExportFormat::Markdown, Some("t"));
+        let md = render_export_content(&app, &grid, ExportFormat::Markdown, Some(&("".to_string(), "t".to_string())));
         assert!(md.contains(&huge));
     }
 
@@ -15831,10 +16280,11 @@ mod tests {
     fn import_done_invalidates_the_count_cache() {
         let (tx, _rx) = tokio::sync::mpsc::unbounded_channel::<OpResult>();
         let mut app = test_app();
-        app.count_cache.insert("d\u{1}t\u{1}".into(), 5);
+        app.count_cache.insert("d\u{1}\u{1}t\u{1}".into(), 5);
         app.import_progress = Some((1, 1));
         let rep = ImportReport {
             table: "t".into(),
+            schema: String::new(),
             mode: ImportMode::Append,
             total: 1,
             inserted: 1,
@@ -16477,18 +16927,30 @@ mod tests {
 
     #[test]
     fn count_cache_key_depends_on_filter_not_sort() {
-        assert_eq!(count_cache_key("db", "t", ""), count_cache_key("db", "t", ""));
-        assert_ne!(
-            count_cache_key("db", "t", "a = 1"),
-            count_cache_key("db", "t", "a = 2")
+        assert_eq!(
+            count_cache_key("db", "", "t", ""),
+            count_cache_key("db", "", "t", "")
         );
-        assert_ne!(count_cache_key("db1", "t", ""), count_cache_key("db2", "t", ""));
+        assert_ne!(
+            count_cache_key("db", "", "t", "a = 1"),
+            count_cache_key("db", "", "t", "a = 2")
+        );
+        assert_ne!(
+            count_cache_key("db1", "", "t", ""),
+            count_cache_key("db2", "", "t", "")
+        );
+        // The schema is part of the key: `public.orders` ≠ `inv.orders`.
+        assert_ne!(
+            count_cache_key("db", "public", "orders", ""),
+            count_cache_key("db", "inv", "orders", "")
+        );
     }
 
     #[test]
     fn page_state_extra_reports_filter_and_sort() {
         let ps = PageState {
             table: "t".into(),
+            schema: String::new(),
             table_type: None,
             page: 0,
             page_size: 50,
@@ -16506,6 +16968,7 @@ mod tests {
     fn page_state_extra_is_empty_without_filter_or_sort() {
         let ps = PageState {
             table: "t".into(),
+            schema: String::new(),
             table_type: None,
             page: 0,
             page_size: 50,
@@ -16928,7 +17391,7 @@ mod tests {
                 data_type: "int".into(),
             },
         ];
-        let sql = import_insert_sql(&cfg, "users", &cols, &["7".into(), "Ada".into()]);
+        let sql = import_insert_sql(&cfg, "", "users", &cols, &["7".into(), "Ada".into()]);
         assert_eq!(sql, "INSERT INTO `users` (`id`, `name`) VALUES (7, 'Ada');");
     }
 
@@ -17000,7 +17463,7 @@ mod tests {
             vec![Val::Text("2".into()), Val::Null],
             vec![Val::Text("3".into()), Val::Text("c".into())],
         ];
-        let out = batch_insert_sql(&cfg, "t", &columns, &rows, &types, 2);
+        let out = batch_insert_sql(&cfg, "", "t", &columns, &rows, &types, 2);
         assert_eq!(
             out,
             "INSERT INTO `t` (`id`, `name`) VALUES\n(1, 'a'),\n(2, NULL);\nINSERT INTO `t` (`id`, `name`) VALUES\n(3, 'c');\n"
@@ -17407,14 +17870,14 @@ mod tests {
         let path = std::env::temp_dir().join(format!("dbxt-test-{}.json", Uuid::new_v4()));
         let mut cfg = TuiConfig::default();
         cfg.set_compact(Some(true));
-        let e = cfg.entry("shop", "orders");
+        let e = cfg.entry("shop", "", "orders");
         e.hidden = ["secret".to_string()].into_iter().collect();
         e.compact = Some(false);
         e.order_by = Some("\"id\" DESC".into());
         cfg.save(&path);
         let back = TuiConfig::load(&path);
         assert_eq!(back.compact, Some(true));
-        let p = back.table("shop", "orders").unwrap();
+        let p = back.table("shop", "", "orders").unwrap();
         assert_eq!(p.hidden.len(), 1);
         assert!(p.hidden.contains("secret"));
         assert_eq!(p.compact, Some(false));
@@ -17442,9 +17905,9 @@ mod tests {
         let cfg = TuiConfig::load(&path);
         assert_eq!(cfg.compact, None);
         // A wrong-shaped table map / entry is skipped, not fatal.
-        assert!(cfg.table("db", "t").is_none());
+        assert!(cfg.table("db", "", "t").is_none());
         // A nested entry with every field the wrong type degrades to defaults.
-        let p = cfg.table("db3", "t").expect("entry kept as defaults");
+        let p = cfg.table("db3", "", "t").expect("entry kept as defaults");
         assert!(p.hidden.is_empty() && p.compact.is_none() && p.order_by.is_none());
         let _ = std::fs::remove_file(&path);
     }
@@ -17454,24 +17917,242 @@ mod tests {
         let path = std::env::temp_dir().join(format!("dbxt-merge-{}.json", Uuid::new_v4()));
         // Session A stores a sort for one table.
         let mut a = TuiConfig::default();
-        a.entry("db", "a").order_by = Some("\"id\" ASC".into());
+        a.entry("db", "", "a").order_by = Some("\"id\" ASC".into());
         a.save(&path);
         // Session B knows nothing about table `a` (older snapshot) and writes `b`.
         // Its save must not wipe A's entry.
         let mut b = TuiConfig::default();
-        b.entry("db", "b").hidden = ["x".to_string()].into_iter().collect();
+        b.entry("db", "", "b").hidden = ["x".to_string()].into_iter().collect();
         b.save(&path);
         let after = TuiConfig::load(&path);
-        assert!(after.table("db", "a").is_some(), "B must not clobber A");
-        assert!(after.table("db", "b").is_some());
+        assert!(after.table("db", "", "a").is_some(), "B must not clobber A");
+        assert!(after.table("db", "", "b").is_some());
         // Resetting a table to defaults removes its stored entry instead of
         // silently keeping the stale one.
         let mut c = TuiConfig::default();
-        c.entry("db", "a");
+        c.entry("db", "", "a");
         c.save(&path);
         let cleared = TuiConfig::load(&path);
-        assert!(cleared.table("db", "a").is_none());
-        assert!(cleared.table("db", "b").is_some(), "unrelated entry survives");
+        assert!(cleared.table("db", "", "a").is_none());
+        assert!(cleared.table("db", "", "b").is_some(), "unrelated entry survives");
+        let _ = std::fs::remove_file(&path);
+    }
+
+    // ── R26: schema-aware browsing ──
+
+    #[test]
+    fn schema_picker_engine_is_opt_in() {
+        assert!(schema_picker_engine(parse_database_type("postgres").unwrap()));
+        assert!(schema_picker_engine(parse_database_type("sqlserver").unwrap()));
+        assert!(schema_picker_engine(parse_database_type("oracle").unwrap()));
+        // Embedded / single-namespace engines keep the flat list.
+        assert!(!schema_picker_engine(parse_database_type("sqlite").unwrap()));
+        assert!(!schema_picker_engine(parse_database_type("duckdb").unwrap()));
+        assert!(!schema_picker_engine(parse_database_type("mysql").unwrap()));
+    }
+
+    #[test]
+    fn qualified_table_reference_quotes_the_schema() {
+        let pg = parse_database_type("postgres").unwrap();
+        let mysql = parse_database_type("mysql").unwrap();
+        assert_eq!(table_ref(pg, "inv", "items"), "\"inv\".\"items\"");
+        // No schema → the pre-R26 unqualified form, so MySQL / SQLite are unchanged.
+        assert_eq!(table_ref(pg, "", "items"), "\"items\"");
+        assert_eq!(table_ref(mysql, "", "items"), "`items`");
+        // A MySQL database qualifier is valid too.
+        assert_eq!(table_ref(mysql, "shop", "items"), "`shop`.`items`");
+    }
+
+    #[test]
+    fn qualified_display_and_pref_key_fold_in_the_schema() {
+        assert_eq!(qualified_display("inv", "items"), "inv.items");
+        assert_eq!(qualified_display("", "items"), "items");
+        assert_eq!(table_pref_key("public", "orders"), "public.orders");
+        assert_eq!(table_pref_key("", "orders"), "orders");
+    }
+
+    #[test]
+    fn import_insert_sql_qualifies_the_schema() {
+        let cfg = test_conn("postgres");
+        let cols = vec![
+            ImportCol {
+                name: "item_id".into(),
+                src: Some(0),
+                ty: ColType::Int,
+                data_type: "integer".into(),
+            },
+            ImportCol {
+                name: "sku".into(),
+                src: Some(1),
+                ty: ColType::Text,
+                data_type: "text".into(),
+            },
+        ];
+        let sql = import_insert_sql(&cfg, "inv", "items", &cols, &["1".into(), "SKU-1".into()]);
+        assert_eq!(
+            sql,
+            "INSERT INTO \"inv\".\"items\" (\"item_id\", \"sku\") VALUES (1, 'SKU-1');"
+        );
+    }
+
+    #[test]
+    fn update_sql_qualifies_the_schema() {
+        let cfg = test_conn("postgres");
+        let sql = build_update_sql(
+            &cfg,
+            "inv",
+            "items",
+            "qty",
+            Some("integer"),
+            "5",
+            "\"item_id\" = 1",
+        );
+        assert_eq!(
+            sql,
+            "UPDATE \"inv\".\"items\"\nSET \"qty\" = 5\nWHERE \"item_id\" = 1;"
+        );
+    }
+
+    #[test]
+    fn batch_insert_sql_qualifies_the_schema() {
+        let cfg = test_conn("postgres");
+        let columns = vec!["id".to_string(), "name".to_string()];
+        let rows = vec![vec![Val::Text("1".into()), Val::Text("a".into())]];
+        let types = vec![Some("integer".to_string()), Some("text".to_string())];
+        let out = batch_insert_sql(&cfg, "inv", "items", &columns, &rows, &types, 10);
+        assert!(
+            out.starts_with("INSERT INTO \"inv\".\"items\" (\"id\", \"name\") VALUES"),
+            "{out}"
+        );
+    }
+
+    #[test]
+    fn column_type_is_matched_per_schema() {
+        let mut app = test_app();
+        app.table_meta = Some(TableMeta {
+            table: "orders".into(),
+            schema: "public".into(),
+            columns: vec![ColumnInfo {
+                name: "amount".into(),
+                data_type: "numeric(10,2)".into(),
+                ..Default::default()
+            }],
+        });
+        assert_eq!(
+            column_type(&app, "public", "orders", "amount").as_deref(),
+            Some("numeric(10,2)")
+        );
+        // Same table name in another schema must not inherit the metadata.
+        assert!(column_type(&app, "inv", "orders", "amount").is_none());
+    }
+
+    #[test]
+    fn picker_lists_schemas_before_databases() {
+        let mut app = test_app();
+        app.selected = Some(test_conn("postgres"));
+        app.databases = vec!["shop".into(), "postgres".into()];
+        app.schemas = vec!["public".into(), "inv".into()];
+        app.schema = "inv".into();
+        let entries = picker_entries(&app);
+        assert_eq!(
+            entries,
+            vec![
+                (PickerKind::Schema, "public".into()),
+                (PickerKind::Schema, "inv".into()),
+                (PickerKind::Database, "shop".into()),
+                (PickerKind::Database, "postgres".into()),
+            ]
+        );
+        // The highlight starts on the current schema, not the current database.
+        assert_eq!(db_current_index(&app), 1);
+        // Labels separate the two kinds once the schema layer is on.
+        let labels = db_entries(&app);
+        assert!(labels[0].starts_with("模式"), "{labels:?}");
+        assert!(labels[2].starts_with("数据库"), "{labels:?}");
+    }
+
+    #[test]
+    fn picker_is_flat_without_schemas() {
+        let mut app = test_app();
+        app.selected = Some(test_conn("mysql"));
+        app.databases = vec!["shop".into()];
+        app.schemas.clear();
+        assert_eq!(
+            picker_entries(&app),
+            vec![(PickerKind::Database, "shop".into())]
+        );
+        // MySQL labels keep their pre-R26 plain form.
+        assert_eq!(db_entries(&app), vec!["shop".to_string()]);
+    }
+
+    #[test]
+    fn stale_table_list_is_discarded() {
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel::<OpResult>();
+        let mut app = test_app();
+        let table = |name: &str| TableInfo {
+            name: name.into(),
+            table_type: "TABLE".into(),
+            comment: None,
+            parent_schema: None,
+            parent_name: None,
+        };
+        app.tables_gen = 2;
+        app.tables_all = vec![table("inv_items")];
+        // A reply for an older generation (a slow `public` list the user already
+        // left) must not replace the current one.
+        apply_op_result(
+            &mut app,
+            OpResult::TablesFor {
+                tables: vec![table("public_orders")],
+                gen: 1,
+            },
+            &tx,
+        );
+        assert_eq!(app.tables_all.len(), 1);
+        assert_eq!(app.tables_all[0].name, "inv_items");
+        // The current generation is applied.
+        apply_op_result(
+            &mut app,
+            OpResult::TablesFor {
+                tables: vec![table("inv_items"), table("inv_orders")],
+                gen: 2,
+            },
+            &tx,
+        );
+        assert_eq!(app.tables_all.len(), 2);
+    }
+
+    #[test]
+    fn default_schema_prefers_public() {
+        assert_eq!(default_schema(&["inv".into(), "public".into()]), "public");
+        assert_eq!(default_schema(&["inv".into(), "other".into()]), "inv");
+        assert_eq!(default_schema(&[]), "");
+    }
+
+    #[test]
+    fn config_persists_per_schema_table_keys() {
+        let path = std::env::temp_dir().join(format!("dbxt-schema-{}.json", Uuid::new_v4()));
+        let mut cfg = TuiConfig::default();
+        cfg.entry("shop", "public", "orders").order_by = Some("\"id\" DESC".into());
+        cfg.entry("shop", "inv", "orders").hidden = ["secret".to_string()].into_iter().collect();
+        cfg.save(&path);
+        let back = TuiConfig::load(&path);
+        // Same table name, two schemas → two independent entries.
+        assert_eq!(
+            back.table("shop", "public", "orders")
+                .unwrap()
+                .order_by
+                .as_deref(),
+            Some("\"id\" DESC")
+        );
+        assert!(back
+            .table("shop", "inv", "orders")
+            .unwrap()
+            .hidden
+            .contains("secret"));
+        // The public entry kept no hidden set, and vice versa.
+        assert!(back.table("shop", "public", "orders").unwrap().hidden.is_empty());
+        assert!(back.table("shop", "inv", "orders").unwrap().order_by.is_none());
         let _ = std::fs::remove_file(&path);
     }
 
@@ -17730,6 +18411,7 @@ mod tests {
         app.import_prompt = Some(ImportPrompt {
             input: TextArea::default(),
             table: "t".into(),
+            schema: String::new(),
             db: "d".into(),
             error: None,
         });
@@ -17738,6 +18420,7 @@ mod tests {
 
         app.import_report = Some(Box::new(ImportReport {
             table: "t".into(),
+            schema: String::new(),
             mode: ImportMode::Append,
             total: 1,
             inserted: 1,

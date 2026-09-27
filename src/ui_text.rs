@@ -303,7 +303,6 @@ pub static ALL_KEYS: &[&str] = &[
     "加载 {} 第 {} 页…",
     "加载 {} 结构…",
     "加载 {} 表…",
-    "加载 {}.{} 数据…",
     "加载更多… (上限 {} 行)",
     "加载连接…",
     "勾选",
@@ -391,7 +390,7 @@ pub static ALL_KEYS: &[&str] = &[
     "收藏",
     "收起 / 展开当前焦点区域",
     "收起结果 / 关闭浮层",
-    "数据库列表（浮层内 r 刷新）",
+    "数据库 / 模式列表（PG 等支持 schema 的连接；浮层内 r 刷新）",
     "整屏滚动，跨页衔接",
     "整行详情（紧凑列模式）/ 完整单元格",
     "整行详情（纵向，含隐藏列）",
@@ -791,6 +790,14 @@ pub static ALL_KEYS: &[&str] = &[
     "导出",
     "确认",
     "快选",
+    // ── R26: schema picker ──
+    "模式",
+    "数据库",
+    " 模式 / 数据库 · ↑↓ Enter · Esc 关 ",
+    "切换 schema → {}",
+    "加载 {} 数据…",
+    "{} · schema {} · d 切换",
+    "无法列举 schema（{}），按默认命名空间浏览",
 ];
 
 /// The Chinese → English table. Keys must match the source literals exactly.
@@ -960,7 +967,6 @@ fn en_of(zh: &'static str) -> Option<&'static str> {
         "加载 {} 第 {} 页…" => Some("Loading {} page {}…"),
         "加载 {} 结构…" => Some("Loading {} structure…"),
         "加载 {} 表…" => Some("Loading {} tables…"),
-        "加载 {}.{} 数据…" => Some("Loading {}.{} data…"),
         "加载更多… (上限 {} 行)" => Some("Load more… (cap {} rows)"),
         "加载连接…" => Some("Connecting…"),
         "勾选" => Some("toggle"),
@@ -1048,7 +1054,7 @@ fn en_of(zh: &'static str) -> Option<&'static str> {
         "收藏" => Some("save"),
         "收起 / 展开当前焦点区域" => Some("Collapse / expand the focused pane"),
         "收起结果 / 关闭浮层" => Some("Collapse results / close overlay"),
-        "数据库列表（浮层内 r 刷新）" => Some("Database list (r refreshes inside the overlay)"),
+        "数据库 / 模式列表（PG 等支持 schema 的连接；浮层内 r 刷新）" => Some("Database / schema list (PostgreSQL et al.; r refreshes inside the overlay)"),
         "整屏滚动，跨页衔接" => Some("Scroll a full screen, carrying across pages"),
         "整行详情（紧凑列模式）/ 完整单元格" => Some("Full row details (compact mode) / full cell"),
         "整行详情（纵向，含隐藏列）" => Some("Full row details (vertical, including hidden columns)"),
@@ -1449,6 +1455,18 @@ fn en_of(zh: &'static str) -> Option<&'static str> {
         "导出" => Some("export"),
         "确认" => Some("confirm"),
         "快选" => Some("quick pick"),
+        // ── R26: schema picker ──
+        "模式" => Some("Schema"),
+        "数据库" => Some("Database"),
+        " 模式 / 数据库 · ↑↓ Enter · Esc 关 " => {
+            Some(" Schema / Database · ↑↓ Enter · Esc to close ")
+        }
+        "切换 schema → {}" => Some("Switch schema → {}"),
+        "加载 {} 数据…" => Some("Loading {} data…"),
+        "{} · schema {} · d 切换" => Some("{} · schema {} · d to switch"),
+        "无法列举 schema（{}），按默认命名空间浏览" => {
+            Some("Cannot list schemas ({}); browsing the default namespace")
+        }
         _ => None,
     }
 }

@@ -9,7 +9,7 @@ A keyboard-first terminal UI for databases, built on the [DBX](https://github.co
 **Connections** — shared with DBX Desktop
 - Connections live in DBX's own SQLite store (`dbx.db`), so everything you configured there shows up automatically.
 - `c` creates a connection in-TUI, `p` duplicates one into the form, `Enter` connects; rows are colour-coded by database family.
-- `d` opens a database list and switches — one gesture for MySQL/PostgreSQL schemas, MongoDB databases and Redis logical DBs.
+- `d` opens a switcher — MySQL databases, PostgreSQL (and other schema-aware engines') **schemas then databases**, MongoDB databases and Redis logical DBs, all one gesture.
 - `o` returns to the picker; `r` reloads the list in place.
 
 **SQL editor & results**
@@ -109,7 +109,7 @@ The TUI's `?` overlay and `dbxt --help` carry the complete list; this is the sho
 | Context | Keys |
 | --- | --- |
 | Global | `?` help · `Tab`/`Shift-Tab` panes · `Alt-1/2/3` focus · `F5`/`Ctrl-J` run · `Ctrl-C` quit |
-| Connections | `↑` `↓` move · `Enter` connect · `c` new · `p` duplicate · `d` database list · `o` picker |
+| Connections | `↑` `↓` move · `Enter` connect · `c` new · `p` duplicate · `d` database/schema switcher · `o` picker |
 | Sidebar | `↑` `↓` tables · `/` filter · `Enter` browse · `r` structure · `I` import CSV · `t` recent |
 | Results | `↑` `↓` rows · `←` `→` columns · `n`/`p` pages · `Enter`/`v` cell · `e` edit · `i` insert · `Delete` delete |
 | Results (more) | `f` filter · `s` sort · `Ctrl-K` extra sort · `Ctrl-R` clear · `y` copy row · `/` search · `Ctrl-Y` export · `[` `]` tabs |
@@ -125,7 +125,7 @@ Per-table choices (compact widths, hidden columns, sort) are written to `~/.conf
 
 Early but usable. Verified end-to-end against real MySQL 8.4, PostgreSQL 16, Redis and MongoDB servers.
 
-**PostgreSQL** — the SQL backend speaks the PostgreSQL dialect end to end. Identifiers are double-quoted (`"schema"."table"`, reserved words included); `bytea` (`0x…` cells round-trip as `'\x…'::bytea`), `uuid`, `jsonb`, arrays (`ARRAY[…]`) and enums render in full and copy/export as valid SQL; `serial` / identity columns are skipped by the insert template so the sequence stays authoritative; and `Ctrl-P` issues a plain `EXPLAIN` (never `EXPLAIN ANALYZE`), so a write statement is planned without being executed. Structure and DDL read `pg_catalog` with an `information_schema` fallback, and the DDL resolves the relation's visible schema (`CREATE TABLE "public"."accounts"`, plus indexes, constraints and comments). Browsing covers the connection's `public` schema; tables in other schemas (e.g. `inv.items`) are not listed yet.
+**PostgreSQL** — the SQL backend speaks the PostgreSQL dialect end to end. Identifiers are double-quoted (`"schema"."table"`, reserved words included); `bytea` (`0x…` cells round-trip as `'\x…'::bytea`), `uuid`, `jsonb`, arrays (`ARRAY[…]`) and enums render in full and copy/export as valid SQL; `serial` / identity columns are skipped by the insert template so the sequence stays authoritative; and `Ctrl-P` issues a plain `EXPLAIN` (never `EXPLAIN ANALYZE`), so a write statement is planned without being executed. Structure and DDL read `pg_catalog` with an `information_schema` fallback, and the DDL resolves the relation's visible schema (`CREATE TABLE "public"."accounts"`, plus indexes, constraints and comments). Browsing is schema-aware: `d` lists the database's schemas (schemas first, then databases), the sidebar shows `inv.items`-style qualified names, and table data, structure, DDL, cell edits, inserts, deletes, filters, sorts, CSV import/export and INSERT export all carry the selected schema — so `public.orders` and `inv.orders` never mix. Column visibility, the saved sort and the `COUNT(*)` cache are keyed by `database.schema.table`.
 
 - [x] SQL browsing, editing, transactions, filter/sort, completion, CSV import/export and result tabs
 - [x] Redis key browser with batch key operations
