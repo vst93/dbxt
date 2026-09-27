@@ -1793,13 +1793,35 @@ fn env_log_path(var: &str, default_name: &str) -> Option<PathBuf> {
     }
 }
 
+/// Version-selection rule, split out from [`dbxt_version`] so the compile-time
+/// injection can be unit-tested: an injected release version wins, an empty one
+/// is ignored, and everything else falls back to Cargo.toml.
+fn pick_version<'a>(injected: Option<&'a str>, fallback: &'a str) -> &'a str {
+    match injected {
+        Some(v) if !v.is_empty() => v,
+        _ => fallback,
+    }
+}
+
+/// The version this binary reports.
+///
+/// Release artifacts get the git tag injected through `DBXT_VERSION` at compile
+/// time (see the `build` job in `.github/workflows/release.yml`), so their
+/// `--version` matches the tag even though Cargo.toml is not bumped for every
+/// release. A plain `cargo build` sees no such variable and falls back to
+/// `CARGO_PKG_VERSION`.
+fn dbxt_version() -> &'static str {
+    pick_version(option_env!("DBXT_VERSION"), env!("CARGO_PKG_VERSION"))
+}
+
+/// The exact `--version` line. Kept in one place so the format is tested once.
+fn version_line() -> String {
+    format!("dbxt {}", dbxt_version())
+}
+
 /// `dbxt --help`: a short usage summary. The full manual lives in the README.
 fn print_help() {
-    println!(
-        "dbxt {} — {}",
-        env!("CARGO_PKG_VERSION"),
-        t("DBX 的终端界面")
-    );
+    println!("dbxt {} — {}", dbxt_version(), t("DBX 的终端界面"));
     println!();
     println!("{}: dbxt [DBX_STORE]", t("用法"));
     println!();
@@ -1825,7 +1847,7 @@ async fn main() -> Result<()> {
     if let Some(arg) = std::env::args().nth(1) {
         match arg.as_str() {
             "-V" | "--version" => {
-                println!("dbxt {}", env!("CARGO_PKG_VERSION"));
+                println!("{}", version_line());
                 return Ok(());
             }
             "-h" | "--help" => {
@@ -11343,5 +11365,37 @@ mod tests {
             );
         }
         assert!(ui_text::ALL_KEYS.len() > 300);
+    }
+
+    #[test]
+    fn version_picks_injected_then_cargo() {
+        // An injected release tag wins over Cargo.toml...
+        assert_eq!(pick_version(Some("0.0.1"), "0.1.0"), "0.0.1");
+        // ...a missing or empty injection falls back to Cargo.toml.
+        assert_eq!(pick_version(None, "0.1.0"), "0.1.0");
+        assert_eq!(pick_version(Some(""), "0.1.0"), "0.1.0");
+    }
+
+    #[test]
+    fn version_output_is_a_parseable_semver_line() {
+        // cmd/install.sh reads this line, so the format is a contract: exactly
+        // one `dbxt ` prefix followed by `x.y.z` (an optional pre-release
+        // suffix such as `0.2.0-rc1` is allowed).
+        let line = version_line();
+        let ver = line
+            .strip_prefix("dbxt ")
+            .unwrap_or_else(|| panic!("unexpected --version format: {line:?}"));
+        let core = ver.split(['-', '+']).next().unwrap();
+        let parts: Vec<&str> = core.split('.').collect();
+        assert_eq!(parts.len(), 3, "not x.y.z: {ver:?}");
+        for p in parts {
+            assert!(
+                !p.is_empty() && p.bytes().all(|b| b.is_ascii_digit()),
+                "non-numeric component in {ver:?}"
+            );
+        }
+        // The reported value is the one actually compiled in.
+        assert_eq!(ver, dbxt_version());
+        assert!(!dbxt_version().is_empty());
     }
 }

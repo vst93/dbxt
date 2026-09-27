@@ -57,6 +57,7 @@ $Z = @{
     TRYING_DIRECT    = U(229,176,157,232,175,149,231,155,180,232,191,158,46,46,46)
     CONNECTING       = U(232,191,158,230,142,165,228,184,173,46,46,46)
     UP_TO_DATE       = U(229,183,178,230,152,175,230,156,128,230,150,176,231,137,136,230,156,172)
+    NEWER_KEPT       = U(229,183,178,229,174,137,232,163,133,231,137,136,230,156,172,230,175,148,230,156,128,230,150,176,229,143,145,229,184,131,231,137,136,230,155,180,230,150,176,239,188,140,228,191,157,231,149,153,231,142,176,230,156,137,231,137,136,230,156,172,239,188,136,231,148,168,32,45,45,102,111,114,99,101,32,233,135,141,230,150,176,229,174,137,232,163,133,239,188,137)
     UPGRADING        = U(229,141,135,231,186,167)
     INSTALL_TO       = U(229,174,137,232,163,133,229,136,176)
     SHA_TOOL_MISSING = U(230,151,160,32,83,72,65,50,53,54,32,229,183,165,229,133,183,239,188,140,232,183,179,232,191,135)
@@ -350,6 +351,40 @@ function Get-InstalledVersion($exe) {
     return $null
 }
 
+# True when version $a is strictly newer than $b. Mirrors `version_gt` in
+# install.sh: `x.y.z` with an optional pre-release suffix (`0.2.0-rc1`), where a
+# pre-release is older than its final release. Anything unparseable is reported
+# as *not* newer, so it can never trigger an "upgrade".
+function Test-VersionNewer($a, $b) {
+    if ($a -eq $b) { return $false }
+
+    $aCore, $aPre = $a -split '-', 2
+    $bCore, $bPre = $b -split '-', 2
+    if ($null -eq $aPre) { $aPre = '' }
+    if ($null -eq $bPre) { $bPre = '' }
+
+    $ac = @($aCore -split '\.')
+    $bc = @($bCore -split '\.')
+    $n = [Math]::Max($ac.Count, $bc.Count)
+    for ($i = 0; $i -lt $n; $i++) {
+        $x = if ($i -lt $ac.Count) { $ac[$i] } else { '0' }
+        $y = if ($i -lt $bc.Count) { $bc[$i] } else { '0' }
+        if (($x -notmatch '^[0-9]+$') -or ($y -notmatch '^[0-9]+$')) { return $false }
+        $xi = [int64]$x
+        $yi = [int64]$y
+        if ($xi -gt $yi) { return $true }
+        if ($xi -lt $yi) { return $false }
+    }
+
+    # Equal cores: the one without a pre-release suffix is the newer.
+    if (($aPre -eq '') -and ($bPre -ne '')) { return $true }
+    if (($aPre -ne '') -and ($bPre -eq '')) { return $false }
+    if (($aPre -ne '') -and ($bPre -ne '')) {
+        return [string]::CompareOrdinal($aPre, $bPre) -gt 0
+    }
+    return $false
+}
+
 function Install-Binary($zipFile, $installDir) {
     $extractDir = Join-Path $env:TEMP "dbxt-extract-$(Get-Random)"
 
@@ -412,12 +447,24 @@ function Main {
 
     # install / upgrade / already up to date
     $current = Get-InstalledVersion (Join-Path $installPath "$BINARY_NAME.exe")
-    if ($current -and ($current -eq $version) -and (-not $Force)) {
-        Log-Info "$(t 'Already up to date' $Z.UP_TO_DATE): $BINARY_NAME $current"
-        Write-Host ""
-        Write-Host "  [OK] $(t 'Done!' $Z.DONE)" -ForegroundColor Green
-        Write-Host ""
-        return
+    if ($current -and (-not $Force)) {
+        if ($current -eq $version) {
+            Log-Info "$(t 'Already up to date' $Z.UP_TO_DATE): $BINARY_NAME $current"
+            Write-Host ""
+            Write-Host "  [OK] $(t 'Done!' $Z.DONE)" -ForegroundColor Green
+            Write-Host ""
+            return
+        }
+        # Only a strictly newer release is worth installing. This keeps a
+        # from-source build (whose `--version` is Cargo.toml's and can be ahead
+        # of the latest release tag) from being "upgraded" backwards.
+        if (Test-VersionNewer $current $version) {
+            Log-Info "$(t 'Installed version is newer than the latest release; keeping it (use --force to reinstall)' $Z.NEWER_KEPT): $current (latest: $version)"
+            Write-Host ""
+            Write-Host "  [OK] $(t 'Done!' $Z.DONE)" -ForegroundColor Green
+            Write-Host ""
+            return
+        }
     }
     if ($current) {
         Log-Info "$(t 'Upgrading' $Z.UPGRADING) $current -> $version"

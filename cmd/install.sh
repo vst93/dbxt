@@ -593,6 +593,46 @@ installed_version() {
     printf '%s' "$out" | grep -oE '[0-9]+\.[0-9]+\.[0-9]+[0-9A-Za-z.+-]*' | head -n 1 || true
 }
 
+# True (exit 0) when version $1 is strictly newer than $2. Handles `x.y.z`
+# with an optional pre-release suffix (`0.2.0-rc1`): per semver a pre-release is
+# older than its final release. Anything that does not parse as numeric is
+# reported as *not* newer, so an unparseable value can never trigger an
+# "upgrade" (the conservative direction).
+version_gt() {
+    local a="$1" b="$2"
+    if [ "$a" = "$b" ]; then return 1; fi
+
+    local a_core="${a%%-*}" b_core="${b%%-*}"
+    local a_pre="" b_pre=""
+    case "$a" in *-*) a_pre="${a#*-}" ;; esac
+    case "$b" in *-*) b_pre="${b#*-}" ;; esac
+
+    local IFS='.' i x y
+    local -a ac bc
+    read -r -a ac <<< "$a_core"
+    read -r -a bc <<< "$b_core"
+
+    local n=${#ac[@]}
+    [ "${#bc[@]}" -gt "$n" ] && n=${#bc[@]}
+    for (( i = 0; i < n; i++ )); do
+        x="${ac[i]:-0}"; y="${bc[i]:-0}"
+        case "$x$y" in
+            *[!0-9]*) return 1 ;;
+        esac
+        if [ "$((10#$x))" -gt "$((10#$y))" ]; then return 0; fi
+        if [ "$((10#$x))" -lt "$((10#$y))" ]; then return 1; fi
+    done
+
+    # Equal cores: the one without a pre-release suffix is the newer.
+    if [ -z "$a_pre" ] && [ -n "$b_pre" ]; then return 0; fi
+    if [ -n "$a_pre" ] && [ -z "$b_pre" ]; then return 1; fi
+    if [ -n "$a_pre" ] && [ -n "$b_pre" ]; then
+        # Same core and both pre-release: compare identifiers (rc2 > rc1).
+        if [ "$a_pre" \> "$b_pre" ]; then return 0; else return 1; fi
+    fi
+    return 1
+}
+
 ensure_dir_exists() {
     local dir="$1"
     [ -d "$dir" ] && return 0
@@ -685,10 +725,20 @@ main() {
     # install / upgrade / already up to date
     local current
     current="$(installed_version "$INSTALL_PATH/$BINARY_NAME" || true)"
-    if [ -n "$current" ] && [ "$current" = "$VERSION" ] && [ "$FORCE_INSTALL" != "1" ]; then
-        log_info "$(t "Already up to date: $BINARY_NAME $current" "${BINARY_NAME} 已是最新版本: $current")"
-        printf "\n${GRN}${B}✔ %s${R}\n\n" "$(t "Done!" "安装完成!")"
-        return 0
+    if [ -n "$current" ] && [ "$FORCE_INSTALL" != "1" ]; then
+        if [ "$current" = "$VERSION" ]; then
+            log_info "$(t "Already up to date: $BINARY_NAME $current" "${BINARY_NAME} 已是最新版本: $current")"
+            printf "\n${GRN}${B}✔ %s${R}\n\n" "$(t "Done!" "安装完成!")"
+            return 0
+        fi
+        # Only a strictly newer release is worth installing. This keeps a
+        # from-source build — whose `--version` is Cargo.toml's and can be ahead
+        # of the latest release tag — from being "upgraded" backwards.
+        if version_gt "$current" "$VERSION"; then
+            log_info "$(t "Installed $current is newer than the latest release $VERSION; keeping it (use --force to reinstall)" "已安装的 $current 比最新发布版 $VERSION 更新，保留现有版本（用 --force 重新安装）")"
+            printf "\n${GRN}${B}✔ %s${R}\n\n" "$(t "Done!" "安装完成!")"
+            return 0
+        fi
     fi
     if [ -n "$current" ]; then
         log_info "$(t "Upgrading $current → $VERSION" "升级 $current → $VERSION")"

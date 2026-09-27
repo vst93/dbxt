@@ -114,7 +114,7 @@ curl -fsSL https://cdn.jsdelivr.net/gh/vst93/dbxt@master/cmd/install.sh | bash
 | `--preview` | Install the latest pre-release |
 | `--musl` | Linux: install the fully static musl build |
 
-The script reads the version from the GitHub release, verifies the `.sha256` and installs the binary. It reports **install / upgrade / already up to date**, and on a checksum mismatch it asks before continuing (`--force` skips the question). If `github.com` is slow or blocked it retries through `ghfast.top`, `mirror.ghproxy.com`, `gh-proxy.com` and `gh-proxy.net`. The same switches are available as environment variables (`DBXT_INSTALL_DIR`, `DBXT_FORCE_INSTALL=1`, `DBXT_SKIP_GITHUB=1`, `DBXT_PREVIEW=1`, `DBXT_MUSL=1`, `DBXT_LANG=zh`).
+The script reads the version from the GitHub release, verifies the `.sha256` and installs the binary. It reports **install / upgrade / already up to date** — and if the installed build is newer than the latest release (for example a binary you built from a checkout) it keeps it rather than downgrading, unless `--force` is given. On a checksum mismatch it asks before continuing (`--force` skips the question). If `github.com` is slow or blocked it retries through `ghfast.top`, `mirror.ghproxy.com`, `gh-proxy.com` and `gh-proxy.net`. The same switches are available as environment variables (`DBXT_INSTALL_DIR`, `DBXT_FORCE_INSTALL=1`, `DBXT_SKIP_GITHUB=1`, `DBXT_PREVIEW=1`, `DBXT_MUSL=1`, `DBXT_LANG=zh`).
 
 ### Windows (PowerShell)
 
@@ -184,7 +184,7 @@ cargo build --release    # target/release/dbxt
 
 The first build compiles the full DBX kernel plus several C dependencies (OpenSSL, AWS-LC, SQLite, zstd) from source — expect several minutes. You need a C toolchain (`cc` / `gcc`, `make` and `perl`); no system SQLite or OpenSSL install is required. On Windows x86_64 `aws-lc-sys` additionally needs NASM. The release profile strips symbols and enables thin LTO. Prebuilt binaries are produced by the [`Release` workflow](.github/workflows/release.yml).
 
-`dbxt --version` prints the version and `dbxt --help` the usage, without opening the TUI.
+`dbxt --version` prints the version and `dbxt --help` the usage, without opening the TUI. Release binaries report the tag they were built from (the version is injected at build time through `DBXT_VERSION`); a local `cargo build` reports the version in `Cargo.toml`.
 
 ## Usage
 

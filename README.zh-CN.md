@@ -114,7 +114,7 @@ curl -fsSL https://cdn.jsdelivr.net/gh/vst93/dbxt@master/cmd/install.sh | bash
 | `--preview` | 安装最新预览版 |
 | `--musl` | Linux：安装全静态 musl 构建 |
 
-脚本从 GitHub Release 读取版本、校验 `.sha256` 并安装，会区分**安装 / 升级 / 已是最新**三态；校验不匹配时会先询问（`--force` 跳过询问）。直连 `github.com` 慢或不通时，会自动依次尝试 `ghfast.top`、`mirror.ghproxy.com`、`gh-proxy.com`、`gh-proxy.net`。同名开关也可用环境变量传入（`DBXT_INSTALL_DIR`、`DBXT_FORCE_INSTALL=1`、`DBXT_SKIP_GITHUB=1`、`DBXT_PREVIEW=1`、`DBXT_MUSL=1`、`DBXT_LANG=zh`）。
+脚本从 GitHub Release 读取版本、校验 `.sha256` 并安装，会区分**安装 / 升级 / 已是最新**三态；若已安装版本比最新发布版更新（例如你自己从源码编译的版本），则保留现有版本而不降级，除非传入 `--force`。校验不匹配时会先询问（`--force` 跳过询问）。直连 `github.com` 慢或不通时，会自动依次尝试 `ghfast.top`、`mirror.ghproxy.com`、`gh-proxy.com`、`gh-proxy.net`。同名开关也可用环境变量传入（`DBXT_INSTALL_DIR`、`DBXT_FORCE_INSTALL=1`、`DBXT_SKIP_GITHUB=1`、`DBXT_PREVIEW=1`、`DBXT_MUSL=1`、`DBXT_LANG=zh`）。
 
 ### Windows (PowerShell)
 
@@ -184,7 +184,7 @@ cargo build --release    # target/release/dbxt
 
 首次构建会从源码编译完整的 DBX 内核以及多个 C 依赖（OpenSSL、AWS-LC、SQLite、zstd），需要几分钟。需要 C 工具链（`cc` / `gcc`、`make`、`perl`）；无需安装系统 SQLite 或 OpenSSL。Windows x86_64 上 `aws-lc-sys` 还需要 NASM。release 配置已启用符号裁剪和 thin LTO。预编译包由 [`Release` 工作流](.github/workflows/release.yml) 产出。
 
-`dbxt --version` 输出版本，`dbxt --help` 输出用法，均不会启动 TUI。
+`dbxt --version` 输出版本，`dbxt --help` 输出用法，均不会启动 TUI。发布版二进制报告其构建所用的 tag（版本在构建时通过 `DBXT_VERSION` 注入）；本地 `cargo build` 则报告 `Cargo.toml` 中的版本。
 
 ## 使用
 
