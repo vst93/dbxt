@@ -7,7 +7,7 @@ mod ui_text;
 use ui_text::{t, tf};
 
 use std::collections::{HashMap, HashSet, VecDeque};
-use std::io::Write;
+use std::io::{IsTerminal, Write};
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -1820,22 +1820,50 @@ fn version_line() -> String {
 }
 
 /// `dbxt --help`: a short usage summary. The full manual lives in the README.
-fn print_help() {
-    println!("dbxt {} — {}", dbxt_version(), t("DBX 的终端界面"));
-    println!();
-    println!("{}: dbxt [DBX_STORE]", t("用法"));
-    println!();
-    println!("{}:", t("参数"));
-    println!(
-        "{}",
-        t("  DBX_STORE  dbx.db 文件或其所在目录（默认：DBX_DATA_DIR 或平台默认位置）")
-    );
-    println!();
-    println!("{}:", t("选项"));
-    println!("{}", t("  -h, --help     显示本帮助"));
-    println!("{}", t("  -V, --version  显示版本"));
-    println!();
-    println!("{}: https://github.com/vst93/dbxt", t("文档"));
+///
+/// Kept as a plain string (rather than a series of `println!`) so the exact
+/// text is unit-testable and so the caller can route it through
+/// [`write_stdout`], which tolerates a closed pipe.
+fn help_text() -> String {
+    format!(
+        "dbxt {} — {}\n\n{}: dbxt [DBX_STORE]\n\n{}:\n{}\n\n{}:\n{}\n{}\n\n{}: https://github.com/vst93/dbxt\n",
+        dbxt_version(),
+        t("DBX 的终端界面"),
+        t("用法"),
+        t("参数"),
+        t("  DBX_STORE  dbx.db 文件或其所在目录（默认：DBX_DATA_DIR 或平台默认位置）"),
+        t("选项"),
+        t("  -h, --help     显示本帮助"),
+        t("  -V, --version  显示版本"),
+        t("文档"),
+    )
+}
+
+/// Write a block of text to stdout, exiting quietly when the reader has gone
+/// away (`dbxt --help | head -1`).
+///
+/// Rust ignores `SIGPIPE` at startup, so a closed pipe surfaces as an `EPIPE`
+/// write error instead of a signal. The two conventional fixes are (a) restore
+/// `SIG_DFL` so the process dies by signal, or (b) treat `BrokenPipe` as a
+/// normal, silent exit. We pick (b): it keeps a *meaningful, zero* exit status
+/// for `set -euo pipefail` callers such as `cmd/install.sh`, needs no `unsafe`
+/// signal handling, and touches only the non-TUI output paths — the TUI itself
+/// is never affected. Any other write error is a genuine failure and
+/// propagates, so the process still exits non-zero.
+fn write_stdout(text: &str) -> Result<()> {
+    let mut out = std::io::stdout().lock();
+    match out.write_all(text.as_bytes()).and_then(|()| out.flush()) {
+        Ok(()) => Ok(()),
+        Err(e) if e.kind() == std::io::ErrorKind::BrokenPipe => std::process::exit(0),
+        Err(e) => Err(e.into()),
+    }
+}
+
+/// Best-effort stderr line that never panics (a closed stderr is ignored).
+fn write_stderr(text: &str) {
+    let mut err = std::io::stderr().lock();
+    let _ = err.write_all(text.as_bytes());
+    let _ = err.flush();
 }
 
 #[tokio::main]
@@ -1847,16 +1875,38 @@ async fn main() -> Result<()> {
     if let Some(arg) = std::env::args().nth(1) {
         match arg.as_str() {
             "-V" | "--version" => {
-                println!("{}", version_line());
+                write_stdout(&format!("{}\n", version_line()))?;
                 return Ok(());
             }
             "-h" | "--help" => {
-                print_help();
+                write_stdout(&help_text())?;
                 return Ok(());
+            }
+            // An unknown option is a usage error (exit 2, like cmd/install.sh):
+            // previously `dbxt --foo` was taken as a store path, created a file
+            // literally named `--foo`, and then failed inside the TUI.
+            s if s.len() > 1 && s.starts_with('-') => {
+                write_stderr(&format!(
+                    "{}\n{}: dbxt [DBX_STORE]  (-h/--help)\n",
+                    tf("未知选项: {}", &[&s]),
+                    t("用法"),
+                ));
+                std::process::exit(2);
             }
             _ => {}
         }
     }
+    // The TUI needs a real terminal on stdout; without one ratatui's init()
+    // panics (exit 101). Report it cleanly *before* touching the store, so a
+    // non-interactive caller gets a sensible non-zero exit code and no side
+    // effects (no store file created).
+    if !std::io::stdout().is_terminal() {
+        anyhow::bail!(
+            "{}",
+            t("stdout 不是终端，无法启动 TUI（--help / --version 可在管道中使用）")
+        );
+    }
+
     // The positional argument is the `dbx.db` file itself. A directory is also
     // accepted (and joined with `dbx.db`) so the historical documented usage
     // keeps working.
@@ -11397,5 +11447,39 @@ mod tests {
         // The reported value is the one actually compiled in.
         assert_eq!(ver, dbxt_version());
         assert!(!dbxt_version().is_empty());
+    }
+
+    #[test]
+    fn help_text_matches_the_real_cli() {
+        // The non-interactive `--help` is a contract too: it must name the
+        // store argument, both options and the docs URL, and end in a newline
+        // (it is written verbatim to stdout).
+        let help = help_text();
+        assert!(help.starts_with(&format!("dbxt {} — ", dbxt_version())));
+        assert!(help.contains("dbxt [DBX_STORE]"));
+        assert!(help.contains("DBX_STORE"));
+        assert!(help.contains("-h, --help"));
+        assert!(help.contains("-V, --version"));
+        assert!(help.contains("https://github.com/vst93/dbxt"));
+        assert!(help.ends_with('\n'));
+        // Exactly the two long options the parser actually accepts.
+        assert_eq!(help.matches("--").count(), 2, "unexpected --help drift: {help:?}");
+    }
+
+    #[test]
+    fn unknown_option_and_no_tty_have_translations() {
+        use ui_text::{t_lang, tf_lang, Lang};
+        assert_eq!(
+            tf_lang("未知选项: {}", &[&"--foo"], Lang::En),
+            "Unknown option: --foo"
+        );
+        assert_eq!(t_lang("用法", Lang::En), "Usage");
+        assert_eq!(
+            t_lang(
+                "stdout 不是终端，无法启动 TUI（--help / --version 可在管道中使用）",
+                Lang::En
+            ),
+            "stdout is not a terminal, cannot start the TUI (--help / --version work over a pipe)"
+        );
     }
 }

@@ -184,7 +184,17 @@ cargo build --release    # target/release/dbxt
 
 The first build compiles the full DBX kernel plus several C dependencies (OpenSSL, AWS-LC, SQLite, zstd) from source — expect several minutes. You need a C toolchain (`cc` / `gcc`, `make` and `perl`); no system SQLite or OpenSSL install is required. On Windows x86_64 `aws-lc-sys` additionally needs NASM. The release profile strips symbols and enables thin LTO. Prebuilt binaries are produced by the [`Release` workflow](.github/workflows/release.yml).
 
-`dbxt --version` prints the version and `dbxt --help` the usage, without opening the TUI. Release binaries report the tag they were built from (the version is injected at build time through `DBXT_VERSION`); a local `cargo build` reports the version in `Cargo.toml`.
+`dbxt --version` prints the version and `dbxt --help` the usage, without opening the TUI. Release binaries report the tag they were built from (the version is injected at build time through `DBXT_VERSION`); a local `cargo build` reports the version in `Cargo.toml`. Both commands are pipe-safe: when the reader goes away (`dbxt --help | head -1`) dbxt exits `0` silently instead of panicking on `EPIPE`.
+
+### Exit codes
+
+| Code | Meaning |
+| --- | --- |
+| `0` | Normal exit — including `--help` / `--version` and a closed stdout pipe |
+| `1` | Runtime failure (store could not be opened, stdout is not a terminal, …) |
+| `2` | Usage error (unknown option) |
+
+`--version` is the probe `cmd/install.sh` relies on, so it always exits `0` when it can write, and a failure to write (anything other than a closed pipe) still exits non-zero.
 
 ## Usage
 

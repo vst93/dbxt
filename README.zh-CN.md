@@ -184,7 +184,17 @@ cargo build --release    # target/release/dbxt
 
 首次构建会从源码编译完整的 DBX 内核以及多个 C 依赖（OpenSSL、AWS-LC、SQLite、zstd），需要几分钟。需要 C 工具链（`cc` / `gcc`、`make`、`perl`）；无需安装系统 SQLite 或 OpenSSL。Windows x86_64 上 `aws-lc-sys` 还需要 NASM。release 配置已启用符号裁剪和 thin LTO。预编译包由 [`Release` 工作流](.github/workflows/release.yml) 产出。
 
-`dbxt --version` 输出版本，`dbxt --help` 输出用法，均不会启动 TUI。发布版二进制报告其构建所用的 tag（版本在构建时通过 `DBXT_VERSION` 注入）；本地 `cargo build` 则报告 `Cargo.toml` 中的版本。
+`dbxt --version` 输出版本，`dbxt --help` 输出用法，均不会启动 TUI。发布版二进制报告其构建所用的 tag（版本在构建时通过 `DBXT_VERSION` 注入）；本地 `cargo build` 则报告 `Cargo.toml` 中的版本。两个命令都管道安全：当读取端提前退出（`dbxt --help | head -1`）时，dbxt 静默以 `0` 退出，不再因 `EPIPE` panic。
+
+### 退出码
+
+| 退出码 | 含义 |
+| --- | --- |
+| `0` | 正常退出——包括 `--help` / `--version` 以及 stdout 管道被关闭 |
+| `1` | 运行时失败（无法打开存储、stdout 不是终端等） |
+| `2` | 用法错误（未知选项） |
+
+`--version` 是 `cmd/install.sh` 依赖的探测命令，因此只要能写出就始终返回 `0`；除管道关闭以外的写失败仍返回非零。
 
 ## 使用
 
