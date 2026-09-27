@@ -544,6 +544,140 @@ fn redis_ttl_label(ttl: i64) -> String {
     }
 }
 
+/// How many keys one batch command may carry. A multi-key `DEL` with thousands
+/// of arguments risks a huge line and a slow single round trip, so the batch is
+/// split into chunks of this size (also the per-batch safety ceiling).
+pub const REDIS_BATCH_LIMIT: usize = 1000;
+/// Keys per generated `DEL` command.
+pub const REDIS_BATCH_CHUNK: usize = 100;
+
+/// Quote one key / value for the redis-cli tokenizer the backend uses.
+fn redis_quote(s: &str) -> String {
+    let escaped = s.replace('\\', "\\\\").replace('"', "\\\"");
+    format!("\"{escaped}\"")
+}
+
+/// Build the `DEL` commands for a batch of display key names, chunked so one
+/// command never grows unbounded.
+fn redis_batch_del_commands(displays: &[String]) -> Vec<String> {
+    if displays.is_empty() {
+        return Vec::new();
+    }
+    displays
+        .chunks(REDIS_BATCH_CHUNK)
+        .map(|chunk| {
+            let keys: Vec<String> = chunk.iter().map(|k| redis_quote(k)).collect();
+            format!("DEL {}", keys.join(" "))
+        })
+        .collect()
+}
+
+/// Build one `EXPIRE key seconds` command per key. `ttl` is validated by the
+/// caller; a non-numeric value yields an empty plan.
+fn redis_batch_ttl_commands(displays: &[String], ttl: &str) -> Vec<String> {
+    let ttl = ttl.trim();
+    if ttl.parse::<i64>().is_err() {
+        return Vec::new();
+    }
+    displays
+        .iter()
+        .map(|k| format!("EXPIRE {} {}", redis_quote(k), ttl))
+        .collect()
+}
+
+/// Plan a prefix replacement: every key starting with `old_prefix` maps to
+/// `new_prefix` + the remainder. Keys that do not match are left untouched.
+fn redis_prefix_rename_plan(
+    displays: &[String],
+    old_prefix: &str,
+    new_prefix: &str,
+) -> Vec<(String, String)> {
+    displays
+        .iter()
+        .filter_map(|k| {
+            let rest = k.strip_prefix(old_prefix)?;
+            let new_name = format!("{new_prefix}{rest}");
+            (new_name != *k).then(|| (k.clone(), new_name))
+        })
+        .collect()
+}
+
+/// Build the `RENAME old new` commands for a prefix replacement.
+fn redis_batch_rename_commands(
+    displays: &[String],
+    old_prefix: &str,
+    new_prefix: &str,
+) -> Vec<String> {
+    redis_prefix_rename_plan(displays, old_prefix, new_prefix)
+        .into_iter()
+        .map(|(old, new)| format!("RENAME {} {}", redis_quote(&old), redis_quote(&new)))
+        .collect()
+}
+
+/// Which batch write a key-browser gesture generates.
+#[derive(Clone, Copy, PartialEq, Debug)]
+pub enum RedisBatchKind {
+    Delete,
+    Ttl,
+    RenamePrefix,
+}
+
+/// A generated batch, ready to be shown in the red confirmation layer.
+#[derive(Debug)]
+pub struct RedisBatchPlan {
+    pub commands: Vec<String>,
+    /// When set, the red layer must ask for a typed count / `YES` first.
+    pub typed_confirm: Option<usize>,
+    pub summary: String,
+}
+
+/// Pure batch planner: turn a gesture + targets into commands, a typed-confirm
+/// requirement and a human summary. Errors are translated status strings.
+fn redis_plan_batch(
+    kind: RedisBatchKind,
+    targets: &[(String, String)],
+    all_loaded: bool,
+    arg: &str,
+) -> Result<RedisBatchPlan, String> {
+    let displays: Vec<String> = targets.iter().map(|(_, d)| d.clone()).collect();
+    match kind {
+        RedisBatchKind::Delete => Ok(RedisBatchPlan {
+            commands: redis_batch_del_commands(&displays),
+            typed_confirm: all_loaded.then_some(displays.len()),
+            summary: tf("批量删除 {} 个 key", &[&displays.len()]),
+        }),
+        RedisBatchKind::Ttl => {
+            let ttl = arg.trim();
+            if ttl.parse::<i64>().is_err() {
+                return Err(t("TTL 需为整数秒（-1 持久化，0 立即删除）").to_string());
+            }
+            let commands = redis_batch_ttl_commands(&displays, ttl);
+            if commands.is_empty() {
+                return Err(t("没有可操作的 key").to_string());
+            }
+            Ok(RedisBatchPlan {
+                commands,
+                typed_confirm: None,
+                summary: tf("批量设置 TTL={}s · {} 个 key", &[&ttl, &displays.len()]),
+            })
+        }
+        RedisBatchKind::RenamePrefix => {
+            let Some((old, new)) = arg.split_once('=') else {
+                return Err(t("格式：旧前缀=新前缀，例 app: = new:").to_string());
+            };
+            let plan = redis_prefix_rename_plan(&displays, old, new);
+            if plan.is_empty() {
+                return Err(t("没有 key 匹配该前缀（未改名）").to_string());
+            }
+            Ok(RedisBatchPlan {
+                commands: redis_batch_rename_commands(&displays, old, new),
+                typed_confirm: None,
+                summary: tf("批量前缀重命名 {} → {} · {} 个 key", &[&old, &new, &plan.len()]),
+            })
+        }
+    }
+}
+
 /// Flatten a page of MongoDB documents into a grid: the union of top-level keys
 /// (with `_id` first) becomes the columns, and each document is one row.
 fn mongo_docs_grid(docs: &[serde_json::Value]) -> Grid {
@@ -579,6 +713,103 @@ fn mongo_docs_grid(docs: &[serde_json::Value]) -> Grid {
         rows,
         note: tf("{} 个文档", &[&(docs.len())]),
     }
+}
+
+/// True when `s` looks like a 24-char hex ObjectId. A genuine string `_id` with
+/// that shape must be marked so the driver does not reinterpret it.
+fn is_object_id_hex(s: &str) -> bool {
+    s.len() == 24 && s.chars().all(|c| c.is_ascii_hexdigit())
+}
+
+/// Convert a document's `_id` value (in the driver's `bson_to_json` shape) into
+/// the `id` argument the MongoDB document APIs expect.
+fn mongo_id_arg(id: &serde_json::Value) -> String {
+    match id {
+        serde_json::Value::String(s) => {
+            if is_object_id_hex(s) {
+                // `__dbx_mongo_string_id__` + a JSON string tells the driver this
+                // is an explicitly typed BSON string, not an ObjectId.
+                format!(
+                    "__dbx_mongo_string_id__{}",
+                    serde_json::Value::String(s.clone())
+                )
+            } else {
+                s.clone()
+            }
+        }
+        serde_json::Value::Number(n) => n.to_string(),
+        serde_json::Value::Object(map) => {
+            if let Some(oid) = map.get("$oid").and_then(|v| v.as_str()) {
+                oid.to_string()
+            } else {
+                serde_json::to_string(id).unwrap_or_default()
+            }
+        }
+        other => serde_json::to_string(other).unwrap_or_default(),
+    }
+}
+
+/// A short, human-readable rendering of an `_id` for a confirmation prompt.
+fn mongo_id_label(id: &serde_json::Value) -> String {
+    match id {
+        serde_json::Value::Object(map) => {
+            if let Some(oid) = map.get("$oid").and_then(|v| v.as_str()) {
+                oid.to_string()
+            } else if let Some(n) = map.get("$numberLong").and_then(|v| v.as_str()) {
+                n.to_string()
+            } else {
+                serde_json::to_string(id).unwrap_or_default()
+            }
+        }
+        serde_json::Value::String(s) => s.clone(),
+        other => other.to_string(),
+    }
+}
+
+/// Top-level field diff between two documents, capped for the confirmation
+/// layer. Each line is `field: old -> new` (or `+` / `-` for added / removed).
+fn mongo_doc_diff(old: &serde_json::Value, new: &serde_json::Value, cap: usize) -> Vec<String> {
+    let empty = serde_json::Map::new();
+    let old_map = old.as_object().unwrap_or(&empty);
+    let new_map = new.as_object().unwrap_or(&empty);
+    let mut keys: Vec<&String> = Vec::new();
+    for k in old_map.keys().chain(new_map.keys()) {
+        if !keys.contains(&k) {
+            keys.push(k);
+        }
+    }
+    let mut out: Vec<String> = Vec::new();
+    for k in keys {
+        if k == "_id" {
+            continue;
+        }
+        let before = old_map.get(k);
+        let after = new_map.get(k);
+        if before == after {
+            continue;
+        }
+        let show = |v: Option<&serde_json::Value>| match v {
+            None => "—".to_string(),
+            Some(v) => truncate_disp(&one_line(&v.to_string()), 60),
+        };
+        let mark = if before.is_none() {
+            "+ "
+        } else if after.is_none() {
+            "- "
+        } else {
+            "~ "
+        };
+        out.push(format!(
+            "{mark}{k}: {} → {}",
+            show(before),
+            show(after)
+        ));
+        if out.len() >= cap {
+            out.push(t("…（更多字段已省略）").to_string());
+            break;
+        }
+    }
+    out
 }
 
 /// One statement inside a multi-statement script run.
@@ -664,15 +895,67 @@ struct Confirm {
     /// Set for Redis writes: Enter runs `cmd` via the Redis console instead of
     /// SQL, then reloads the key list / the named key's value.
     redis: Option<RedisConfirm>,
+    /// Set for MongoDB document writes: Enter runs the matching insert / update /
+    /// delete through the document driver, then reloads the current page.
+    mongo: Option<MongoConfirm>,
 }
 
 /// A pending Redis write shown in the red confirmation layer.
 #[derive(Clone)]
 struct RedisConfirm {
     db: u32,
+    /// Single command for a one-key write (SET / EXPIRE / RENAME / HSET / DEL).
     cmd: String,
+    /// When non-empty, run these commands in order instead of `cmd`.
+    batch: Vec<String>,
+    /// Batch targets as `(raw, display)`, kept so a typed re-confirmation can
+    /// regenerate / describe exactly what is about to change.
+    batch_keys: Vec<(String, String)>,
     reload_value: Option<String>,
     reload_list: bool,
+    /// When set, Enter on the red layer first opens a typed confirmation that
+    /// must repeat this key count (or `YES`) before the batch runs.
+    typed_confirm: Option<usize>,
+    /// Human summary used by the typed confirmation prompt.
+    summary: String,
+}
+
+/// A pending MongoDB document write shown in the red confirmation layer.
+#[derive(Clone)]
+struct MongoConfirm {
+    db: String,
+    collection: String,
+    action: MongoAction,
+}
+
+/// The concrete MongoDB write behind a [`MongoConfirm`].
+#[derive(Clone)]
+enum MongoAction {
+    Insert { doc_json: String },
+    Update { id: String, doc_json: String },
+    Delete { id: String },
+}
+
+/// The JSON editor dialog used to edit / insert a MongoDB document.
+#[derive(Clone, Copy, PartialEq, Debug)]
+enum MongoDocMode {
+    Edit,
+    Insert,
+}
+
+#[derive(Clone)]
+struct MongoDocDialog {
+    mode: MongoDocMode,
+    db: String,
+    collection: String,
+    /// The document as fetched (Extended-JSON-ish shape produced by the driver),
+    /// used to detect `_id` tampering and to compute the save diff.
+    original: serde_json::Value,
+    /// `_id` argument for an update / delete (empty for insert).
+    id: String,
+    editor: TextArea<'static>,
+    /// Last validation error, shown under the editor until the next save.
+    error: Option<String>,
 }
 
 #[derive(Clone, Copy, PartialEq)]
@@ -788,6 +1071,12 @@ enum RedisPromptKind {
     StringValue,
     /// New value for a hash field.
     HashField,
+    /// New TTL applied to a whole batch of selected keys.
+    BatchTtl,
+    /// `old=new` prefix replacement applied to a whole batch of selected keys.
+    BatchRenamePrefix,
+    /// Typed re-confirmation of a dangerous batch (repeat the key count / YES).
+    BatchConfirm,
 }
 
 #[derive(Clone)]
@@ -801,6 +1090,8 @@ struct RedisPrompt {
     /// Hash field name, when the prompt edits a hash member.
     field: String,
     input: TextArea<'static>,
+    /// Batch targets as `(raw, display)`, empty for single-key prompts.
+    batch: Vec<(String, String)>,
 }
 
 /// SQL prefix-completion popup in the editor (Ctrl-Space). Tab / Enter accept,
@@ -1304,6 +1595,14 @@ enum Op {
         reload_value: Option<String>,
         reload_list: bool,
     },
+    /// Execute a batch of generated Redis commands in order (multi-key DEL /
+    /// EXPIRE / RENAME), then refresh the key list.
+    RedisBatchWrite {
+        cfg: Box<ConnectionConfig>,
+        db: u32,
+        cmds: Vec<String>,
+        reload_list: bool,
+    },
     /// Append the next page of a large Redis collection value.
     RedisMore {
         cfg: Box<ConnectionConfig>,
@@ -1328,6 +1627,28 @@ enum Op {
         cfg: Box<ConnectionConfig>,
         db: String,
         collection: String,
+    },
+    /// Insert a new MongoDB document from the JSON editor.
+    MongoInsert {
+        cfg: Box<ConnectionConfig>,
+        db: String,
+        collection: String,
+        doc_json: String,
+    },
+    /// Replace a MongoDB document (`_id` unchanged) from the JSON editor.
+    MongoUpdate {
+        cfg: Box<ConnectionConfig>,
+        db: String,
+        collection: String,
+        id: String,
+        doc_json: String,
+    },
+    /// Delete one MongoDB document by `_id`.
+    MongoDelete {
+        cfg: Box<ConnectionConfig>,
+        db: String,
+        collection: String,
+        id: String,
     },
     Mongo(Box<ConnectionConfig>, String, String),
     History(Box<ConnectionConfig>),
@@ -1402,6 +1723,12 @@ enum OpResult {
         reload_value: Option<String>,
         reload_list: bool,
     },
+    RedisBatchWritten {
+        executed: usize,
+        total: usize,
+        first_error: Option<String>,
+        reload_list: bool,
+    },
     RedisMore {
         rows: Vec<Vec<Val>>,
         row_keys: Vec<String>,
@@ -1415,10 +1742,17 @@ enum OpResult {
         collection: String,
         filter: String,
         gen: u64,
+        /// The page's raw documents, retained for edit / delete mapping.
+        docs: Vec<serde_json::Value>,
     },
     MongoIndexes {
         collection: String,
         grid: Box<Grid>,
+    },
+    /// A MongoDB document write finished; the summary is shown and the current
+    /// page is reloaded.
+    MongoWritten {
+        summary: String,
     },
     History(Vec<String>),
     Snippets(Vec<(String, String)>),
@@ -1729,6 +2063,32 @@ async fn run_op(backend: &LocalBackend, op: Op) -> OpResult {
             }
             Err(e) => OpResult::Error(format!("redis: {e}")),
         },
+        Op::RedisBatchWrite {
+            cfg,
+            db,
+            cmds,
+            reload_list,
+        } => {
+            let total = cmds.len();
+            let mut executed = 0usize;
+            let mut first_error: Option<String> = None;
+            for cmd in &cmds {
+                match backend.execute_redis_command(&cfg, db, cmd, true).await {
+                    Ok(_) => executed += 1,
+                    Err(e) => {
+                        if first_error.is_none() {
+                            first_error = Some(e);
+                        }
+                    }
+                }
+            }
+            OpResult::RedisBatchWritten {
+                executed,
+                total,
+                first_error,
+                reload_list,
+            }
+        },
         Op::RedisMore {
             cfg,
             db,
@@ -1806,6 +2166,7 @@ async fn run_op(backend: &LocalBackend, op: Op) -> OpResult {
                         collection,
                         filter: filter.unwrap_or("").to_string(),
                         gen,
+                        docs,
                     }
                 }
                 Err(e) => OpResult::Error(format!("mongo docs: {e}")),
@@ -1831,6 +2192,67 @@ async fn run_op(backend: &LocalBackend, op: Op) -> OpResult {
                 Err(e) => OpResult::Error(format!("mongo indexes: {e}")),
             }
         }
+        Op::MongoInsert {
+            cfg,
+            db,
+            collection,
+            doc_json,
+        } => match dbx_core::mongo_ops::mongo_insert_document_core(
+            backend.state().as_ref(),
+            &cfg.id,
+            &db,
+            &collection,
+            &doc_json,
+        )
+        .await
+        {
+            Ok(id) => OpResult::MongoWritten {
+                summary: tf("已插入文档 _id={}", &[&id]),
+            },
+            Err(e) => OpResult::Error(format!("mongo insert: {e}")),
+        },
+        Op::MongoUpdate {
+            cfg,
+            db,
+            collection,
+            id,
+            doc_json,
+        } => match dbx_core::mongo_ops::mongo_update_document_core(
+            backend.state().as_ref(),
+            &cfg.id,
+            &db,
+            &collection,
+            &id,
+            &doc_json,
+            None,
+        )
+        .await
+        {
+            Ok(n) => OpResult::MongoWritten {
+                summary: tf("已更新文档 _id={}（{} 处修改）", &[&id, &n]),
+            },
+            Err(e) => OpResult::Error(format!("mongo update: {e}")),
+        },
+        Op::MongoDelete {
+            cfg,
+            db,
+            collection,
+            id,
+        } => match dbx_core::mongo_ops::mongo_delete_document_core(
+            backend.state().as_ref(),
+            &cfg.id,
+            &db,
+            &collection,
+            &id,
+            None,
+        )
+        .await
+        {
+            Ok(n) => OpResult::MongoWritten {
+                summary: tf("已删除文档 _id={}（{} 行）", &[&id, &n]),
+            },
+            Err(e) => OpResult::Error(format!("mongo delete: {e}")),
+        },
         Op::Redis(cfg, db, cmd) => {
             match backend.execute_redis_command(&cfg, db, &cmd, true).await {
                 // skip_safety_check = true: this is an interactive human console (like the DBX
@@ -2363,10 +2785,21 @@ struct App {
     redis_list: ListState,
     redis_value: Option<RedisValueView>,
     redis_prompt: Option<RedisPrompt>,
+    /// Raw keys multi-selected in the browser (space / shift-range / a).
+    redis_selected: HashSet<String>,
+    /// Anchor index for a shift range selection.
+    redis_anchor: Option<usize>,
+    /// A batch confirm awaiting its typed re-confirmation.
+    redis_pending_batch: Option<RedisConfirm>,
     // ── MongoDB document browser ──
     mongo_page: usize,
     mongo_filter: String,
     mongo_gen: u64,
+    /// Documents of the current page, so `e` / `Del` can map a grid row back to
+    /// its source document.
+    mongo_docs: Vec<serde_json::Value>,
+    /// The JSON editor dialog for a MongoDB document edit / insert.
+    mongo_dialog: Option<MongoDocDialog>,
 
     form: ConnForm,
 
@@ -2755,9 +3188,14 @@ async fn run_app(mut terminal: ratatui::DefaultTerminal, backend: Arc<LocalBacke
         redis_list: ListState::default(),
         redis_value: None,
         redis_prompt: None,
+        redis_selected: HashSet::new(),
+        redis_anchor: None,
+        redis_pending_batch: None,
         mongo_page: 0,
         mongo_filter: String::new(),
         mongo_gen: 0,
+        mongo_docs: Vec::new(),
+        mongo_dialog: None,
         form: ConnForm::default(),
         layout_mode: LayoutMode::Mid,
         term_h: 0,
@@ -3105,6 +3543,16 @@ fn apply_op_result(app: &mut App, res: OpResult, tx: &Tx) {
             app.redis_scan.cursor = cursor;
             app.redis_scan.total = total;
             app.redis_scan.exhausted = cursor == 0;
+            // Drop selections whose key is no longer in the loaded window (a
+            // rescan can remove keys); keep them across a load-more append.
+            if !app.redis_selected.is_empty() {
+                let present: HashSet<String> =
+                    app.redis_scan.keys.iter().map(|k| k.key_raw.clone()).collect();
+                app.redis_selected.retain(|k| present.contains(k));
+                if app.redis_selected.is_empty() {
+                    app.redis_anchor = None;
+                }
+            }
             let n = app.redis_scan.keys.len();
             let sel = app.redis_list.selected().unwrap_or(0).min(n.saturating_sub(1));
             app.redis_list.select((n > 0).then_some(sel));
@@ -3172,6 +3620,27 @@ fn apply_op_result(app: &mut App, res: OpResult, tx: &Tx) {
                 }
             }
         }
+        OpResult::RedisBatchWritten {
+            executed,
+            total,
+            first_error,
+            reload_list,
+        } => {
+            // A batch invalidates the selection: keys may be gone or renamed.
+            app.redis_selected.clear();
+            app.redis_anchor = None;
+            app.redis_pending_batch = None;
+            app.status = match first_error {
+                Some(e) => tf("⚠ 批量完成 {}/{}：{}", &[&executed, &total, &truncate_disp(&one_line(&e), 60)]),
+                None => tf("✓ 批量完成 {}/{} 条命令", &[&executed, &total]),
+            };
+            if reload_list {
+                app.redis_value = None;
+                app.clear_grid();
+                app.focus = Focus::Sidebar;
+                start_redis_scan(app, tx, true);
+            }
+        }
         OpResult::RedisMore {
             rows,
             row_keys,
@@ -3206,6 +3675,7 @@ fn apply_op_result(app: &mut App, res: OpResult, tx: &Tx) {
             collection,
             filter,
             gen,
+            docs,
         } => {
             if gen != app.mongo_gen {
                 return;
@@ -3220,6 +3690,7 @@ fn apply_op_result(app: &mut App, res: OpResult, tx: &Tx) {
             app.set_grid(*grid);
             app.mongo_page = page;
             app.mongo_filter = filter.clone();
+            app.mongo_docs = docs;
             app.page_state = Some(PageState {
                 table: collection.clone(),
                 table_type: None,
@@ -3256,6 +3727,12 @@ fn apply_op_result(app: &mut App, res: OpResult, tx: &Tx) {
             app.col_cursor = 0;
             app.focus = Focus::Preview;
             app.status = tf("{} 索引 · {} · Esc 返回", &[&(fix_double_encoding(&collection)), &(n)]);
+        }
+        OpResult::MongoWritten { summary } => {
+            app.status = format!("✓ {summary}");
+            app.mongo_dialog = None;
+            let page = app.mongo_page;
+            reload_mongo_docs(app, tx, page);
         }
         OpResult::Mongo(s) => {
             app.cmd_output.push(s);
@@ -3474,7 +3951,20 @@ fn confirm_key(app: &mut App, tx: &Tx, k: KeyEvent) {
     match k.code {
         KeyCode::Enter | KeyCode::Char('y') | KeyCode::Char('Y') => {
             if let Some(c) = app.confirm.take() {
+                if let Some(mc) = c.mongo {
+                    run_mongo_action(app, tx, mc);
+                    return;
+                }
                 if let Some(rc) = c.redis {
+                    // A select-all delete demands a typed re-confirmation first.
+                    if rc.typed_confirm.is_some() {
+                        open_redis_typed_confirm(app, rc);
+                        return;
+                    }
+                    if !rc.batch.is_empty() {
+                        run_redis_batch(app, tx, rc.db, rc.batch, rc.reload_list);
+                        return;
+                    }
                     run_redis_write(app, tx, rc.db, &rc.cmd, rc.reload_value, rc.reload_list);
                     return;
                 }
@@ -3496,6 +3986,67 @@ fn confirm_key(app: &mut App, tx: &Tx, k: KeyEvent) {
         }
         _ => {}
     }
+}
+
+/// Open the typed re-confirmation prompt for a dangerous batch (repeat the key
+/// count or `YES`). The pending batch is stashed so the prompt can run it.
+fn open_redis_typed_confirm(app: &mut App, rc: RedisConfirm) {
+    let need = rc.typed_confirm.unwrap_or(0);
+    let title = tf("二次确认 · {}", &[&rc.summary]);
+    let batch = rc.batch_keys.clone();
+    app.redis_pending_batch = Some(rc);
+    let mut ta = TextArea::default();
+    ta.set_placeholder_text(tf("输入 {} 或 YES", &[&need]));
+    app.redis_prompt = Some(RedisPrompt {
+        kind: RedisPromptKind::BatchConfirm,
+        title,
+        key_display: String::new(),
+        key_raw: String::new(),
+        field: String::new(),
+        batch,
+        input: ta,
+    });
+    app.status = tf("二次确认：输入 {} 或 YES", &[&need]);
+}
+
+/// Run a confirmed MongoDB document write, then reload the current page.
+fn run_mongo_action(app: &mut App, tx: &Tx, mc: MongoConfirm) {
+    let Some(cfg) = app.selected.clone() else {
+        app.status = t("✗ 未选择连接").into();
+        return;
+    };
+    app.loading = true;
+    let op = match mc.action {
+        MongoAction::Insert { doc_json } => {
+            app.status = tf("插入文档到 {}…", &[&fix_double_encoding(&mc.collection)]);
+            Op::MongoInsert {
+                cfg: Box::new(cfg),
+                db: mc.db,
+                collection: mc.collection,
+                doc_json,
+            }
+        }
+        MongoAction::Update { id, doc_json } => {
+            app.status = tf("更新文档 {}…", &[&truncate_disp(&id, 40)]);
+            Op::MongoUpdate {
+                cfg: Box::new(cfg),
+                db: mc.db,
+                collection: mc.collection,
+                id,
+                doc_json,
+            }
+        }
+        MongoAction::Delete { id } => {
+            app.status = tf("删除文档 {}…", &[&truncate_disp(&id, 40)]);
+            Op::MongoDelete {
+                cfg: Box::new(cfg),
+                db: mc.db,
+                collection: mc.collection,
+                id,
+            }
+        }
+    };
+    app.spawn(tx, op);
 }
 
 fn browse_key(app: &mut App, tx: &Tx, k: KeyEvent) {
@@ -3546,9 +4097,15 @@ fn browse_key(app: &mut App, tx: &Tx, k: KeyEvent) {
         return;
     }
 
-    // Redis input dialogs (pattern / TTL / rename / value) are modal.
+    // Redis input dialogs (pattern / TTL / rename / value / batch) are modal.
     if app.redis_prompt.is_some() {
         redis_prompt_key(app, tx, k);
+        return;
+    }
+
+    // MongoDB document JSON editor is modal.
+    if app.mongo_dialog.is_some() {
+        mongo_dialog_key(app, k);
         return;
     }
 
@@ -3910,8 +4467,42 @@ fn sidebar_key(app: &mut App, tx: &Tx, k: KeyEvent) {
         return;
     }
 
-    // Redis connection → key browser (SCAN pagination, pattern filter).
+    // Redis connection → key browser (SCAN pagination, pattern filter,
+    // multi-select batch operations).
     if app.backend_kind == Backend::Redis {
+        // Shift + ↑/↓/Home/End extends a multi-select range from the anchor.
+        if k.modifiers.contains(KeyModifiers::SHIFT) {
+            match k.code {
+                KeyCode::Up => {
+                    let i = app.redis_list.selected().unwrap_or(0).saturating_sub(1);
+                    redis_select_range(app, i);
+                    return;
+                }
+                KeyCode::Down => {
+                    let n = app.redis_scan.keys.len();
+                    let i = (app.redis_list.selected().unwrap_or(0) + 1).min(n.saturating_sub(1));
+                    redis_select_range(app, i);
+                    return;
+                }
+                KeyCode::Home => {
+                    redis_select_range(app, 0);
+                    return;
+                }
+                KeyCode::End => {
+                    let n = app.redis_scan.keys.len();
+                    if n > 0 {
+                        redis_select_range(app, n - 1);
+                    }
+                    return;
+                }
+                _ => {}
+            }
+        }
+        // Ctrl-D is the delete shortcut the results pane also uses.
+        if k.modifiers.contains(KeyModifiers::CONTROL) && k.code == KeyCode::Char('d') {
+            redis_batch_delete(app);
+            return;
+        }
         match k.code {
             KeyCode::Tab => app.focus = Focus::Editor,
             KeyCode::Char('c') => {
@@ -3929,6 +4520,31 @@ fn sidebar_key(app: &mut App, tx: &Tx, k: KeyEvent) {
             KeyCode::Char('/') => open_redis_pattern_prompt(app),
             // `n` fetches the next SCAN page.
             KeyCode::Char('n') => start_redis_scan(app, tx, false),
+            // Space toggles one key; `a` selects every loaded key.
+            KeyCode::Char(' ') => {
+                redis_toggle_select(app);
+                let n = app.redis_selected.len();
+                app.status = if n > 0 {
+                    tf("已选 {} 个 key", &[&n])
+                } else {
+                    t("已清除选择").into()
+                };
+            }
+            KeyCode::Char('a') => redis_select_all(app),
+            // `y` copies the selected key names (or the focused one).
+            KeyCode::Char('y') => redis_copy_selection(app),
+            // Batch operations act on the selection (focused key when empty).
+            KeyCode::Delete => redis_batch_delete(app),
+            KeyCode::Char('x') => open_redis_batch_ttl_prompt(app),
+            KeyCode::Char('m') => open_redis_batch_rename_prompt(app),
+            // Esc clears the selection when there is one.
+            KeyCode::Esc => {
+                if !app.redis_selected.is_empty() {
+                    app.redis_selected.clear();
+                    app.redis_anchor = None;
+                    app.status = t("已清除选择").into();
+                }
+            }
             KeyCode::Up | KeyCode::Char('k') => {
                 let n = app.redis_scan.keys.len();
                 if n > 0 {
@@ -4892,6 +5508,9 @@ fn back_to_picker(app: &mut App) {
     app.redis_value = None;
     app.redis_scan = RedisScanState::default();
     app.redis_list = ListState::default();
+    app.redis_selected.clear();
+    app.redis_anchor = None;
+    app.redis_pending_batch = None;
     app.picker_open = true;
 }
 
@@ -4905,6 +5524,8 @@ fn cycle_redis_db(app: &mut App, tx: &Tx, forward: bool) {
     app.redis_value = None;
     app.clear_grid();
     app.set_placeholder();
+    app.redis_selected.clear();
+    app.redis_anchor = None;
     app.status = tf("redis db → {}", &[&(app.redis_db)]);
     start_redis_scan(app, tx, true);
 }
@@ -4920,6 +5541,7 @@ fn open_redis_pattern_prompt(app: &mut App) {
         key_display: String::new(),
         key_raw: String::new(),
         field: String::new(),
+        batch: Vec::new(),
         input: ta,
     });
 }
@@ -4939,6 +5561,7 @@ fn open_redis_ttl_prompt(app: &mut App) {
         key_display: view.key_display.clone(),
         key_raw: view.key_raw.clone(),
         field: String::new(),
+        batch: Vec::new(),
         input: ta,
     });
 }
@@ -4956,6 +5579,7 @@ fn open_redis_rename_prompt(app: &mut App) {
         key_display: view.key_display.clone(),
         key_raw: view.key_raw.clone(),
         field: String::new(),
+        batch: Vec::new(),
         input: ta,
     });
 }
@@ -4977,6 +5601,7 @@ fn open_redis_edit(app: &mut App) {
                 key_display: view.key_display.clone(),
                 key_raw: view.key_raw.clone(),
                 field: String::new(),
+                batch: Vec::new(),
                 input: ta,
             });
         }
@@ -5002,6 +5627,7 @@ fn open_redis_edit(app: &mut App) {
                 key_display: view.key_display.clone(),
                 key_raw: view.key_raw.clone(),
                 field,
+                batch: Vec::new(),
                 input: ta,
             });
         }
@@ -5025,7 +5651,10 @@ fn redis_prompt_command(kind: RedisPromptKind, key: &str, field: &str, input: &s
         RedisPromptKind::Rename => format!("RENAME {} {}", q(key), q(input.trim())),
         RedisPromptKind::StringValue => format!("SET {} {}", q(key), q(input)),
         RedisPromptKind::HashField => format!("HSET {} {} {}", q(key), q(field), q(input)),
-        RedisPromptKind::Pattern => String::new(),
+        RedisPromptKind::Pattern
+        | RedisPromptKind::BatchTtl
+        | RedisPromptKind::BatchRenamePrefix
+        | RedisPromptKind::BatchConfirm => String::new(),
     }
 }
 
@@ -5620,11 +6249,307 @@ fn redis_confirm_delete(app: &mut App) {
         redis: Some(RedisConfirm {
             db: app.redis_db,
             cmd,
+            batch: Vec::new(),
+            batch_keys: Vec::new(),
             reload_value: None,
             reload_list: true,
+            typed_confirm: None,
+            summary: String::new(),
         }),
+        mongo: None,
     });
     app.status = t("删除确认 · Enter 执行 · Esc 取消").into();
+}
+
+/// Run a generated batch of Redis commands in order.
+fn run_redis_batch(app: &mut App, tx: &Tx, db: u32, cmds: Vec<String>, reload_list: bool) {
+    let Some(cfg) = app.selected.clone() else {
+        app.status = t("✗ 未选择连接").into();
+        return;
+    };
+    let n = cmds.len();
+    app.loading = true;
+    app.status = tf("批量执行 {} 条命令…", &[&n]);
+    app.spawn(
+        tx,
+        Op::RedisBatchWrite {
+            cfg: Box::new(cfg),
+            db,
+            cmds,
+            reload_list,
+        },
+    );
+}
+
+/// The batch targets in list order as `(raw, display)`. When nothing is
+/// explicitly selected, the focused key is the single target.
+fn redis_selection_targets(
+    selected: &HashSet<String>,
+    keys: &[RedisKeyInfo],
+    focused: Option<usize>,
+) -> Vec<(String, String)> {
+    let mut out: Vec<(String, String)> = keys
+        .iter()
+        .filter(|k| selected.contains(&k.key_raw))
+        .map(|k| (k.key_raw.clone(), k.key_display.clone()))
+        .collect();
+    if out.is_empty() {
+        if let Some(i) = focused {
+            if let Some(k) = keys.get(i) {
+                out.push((k.key_raw.clone(), k.key_display.clone()));
+            }
+        }
+    }
+    out
+}
+
+fn redis_batch_targets(app: &App) -> Vec<(String, String)> {
+    redis_selection_targets(&app.redis_selected, &app.redis_scan.keys, app.redis_list.selected())
+}
+
+/// True when the selection covers every loaded key (used to force the extra
+/// typed confirmation before a destructive select-all delete).
+fn redis_selection_is_all(selected: &HashSet<String>, keys: &[RedisKeyInfo]) -> bool {
+    !selected.is_empty() && selected.len() == keys.len()
+}
+
+fn redis_all_selected(app: &App) -> bool {
+    redis_selection_is_all(&app.redis_selected, &app.redis_scan.keys)
+}
+
+/// Toggle the key at `idx` in / out of the selection.
+fn redis_selection_toggle(
+    selected: &mut HashSet<String>,
+    anchor: &mut Option<usize>,
+    keys: &[RedisKeyInfo],
+    idx: usize,
+) {
+    let Some(k) = keys.get(idx) else {
+        return;
+    };
+    let raw = k.key_raw.clone();
+    if !selected.remove(&raw) {
+        selected.insert(raw);
+    }
+    *anchor = Some(idx);
+}
+
+/// Extend the selection from the anchor to `to` (additive).
+fn redis_selection_range(
+    selected: &mut HashSet<String>,
+    anchor: &mut Option<usize>,
+    keys: &[RedisKeyInfo],
+    to: usize,
+) {
+    let n = keys.len();
+    if n == 0 {
+        return;
+    }
+    let to = to.min(n - 1);
+    let a = anchor.unwrap_or(to).min(n - 1);
+    let (lo, hi) = if a <= to { (a, to) } else { (to, a) };
+    for k in keys.iter().take(hi + 1).skip(lo) {
+        selected.insert(k.key_raw.clone());
+    }
+    *anchor = Some(a);
+}
+
+/// Select every loaded key (the `a` gesture).
+fn redis_selection_all(
+    selected: &mut HashSet<String>,
+    anchor: &mut Option<usize>,
+    keys: &[RedisKeyInfo],
+) {
+    for k in keys {
+        selected.insert(k.key_raw.clone());
+    }
+    if !keys.is_empty() {
+        *anchor = Some(0);
+    }
+}
+
+/// Toggle the focused key's selection.
+fn redis_toggle_select(app: &mut App) {
+    let Some(i) = app.redis_list.selected() else {
+        return;
+    };
+    redis_selection_toggle(
+        &mut app.redis_selected,
+        &mut app.redis_anchor,
+        &app.redis_scan.keys,
+        i,
+    );
+}
+
+/// Extend the selection from the anchor to `to` (additive).
+fn redis_select_range(app: &mut App, to: usize) {
+    redis_selection_range(
+        &mut app.redis_selected,
+        &mut app.redis_anchor,
+        &app.redis_scan.keys,
+        to,
+    );
+    let n = app.redis_scan.keys.len();
+    if n > 0 {
+        app.redis_list.select(Some(to.min(n - 1)));
+    }
+}
+
+/// Select every loaded key (the `a` gesture).
+fn redis_select_all(app: &mut App) {
+    if app.redis_scan.keys.is_empty() {
+        return;
+    }
+    redis_selection_all(
+        &mut app.redis_selected,
+        &mut app.redis_anchor,
+        &app.redis_scan.keys,
+    );
+    app.status = tf("已全选 {} 个 key", &[&app.redis_selected.len()]);
+}
+
+/// `y` in the key browser: copy the selected key names (or the focused one).
+fn redis_copy_selection(app: &mut App) {
+    let targets = redis_batch_targets(app);
+    if targets.is_empty() {
+        app.status = t("先选中一个 key").into();
+        return;
+    }
+    let text = targets
+        .iter()
+        .map(|(_, d)| d.as_str())
+        .collect::<Vec<_>>()
+        .join("\n");
+    let n = targets.len();
+    match clipboard_copy(&text) {
+        Some(p) => app.status = tf("✓ 已复制 {} 个 key 名 · 兜底 {}", &[&n, &(p.display())]),
+        None => app.status = tf("✓ 已复制 {} 个 key 名 · OSC52 剪贴板", &[&n]),
+    }
+}
+
+/// A concise confirmation preview: the first commands plus a count summary.
+fn redis_batch_preview(cmds: &[String], keys: usize) -> String {
+    let mut s = String::new();
+    for c in cmds.iter().take(4) {
+        s.push_str(c);
+        s.push('\n');
+    }
+    if cmds.len() > 4 {
+        s.push_str(&tf("… 其余 {} 条命令", &[&(cmds.len() - 4)]));
+        s.push('\n');
+    }
+    s.push_str(&tf("共 {} 个 key · {} 条命令", &[&keys, &cmds.len()]));
+    s
+}
+
+/// Open the red confirmation layer for a generated Redis batch.
+fn redis_open_batch_confirm(
+    app: &mut App,
+    commands: Vec<String>,
+    targets: Vec<(String, String)>,
+    typed_confirm: Option<usize>,
+    summary: String,
+) {
+    let n = targets.len();
+    let pattern = app.redis_scan.pattern.clone();
+    app.confirm = Some(Confirm {
+        sql: redis_batch_preview(&commands, n),
+        reasons: vec![
+            tf("将影响 {} 个 key（模式 {}）", &[&n, &pattern]),
+            t("Enter 后按顺序执行，不可撤销").into(),
+        ],
+        refresh: false,
+        clear_batch: false,
+        redis: Some(RedisConfirm {
+            db: app.redis_db,
+            cmd: String::new(),
+            batch: commands,
+            batch_keys: targets,
+            reload_value: None,
+            reload_list: true,
+            typed_confirm,
+            summary,
+        }),
+        mongo: None,
+    });
+    app.status = t("批量确认 · Enter 执行 · Esc 取消").into();
+}
+
+/// `Del` in the key browser: batch delete the selected keys.
+fn redis_batch_delete(app: &mut App) {
+    let targets = redis_batch_targets(app);
+    if targets.is_empty() {
+        app.status = t("先选中一个 key").into();
+        return;
+    }
+    if targets.len() > REDIS_BATCH_LIMIT {
+        app.status = tf(
+            "选中 {} 个 key 超过单页上限 {}，请分批操作（space 取消部分选择）",
+            &[&(targets.len()), &(REDIS_BATCH_LIMIT)],
+        );
+        return;
+    }
+    let all_loaded = redis_all_selected(app);
+    let Ok(plan) = redis_plan_batch(RedisBatchKind::Delete, &targets, all_loaded, "") else {
+        return;
+    };
+    let n = targets.len();
+    let pattern = app.redis_scan.pattern.clone();
+    redis_open_batch_confirm(app, plan.commands, targets, plan.typed_confirm, plan.summary);
+    if let Some(c) = app.confirm.as_mut() {
+        c.reasons = vec![
+            tf("将批量删除 {} 个 key（模式 {}）", &[&n, &pattern]),
+            t("DEL 不可撤销，Enter 后立即执行").into(),
+        ];
+    }
+}
+
+/// `x` in the key browser: open the batch TTL prompt.
+fn open_redis_batch_ttl_prompt(app: &mut App) {
+    let targets = redis_batch_targets(app);
+    if targets.is_empty() {
+        app.status = t("先选中一个 key").into();
+        return;
+    }
+    let mut ta = TextArea::default();
+    ta.set_placeholder_text(t("秒数（-1 = 持久化，0 = 立即删除）"));
+    app.redis_prompt = Some(RedisPrompt {
+        kind: RedisPromptKind::BatchTtl,
+        title: tf("批量设置 TTL · {} 个 key", &[&targets.len()]),
+        key_display: String::new(),
+        key_raw: String::new(),
+        field: String::new(),
+        batch: targets,
+        input: ta,
+    });
+}
+
+/// `m` in the key browser: open the batch prefix-rename prompt.
+fn open_redis_batch_rename_prompt(app: &mut App) {
+    let targets = redis_batch_targets(app);
+    if targets.is_empty() {
+        app.status = t("先选中一个 key").into();
+        return;
+    }
+    // Prefill the old prefix from the SCAN pattern when it ends with `*`.
+    let old = app
+        .redis_scan
+        .pattern
+        .strip_suffix('*')
+        .filter(|p| !p.is_empty() && *p != "*")
+        .unwrap_or("");
+    let mut ta = TextArea::from(vec![format!("{old}=")]);
+    ta.set_placeholder_text(t("旧前缀=新前缀，例: app: = new:"));
+    ta.move_cursor(CursorMove::End);
+    app.redis_prompt = Some(RedisPrompt {
+        kind: RedisPromptKind::BatchRenamePrefix,
+        title: tf("批量前缀重命名 · {} 个 key", &[&targets.len()]),
+        key_display: String::new(),
+        key_raw: String::new(),
+        field: String::new(),
+        batch: targets,
+        input: ta,
+    });
 }
 
 /// Keys for a Redis value grid: edit the string / hash field, expire, rename,
@@ -5693,6 +6618,7 @@ fn mongo_docs_key(app: &mut App, tx: &Tx, k: KeyEvent) {
             KeyCode::Char('e') => app.focus = Focus::Editor,
             KeyCode::Char('f') => page_turn(app, tx, true),
             KeyCode::Char('b') => page_turn(app, tx, false),
+            KeyCode::Char('d') => mongo_confirm_delete(app),
             _ => {}
         }
         return;
@@ -5707,6 +6633,10 @@ fn mongo_docs_key(app: &mut App, tx: &Tx, k: KeyEvent) {
     match k.code {
         KeyCode::Esc => app.focus = Focus::Sidebar,
         KeyCode::Char('f') => open_mongo_filter_prompt(app),
+        // Document CRUD: edit / insert / delete (all confirmed).
+        KeyCode::Char('e') => open_mongo_edit(app),
+        KeyCode::Char('i') => open_mongo_insert(app),
+        KeyCode::Delete => mongo_confirm_delete(app),
         KeyCode::Char('y') => copy_redis_row(app),
         KeyCode::Char('o') => open_row_popup(app),
         KeyCode::Char('v') => open_cell_popup(app),
@@ -5745,6 +6675,209 @@ fn open_mongo_filter_prompt(app: &mut App) {
     app.filter_prompt = Some(ta);
 }
 
+/// The focused document from the retained page, plus its index in that page.
+fn mongo_focused_doc(app: &App) -> Option<(usize, serde_json::Value)> {
+    let idx = app.full_row_index()?;
+    let doc = app.mongo_docs.get(idx)?.clone();
+    Some((idx, doc))
+}
+
+/// `e` — open the JSON editor for the focused document.
+fn open_mongo_edit(app: &mut App) {
+    let Some((_idx, doc)) = mongo_focused_doc(app) else {
+        app.status = t("没有可编辑的文档").into();
+        return;
+    };
+    let Some(coll) = app.selected_table().map(|t| t.name.clone()) else {
+        return;
+    };
+    let id_value = doc.get("_id").cloned().unwrap_or(serde_json::Value::Null);
+    let id = mongo_id_arg(&id_value);
+    let text = serde_json::to_string_pretty(&doc).unwrap_or_else(|_| doc.to_string());
+    let mut editor = TextArea::from(text.split('\n').collect::<Vec<_>>());
+    editor.move_cursor(CursorMove::Top);
+    editor.set_placeholder_text(t("JSON 文档（_id 不可修改）"));
+    app.mongo_dialog = Some(MongoDocDialog {
+        mode: MongoDocMode::Edit,
+        db: app.current_db(),
+        collection: coll,
+        original: doc,
+        id,
+        editor,
+        error: None,
+    });
+    app.status = t("编辑文档 · Ctrl-S 校验并保存 · Esc 取消").into();
+}
+
+/// `i` — open the JSON editor with an empty document template.
+fn open_mongo_insert(app: &mut App) {
+    let Some(coll) = app.selected_table().map(|t| t.name.clone()) else {
+        return;
+    };
+    let mut editor = TextArea::from(vec!["{", "  ", "}"]);
+    editor.move_cursor(CursorMove::Top);
+    editor.move_cursor(CursorMove::Down);
+    editor.move_cursor(CursorMove::End);
+    editor.set_placeholder_text(t("新文档 JSON（省略 _id 则由 MongoDB 生成）"));
+    app.mongo_dialog = Some(MongoDocDialog {
+        mode: MongoDocMode::Insert,
+        db: app.current_db(),
+        collection: coll,
+        original: serde_json::Value::Object(serde_json::Map::new()),
+        id: String::new(),
+        editor,
+        error: None,
+    });
+    app.status = t("插入文档 · Ctrl-S 校验并保存 · Esc 取消").into();
+}
+
+/// `Del` — confirm deleting the focused document by `_id`.
+fn mongo_confirm_delete(app: &mut App) {
+    let Some((_idx, doc)) = mongo_focused_doc(app) else {
+        app.status = t("没有可删除的文档").into();
+        return;
+    };
+    let id_value = doc.get("_id").cloned().unwrap_or(serde_json::Value::Null);
+    let label = mongo_id_label(&id_value);
+    let id = mongo_id_arg(&id_value);
+    let Some(coll) = app.selected_table().map(|t| t.name.clone()) else {
+        return;
+    };
+    let db = app.current_db();
+    app.confirm = Some(Confirm {
+        sql: format!(
+            "db.{}.deleteOne({{_id: {}}})",
+            fix_double_encoding(&coll),
+            serde_json::to_string(&id_value).unwrap_or_default()
+        ),
+        reasons: vec![
+            tf("将删除文档 _id={}（不可撤销）", &[&label]),
+            t("Enter 后立即执行").into(),
+        ],
+        refresh: false,
+        clear_batch: false,
+        redis: None,
+        mongo: Some(MongoConfirm {
+            db,
+            collection: coll,
+            action: MongoAction::Delete { id },
+        }),
+    });
+    app.status = t("删除文档确认 · Enter 执行 · Esc 取消").into();
+}
+
+/// Handle keys in the MongoDB JSON editor. Ctrl-S validates and opens the
+/// confirmation layer; everything else is text editing.
+fn mongo_dialog_key(app: &mut App, k: KeyEvent) {
+    let Some(mut d) = app.mongo_dialog.take() else {
+        return;
+    };
+    if k.modifiers.contains(KeyModifiers::CONTROL) && k.code == KeyCode::Char('s') {
+        mongo_dialog_submit(app, d);
+        return;
+    }
+    if k.code == KeyCode::Esc {
+        app.status = t("已取消").into();
+        return;
+    }
+    d.editor.input(k);
+    d.error = None;
+    app.mongo_dialog = Some(d);
+}
+
+/// Validate the editor's JSON and route a valid edit / insert through the red
+/// confirmation layer (an edit previews its top-level diff first).
+fn mongo_dialog_submit(app: &mut App, d: MongoDocDialog) {
+    let text = d.editor.lines().join("\n");
+    let parsed: serde_json::Value = match serde_json::from_str(&text) {
+        Ok(v) => v,
+        Err(e) => {
+            let mut d = d;
+            d.error = Some(tf("JSON 非法：{}", &[&e]));
+            app.mongo_dialog = Some(d);
+            app.status = tf("✗ JSON 非法：{}", &[&e]);
+            return;
+        }
+    };
+    if !parsed.is_object() {
+        let mut d = d;
+        d.error = Some(t("文档必须是 JSON 对象 { … }").to_string());
+        app.mongo_dialog = Some(d);
+        app.status = t("✗ 文档必须是 JSON 对象").into();
+        return;
+    }
+    let doc_json = serde_json::to_string(&parsed).unwrap_or(text);
+    match d.mode {
+        MongoDocMode::Insert => {
+            let preview = serde_json::to_string_pretty(&parsed).unwrap_or_default();
+            app.confirm = Some(Confirm {
+                sql: preview,
+                reasons: vec![
+                    tf(
+                        "将向 {}.{} 插入 1 个文档",
+                        &[&fix_double_encoding(&d.db), &fix_double_encoding(&d.collection)],
+                    ),
+                    t("Enter 执行 · Esc 取消").into(),
+                ],
+                refresh: false,
+                clear_batch: false,
+                redis: None,
+                mongo: Some(MongoConfirm {
+                    db: d.db.clone(),
+                    collection: d.collection.clone(),
+                    action: MongoAction::Insert { doc_json },
+                }),
+            });
+            app.status = t("插入确认 · Enter 执行 · Esc 取消").into();
+        }
+        MongoDocMode::Edit => {
+            let old_id = d.original.get("_id");
+            let new_id = parsed.get("_id");
+            if old_id != new_id {
+                let mut d = d;
+                d.error = Some(t("_id 不可修改（请恢复原值）").to_string());
+                app.mongo_dialog = Some(d);
+                app.status = t("✗ _id 不可修改").into();
+                return;
+            }
+            let diff = mongo_doc_diff(&d.original, &parsed, 12);
+            let mut body = String::new();
+            if diff.is_empty() {
+                body.push_str(t("（没有字段变化）"));
+            } else {
+                for line in &diff {
+                    body.push_str(line);
+                    body.push('\n');
+                }
+            }
+            body.push('\n');
+            body.push_str(&serde_json::to_string_pretty(&parsed).unwrap_or_default());
+            app.confirm = Some(Confirm {
+                sql: body,
+                reasons: vec![
+                    tf(
+                        "将替换文档 _id={}",
+                        &[&mongo_id_label(old_id.unwrap_or(&serde_json::Value::Null))],
+                    ),
+                    t("Enter 执行 · Esc 取消").into(),
+                ],
+                refresh: false,
+                clear_batch: false,
+                redis: None,
+                mongo: Some(MongoConfirm {
+                    db: d.db.clone(),
+                    collection: d.collection.clone(),
+                    action: MongoAction::Update {
+                        id: d.id.clone(),
+                        doc_json,
+                    },
+                }),
+            });
+            app.status = t("更新确认（含 diff）· Enter 执行 · Esc 取消").into();
+        }
+    }
+}
+
 /// Handle a Redis input dialog. Enter turns the input into a command and routes
 /// it through the confirmation layer; the pattern dialog is read-only-safe and
 /// applies immediately.
@@ -5753,6 +6886,7 @@ fn redis_prompt_key(app: &mut App, tx: &Tx, k: KeyEvent) {
         return;
     };
     if k.code == KeyCode::Esc {
+        app.redis_pending_batch = None;
         app.status = t("已取消").into();
         return;
     }
@@ -5762,14 +6896,98 @@ fn redis_prompt_key(app: &mut App, tx: &Tx, k: KeyEvent) {
         return;
     }
     let input = p.input.lines().join("\n");
-    if p.kind == RedisPromptKind::Pattern {
-        let pat = input.trim();
-        app.redis_scan.pattern = if pat.is_empty() { "*".to_string() } else { pat.to_string() };
-        app.redis_value = None;
-        app.clear_grid();
-        app.status = tf("匹配模式 → {}", &[&(app.redis_scan.pattern)]);
-        start_redis_scan(app, tx, true);
-        return;
+    match p.kind {
+        RedisPromptKind::Pattern => {
+            let pat = input.trim();
+            app.redis_scan.pattern = if pat.is_empty() { "*".to_string() } else { pat.to_string() };
+            app.redis_value = None;
+            app.clear_grid();
+            app.redis_selected.clear();
+            app.redis_anchor = None;
+            app.status = tf("匹配模式 → {}", &[&(app.redis_scan.pattern)]);
+            start_redis_scan(app, tx, true);
+            return;
+        }
+        RedisPromptKind::BatchConfirm => {
+            let need = app
+                .redis_pending_batch
+                .as_ref()
+                .and_then(|r| r.typed_confirm)
+                .unwrap_or(0);
+            let typed = input.trim();
+            if typed != need.to_string() && !typed.eq_ignore_ascii_case("YES") {
+                app.status = tf("输入不匹配（需 {} 或 YES）", &[&need]);
+                app.redis_prompt = Some(p);
+                return;
+            }
+            if let Some(rc) = app.redis_pending_batch.take() {
+                if !rc.batch.is_empty() {
+                    run_redis_batch(app, tx, rc.db, rc.batch, rc.reload_list);
+                }
+            }
+            return;
+        }
+        RedisPromptKind::BatchTtl => {
+            let ttl = input.trim().to_string();
+            let plan = match redis_plan_batch(RedisBatchKind::Ttl, &p.batch, false, &ttl) {
+                Ok(plan) => plan,
+                Err(e) => {
+                    app.status = format!("✗ {e}");
+                    app.redis_prompt = Some(p);
+                    return;
+                }
+            };
+            let n = p.batch.len();
+            let pattern = app.redis_scan.pattern.clone();
+            redis_open_batch_confirm(app, plan.commands, p.batch.clone(), plan.typed_confirm, plan.summary);
+            if let Some(c) = app.confirm.as_mut() {
+                c.reasons = vec![
+                    tf(
+                        "将对 {} 个 key 设置 TTL={}s（模式 {}）",
+                        &[&n, &ttl, &pattern],
+                    ),
+                    t("Enter 后立即执行").into(),
+                ];
+            }
+            return;
+        }
+        RedisPromptKind::BatchRenamePrefix => {
+            let plan = match redis_plan_batch(
+                RedisBatchKind::RenamePrefix,
+                &p.batch,
+                false,
+                &input,
+            ) {
+                Ok(plan) => plan,
+                Err(e) => {
+                    app.status = format!("✗ {e}");
+                    app.redis_prompt = Some(p);
+                    return;
+                }
+            };
+            let Some((old, new)) = input.split_once('=') else {
+                return;
+            };
+            let renamed = redis_prefix_rename_plan(
+                &p.batch.iter().map(|(_, d)| d.clone()).collect::<Vec<_>>(),
+                old,
+                new,
+            )
+            .len();
+            let pattern = app.redis_scan.pattern.clone();
+            redis_open_batch_confirm(app, plan.commands, p.batch.clone(), plan.typed_confirm, plan.summary);
+            if let Some(c) = app.confirm.as_mut() {
+                c.reasons = vec![
+                    tf(
+                        "将重命名 {} 个 key：{} → {}（模式 {}）",
+                        &[&renamed, &old, &new, &pattern],
+                    ),
+                    t("Enter 后立即执行").into(),
+                ];
+            }
+            return;
+        }
+        _ => {}
     }
     let cmd = redis_prompt_command(p.kind, &p.key_display, &p.field, &input);
     if cmd.is_empty() {
@@ -5780,7 +6998,10 @@ fn redis_prompt_key(app: &mut App, tx: &Tx, k: KeyEvent) {
         RedisPromptKind::Rename => (None, true),
         RedisPromptKind::StringValue | RedisPromptKind::HashField => (Some(p.key_raw.clone()), false),
         RedisPromptKind::Ttl => (Some(p.key_raw.clone()), true),
-        RedisPromptKind::Pattern => (None, false),
+        RedisPromptKind::Pattern
+        | RedisPromptKind::BatchTtl
+        | RedisPromptKind::BatchRenamePrefix
+        | RedisPromptKind::BatchConfirm => (None, false),
     };
     app.confirm = Some(Confirm {
         sql: cmd.clone(),
@@ -5793,9 +7014,14 @@ fn redis_prompt_key(app: &mut App, tx: &Tx, k: KeyEvent) {
         redis: Some(RedisConfirm {
             db: app.redis_db,
             cmd,
+            batch: Vec::new(),
+            batch_keys: Vec::new(),
             reload_value,
             reload_list,
+            typed_confirm: None,
+            summary: String::new(),
         }),
+        mongo: None,
     });
     app.status = t("确认写入 · Enter 执行 · Esc 取消").into();
 }
@@ -7327,6 +8553,7 @@ fn delete_row(app: &mut App) {
         refresh: true,
         clear_batch: false,
         redis: None,
+        mongo: None,
     });
     app.status = t("删除确认 · Enter 执行 · Esc 取消").into();
 }
@@ -7504,6 +8731,7 @@ fn submit_edit_sql(app: &mut App, tx: &Tx, sql: String) {
             refresh: true,
             clear_batch: false,
             redis: None,
+            mongo: None,
         });
         return;
     }
@@ -7537,6 +8765,7 @@ fn commit_batch(app: &mut App) {
         refresh: true,
         clear_batch: true,
         redis: None,
+        mongo: None,
     });
     app.status = tf("批量提交确认（{} 条）· Enter 执行 · Esc 取消", &[&(n)]);
 }
@@ -7735,6 +8964,7 @@ fn run_sql(app: &mut App, tx: &Tx) {
             refresh: false,
             clear_batch: false,
             redis: None,
+            mongo: None,
         });
         return;
     }
@@ -8811,6 +10041,9 @@ fn ui(f: &mut Frame, app: &mut App) {
     if app.redis_prompt.is_some() {
         render_redis_prompt(f, f.area(), app);
     }
+    if app.mongo_dialog.is_some() {
+        render_mongo_dialog(f, f.area(), app);
+    }
     if app.edit_dialog.is_some() {
         render_edit_dialog(f, f.area(), app);
     }
@@ -8976,6 +10209,10 @@ fn context_info(app: &App) -> String {
     if !app.col_hidden.is_empty() {
         parts.push(tf("隐藏列 {}", &[&(app.col_hidden.len())]));
     }
+    // Redis multi-select count (batch operations target the selection).
+    if app.backend_kind == Backend::Redis && !app.redis_selected.is_empty() {
+        parts.push(tf("已选 {}", &[&(app.redis_selected.len())]));
+    }
     // Touch fallback: vertical wheel pans columns (Ctrl-G).
     if app.pan_mode {
         parts.push(t("横滚 开").into());
@@ -9102,6 +10339,7 @@ enum FooterView {
     FilterPrompt,
     Popup,
     EditDialog,
+    MongoDoc,
     DbPicker,
     Confirm,
     ConnPicker,
@@ -9144,6 +10382,8 @@ fn footer_ctx(app: &App) -> FooterCtx {
         FooterView::Popup
     } else if app.edit_dialog.is_some() {
         FooterView::EditDialog
+    } else if app.mongo_dialog.is_some() {
+        FooterView::MongoDoc
     } else if app.db_picker_open {
         FooterView::DbPicker
     } else if app.confirm.is_some() {
@@ -9211,6 +10451,10 @@ fn footer_hints_ctx(ctx: FooterCtx) -> Vec<Hint> {
             ("Ctrl-V", t("转编辑器")),
             ("Ctrl-T", t("加入批量")),
         ],
+        FooterView::MongoDoc => vec![
+            ("Ctrl-S", t("校验并保存")),
+            ("Esc", t("取消")),
+        ],
         FooterView::DbPicker => vec![
             ("↑↓", t("选择")),
             ("Enter", t("切换")),
@@ -9233,8 +10477,13 @@ fn footer_hints_ctx(ctx: FooterCtx) -> Vec<Hint> {
         ],
         FooterView::RedisKeys => vec![
             ("↑↓", t("key")),
-            ("/", t("匹配模式")),
+            ("Space", t("勾选")),
+            ("a", t("全选")),
             ("Enter", t("查看值")),
+            ("Del", t("批量删")),
+            ("x", t("批量TTL")),
+            ("m", t("批量改名")),
+            ("/", t("匹配模式")),
             ("n", t("更多")),
             ("r", t("重扫")),
             ("d", t("逻辑库")),
@@ -9255,6 +10504,9 @@ fn footer_hints_ctx(ctx: FooterCtx) -> Vec<Hint> {
             ("↑↓", t("行")),
             ("←→", t("列")),
             ("Enter", t("详情")),
+            ("e", t("编辑")),
+            ("i", t("插入")),
+            ("Del", t("删文档")),
             ("n/p", t("翻页")),
             ("f", t("JSON 过滤")),
             ("/", t("搜索")),
@@ -10638,8 +11890,15 @@ fn render_redis_sidebar(f: &mut Frame, area: Rect, app: &App, lines: &mut Vec<Li
         } else {
             String::new()
         };
+        let picked = app.redis_selected.contains(&key.key_raw);
         let marker = if sel == Some(i) { "▸" } else { " " };
-        let name_w = w.saturating_sub(4 + ttl.len());
+        let check = if picked { "[x]" } else { "[ ]" };
+        let check_style = if picked {
+            Style::default().fg(Color::Green).add_modifier(Modifier::BOLD)
+        } else {
+            Style::default().fg(Color::DarkGray)
+        };
+        let name_w = w.saturating_sub(8 + ttl.len());
         let name = truncate_disp(&fix_double_encoding(&key.key_display), name_w.max(4));
         let row_style = if sel == Some(i) {
             Style::default().fg(Color::Green).add_modifier(Modifier::BOLD)
@@ -10648,6 +11907,7 @@ fn render_redis_sidebar(f: &mut Frame, area: Rect, app: &App, lines: &mut Vec<Li
         };
         lines.push(Line::from(vec![
             Span::styled(marker, row_style),
+            Span::styled(check, check_style),
             Span::styled(badge, Style::default().fg(color).add_modifier(Modifier::BOLD)),
             Span::styled(format!(" {name}"), row_style),
             Span::styled(ttl, Style::default().fg(Color::DarkGray)),
@@ -10666,7 +11926,11 @@ fn render_redis_sidebar(f: &mut Frame, area: Rect, app: &App, lines: &mut Vec<Li
     }
 
     let conn = app.selected.as_ref().map(|c| c.name.clone()).unwrap_or_default();
-    let title = format!(" {} · {} keys ",  conn,  n);
+    let title = if app.redis_selected.is_empty() {
+        format!(" {} · {} keys ",  conn,  n)
+    } else {
+        tf(" {} · {} keys · 已选 {} ", &[&(conn), &(n), &(app.redis_selected.len())])
+    };
     f.render_widget(
         Paragraph::new(lines.clone()).block(
             Block::default()
@@ -11521,6 +12785,9 @@ fn render_redis_prompt(f: &mut Frame, area: Rect, app: &mut App) {
             Some(RedisPromptKind::Rename) => t("新 key 名（已存在的 key 会被覆盖）"),
             Some(RedisPromptKind::StringValue) => t("新的 string 内容（支持多行）"),
             Some(RedisPromptKind::HashField) => t("新的 hash 字段值"),
+            Some(RedisPromptKind::BatchTtl) => t("秒数；-1 = 持久化，0 = 立即删除"),
+            Some(RedisPromptKind::BatchRenamePrefix) => t("旧前缀=新前缀，例 app: = new:"),
+            Some(RedisPromptKind::BatchConfirm) => t("输入 key 数或 YES 以确认删除"),
             None => "",
         };
         f.render_widget(
@@ -11531,6 +12798,94 @@ fn render_redis_prompt(f: &mut Frame, area: Rect, app: &mut App) {
             hint_area,
         );
     }
+}
+
+/// The MongoDB document JSON editor: a full-height text area plus a validation
+/// / hint line at the bottom.
+fn render_mongo_dialog(f: &mut Frame, area: Rect, app: &mut App) {
+    let Some(d) = app.mongo_dialog.clone() else {
+        return;
+    };
+    let w = {
+        let avail = area.width.saturating_sub(4);
+        if avail < 34 {
+            area.width
+        } else {
+            avail.min(86)
+        }
+    };
+    let h = area.height.saturating_sub(2).max(5);
+    let x = area.x + (area.width.saturating_sub(w)) / 2;
+    let y = area.y + (area.height.saturating_sub(h)) / 2;
+    let box_area = Rect {
+        x,
+        y,
+        width: w,
+        height: h,
+    };
+    f.render_widget(Clear, box_area);
+    let title = match d.mode {
+        MongoDocMode::Edit => tf(
+            " ✎ 编辑文档 {}.{} ",
+            &[&fix_double_encoding(&d.db), &fix_double_encoding(&d.collection)],
+        ),
+        MongoDocMode::Insert => tf(
+            " ➕ 插入文档 {}.{} ",
+            &[&fix_double_encoding(&d.db), &fix_double_encoding(&d.collection)],
+        ),
+    };
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .title(Span::styled(
+            title,
+            Style::default()
+                .fg(Color::Yellow)
+                .add_modifier(Modifier::BOLD),
+        ))
+        .border_set(border::THICK)
+        .border_style(Style::default().fg(Color::Yellow));
+    let inner = block.inner(box_area);
+    f.render_widget(block, box_area);
+    let bottom_h = 2u16.min(inner.height.saturating_sub(1));
+    let ta_h = inner.height.saturating_sub(bottom_h).max(1);
+    let ta_area = Rect {
+        x: inner.x,
+        y: inner.y,
+        width: inner.width,
+        height: ta_h,
+    };
+    if let Some(dd) = app.mongo_dialog.as_mut() {
+        dd.editor.set_block(Block::default());
+        f.render_widget(&dd.editor, ta_area);
+    }
+    let mut lines: Vec<Line> = Vec::new();
+    if let Some(err) = &d.error {
+        lines.push(Line::from(Span::styled(
+            format!("✗ {err}"),
+            Style::default().fg(Color::Red),
+        )));
+    } else if d.mode == MongoDocMode::Edit {
+        lines.push(Line::from(Span::styled(
+            t("_id 不可修改 · Ctrl-S 预览 diff 后确认"),
+            Style::default().fg(Color::DarkGray),
+        )));
+    } else {
+        lines.push(Line::from(Span::styled(
+            t("输入 JSON 对象，可省略 _id"),
+            Style::default().fg(Color::DarkGray),
+        )));
+    }
+    lines.push(Line::from(Span::styled(
+        t("Ctrl-S 校验并保存 · Esc 取消 · 方向键移动"),
+        Style::default().fg(Color::DarkGray),
+    )));
+    let hint_area = Rect {
+        x: inner.x,
+        y: inner.y + ta_h,
+        width: inner.width,
+        height: inner.height.saturating_sub(ta_h),
+    };
+    f.render_widget(Paragraph::new(lines), hint_area);
 }
 
 fn render_filter_prompt(f: &mut Frame, area: Rect, app: &mut App) {
@@ -11705,17 +13060,20 @@ const HELP_ROWS: &[(&str, &str)] = &[
     ("use <db>", "MongoDB 切库"),
     ("— Redis key 浏览器 —", ""),
     ("↑ ↓ / Enter", "选择 key / 查看 value"),
+    ("Space / Shift+↑↓", "勾选 key / 范围选（a 全选已加载）"),
     ("/", "编辑 SCAN MATCH 模式（留空 = 全部）"),
     ("n / End", "加载下一 SCAN 页"),
     ("r", "以当前模式重扫"),
     ("[ ]", "切换逻辑 db"),
-    ("e / x / m / Del", "编辑 string·hash 字段 / TTL / 重命名 / 删除 key（均确认）"),
+    ("Del / x / m", "批量删除 / 设 TTL / 前缀重命名选中 key（均确认）"),
+    ("y", "复制选中的 key 名（每行一个）"),
+    ("value: e x m Del", "编辑 string·hash 字段 / TTL / 重命名 / 删除 key（均确认）"),
     ("value 内 n", "大集合继续加载 200 项"),
-    ("y", "复制当前行为 TSV"),
     ("— MongoDB 文档浏览器 —", ""),
     ("Enter", "浏览 collection 文档（JSON 网格）"),
     ("n / p", "文档翻页"),
     ("f", "JSON 过滤（如 {\"age\": {\"$gt\": 30}}，留空清除）"),
+    ("e / i / Del", "编辑 / 插入 / 删除文档（均确认，_id 不可改）"),
     ("r", "查看 collection 索引"),
     ("— 危险操作 / 删除确认 —", ""),
     ("Enter / y", "执行（SQL 全文可见）"),
@@ -13572,5 +14930,171 @@ mod tests {
         assert_eq!(redis_type_badge("zset").0, "Z");
         assert_eq!(redis_type_badge("stream").0, "X");
         assert_eq!(redis_type_badge("weird").0, "?");
+    }
+
+    // ── R21: Redis batch key operations ──
+
+    fn rk(raw: &str, display: &str) -> RedisKeyInfo {
+        RedisKeyInfo {
+            key_display: display.to_string(),
+            key_raw: raw.to_string(),
+            key_type: "string".to_string(),
+            ttl: -1,
+            size: 0,
+            value_preview: String::new(),
+        }
+    }
+
+    #[test]
+    fn redis_multi_select_toggles_and_ranges() {
+        let keys = vec![rk("a", "app:1"), rk("b", "app:2"), rk("c", "app:3"), rk("d", "app:4")];
+        let mut sel: HashSet<String> = HashSet::new();
+        let mut anchor: Option<usize> = None;
+        redis_selection_toggle(&mut sel, &mut anchor, &keys, 0);
+        assert!(sel.contains("a"));
+        assert_eq!(anchor, Some(0));
+        redis_selection_toggle(&mut sel, &mut anchor, &keys, 0);
+        assert!(sel.is_empty(), "space toggles off");
+        // A range extends from the anchor, additively.
+        redis_selection_toggle(&mut sel, &mut anchor, &keys, 1);
+        redis_selection_range(&mut sel, &mut anchor, &keys, 3);
+        assert_eq!(sel.len(), 3);
+        assert!(sel.contains("b") && sel.contains("c") && sel.contains("d"));
+        assert_eq!(anchor, Some(1));
+        // A reverse range keeps everything and adds the earlier keys.
+        redis_selection_range(&mut sel, &mut anchor, &keys, 0);
+        assert!(sel.contains("a"));
+        // Targets preserve list order, not set order.
+        let targets = redis_selection_targets(&sel, &keys, None);
+        assert_eq!(
+            targets.iter().map(|(r, _)| r.as_str()).collect::<Vec<_>>(),
+            vec!["a", "b", "c", "d"]
+        );
+    }
+
+    #[test]
+    fn redis_select_all_and_target_fallback() {
+        let keys = vec![rk("a", "app:1"), rk("b", "app:2")];
+        let mut sel: HashSet<String> = HashSet::new();
+        let mut anchor: Option<usize> = None;
+        assert!(!redis_selection_is_all(&sel, &keys));
+        redis_selection_all(&mut sel, &mut anchor, &keys);
+        assert!(redis_selection_is_all(&sel, &keys));
+        assert_eq!(anchor, Some(0));
+        // An empty selection falls back to the focused key.
+        let empty: HashSet<String> = HashSet::new();
+        assert_eq!(
+            redis_selection_targets(&empty, &keys, Some(1)),
+            vec![("b".to_string(), "app:2".to_string())]
+        );
+        assert!(redis_selection_targets(&empty, &keys, None).is_empty());
+    }
+
+    #[test]
+    fn redis_batch_del_chunks_and_quotes() {
+        let displays: Vec<String> = (0..250).map(|i| format!("app:{i}")).collect();
+        let cmds = redis_batch_del_commands(&displays);
+        assert_eq!(cmds.len(), 3, "100 + 100 + 50");
+        assert!(cmds[0].starts_with("DEL \"app:0\" \"app:1\""));
+        assert!(cmds[2].ends_with("\"app:249\""));
+        // Quotes / backslashes survive the redis-cli tokenizer.
+        assert_eq!(
+            redis_batch_del_commands(&["a\"b\\c".to_string()]),
+            vec!["DEL \"a\\\"b\\\\c\"".to_string()]
+        );
+        assert!(redis_batch_del_commands(&[]).is_empty());
+    }
+
+    #[test]
+    fn redis_prefix_rename_plan_filters_and_rewrites() {
+        let displays = vec!["app:1".to_string(), "other:2".to_string(), "app:3".to_string()];
+        assert_eq!(
+            redis_prefix_rename_plan(&displays, "app:", "new:"),
+            vec![
+                ("app:1".to_string(), "new:1".to_string()),
+                ("app:3".to_string(), "new:3".to_string()),
+            ]
+        );
+        // A same-prefix replacement is a no-op and is dropped.
+        assert!(redis_prefix_rename_plan(&displays, "app:", "app:").is_empty());
+        // An empty old prefix prepends to every key.
+        assert_eq!(redis_prefix_rename_plan(&displays, "", "x").len(), 3);
+        let cmds = redis_batch_rename_commands(&displays, "app:", "new:");
+        assert_eq!(cmds, vec!["RENAME \"app:1\" \"new:1\"", "RENAME \"app:3\" \"new:3\""]);
+    }
+
+    #[test]
+    fn redis_batch_ttl_validates_and_generates() {
+        let displays = vec!["a".to_string(), "b".to_string()];
+        assert_eq!(
+            redis_batch_ttl_commands(&displays, "60"),
+            vec!["EXPIRE \"a\" 60", "EXPIRE \"b\" 60"]
+        );
+        assert!(redis_batch_ttl_commands(&displays, "nope").is_empty());
+        assert!(redis_batch_ttl_commands(&displays, "1.5").is_empty());
+    }
+
+    #[test]
+    fn redis_batch_confirm_flow_requires_typed_count_only_for_select_all_delete() {
+        let targets = vec![("a".into(), "app:1".into()), ("b".into(), "app:2".into())];
+        let plan = redis_plan_batch(RedisBatchKind::Delete, &targets, false, "").unwrap();
+        assert_eq!(plan.typed_confirm, None);
+        assert_eq!(plan.commands.len(), 1);
+        // Selecting every loaded key escalates to a typed re-confirmation.
+        let plan = redis_plan_batch(RedisBatchKind::Delete, &targets, true, "").unwrap();
+        assert_eq!(plan.typed_confirm, Some(2));
+        // TTL / rename never demand the typed confirm, even on a select-all.
+        assert_eq!(
+            redis_plan_batch(RedisBatchKind::Ttl, &targets, true, "30")
+                .unwrap()
+                .typed_confirm,
+            None
+        );
+        assert_eq!(
+            redis_plan_batch(RedisBatchKind::RenamePrefix, &targets, true, "app:=new:")
+                .unwrap()
+                .typed_confirm,
+            None
+        );
+        // Invalid arguments surface an error instead of a broken command.
+        assert!(redis_plan_batch(RedisBatchKind::Ttl, &targets, false, "abc").is_err());
+        assert!(redis_plan_batch(RedisBatchKind::RenamePrefix, &targets, false, "no-equals").is_err());
+    }
+
+    // ── R21: MongoDB document CRUD ──
+
+    #[test]
+    fn mongo_id_arg_preserves_string_object_id_shape() {
+        // A real ObjectId arrives as {"$oid": ...} and is passed as its hex form.
+        assert_eq!(
+            mongo_id_arg(&serde_json::json!({"$oid": "507f1f77bcf86cd799439011"})),
+            "507f1f77bcf86cd799439011"
+        );
+        // A genuine 24-hex string _id must be marked so it is not reinterpreted.
+        assert_eq!(
+            mongo_id_arg(&serde_json::json!("507f1f77bcf86cd799439011")),
+            "__dbx_mongo_string_id__\"507f1f77bcf86cd799439011\""
+        );
+        assert_eq!(mongo_id_arg(&serde_json::json!("customer-42")), "customer-42");
+        assert_eq!(mongo_id_arg(&serde_json::json!(42)), "42");
+        assert_eq!(
+            mongo_id_arg(&serde_json::json!({"$numberLong": "2048938405781032962"})),
+            "{\"$numberLong\":\"2048938405781032962\"}"
+        );
+        assert_eq!(mongo_id_label(&serde_json::json!({"$oid": "abc"})), "abc");
+        assert_eq!(mongo_id_label(&serde_json::json!("plain")), "plain");
+    }
+
+    #[test]
+    fn mongo_doc_diff_reports_top_level_changes() {
+        let old = serde_json::json!({"_id": {"$oid": "x"}, "name": "Ada", "age": 30, "gone": true});
+        let new = serde_json::json!({"_id": {"$oid": "x"}, "name": "Grace", "age": 30, "added": 1});
+        let diff = mongo_doc_diff(&old, &new, 10);
+        assert!(diff.iter().any(|l| l.contains("name") && l.contains("Ada") && l.contains("Grace")));
+        assert!(diff.iter().any(|l| l.starts_with("+ added")));
+        assert!(diff.iter().any(|l| l.starts_with("- gone")));
+        assert!(!diff.iter().any(|l| l.contains("age")), "unchanged fields are omitted");
+        assert!(!diff.iter().any(|l| l.contains("_id")), "_id is never part of the diff");
+        assert!(mongo_doc_diff(&old, &old, 10).is_empty());
     }
 }
