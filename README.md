@@ -37,7 +37,8 @@ Early but usable. Verified end-to-end against real MySQL 8.4, Redis and MongoDB 
 - ✅ **Responsive layout**: `Ctrl-A` is a single master switch for auto-collapse — off (the default) keeps every pane expanded; on collapses the unfocused sidebar / editor to a one-line strip so the focused pane owns the space. Below 50 columns the panes **stack vertically** (sidebar strip → editor → results). `Ctrl-W` collapses / expands just the focused pane (a manual override that always wins), `Tab`/`Shift-Tab` cycle panes, `Alt-1`/`Alt-2`/`Alt-3` jump straight to one, and clicking a collapsed strip expands and focuses it. The current auto-collapse state is shown in the status bar and the help overlay
 - ✅ Redis: connect, `SET`/`GET`/`KEYS`/`DBSIZE`, quoted args, and `[`/`]` db switching verified end-to-end
 - ✅ MongoDB: `db.col.find({})`, `use <db>` database switching, and multi-row output verified end-to-end
-- ⚠️ Cross-platform release builds (Windows / macOS / Android-Termux) planned, not yet verified
+- ✅ `dbxt --version` / `dbxt --help` answer without starting the TUI
+- ⚠️ Prebuilt binaries for Linux (x86_64 / ARM64, glibc + static musl), macOS (Intel / Apple Silicon) and Windows (x86_64) are produced by the release workflow; only the Linux x86_64 build has been exercised on this machine, so the other artifacts are untested. Android/Termux has no dedicated build — see *Installation*
 
 ## Relationship to DBX
 
@@ -88,15 +89,102 @@ Backup notes (from DBX's `storage.rs`, verified against v0.6.9):
 - Passwords are stored **in plaintext** in the `connection_secrets` table; the file's owner-only permissions (600) are the protection. There is no external key, so a copied file works as-is on another machine — `chmod 600` it after copying.
 - If DBX is running, the file may have `-wal`/`-shm` sidecars. Either quit DBX before copying, or take a consistent snapshot: `sqlite3 dbx.db ".backup '/backup/path/dbx.db'"`.
 
-## Build
+## Installation
+
+### One-line script (Linux / macOS)
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/vst93/dbxt/refs/heads/master/cmd/install.sh | bash
+```
+
+China mirror (jsdelivr):
+
+```bash
+curl -fsSL https://cdn.jsdelivr.net/gh/vst93/dbxt@master/cmd/install.sh | bash
+```
+
+| Option | Description |
+| --- | --- |
+| `--help` | Show all options |
+| `--lang en` | English interface |
+| `--lang zh` | 中文界面 |
+| `--install-dir <dir>` | Install to a custom directory (default `~/.local/bin`, or `$PREFIX/bin` on Termux) |
+| `--force` | Reinstall / upgrade even when already up to date |
+| `--skip-github` | Skip the direct GitHub download, use the mirrors only |
+| `--preview` | Install the latest pre-release |
+| `--musl` | Linux: install the fully static musl build |
+
+The script reads the version from the GitHub release, verifies the `.sha256` and installs the binary. It reports **install / upgrade / already up to date**, and on a checksum mismatch it asks before continuing (`--force` skips the question). If `github.com` is slow or blocked it retries through `ghfast.top`, `mirror.ghproxy.com`, `gh-proxy.com` and `gh-proxy.net`. The same switches are available as environment variables (`DBXT_INSTALL_DIR`, `DBXT_FORCE_INSTALL=1`, `DBXT_SKIP_GITHUB=1`, `DBXT_PREVIEW=1`, `DBXT_MUSL=1`, `DBXT_LANG=zh`).
+
+### Windows (PowerShell)
+
+```powershell
+irm https://raw.githubusercontent.com/vst93/dbxt/master/cmd/install.ps1 | iex
+```
+
+China mirror:
+
+```powershell
+irm https://cdn.jsdelivr.net/gh/vst93/dbxt@master/cmd/install.ps1 | iex
+```
+
+| Environment variable | Description |
+| --- | --- |
+| `DBXT_INSTALL_DIR=path` | Install to a custom directory (default `%USERPROFILE%\.local\bin`) |
+| `DBXT_FORCE_INSTALL=1` | Reinstall / upgrade even when already up to date |
+| `DBXT_SKIP_GITHUB=1` | Skip the direct GitHub download, use the mirrors only |
+| `DBXT_PREVIEW=1` | Install the latest pre-release |
+| `DBXT_LANG=zh` | 中文界面 |
+
+The Windows installer adds the install directory to the user `PATH` when it is missing (restart the terminal to pick it up).
+
+### Manual download
+
+Every release attaches one archive per platform plus a matching `.sha256`:
+
+| File | Platform |
+| --- | --- |
+| `dbxt-linux-amd64.zip` | Linux, x86_64 (glibc) |
+| `dbxt-linux-arm64.zip` | Linux, ARM64 (glibc) |
+| `dbxt-linux-amd64-musl.zip` | Linux, x86_64 (static) |
+| `dbxt-linux-arm64-musl.zip` | Linux, ARM64 (static) |
+| `dbxt-darwin-amd64.zip` | macOS, Intel |
+| `dbxt-darwin-arm64.zip` | macOS, Apple Silicon |
+| `dbxt-windows-amd64.zip` | Windows, x86_64 |
+
+Unzip the archive and put `dbxt` (`dbxt.exe` on Windows) on your `PATH`. The `gnu` Linux builds link the CI runner's glibc (2.39 on Ubuntu 24.04), so on an older distribution prefer the static `musl` build, which has no glibc requirement at all.
+
+### Android / Termux
+
+There is **no dedicated Android artifact**. `dbxt-linux-arm64-musl.zip` is a fully static aarch64 binary and usually starts under Termux, but Android is bionic rather than glibc, so this is not an officially supported combination. The reliable route is to build from source inside Termux:
+
+```bash
+pkg install rust git
+curl -fsSL https://raw.githubusercontent.com/vst93/dbxt/refs/heads/master/cmd/install.sh | bash   # tries the static build
+# or build locally:
+git clone https://github.com/vst93/dbxt && cd dbxt && cargo build --release
+```
+
+`dbxt-linux-arm64.zip` (glibc) will **not** run there.
+
+### Build from source
 
 Requires Rust 1.85+ (edition 2021).
 
 ```bash
-cargo build --release
+cargo install --git https://github.com/vst93/dbxt
 ```
 
-The first build compiles the full DBX kernel (several minutes; sqlite is bundled, so no system sqlite is needed). The release profile strips symbols and enables thin LTO.
+Or clone and build:
+
+```bash
+git clone https://github.com/vst93/dbxt && cd dbxt
+cargo build --release    # target/release/dbxt
+```
+
+The first build compiles the full DBX kernel plus several C dependencies (OpenSSL, AWS-LC, SQLite, zstd) from source — expect several minutes. You need a C toolchain (`cc` / `gcc`, `make` and `perl`); no system SQLite or OpenSSL install is required. On Windows x86_64 `aws-lc-sys` additionally needs NASM. The release profile strips symbols and enables thin LTO. Prebuilt binaries are produced by the [`Release` workflow](.github/workflows/release.yml).
+
+`dbxt --version` prints the version and `dbxt --help` the usage, without opening the TUI.
 
 ## Usage
 
@@ -339,7 +427,8 @@ Keystrokes are never traced, so a password typed into the connection form cannot
 - [x] Persist the compact-column and column-visibility choices across sessions — now stored per `database.table` in `~/.config/dbxt/tui.json` (sort included)
 - [ ] In-TUI result-row editing without a primary key (a stable row identity)
 - [ ] Search across pages / the whole result set (today `/` filters the loaded page)
-- [ ] Release builds for Windows, macOS (Intel/Apple Silicon), Linux (glibc + musl), Android Termux (aarch64 musl, static)
+- [x] Release builds for Linux (glibc + static musl), macOS (Intel / Apple Silicon) and Windows (x86_64) — the release workflow produces them; only Linux x86_64 is verified so far
+- [ ] An official Android/Termux build (today: the static aarch64 binary or a source build)
 
 ## License
 

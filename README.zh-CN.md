@@ -37,7 +37,8 @@
 - ✅ **自适应布局**：`Ctrl-A` 是自动折叠的唯一总开关 —— 默认关闭（所有栏保持展开）；开启后非焦点的侧栏 / 编辑器**收缩为单行条**，把空间让给焦点区。低于 50 列时各栏**纵向堆叠**（侧栏条 → 编辑器 → 结果）。`Ctrl-W` 只收起/展开当前焦点栏（手动覆盖优先于总开关），`Tab`/`Shift-Tab` 循环切换区域，`Alt-1`/`Alt-2`/`Alt-3` 直接聚焦，点击收起条即展开并聚焦。状态栏与帮助浮层常显当前自动折叠状态
 - ✅ Redis：连接、`SET`/`GET`/`KEYS`/`DBSIZE`、带引号参数、`[` `]` 切换 db 均已端到端实测
 - ✅ MongoDB：`db.col.find({})`、`use <db>` 切库、多行输出均已端到端实测
-- ⚠️ 跨平台发布构建（Windows / macOS / Android-Termux）规划中，未验证
+- ✅ `dbxt --version` / `dbxt --help` 不启动 TUI 即可输出版本与用法
+- ⚠️ 发布工作流会产出 Linux（x86_64 / ARM64，glibc + 静态 musl）、macOS（Intel / Apple Silicon）与 Windows（x86_64）预编译包；目前只有 Linux x86_64 在本机实测过，其余产物未验证。Android/Termux 无专用构建 —— 见《安装》
 
 ## 与 DBX 的关系
 
@@ -88,15 +89,102 @@ dbxt 不受官方 CLI 静态白名单限制 —— 那份清单是 `dbx-cli` 里
 - 密码在 `connection_secrets` 表中**明文存储**，靠文件 owner-only 权限（600）保护。没有外部密钥，拷到其他机器直接可用 —— 拷完记得 `chmod 600`。
 - DBX 运行时可能存在 `-wal`/`-shm` 伴生文件。要么退出 DBX 后再拷贝，要么做一致性快照：`sqlite3 dbx.db ".backup '/备份路径/dbx.db'"`。
 
-## 构建
+## 安装
+
+### 一键脚本（Linux / macOS）
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/vst93/dbxt/refs/heads/master/cmd/install.sh | bash
+```
+
+国内加速（jsdelivr）：
+
+```bash
+curl -fsSL https://cdn.jsdelivr.net/gh/vst93/dbxt@master/cmd/install.sh | bash
+```
+
+| 参数 | 说明 |
+| --- | --- |
+| `--help` | 显示所有选项 |
+| `--lang en` | 使用英文界面 |
+| `--lang zh` | 使用中文界面 |
+| `--install-dir <dir>` | 安装到指定目录（默认 `~/.local/bin`，Termux 下为 `$PREFIX/bin`） |
+| `--force` | 已是最新时也强制重装 / 升级 |
+| `--skip-github` | 跳过 GitHub 直连，仅使用镜像 |
+| `--preview` | 安装最新预览版 |
+| `--musl` | Linux：安装全静态 musl 构建 |
+
+脚本从 GitHub Release 读取版本、校验 `.sha256` 并安装，会区分**安装 / 升级 / 已是最新**三态；校验不匹配时会先询问（`--force` 跳过询问）。直连 `github.com` 慢或不通时，会自动依次尝试 `ghfast.top`、`mirror.ghproxy.com`、`gh-proxy.com`、`gh-proxy.net`。同名开关也可用环境变量传入（`DBXT_INSTALL_DIR`、`DBXT_FORCE_INSTALL=1`、`DBXT_SKIP_GITHUB=1`、`DBXT_PREVIEW=1`、`DBXT_MUSL=1`、`DBXT_LANG=zh`）。
+
+### Windows (PowerShell)
+
+```powershell
+irm https://raw.githubusercontent.com/vst93/dbxt/master/cmd/install.ps1 | iex
+```
+
+国内加速：
+
+```powershell
+irm https://cdn.jsdelivr.net/gh/vst93/dbxt@master/cmd/install.ps1 | iex
+```
+
+| 环境变量 | 说明 |
+| --- | --- |
+| `DBXT_INSTALL_DIR=path` | 安装到指定目录（默认 `%USERPROFILE%\.local\bin`） |
+| `DBXT_FORCE_INSTALL=1` | 已是最新时也强制重装 / 升级 |
+| `DBXT_SKIP_GITHUB=1` | 跳过 GitHub 直连，仅使用镜像 |
+| `DBXT_PREVIEW=1` | 安装最新预览版 |
+| `DBXT_LANG=zh` | 使用中文界面 |
+
+Windows 安装脚本会在安装目录不在用户 `PATH` 时自动加入（需重开终端生效）。
+
+### 手动下载
+
+每个 Release 会附上各平台压缩包及对应的 `.sha256`：
+
+| 文件 | 平台 |
+| --- | --- |
+| `dbxt-linux-amd64.zip` | Linux，x86_64（glibc） |
+| `dbxt-linux-arm64.zip` | Linux，ARM64（glibc） |
+| `dbxt-linux-amd64-musl.zip` | Linux，x86_64（静态） |
+| `dbxt-linux-arm64-musl.zip` | Linux，ARM64（静态） |
+| `dbxt-darwin-amd64.zip` | macOS，Intel |
+| `dbxt-darwin-arm64.zip` | macOS，Apple Silicon |
+| `dbxt-windows-amd64.zip` | Windows，x86_64 |
+
+解压后把 `dbxt`（Windows 为 `dbxt.exe`）放入 `PATH`。`gnu` 版 Linux 构建链接的是 CI 运行器的 glibc（Ubuntu 24.04 为 2.39），老发行版请优先用静态 `musl` 构建（完全不依赖 glibc）。
+
+### Android / Termux
+
+**没有专门的 Android 产物**。`dbxt-linux-arm64-musl.zip` 是全静态 aarch64 二进制，在 Termux 里通常能启动，但 Android 用的是 bionic 而非 glibc，因此属于非官方支持组合。可靠做法是在 Termux 里源码编译：
+
+```bash
+pkg install rust git
+curl -fsSL https://raw.githubusercontent.com/vst93/dbxt/refs/heads/master/cmd/install.sh | bash   # 会尝试静态构建
+# 或本地编译：
+git clone https://github.com/vst93/dbxt && cd dbxt && cargo build --release
+```
+
+`dbxt-linux-arm64.zip`（glibc）在该环境下**无法运行**。
+
+### 从源码构建
 
 需要 Rust 1.85+（edition 2021）。
 
 ```bash
-cargo build --release
+cargo install --git https://github.com/vst93/dbxt
 ```
 
-首次构建会编译完整的 DBX 内核（需几分钟；SQLite 已打包内置，无需系统 sqlite）。release 配置已启用符号裁剪和 thin LTO。
+或克隆后编译：
+
+```bash
+git clone https://github.com/vst93/dbxt && cd dbxt
+cargo build --release    # target/release/dbxt
+```
+
+首次构建会从源码编译完整的 DBX 内核以及多个 C 依赖（OpenSSL、AWS-LC、SQLite、zstd），需要几分钟。需要 C 工具链（`cc` / `gcc`、`make`、`perl`）；无需安装系统 SQLite 或 OpenSSL。Windows x86_64 上 `aws-lc-sys` 还需要 NASM。release 配置已启用符号裁剪和 thin LTO。预编译包由 [`Release` 工作流](.github/workflows/release.yml) 产出。
+
+`dbxt --version` 输出版本，`dbxt --help` 输出用法，均不会启动 TUI。
 
 ## 使用
 
@@ -339,7 +427,8 @@ CSV 导出（`Ctrl-Y`）遵循 RFC 4180 与 DBX：`NULL` 与空串都写成空�
 - [x] 列宽压缩与列显隐选择跨会话持久化 —— 现按 `库.表` 存入 `~/.config/dbxt/tui.json`（含排序）
 - [ ] 无主键表的 TUI 内结果行编辑（需要稳定的行标识）
 - [ ] 跨页 / 整个结果集的搜索（目前 `/` 只过滤已加载的页）
-- [ ] 发布构建：Windows、macOS（Intel/Apple Silicon）、Linux（glibc + musl）、Android Termux（aarch64 musl 静态）
+- [x] 发布构建：Linux（glibc + 静态 musl）、macOS（Intel / Apple Silicon）、Windows（x86_64）—— 已由发布工作流产出；目前仅 Linux x86_64 验证过
+- [ ] 官方 Android/Termux 构建（目前用静态 aarch64 二进制或源码编译）
 
 ## 许可
 

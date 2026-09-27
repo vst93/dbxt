@@ -1793,10 +1793,48 @@ fn env_log_path(var: &str, default_name: &str) -> Option<PathBuf> {
     }
 }
 
+/// `dbxt --help`: a short usage summary. The full manual lives in the README.
+fn print_help() {
+    println!(
+        "dbxt {} — {}",
+        env!("CARGO_PKG_VERSION"),
+        t("DBX 的终端界面")
+    );
+    println!();
+    println!("{}: dbxt [DBX_STORE]", t("用法"));
+    println!();
+    println!("{}:", t("参数"));
+    println!(
+        "{}",
+        t("  DBX_STORE  dbx.db 文件或其所在目录（默认：DBX_DATA_DIR 或平台默认位置）")
+    );
+    println!();
+    println!("{}:", t("选项"));
+    println!("{}", t("  -h, --help     显示本帮助"));
+    println!("{}", t("  -V, --version  显示版本"));
+    println!();
+    println!("{}: https://github.com/vst93/dbxt", t("文档"));
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     // Resolve the UI language once, before any text is drawn.
     ui_text::set_lang(ui_text::detect_lang());
+    // `--version` / `--help` answer before the TUI is initialised, so they work
+    // over a pipe (the install scripts query `--version`) and without a terminal.
+    if let Some(arg) = std::env::args().nth(1) {
+        match arg.as_str() {
+            "-V" | "--version" => {
+                println!("dbxt {}", env!("CARGO_PKG_VERSION"));
+                return Ok(());
+            }
+            "-h" | "--help" => {
+                print_help();
+                return Ok(());
+            }
+            _ => {}
+        }
+    }
     // The positional argument is the `dbx.db` file itself. A directory is also
     // accepted (and joined with `dbx.db`) so the historical documented usage
     // keeps working.

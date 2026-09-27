@@ -528,6 +528,15 @@ pub static ALL_KEYS: &[&str] = &[
     "默认值",
     "（附加排序键）",
     "🔍「{}」{} 命中 · ",
+    // CLI help (`dbxt --help`)
+    "  DBX_STORE  dbx.db 文件或其所在目录（默认：DBX_DATA_DIR 或平台默认位置）",
+    "  -h, --help     显示本帮助",
+    "  -V, --version  显示版本",
+    "DBX 的终端界面",
+    "参数",
+    "文档",
+    "选项",
+    "用法",
 ];
 
 /// The Chinese → English table. Keys must match the source literals exactly.
@@ -922,6 +931,14 @@ fn en_of(zh: &'static str) -> Option<&'static str> {
         "默认值" => Some("default"),
         "（附加排序键）" => Some("(append sort key)"),
         "🔍「{}」{} 命中 · " => Some("🔍 \"{}\" {} hits · "),
+        "  DBX_STORE  dbx.db 文件或其所在目录（默认：DBX_DATA_DIR 或平台默认位置）" => Some("  DBX_STORE  path to dbx.db or its directory (default: DBX_DATA_DIR or the platform default)"),
+        "  -h, --help     显示本帮助" => Some("  -h, --help     show this help"),
+        "  -V, --version  显示版本" => Some("  -V, --version  show version"),
+        "DBX 的终端界面" => Some("terminal UI for DBX"),
+        "参数" => Some("Arguments"),
+        "文档" => Some("Docs"),
+        "选项" => Some("Options"),
+        "用法" => Some("Usage"),
         _ => None,
     }
 }
