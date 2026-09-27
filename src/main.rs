@@ -665,7 +665,31 @@ fn one_line(s: &str) -> String {
 /// table / database / column names, so dbxt applies the same reversal when
 /// *rendering* identifiers. The raw name is always what is sent to the server,
 /// and correctly stored CJK names (chars > U+00FF) pass through untouched.
+///
+/// Real data can carry more than one such layer (a name written through a latin1
+/// connection twice, or a latin1 dump imported into a latin1 connection). One
+/// pass is not enough there: the intermediate string already contains non-Latin-1
+/// characters (`•`, `™`) and is therefore mistaken for a successful decode. So
+/// repeat the reversal until it stops changing (bounded, so a pathological input
+/// can never loop) and peel every layer off.
 fn fix_double_encoding(s: &str) -> String {
+    let mut current = s.to_string();
+    // Two layers is the realistic worst case; 4 leaves headroom and still
+    // terminates immediately for clean names (first pass is a no-op).
+    for _ in 0..4 {
+        let next = reverse_double_encoding_once(&current);
+        if next == current {
+            break;
+        }
+        current = next;
+    }
+    current
+}
+
+/// One CP1252→UTF-8 reversal pass. Returns the input unchanged when the bytes
+/// are not valid UTF-8 or the result carries no char above U+00FF (i.e. the
+/// reversal did not reveal CJK, so it is assumed to have been a false positive).
+fn reverse_double_encoding_once(s: &str) -> String {
     let mut bytes = Vec::with_capacity(s.len());
     for c in s.chars() {
         let byte = match c as u32 {
@@ -1008,7 +1032,7 @@ async fn run_op(backend: &LocalBackend, op: Op) -> OpResult {
                 databases: vec![cfg.database.clone().unwrap_or_default()],
                 warning: Some(match cfg.database.as_deref() {
                     Some(db) if !db.is_empty() => {
-                        tf("无法列举数据库（{}），仅使用配置库 {}", &[&(e), &(db)])
+                        tf("无法列举数据库（{}），仅使用配置库 {}", &[&(e), &(fix_double_encoding(&db))])
                     }
                     _ => tf("无法列举数据库（{}），将使用连接默认库", &[&(e)]),
                 }),
@@ -2145,7 +2169,7 @@ fn apply_op_result(app: &mut App, res: OpResult, tx: &Tx) {
                 app.status = if db.is_empty() {
                     tf("加载 {} 表…", &[&(cfg.name)])
                 } else {
-                    tf("加载 {} 表…", &[&(db)])
+                    tf("加载 {} 表…", &[&(fix_double_encoding(&db))])
                 };
                 app.spawn(tx, Op::ListTables(Box::new(cfg.clone()), db));
                 app.spawn(tx, Op::History(Box::new(cfg)));
@@ -2180,7 +2204,7 @@ fn apply_op_result(app: &mut App, res: OpResult, tx: &Tx) {
                     open_table_data(app, tx);
                     return;
                 }
-                app.status = tf("✗ 未找到表 {}", &[&(name)]);
+                app.status = tf("✗ 未找到表 {}", &[&(fix_double_encoding(&name))]);
                 return;
             }
             app.status = if app.table_filter.is_empty() {
@@ -2207,7 +2231,7 @@ fn apply_op_result(app: &mut App, res: OpResult, tx: &Tx) {
             app.col_cursor = 0;
             app.cell_popup = None;
             app.focus = Focus::Preview;
-            app.status = tf("{} 结构 · {} 字段 · t 切换 DDL · Esc 返回", &[&(table), &(n)]);
+            app.status = tf("{} 结构 · {} 字段 · t 切换 DDL · Esc 返回", &[&(fix_double_encoding(&table)), &(n)]);
         }
         OpResult::Ddl { table, text } => {
             if app.selected_table().map(|t| t.name.clone()).as_deref() == Some(table.as_str()) {
@@ -2279,7 +2303,7 @@ fn apply_op_result(app: &mut App, res: OpResult, tx: &Tx) {
                 .unwrap_or_else(|| t("总数未知").into());
             let ps = app.page_state.as_ref().unwrap();
             let extra = page_state_extra(ps);
-            app.status = tf("{}.{} · 第 {} 页 · {} 行 · {}{}", &[&(app.current_db()), &(table), &(page + 1), &(rows), &(total_txt), &(extra)]);
+            app.status = tf("{}.{} · 第 {} 页 · {} 行 · {}{}", &[&(fix_double_encoding(&app.current_db())), &(fix_double_encoding(&table)), &(page + 1), &(rows), &(total_txt), &(extra)]);
             if let Some(msg) = app.pending_write_msg.take() {
                 app.status = tf("{} · 已刷新（第 {} 页）", &[&(msg), &(page + 1)]);
             }
@@ -3095,7 +3119,7 @@ fn load_structure(app: &mut App, tx: &Tx) {
         return;
     };
     app.loading = true;
-    app.status = tf("加载 {} 结构…", &[&(table)]);
+    app.status = tf("加载 {} 结构…", &[&(fix_double_encoding(&table))]);
     let db = app.current_db();
     app.spawn(
         tx,
@@ -3146,7 +3170,7 @@ fn open_table_data(app: &mut App, tx: &Tx) {
         order_by: order_by.clone(),
     });
     app.loading = true;
-    app.status = tf("加载 {}.{} 数据…", &[&(app.current_db()), &(table.0)]);
+    app.status = tf("加载 {}.{} 数据…", &[&(fix_double_encoding(&app.current_db())), &(fix_double_encoding(&table.0))]);
     // Column metadata powers the `e`/`i` templates (primary-key detection).
     app.spawn(
         tx,
@@ -3191,7 +3215,7 @@ fn goto_page(app: &mut App, tx: &Tx, page: usize, pending_sel: Option<usize>) ->
     app.page_pending = true;
     app.pending_sel = pending_sel;
     app.loading = true;
-    app.status = tf("加载 {} 第 {} 页…", &[&(ps.table), &(page + 1)]);
+    app.status = tf("加载 {} 第 {} 页…", &[&(fix_double_encoding(&ps.table)), &(page + 1)]);
     let known = app
         .count_cache
         .get(&count_cache_key(&app.current_db(), &ps.table, &ps.filter))
@@ -3236,7 +3260,7 @@ fn reload_table_view(app: &mut App, tx: &Tx, filter: String, order_by: Option<St
     app.page_pending = true;
     app.pending_sel = Some(0);
     app.loading = true;
-    app.status = tf("加载 {} 第 {} 页…", &[&(ps.table), &(page + 1)]);
+    app.status = tf("加载 {} 第 {} 页…", &[&(fix_double_encoding(&ps.table)), &(page + 1)]);
     let known = app
         .count_cache
         .get(&count_cache_key(&app.current_db(), &ps.table, &filter))
@@ -3416,7 +3440,7 @@ fn reload_tables(app: &mut App, tx: &Tx) {
         app.page_pending = false;
         app.loading = true;
         let db = app.current_db();
-        app.status = tf("切换到 {} …", &[&(db)]);
+        app.status = tf("切换到 {} …", &[&(fix_double_encoding(&db))]);
         app.set_placeholder();
         app.spawn(tx, Op::ListTables(Box::new(cfg), db));
     }
@@ -4697,7 +4721,7 @@ fn toggle_col_visible(app: &mut App) {
     if app.col_hidden.remove(&name) {
         app.reapply_col_filter();
         app.persist_cols();
-        app.status = tf("显示列 {} · 已记住", &[&(name)]);
+        app.status = tf("显示列 {} · 已记住", &[&(fix_double_encoding(&name))]);
     } else {
         let visible = grid
             .columns
@@ -4711,7 +4735,7 @@ fn toggle_col_visible(app: &mut App) {
         app.col_hidden.insert(name.clone());
         app.reapply_col_filter();
         app.persist_cols();
-        app.status = tf("隐藏列 {} · 已记住", &[&(name)]);
+        app.status = tf("隐藏列 {} · 已记住", &[&(fix_double_encoding(&name))]);
     }
 }
 
@@ -4774,13 +4798,13 @@ fn open_recent(app: &mut App, tx: &Tx, idx: usize) {
     // Another database: switch first and let the table-list reply open the table.
     if db != app.current_db() {
         let Some(pos) = app.databases.iter().position(|d| *d == db) else {
-            app.status = tf("✗ 数据库 {} 不在当前连接中", &[&(db)]);
+            app.status = tf("✗ 数据库 {} 不在当前连接中", &[&(fix_double_encoding(&db))]);
             return;
         };
         app.db_index = pos;
         app.pending_open_table = Some(table.clone());
         app.pending_table = None;
-        app.status = tf("切换到 {} 并打开 {} …", &[&(db), &(table)]);
+        app.status = tf("切换到 {} 并打开 {} …", &[&(fix_double_encoding(&db)), &(fix_double_encoding(&table))]);
         reload_tables(app, tx);
         return;
     }
@@ -4788,7 +4812,7 @@ fn open_recent(app: &mut App, tx: &Tx, idx: usize) {
         app.table_list.select(Some(pos));
         open_table_data(app, tx);
     } else {
-        app.status = tf("✗ 未找到表 {}（可能被过滤或已删除）", &[&(table)]);
+        app.status = tf("✗ 未找到表 {}（可能被过滤或已删除）", &[&(fix_double_encoding(&table))]);
     }
 }
 
@@ -8714,7 +8738,7 @@ fn render_ddl(f: &mut Frame, area: Rect, app: &mut App, ddl: &str) {
             Line::from(vec![Span::raw(" ".repeat(indent)), Span::styled(trimmed.to_string(), style)])
         })
         .collect();
-    let title = tf(" 表结构 (DDL) · {} · {}/{} 行 · t 返回字段 ", &[&(table), &((app.ddl_scroll as usize + inner_h).min(total)), &(total)]);
+    let title = tf(" 表结构 (DDL) · {} · {}/{} 行 · t 返回字段 ", &[&(fix_double_encoding(&table)), &((app.ddl_scroll as usize + inner_h).min(total)), &(total)]);
     f.render_widget(
         Paragraph::new(body)
             .scroll((app.ddl_scroll, 0))
@@ -9365,8 +9389,12 @@ fn render_completion(f: &mut Frame, app: &App) {
             };
             let tag = item.kind.to_string();
             let room = (w as usize).saturating_sub(6);
+            // Identifiers are shown decoded (a name stored through a latin1
+            // connection is CP1252 mojibake); `item.text` stays raw so the
+            // accepted fragment is still the name the server actually knows.
+            let shown = fix_double_encoding(&item.text);
             Line::from(vec![
-                Span::styled(format!("{:<room$}",  truncate_disp(&item.text, room)), style),
+                Span::styled(format!("{:<room$}",  truncate_disp(&shown, room)), style),
                 Span::styled(format!("[{tag}]"), style.fg(Color::DarkGray)),
             ])
         })
@@ -9520,7 +9548,14 @@ fn render_edit_dialog(f: &mut Frame, area: Rect, app: &mut App) {
                 header_lines.push(Line::from(vec![
                     Span::styled(t("主键 "), Style::default().fg(Color::DarkGray)),
                     Span::styled(
-                        truncate_disp(&d.keys.join(", "), inner_w.saturating_sub(6)),
+                        truncate_disp(
+                            &d.keys
+                                .iter()
+                                .map(|k| fix_double_encoding(k))
+                                .collect::<Vec<_>>()
+                                .join(", "),
+                            inner_w.saturating_sub(6),
+                        ),
                         Style::default().fg(Color::Cyan),
                     ),
                 ]));
@@ -9553,7 +9588,7 @@ fn render_edit_dialog(f: &mut Frame, area: Rect, app: &mut App) {
             let block = Block::default()
                 .borders(Borders::ALL)
                 .title(Span::styled(
-                    tf(" ✎ 编辑 {}.{} ", &[&(d.db), &(d.table)]),
+                    tf(" ✎ 编辑 {}.{} ", &[&(fix_double_encoding(&d.db)), &(fix_double_encoding(&d.table))]),
                     Style::default()
                         .fg(Color::Yellow)
                         .add_modifier(Modifier::BOLD),
@@ -9617,7 +9652,7 @@ fn render_edit_dialog(f: &mut Frame, area: Rect, app: &mut App) {
         EditKind::Insert => {
             let mut lines: Vec<Line> = Vec::new();
             lines.push(Line::from(Span::styled(
-                tf("新增一行到 {}.{}", &[&(d.db), &(d.table)]),
+                tf("新增一行到 {}.{}", &[&(fix_double_encoding(&d.db)), &(fix_double_encoding(&d.table))]),
                 Style::default().fg(Color::Cyan),
             )));
             for (col, val) in d.insert_preview.iter().take(10) {
@@ -9664,7 +9699,7 @@ fn render_edit_dialog(f: &mut Frame, area: Rect, app: &mut App) {
             let block = Block::default()
                 .borders(Borders::ALL)
                 .title(Span::styled(
-                    tf(" ➕ 插入 {}.{} ", &[&(d.db), &(d.table)]),
+                    tf(" ➕ 插入 {}.{} ", &[&(fix_double_encoding(&d.db)), &(fix_double_encoding(&d.table))]),
                     Style::default()
                         .fg(Color::Green)
                         .add_modifier(Modifier::BOLD),
@@ -10629,12 +10664,30 @@ mod tests {
     }
 
     #[test]
+    fn double_encoding_is_reversed_through_multiple_layers() {
+        // The same name written through a latin1 connection *twice*: the server
+        // stores the CP1252 form of the already-mojibake string. A single pass
+        // stops at the single-mojibake form (it still contains `•`/`™`, i.e.
+        // chars > U+00FF, so the one-pass heuristic thinks it succeeded) — which
+        // is exactly the `ä¿…ç•™è¡¨` that was still reported in the sidebar.
+        let single = "\u{e4}\u{bf}\u{9d}\u{e7}\u{2022}\u{2122}\u{e8}\u{a1}\u{a8}";
+        let double = "\u{c3}\u{a4}\u{c2}\u{bf}\u{c2}\u{9d}\u{c3}\u{a7}\u{e2}\u{20ac}\u{a2}\u{e2}\u{201e}\u{a2}\u{c3}\u{a8}\u{c2}\u{a1}\u{c2}\u{a8}";
+        assert_eq!(reverse_double_encoding_once(double), single);
+        assert_eq!(fix_double_encoding(double), "保留表");
+        // Peeling a layer off already-decoded text must not change it again.
+        assert_eq!(fix_double_encoding(&fix_double_encoding(double)), "保留表");
+    }
+
+    #[test]
     fn double_encoding_leaves_clean_names_alone() {
         // Correctly stored CJK contains chars > U+00FF and must pass through.
         assert_eq!(fix_double_encoding("保留表"), "保留表");
         assert_eq!(fix_double_encoding("users"), "users");
         // A Latin-1 name whose bytes are not valid UTF-8 is left untouched.
         assert_eq!(fix_double_encoding("café"), "café");
+        // A lone CP1252 punctuation char maps to an invalid UTF-8 byte and is
+        // therefore not treated as mojibake.
+        assert_eq!(fix_double_encoding("™"), "™");
     }
 
     #[test]
