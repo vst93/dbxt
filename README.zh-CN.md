@@ -2,480 +2,130 @@
 
 [English](README.md) | **中文**
 
-基于 [DBX](https://github.com/t8y2/dbx) 内核的终端数据库客户端（TUI），键盘和鼠标/触屏都支持。连接只需配置一次 —— 在 DBX 桌面端、DBX CLI 或 dbxt 本身 —— 然后任何终端都能用。
+基于 [DBX](https://github.com/t8y2/dbx) 内核的终端数据库 TUI，键盘优先。连接只需配置一次 —— 在 DBX 桌面端、DBX CLI 或 dbxt 本身 —— 之后任何终端都能用。单个静态二进制：无桌面端、无守护进程、无 HTTP 服务。
 
-## 状态
+## 功能特色
 
-早期但已可用。已对真实 MySQL 8.4、Redis 和 MongoDB 端到端实测：
+**连接管理** —— 与 DBX 桌面端共享
+- 连接存放在 DBX 自己的 SQLite 存储（`dbx.db`）里，你在桌面端配置过的连接自动可见。
+- `c` 在 TUI 内新建连接，`p` 复制到表单，`Enter` 连接；连接按数据库家族着色。
+- `d` 弹出数据库列表并切换 —— MySQL/PostgreSQL 库、MongoDB 库、Redis 逻辑 db 同一套手势。
+- `o` 返回连接选择，`r` 原地刷新列表。
 
-- ✅ 启动、连接选择、TUI 内新建连接
-- ✅ 连接 MySQL，浏览库/表
-- ✅ **表格数据浏览**：侧栏 `Enter` 自动执行分页 `SELECT *`（每页 50 行）。`↑`/`↓` 连续走行 —— 到页底自动加载下一页并把光标放到首行，到页顶反之。`n`/`p` 与 `Ctrl-F`/`Ctrl-B` 翻页时保持光标的相对行号不跳回首行。常显行号列、按内容自适应列宽、总行数与「第 N 页 / 已选第 M 行」指示。`COUNT(*)` 按表在会话内缓存（键含当前过滤条件），翻页不再重复统计
-- ✅ **单元格编辑（`e`）**：为聚焦单元格弹出 **diff 式确认层** —— 列、旧值 → 新值、`WHERE` 条件、主键与**完整生成的 `UPDATE`** 一目了然，新值可就地输入。`Enter` 执行，`Esc` 取消，`Ctrl-V` 把生成的 SQL 转交编辑器，`Ctrl-T` 加入事务批量。确认之前不写库，生成语句仍走危险语句确认。主键从表结构自动识别；无主键的表退化为「全部列匹配」并给出警告。写入成功后显示受影响行数并就地刷新当前页
-- ✅ **快速插入（`i`）**：按列名生成 `INSERT INTO table (cols…) VALUES (…)` 模板（跳过自增列），并在同一个 diff 确认层预览新行内容与**完整 SQL**
-- ✅ **删除行（`Delete` / `Ctrl-D`）**：生成带条件的 `DELETE FROM table WHERE pk = …`（无主键时退化为全部列匹配并警告），始终在红色确认层展示**完整语句**，`Enter` 才执行。成功后就地刷新当前页
-- ✅ **事务批量编辑**：编辑层 `Ctrl-T` 把写入加入队列（状态栏显示 `批量 N 待提交`）；`Ctrl-S` 弹出确认层展示完整 `BEGIN … COMMIT` 脚本，`Enter` 才以单事务提交并汇报影响行数 / 错误（`Esc` 保留队列，`Ctrl-X` 清空）
-- ✅ **行详情（`o`）**：把聚焦整行以可滚动的纵向 `列 = 值` 列表弹出
-- ✅ **过滤 / 排序**：`f` 打开 `WHERE` 输入框，预填当前列（`"col" = `），按条件从第 1 页重新加载；框内常显语法速查（`= != > < >= <= LIKE IN BETWEEN IS NULL AND/OR`，并注明 MySQL/PG 引号差异）。生效条件同时显示在标题、状态栏与列头的 `⚑` 角标；`Ctrl-R` 清除。`s` 按当前列升 / 降序切换，`Ctrl-K` 追加排序键；被排序列头显示 `▲`/`▼`（多列时带序号）。过滤与排序在翻页时保持，排序还会按表持久化
-- ✅ **横向滚动进度条**：结果网格底部边框绘制**半高**轨道 + 滑块，表示当前可见列窗口在全部列中的位置，旁附 `列 1|3-8/21` 数字；全部列可见时自动隐藏；点击轨道可跳转到对应列窗口。右侧边框绘制同款半宽纵向位置指示条
-- ✅ **表结构**：`r` 显示字段列表（类型 / 键 / 可空 / 默认值 / 注释）；`t` 切换 `SHOW CREATE TABLE` DDL（由 DBX 内核按方言生成）
-- ✅ **宽表横向滚动**：`←`/`→`（或 `h`/`l`）移动单元格光标，列窗口跟随；`Shift`/`Alt`/`Ctrl`+滚轮、横向滚轮、左右**滑动**（触屏拖动）与 `Shift`+`←`/`→` 直接横滚列窗口；`z` 可钉住首个数据列（行号列始终钉住）；当前列的表头高亮、聚焦单元格高亮；`Enter` 弹出完整未截断的单元格内容。状态栏常显 `列 1|3-8/21` 式横向位置，底部进度条让位置一目了然。下钻后的脚本结果网格同样支持单元格光标与列滚动
-- ✅ **结果网格**：滚动列时表头同步；`NULL`（灰色斜体）与空串（`''`，灰色）视觉区分；显示耗时与受影响行数
-- ✅ **数据库切换**：`d` 弹出数据库列表（`↑`/`↓` + `Enter` 切换，`Esc` 关闭，`r` 原地刷新列表）—— MySQL/PostgreSQL 库、MongoDB 库、Redis 逻辑 db 同一套手势。侧栏常驻当前库（点击即打开列表）；侧栏 `←`/`→` 保留为快速循环，Redis 的 `[`/`]` 保留为快捷方式。切库后若新库有同名表则保留当前表选择
-- ✅ **DML**：`INSERT`/`UPDATE`/`DELETE` 返回受影响行数；所有生成写入（`e` / `i` / `Delete`）与事务批量都先经确认层展示完整 SQL，`DROP`/`TRUNCATE` 与无 `WHERE` 的 `UPDATE`/`DELETE` 另外弹出红色危险语句确认
-- ✅ **多语句脚本**：`a; b; c;` 批量执行，逐条列出结果，`Enter` 下钻看单条结果集（具备主网格完整的单元格光标 / 列滚动）
-- ✅ **帮助浮层**：`?` 弹出快捷键速查；所有浮层（数据库列表、单元格、行详情、过滤框、帮助、确认框）统一 `Esc` 关闭当前浮层
-- ✅ **移动端效率**：列宽压缩（`Alt-C` / `w`）均分窗格，让宽表在手机屏幕上放下，状态栏显示 `全部 N 列已适配`；`Enter` 把当前行展开为纵向 `列 = 值` 列表；`Alt-H`（`c`）隐藏列（对齐 DBX 的列选择器，按 `库.表` 记住并持久化）；`/` 输入即筛选表名；`Alt-R`（`t`）直达最近浏览的 5 张表。推荐手机用法见下文《移动端效率》
-- ✅ **SQL 补全**：编辑器里 `Ctrl-Space` 补全光标处标识符，并跟随上下文（`表名.` 后只补该表列名；`FROM`/`JOIN` 后优先补表名；`WHERE`/`ON` 后优先补列名），候选标注 `T`/`C`/`K`；`Tab` 上屏，继续输入继续筛选
-- ✅ **按表持久化偏好**：压缩模式、隐藏列与排序写入 `~/.config/dbxt/tui.json`（按 `库.表` 键），下次打开同表自动恢复；配置缺失或损坏则回退默认；保存时与磁盘上的文件合并，两个会话不会互相覆盖
-- ✅ **复制行为 SQL（`y`）**：把聚焦行复制为 `INSERT INTO … VALUES (…)`，NULL / 空串 / 引号转义、二进制列以 `X'…'` 十六进制输出；经 OSC 52（tmux 透传感知）写入剪贴板，并兜底写入 `~/.cache/dbxt/clipboard.txt`
-- ✅ **结果搜索（`/`）**：结果区输入即筛选可见行、高亮命中、显示命中数，`n` / `Shift-N` 循环命中（`Esc` 清除）
-- ✅ **查询收藏双向打通**：`Ctrl-O` 插入 DBX `saved_sql_files` 片段；`s` 把编辑器 SQL 存回共享库（名称输入框、`.sql` 后缀、RFC3339 时间戳），桌面端立即可见
-- ✅ **不抢焦点**：后台翻页只就地刷新结果，只有从侧栏首次打开表时才把焦点移到结果区
-- ✅ **SQL 编辑器**：多行编辑，shell 风格 `↑`/`↓` 历史（从 DBX 共享查询历史初始化），执行后焦点自动到结果区
-- ✅ MySQL 服务端错误原样回显在状态栏
-- ✅ **自适应布局**：`Ctrl-A` 是自动折叠的唯一总开关 —— 默认关闭（所有栏保持展开）；开启后非焦点的侧栏 / 编辑器**收缩为单行条**，把空间让给焦点区。低于 50 列时各栏**纵向堆叠**（侧栏条 → 编辑器 → 结果）。`Ctrl-W` 只收起/展开当前焦点栏（手动覆盖优先于总开关），`Tab`/`Shift-Tab` 循环切换区域，`Alt-1`/`Alt-2`/`Alt-3` 直接聚焦，点击收起条即展开并聚焦。状态栏与帮助浮层常显当前自动折叠状态
-- ✅ **Redis key 浏览器**：连接 Redis 后侧栏自动变为分页 `SCAN` key 列表（绝不阻塞式 `KEYS *`），每行带类型徽标与 TTL；`/` 编辑服务端 `MATCH` 模式，`n` 加载更多，`d` / `[` `]` 切换 16 个逻辑 db。选中 key 后按类型渲染 value —— string（字节数/截断）、hash（`field`/`value`/TTL）、list（`index`/`value`）、set、zset（`score`/`member`）、stream（`id`/`fields`）、RedisJSON；集合超过 200 项可 `n` 继续加载。`e` 编辑 string 或 hash 字段，`x` 设置 TTL，`m` 重命名，`Del` 删除 key，`y` 复制当前行。`Space` 多选 key（`Shift+↑`/`↓` 范围选、`a` 全选已加载），选中后可**批量** `Del` 删除 / `x` 设 TTL / `m` 前缀重命名；所有写操作都走与 SQL 编辑相同的红色确认层，确认文案含影响 key 数与 `MATCH` 模式，全选删除还会二次要求输入 key 数或 `YES`；超过 1000 个 key 会拒绝并提示分批。原生 `redis-cli` 命令台（`Ctrl-L` 后 `Tab`）保留
-- ✅ **MongoDB 文档浏览器**：连接 MongoDB 后列出 collection，`Enter` 以网格浏览文档（顶层字段并集，`_id` 优先），`n`/`p` 翻页，`f` 过滤 JSON（如 `{"age": {"$gt": 30}}`），`r` 查看 collection 索引。内置文档 CRUD：`e` 用 JSON 编辑器编辑当前文档（`_id` 不可改，保存前在红色确认层显示字段级 diff），`i` 以空模板插入新文档，`Del` 按 `_id` 删除文档 —— 每次写入都确认并原地刷新当前页。`db.col.find({})`、`use <db>` 与多行输出仍在 Mongo shell 命令台中可用
-- ✅ `dbxt --version` / `dbxt --help` 不启动 TUI 即可输出版本与用法
-- ⚠️ 发布工作流会产出 Linux（x86_64 / ARM64，glibc + 静态 musl）、macOS（Intel / Apple Silicon）与 Windows（x86_64）预编译包；目前只有 Linux x86_64 在本机实测过，其余产物未验证。Android/Termux 无专用构建 —— 见《安装》
+**SQL 编辑与结果**
+- 多行编辑器，shell 风格 `↑`/`↓` 历史（从 DBX 共享查询历史初始化）；`F5` / `Ctrl-J` 执行。
+- `Ctrl-Space` 按上下文补全标识符（表名 / 列名 / 关键字，标注 `T`/`C`/`K`）；`Tab` 上屏。
+- 每次执行保留独立结果标签（`[` / `]` 切换）；显示耗时与受影响行数。
+- `Ctrl-P` 执行 `EXPLAIN`，`Ctrl-Y` 导出 CSV，`Ctrl-N` 在结果被行数上限截断时加载更多。
+- `Ctrl-O` 插入 DBX 收藏片段；`s` 把编辑器 SQL 存回共享收藏库。
+- 多语句脚本（`a; b; c;`）批量执行，逐条列出结果，`Enter` 下钻单条。
 
-### Redis
+**表格数据与编辑**
+- 侧栏 `Enter` 执行分页 `SELECT *`；`↑`/`↓` 连续走行并跨页自动衔接，`n`/`p` 翻页时保持相对行号。
+- `←`/`→` 移动单元格光标，`z` 钉住首个数据列，`Enter` 弹出完整单元格；底部条显示横向位置。
+- `e` 以 diff 确认层编辑单元格：旧值 → 新值、`WHERE` 条件、主键与完整 `UPDATE` 一目了然。
+- `i` 按列模板插入，`Delete` / `Ctrl-D` 以带条件的 `WHERE` 删除 —— 所有写入先经确认。
+- `Ctrl-T` 排队写入，`Ctrl-S` 以单个 `BEGIN … COMMIT` 执行；`f` 过滤、`s` 排序、`Ctrl-K` 追加排序键、`Ctrl-R` 清除。
+- `y` 把当前行复制为 `INSERT INTO … VALUES (…)`；`/` 搜索可见结果行。
 
-连接 Redis（按类型自动识别）后，侧栏不再是表列表，而是 **key 浏览器**。key 用 `SCAN` 分页获取 —— 绝不发送 `KEYS *`，因此大 keyspace 不会阻塞服务器 —— 每行显示一个字母的类型徽标（`S`tring、`H`ash、`L`ist、s`E`t、`Z`set、stream、`J`son）以及过期 key 的 TTL。`/` 编辑服务端 `MATCH` 模式，`n`（或滚到底部）加载下一页，`r` 从头重扫，`d` / `←` / `→` 切换 16 个逻辑 db。`Enter` 打开 key：结果区按类型渲染 value（string、hash、list、set、zset、stream、RedisJSON 各自合适的列），集合超过 200 项时 `n` 继续加载。`e` 编辑 string 内容或当前 hash 字段，`x` 设置 TTL 秒数（`-1` 持久化，`0` 立即删除），`m` 重命名，`Del` 删除 key，`y` 复制当前行为 TSV。每个写操作都显示在与 SQL 编辑相同的红色确认层中，只有 `Enter` 才执行。
+**表结构**
+- `r` 显示字段列表（类型 / 键 / 可空 / 默认值 / 注释）；`t` 切换按方言生成的 `SHOW CREATE TABLE` DDL。
 
-**批量 key 操作。** `Space` 把当前 key 加入/移出多选（侧栏显示 `[x]` / `[ ]`，状态栏与面板标题显示选中数），`Shift+↑` / `Shift+↓` 从锚点扩展选择范围，`a` 选中全部已加载 key。有选中时，`Del` 批量删除、`x` 对全部设置同一个 TTL、`m` 批量改写 key 名前缀（`旧=新`，按当前 `MATCH` 模式预填）；`y` 把选中的 key 名逐行复制，`Esc` 清空选择。批量写复用红色确认层：摘要给出影响的 key 数与当前 `MATCH` 模式，并在执行前列出生成的 `DEL` / `EXPIRE` / `RENAME` 命令。全选删除被视为最危险的动作 —— 红色层之后还有一道提示，要求输入 key 数（或 `YES`）才能执行。选中超过 1000 个 key 会被拒绝并提示分批，单次批量不会无界放大。批量完成后自动重扫当前页。
+**Redis**
+- 连接 Redis 后打开分页 `SCAN` key 浏览器（绝不 `KEYS *`），带类型与 TTL 徽标、服务端 `MATCH` 模式（`/`）与逻辑 db 切换。
+- `Enter` 按类型渲染 value —— string、hash、list、set、zset、stream、RedisJSON，大集合可继续加载。
+- `e` / `x` / `m` / `Del` 编辑、设 TTL、重命名、删除；`Space` 多选后批量删除 / 设 TTL / 前缀重命名，均走红色确认层。
+- 其他功能仍可用原生 `redis-cli` 命令台（`Ctrl-L`）。
 
-浏览器未覆盖的功能仍可用 `Ctrl-L`（再 `Tab` 切到命令台）的原生 `redis-cli` 命令行完成，支持带引号参数与 `[` `]` 切库。
+**MongoDB**
+- 连接 MongoDB 后列出 collection；`Enter` 以网格浏览文档（顶层字段并集，`_id` 优先）。
+- `n`/`p` 翻页，`f` 应用 JSON 过滤，`r` 查看 collection 索引。
+- `e` 用 JSON 编辑器编辑文档（`_id` 不可改，字段级 diff），`i` 插入，`Del` 按 `_id` 删除 —— 每次写入确认并原地刷新。
 
-### MongoDB
-
-连接 MongoDB 后侧栏列出 collection。`Enter` 以网格浏览该 collection：列是文档顶层字段的并集（`_id` 优先，嵌套值以 JSON 显示），`n`/`p` 翻页，`f` 应用 JSON 过滤（`{"age": {"$gt": 30}}`），留空回车即清除。`r` 显示 collection 的索引（名称 / 列 / 唯一 / 主键 / 类型 / 过滤 / TTL），作为表结构的 Mongo 类比。
-
-**文档 CRUD。** `e` 用 JSON 编辑器打开当前文档（`Ctrl-S` 校验并预览变更，`Esc` 取消）。`_id` 不可修改，改 `_id` 会被拒绝并给出提示；合法修改会打开红色确认层，先显示顶层字段 diff（`~ name: "Ada" → "Grace"`、`+ 新增`、`- 删除`），再显示替换后的完整文档，确认后才执行。`i` 用同样的编辑器打开一个空的 `{ }` 模板插入新文档（可省略 `_id`，由 MongoDB 生成），`Del` 删除当前文档，确认文案包含其 `_id`。JSON 非法会在编辑器内与状态栏给出可读提示，绝不会发往服务器；每次写入成功后原地刷新当前页。Mongo shell 命令台（`Ctrl-L` 后 `Tab`）仍可执行 `db.col.find({})`、`use <db>`、计数等，`d` 切换数据库。
-
-## 与 DBX 的关系
-
-本项目离不开 [DBX](https://github.com/t8y2/dbx)（作者 t8y2，Apache-2.0）。它**不是** fork，也无关联 —— 而是**以库依赖方式内嵌** DBX 的 Rust 内核，在其上加了一层 TUI 界面。
-
-```
-DBX 桌面端 (Tauri)   DBX CLI   DBX MCP   dbxt (本项目)
-        │                 │         │            │
-        └────────────┬────┴─────────┴─────┬──────┘
-                     ▼                    ▼
-              dbx-core (业务编排层)       dbx-mcp (LocalBackend)
-                     │
-              90+ 数据库原生驱动
-                     │
-              共享连接存储：dbx.db
-```
-
-- `dbx-core` + `dbx-mcp` 以 **git 依赖方式固定在 tag `v0.6.9`**。dbxt 进程内直接调用 `dbx_mcp::backend::LocalBackend`：连接增删查改、元数据、SQL 执行、批量、事务、Redis 和 MongoDB 命令，全部走 DBX 桌面端同一套代码路径。
-- **无需桌面端、无 Node.js、无守护进程、无 HTTP 服务。** 单个静态二进制，一切发生在终端里。
-- `Cargo.toml` 的 `[patch.crates-io]` 段镜像了 DBX 自己工作区的补丁（gaussdb 兼容的 `tokio-postgres` fork 和 `mysql_async` fork）。Cargo 不会从 git 依赖传播 `[patch]` 段，所以 dbxt 必须重新声明 —— 升级 DBX tag 时，请对照对应版本 DBX 的 `Cargo.toml` 复查这一段。
-
-### 数据库覆盖
-
-遵循 DBX 自身的执行模型：
-
-| 层级 | 数据库 | dbxt 可用？ |
-| --- | --- | --- |
-| 原生驱动（编译进二进制） | MySQL、PostgreSQL、SQLite、Redis、MongoDB、SQL Server、ClickHouse、Elasticsearch、Doris、StarRocks 等 | ✅ 无头运行，不需要桌面端 |
-| 官方 CLI 直连白名单 | postgres、mysql、sqlite、redshift、doris、starrocks、manticoresearch、rqlite、kwdb、questdb | ✅ |
-| Agent / JDBC 类型 | Oracle、达梦、DB2、Hive、Snowflake、SAP HANA 等 | ❌ 需要 DBX Agent 运行时（Java），超出范围 |
-
-dbxt 不受官方 CLI 静态白名单限制 —— 那份清单是 `dbx-cli` 里的产品决策，不是内核限制。凡 `LocalBackend` 能原生执行的，这里都能用。
-
-### 连接存储（与 DBX 共享）
-
-所有连接保存在一个 SQLite 文件 `dbx.db` 中，DBX 桌面端、DBX CLI、DBX MCP 和 dbxt 共用。你已配置好的连接会被自动读取。
-
-| 平台 | 默认路径 |
-| --- | --- |
-| Linux | `~/.local/share/com.dbx.app/dbx.db` |
-| macOS | `~/Library/Application Support/com.dbx.app/dbx.db` |
-| Windows | `%APPDATA%\com.dbx.app\dbx.db` |
-| 便携（全平台） | `$DBX_DATA_DIR/dbx.db` |
-
-备份说明（源自 DBX 的 `storage.rs`，对照 v0.6.9 核实）：
-
-- 一个文件包含全部内容：连接、密码、查询历史、设置。
-- 密码在 `connection_secrets` 表中**明文存储**，靠文件 owner-only 权限（600）保护。没有外部密钥，拷到其他机器直接可用 —— 拷完记得 `chmod 600`。
-- DBX 运行时可能存在 `-wal`/`-shm` 伴生文件。要么退出 DBX 后再拷贝，要么做一致性快照：`sqlite3 dbx.db ".backup '/备份路径/dbx.db'"`。
+**效率与体验**
+- 任意位置 `?` 打开快捷键速查；所有浮层统一 `Esc` 关闭。
+- `Ctrl-A` 自动折叠非焦点栏，`Ctrl-W` 收起 / 展开当前栏；低于 50 列时各栏纵向堆叠。
+- `Alt-C` 压缩列宽，`Alt-H` 隐藏列，`Alt-R` 直达最近表 —— 选择按 `库.表` 持久化。
+- 鼠标与触屏可用：点击选中、再点确认；滚轮滚行，`Shift`/`Alt`/`Ctrl`+滚轮横滚列。
+- 失败可见：看门狗把无响应的后端变成错误，执行中显示转圈与已用秒数，服务端错误原样回显。
+- 所有界面文案来自同一张表（`src/ui_text.rs`）；默认中文，`DBXT_LANG=en` 切换英文。
 
 ## 安装
 
-### 一键脚本（Linux / macOS）
+一键脚本 —— bash（Termux 同样适用）或 PowerShell：
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/vst93/dbxt/refs/heads/master/cmd/install.sh | bash
 ```
 
-国内加速（jsdelivr）：
-
-```bash
-curl -fsSL https://cdn.jsdelivr.net/gh/vst93/dbxt@master/cmd/install.sh | bash
-```
-
-| 参数 | 说明 |
-| --- | --- |
-| `--help` | 显示所有选项 |
-| `--lang en` | 使用英文界面 |
-| `--lang zh` | 使用中文界面 |
-| `--install-dir <dir>` | 安装到指定目录（默认 `~/.local/bin`，Termux 下为 `$PREFIX/bin`） |
-| `--force` | 已是最新时也强制重装 / 升级 |
-| `--skip-github` | 跳过 GitHub 直连，仅使用镜像 |
-| `--preview` | 安装最新预览版 |
-| `--musl` | Linux：安装全静态 musl 构建 |
-
-脚本从 GitHub Release 读取版本、校验 `.sha256` 并安装，会区分**安装 / 升级 / 已是最新**三态；若已安装版本比最新发布版更新（例如你自己从源码编译的版本），则保留现有版本而不降级，除非传入 `--force`。校验不匹配时会先询问（`--force` 跳过询问）。直连 `github.com` 慢或不通时，会自动依次尝试 `ghfast.top`、`mirror.ghproxy.com`、`gh-proxy.com`、`gh-proxy.net`。同名开关也可用环境变量传入（`DBXT_INSTALL_DIR`、`DBXT_FORCE_INSTALL=1`、`DBXT_SKIP_GITHUB=1`、`DBXT_PREVIEW=1`、`DBXT_MUSL=1`、`DBXT_LANG=zh`）。
-
-### Windows (PowerShell)
-
 ```powershell
 irm https://raw.githubusercontent.com/vst93/dbxt/master/cmd/install.ps1 | iex
 ```
 
-国内加速：
+国内加速：把地址换成 `https://cdn.jsdelivr.net/gh/vst93/dbxt@master/cmd/install.sh`（或 `.../install.ps1`）。脚本从 GitHub Release 读取版本、校验 `.sha256`，安装到 `~/.local/bin`（Termux 为 `$PREFIX/bin`，Windows 为 `%USERPROFILE%\.local\bin`），并区分安装 / 升级 / 已是最新。若本地版本更新则保留而不降级。选项：`--force`、`--preview`、`--musl`、`--skip-github`、`--install-dir <dir>`、`--lang en|zh`，以及同名 `DBXT_*` 环境变量（`--help` 列出全部）。
 
-```powershell
-irm https://cdn.jsdelivr.net/gh/vst93/dbxt@master/cmd/install.ps1 | iex
-```
-
-| 环境变量 | 说明 |
-| --- | --- |
-| `DBXT_INSTALL_DIR=path` | 安装到指定目录（默认 `%USERPROFILE%\.local\bin`） |
-| `DBXT_FORCE_INSTALL=1` | 已是最新时也强制重装 / 升级 |
-| `DBXT_SKIP_GITHUB=1` | 跳过 GitHub 直连，仅使用镜像 |
-| `DBXT_PREVIEW=1` | 安装最新预览版 |
-| `DBXT_LANG=zh` | 使用中文界面 |
-
-Windows 安装脚本会在安装目录不在用户 `PATH` 时自动加入（需重开终端生效）。
-
-### 手动下载
-
-每个 Release 会附上各平台压缩包及对应的 `.sha256`：
+每个 Release 附上各平台压缩包及对应 `.sha256`：
 
 | 文件 | 平台 |
 | --- | --- |
-| `dbxt-linux-amd64.zip` | Linux，x86_64（glibc） |
-| `dbxt-linux-arm64.zip` | Linux，ARM64（glibc） |
-| `dbxt-linux-amd64-musl.zip` | Linux，x86_64（静态） |
-| `dbxt-linux-arm64-musl.zip` | Linux，ARM64（静态） |
-| `dbxt-darwin-amd64.zip` | macOS，Intel |
-| `dbxt-darwin-arm64.zip` | macOS，Apple Silicon |
-| `dbxt-windows-amd64.zip` | Windows，x86_64 |
+| `dbxt-linux-amd64.zip` | Linux x86_64（glibc） |
+| `dbxt-linux-arm64.zip` | Linux ARM64（glibc） |
+| `dbxt-linux-amd64-musl.zip` | Linux x86_64（静态） |
+| `dbxt-linux-arm64-musl.zip` | Linux ARM64（静态） |
+| `dbxt-darwin-amd64.zip` | macOS Intel |
+| `dbxt-darwin-arm64.zip` | macOS Apple Silicon |
+| `dbxt-windows-amd64.zip` | Windows x86_64 |
 
-解压后把 `dbxt`（Windows 为 `dbxt.exe`）放入 `PATH`。`gnu` 版 Linux 构建链接的是 CI 运行器的 glibc（Ubuntu 24.04 为 2.39），老发行版请优先用静态 `musl` 构建（完全不依赖 glibc）。
+解压后把 `dbxt` 放入 `PATH`。glibc 构建链接的是 CI 运行器的 glibc，老发行版请优先用静态 `musl` 构建。Android/Termux 无专用产物 —— 静态 aarch64 构建通常能跑，否则 `pkg install rust` 源码编译。
 
-### Android / Termux
-
-**没有专门的 Android 产物**。`dbxt-linux-arm64-musl.zip` 是全静态 aarch64 二进制，在 Termux 里通常能启动，但 Android 用的是 bionic 而非 glibc，因此属于非官方支持组合。可靠做法是在 Termux 里源码编译：
-
-```bash
-pkg install rust git
-curl -fsSL https://raw.githubusercontent.com/vst93/dbxt/refs/heads/master/cmd/install.sh | bash   # 会尝试静态构建
-# 或本地编译：
-git clone https://github.com/vst93/dbxt && cd dbxt && cargo build --release
-```
-
-`dbxt-linux-arm64.zip`（glibc）在该环境下**无法运行**。
-
-### 从源码构建
-
-需要 Rust 1.85+（edition 2021）。
+源码构建（需要 Rust 1.85+ 与 C 工具链；首次构建会编译 DBX 内核及多个 C 依赖）：
 
 ```bash
 cargo install --git https://github.com/vst93/dbxt
+# 或：git clone https://github.com/vst93/dbxt && cd dbxt && cargo build --release
 ```
 
-或克隆后编译：
+发版由 GitHub Actions 完成：`gh workflow run release.yml`（可加 `-f version=0.2.0`）把最新 tag 的 patch 加一、打 tag、创建 Release 并构建全部七个压缩包。`dbxt --version` 与 `dbxt --help` 不启动 TUI 即可输出。
 
-```bash
-git clone https://github.com/vst93/dbxt && cd dbxt
-cargo build --release    # target/release/dbxt
-```
+## 快速上手
 
-首次构建会从源码编译完整的 DBX 内核以及多个 C 依赖（OpenSSL、AWS-LC、SQLite、zstd），需要几分钟。需要 C 工具链（`cc` / `gcc`、`make`、`perl`）；无需安装系统 SQLite 或 OpenSSL。Windows x86_64 上 `aws-lc-sys` 还需要 NASM。release 配置已启用符号裁剪和 thin LTO。预编译包由 [`Release` 工作流](.github/workflows/release.yml) 产出。
+1. 运行 `dbxt` —— 读取与 DBX 桌面端相同的存储。
+2. 选择连接（`↑` `↓` + `Enter`），或按 `c` 新建。
+3. 在表上按 `Enter` 浏览数据；`/` 过滤表名，`d` 切换数据库。
+4. `e` 编辑单元格、`i` 插入、`Delete` 删除 —— 每次执行前展示完整 SQL。
+5. `F5` 执行编辑器 SQL；`?` 打开完整快捷键帮助。
 
-`dbxt --version` 输出版本，`dbxt --help` 输出用法，均不会启动 TUI。发布版二进制报告其构建所用的 tag（版本在构建时通过 `DBXT_VERSION` 注入）；本地 `cargo build` 则报告 `Cargo.toml` 中的版本。两个命令都管道安全：当读取端提前退出（`dbxt --help | head -1`）时，dbxt 静默以 `0` 退出，不再因 `EPIPE` panic。
+## 快捷键速查
 
-### 退出码
+完整列表在 TUI 的 `?` 浮层与 `dbxt --help` 中；这里只列核心键。
 
-| 退出码 | 含义 |
+| 场景 | 按键 |
 | --- | --- |
-| `0` | 正常退出——包括 `--help` / `--version` 以及 stdout 管道被关闭 |
-| `1` | 运行时失败（无法打开存储、stdout 不是终端等） |
-| `2` | 用法错误（未知选项） |
+| 全局 | `?` 帮助 · `Tab`/`Shift-Tab` 切栏 · `Alt-1/2/3` 聚焦 · `F5`/`Ctrl-J` 执行 · `Ctrl-C` 退出 |
+| 连接 | `↑` `↓` 移动 · `Enter` 连接 · `c` 新建 · `p` 复制 · `d` 数据库列表 · `o` 返回选择 |
+| 侧栏 | `↑` `↓` 表 · `/` 过滤 · `Enter` 浏览 · `r` 表结构 · `t` 最近表 |
+| 结果区 | `↑` `↓` 行 · `←` `→` 列 · `n`/`p` 翻页 · `Enter`/`v` 单元格 · `e` 编辑 · `i` 插入 · `Delete` 删除 |
+| 结果区（续） | `f` 过滤 · `s` 排序 · `Ctrl-K` 追加排序 · `Ctrl-R` 清除 · `y` 复制行 · `/` 搜索 · `Ctrl-Y` CSV · `[` `]` 标签 |
+| Redis | `Space` 多选 · `a` 全选 · `Del`/`x`/`m` 批量删除/TTL/重命名 · `/` MATCH · `n` 更多 · `e` 编辑 · `Enter` 查看 value |
+| MongoDB | `e` 编辑 · `i` 插入 · `Del` 删除 · `f` 过滤 · `n`/`p` 翻页 · `r` 索引 |
+| 浮层 | `Enter`/`y` 确认 · `Esc`/`n` 取消 · `↑` `↓` 滚动 |
 
-`--version` 是 `cmd/install.sh` 依赖的探测命令，因此只要能写出就始终返回 `0`；除管道关闭以外的写失败仍返回非零。
+## 持久化与配置
 
-## 使用
+按表偏好（列宽压缩、隐藏列、排序）写入 `~/.config/dbxt/tui.json`，以 `库.表` 为键；`DBXT_CONFIG` 可覆盖路径，`DBXT_NO_PERSIST=1` 可关闭。`DBXT_LANG=en|zh` 选择界面语言（未设置时由 locale 决定），`DBX_DATA_DIR` 指定其他 DBX 存储，`DBXT_INSTALL_DIR` 是安装脚本的目标目录。
 
-```bash
-# 默认存储（与 DBX 桌面端相同）
-dbxt
+## 状态与路线图
 
-# 显式指定存储文件（你下载的备份、便携文件等）
-dbxt /path/to/dbx.db
-# 也可传目录，会自动拼接 dbx.db
-dbxt /path/to/dir-containing-dbx.db
-# 或
-DBX_DATA_DIR=/path/to/dir dbxt
-```
+早期但已可用。已对真实 MySQL 8.4、Redis 和 MongoDB 端到端实测。
 
-### 环境变量
-
-| 变量 | 作用 |
-| --- | --- |
-| `DBX_DATA_DIR` | DBX 存储目录（含 `dbx.db`） |
-| `DBXT_LANG` | 界面语言：`zh`（默认）或 `en`；未设置时读 `LANG` / `LC_ALL` / `LC_MESSAGES`（`zh*` → 中文，否则英文） |
-| `DBXT_EVENT_TRACE=<path>`（或 `=1`） | 把所有鼠标 / 尺寸事件及其**到达时的原始序列**写入该文件，并把最后一条回显在状态栏 |
-| `DBXT_MOUSE_DEBUG=1`（或 `=<path>`） | 同样的日志（默认 `$TMPDIR/dbxt-mouse.log`），另加实时浮层面板 —— 用来汇报手机滑动到底发了什么 |
-| `DBXT_DRAG_PAN=button\|any\|off` | 滑动的识别方式：按住拖动（默认）、连裸移动也认、或完全不认 |
-| `DBXT_NO_ITALIC=1` | `NULL` 只用灰色，不依赖终端斜体 |
-| `DBXT_CONFIG=<path>` | 持久化 TUI 配置的位置（默认 `~/.config/dbxt/tui.json`，遵循 `XDG_CONFIG_HOME`） |
-| `DBXT_NO_PERSIST=1` | 完全不读也不写 TUI 配置 |
-| `DBXT_CLIPBOARD=off` | 不发送 OSC 52 转义（文件兜底仍然可用） |
-| `DBXT_CLIPBOARD_FILE=<path>` | 复制兜底文件位置（默认 `~/.cache/dbxt/clipboard.txt`） |
-
-### 快捷键
-
-| 场景 | 按键 | 动作 |
-| --- | --- | --- |
-| 全局 | `Ctrl-C` | 退出 |
-| 全局 | `Ctrl-L` | 切换命令模式：SQL → Redis → MongoDB |
-| 全局 | `F5` / `Ctrl-J` | 执行当前 SQL |
-| 连接选择 | `↑` `↓` / `Enter` | 选择 / 连接 |
-| 连接选择 | `c` | 新建连接表单 |
-| 连接选择 | `p` | 复制高亮连接到表单 |
-| 侧栏（已连接） | `↑` `↓` | 移动表列表 |
-| 侧栏 | `/` | 过滤表名（输入即筛选，`Enter` 保留，`Esc` 清除） |
-| 侧栏 | `t` | 最近表浮层（`↑` `↓` + `Enter` 直达） |
-| 侧栏 | `←` `→` | 循环切库（快捷） |
-| 侧栏 | `d` | 弹出数据库列表（SQL / MongoDB / Redis） |
-| 侧栏 | `Enter` | 浏览表格数据（分页 `SELECT *`） |
-| 侧栏 | `r` | 查看表结构（字段 + DDL） |
-| 侧栏 | `o` | 返回连接选择 |
-| 任意位置 | `?` | 快捷键速查（帮助浮层） |
-| 任意位置 | `Tab` / `Shift-Tab` | 下一 / 上一区域（侧栏 → 编辑器 → 结果） |
-| 任意位置 | `Alt-1` / `Alt-2` / `Alt-3` | 直接聚焦 侧栏 / 编辑器 / 结果 |
-| 任意位置 | `Ctrl-A` | 开关自动折叠（开=非焦点栏收起，关=全部展开） |
-| 任意位置 | `Ctrl-W` | 收起 / 展开当前焦点栏 |
-| 任意位置 | `Ctrl-G` | 横滚模式：纵向滚轮 / 上下滑改为横滚列（触屏兜底） |
-| 任意位置 | `Alt-C`（结果区 `w`） | 开关**列宽压缩**：均分列宽，宽表尽量一屏放下，无需横滚 |
-| 任意位置 | `Alt-H`（结果区 `c`） | **列显隐**浮层（`Space` 勾选、`a` 全选、`x` 仅首列；按 `库.表` 持久化） |
-| 任意位置 | `Alt-R`（侧栏 `t`） | **最近表**浮层：最近浏览的 5 张表，`Enter` 直达 |
-| 任意位置 | `Shift`+`←` / `Shift`+`→` | 列窗口横滚一列（按住连滚；编辑器 / 命令行内仍是选中文本） |
-| 任意位置 | `Ctrl-O` | SQL 片段收藏（DBX `saved_sql_files`），插入编辑器 |
-| 任意位置 | `Ctrl-P` | 对编辑器 SQL 执行 `EXPLAIN`（SQL 后端） |
-| 任意位置 | `Ctrl-S` / `Ctrl-X` | 提交 / 清空批量事务队列 |
-| 编辑器 | `Enter` | 换行 |
-| 编辑器 | `Ctrl-Space` | SQL 前缀补全（表名 / 列名 / 关键字，`Tab` 上屏） |
-| 编辑器 | `↑` / `↓` | 历史命令（光标在首行 / 末行时） |
-| 编辑器 | `Esc` | 回到侧栏 |
-| Redis 输入行 | `[` `]` | 切换 Redis db（0/1/2…） |
-| Redis key 浏览器 | `↑` `↓` | 在 key 列表移动 |
-| Redis key 浏览器 | `Space` | 勾选 / 取消当前 key |
-| Redis key 浏览器 | `Shift+↑` / `Shift+↓` | 从锚点扩展选择范围 |
-| Redis key 浏览器 | `a` | 全选已加载的 key |
-| Redis key 浏览器 | `Esc` | 清空选择 |
-| Redis key 浏览器 | `Del` / `x` / `m` | 批量删除 / 设 TTL / 前缀重命名（均有确认） |
-| Redis key 浏览器 | `y` | 复制选中的 key 名（每行一个） |
-| Redis key 浏览器 | `/` | 编辑服务端 `MATCH` 模式（`Enter` 应用，留空 = `*`） |
-| Redis key 浏览器 | `n` / `End` | 加载下一 `SCAN` 页 |
-| Redis key 浏览器 | `r` | 以当前模式从头重扫 |
-| Redis key 浏览器 | `←` `→`（`h` `l`） | 切换逻辑 db（0/1/2…） |
-| Redis key 浏览器 | `Enter` | 按类型打开 key 的 value |
-| Redis value | `e` / `x` / `m` / `Del` | 编辑 string 或 hash 字段 / 设置 TTL / 重命名 / 删除 key（均有确认） |
-| Redis value | `n` | 加载大 hash / list / set / zset 的下一 200 项 |
-| Redis value | `y` | 复制当前行为 TSV |
-| Mongo collection | `r` | collection 索引（表结构的 Mongo 类比） |
-| Mongo 文档 | `n` / `p` | 下一页 / 上一页文档 |
-| Mongo 文档 | `f` | JSON 过滤（`Enter` 应用，留空清除） |
-| Mongo 文档 | `e` | 用 JSON 编辑器编辑当前文档（`_id` 不可改，先预览 diff） |
-| Mongo 文档 | `i` | 用 `{ }` 模板插入新文档 |
-| Mongo 文档 | `Del` | 删除当前文档（确认文案含 `_id`） |
-| Mongo 文档 | `y` | 复制当前文档行为 TSV |
-| MongoDB 输入行 | `use dbname` + `Enter` | 切换数据库 |
-| 结果区 | `↑` `↓` `j` `k` | 移动行光标（到边自动翻页） |
-| 结果区 | `PgUp` / `PgDn` | 整屏滚动，跨页时自动衔接 |
-| 结果区 | `n` / `p` | 下一页 / 上一页，保持相对行号 |
-| 结果区 | `Ctrl-F` / `Ctrl-B` | 下一页 / 上一页 |
-| 结果区 | `←` `→` `h` `l` | 移动单元格光标（列窗口跟随） |
-| 结果区 | `Shift`/`Alt`/`Ctrl`+滚轮、横向滚轮、左右滑动 | 横向滚动列 |
-| 结果区 | `Ctrl-G` | 横滚模式：纵向滚轮改为横滚列 |
-| 结果区 | 底部 `◀` `▶` | 点按向左 / 右翻一屏列（触屏可用） |
-| 结果区 | `[` / `]` | 上一个 / 下一个结果标签（连续查询） |
-| 结果区 | `Ctrl-Y` | 导出当前结果为 CSV（写入 `$HOME`） |
-| 结果区 | `y` | 把聚焦行复制为 `INSERT INTO … VALUES (…)`（OSC 52 剪贴板 + 文件兜底） |
-| 结果区 | `/` | 输入即搜索可见结果行（`Enter` 保留，`Esc` 清除） |
-| 结果区 | `n` / `Shift-N` | 下一个 / 上一个搜索命中（无搜索时 `n` 为下一页） |
-| 结果区 | `Ctrl-N` | 结果被行数上限截断时加载更多行 |
-| 结果区 | `Ctrl-E` | 聚焦 SQL 编辑器 |
-| 结果区 | `Enter` | 弹出聚焦单元格内容 —— 压缩列模式下改为**展开整行**（脚本视图：打开某条语句的结果） |
-| 结果区 | `v` | 弹出聚焦单元格内容（任意模式） |
-| 结果区 | `w` / `c` | 列宽压缩 / 列显隐浮层 |
-| 结果区 | `o` | 整行详情（纵向 `列 = 值` 列表，含被隐藏的列） |
-| 结果区 | `e` | 编辑当前单元格 → diff 确认层（展示完整 SQL） |
-| 结果区 | `i` | 插入一行 → diff 确认层（展示完整 SQL） |
-| 结果区 | `Delete` / `Ctrl-D` | 删除当前行 → 红色确认层 |
-| 结果区 | `f` | `WHERE` 过滤输入框，预填当前列 |
-| 结果区 | `Ctrl-R` | 清除当前过滤 |
-| 结果区 | `s` | 按当前列排序（升序 ↔ 降序） |
-| 结果区 | `Ctrl-K` | 把当前列追加为额外排序键 |
-| 结果区 | `z` | 钉住 / 取消钉住首个数据列 |
-| 结果区 | 点击底部进度条 | 跳转到对应列窗口 |
-| 结果区 | `Home` / `End` | 本页首行 / 末行 |
-| 结果区 | `t` | 切换 字段 ↔ DDL（表结构视图） |
-| 结果区 | `Esc` | 收起结果 / 退出表结构视图 |
-| 单元格弹层 | `↑` `↓` / `PgUp` `PgDn` / `Esc` `Enter` | 滚动 / 关闭 |
-| 行详情 | `↑` `↓` / `PgUp` `PgDn` / `Esc` `Enter` | 滚动 / 关闭 |
-| 过滤框 | `Enter` / `Esc` | 应用 / 取消 |
-| 编辑确认层（UPDATE） | `Enter` / `Esc` / `Ctrl-V` / `Ctrl-T` | 执行 / 取消 / 转编辑器 / 加入批量 |
-| 编辑确认层（INSERT） | `Enter` / `Esc` / `Ctrl-V` / `Ctrl-T` | 执行 / 取消 / 转编辑器 / 加入批量 |
-| 数据库列表 | `↑` `↓` / `Enter` / `r` / `Esc` | 选择 / 切换 / 刷新 / 关闭 |
-| SQL 片段（`Ctrl-O`） | `↑` `↓` / `Enter` / `s` / `r` / `Esc` | 选择 / 插入编辑器 / 收藏当前 SQL / 刷新 / 关闭 |
-| 表名过滤（`/`） | 输入 / `Enter` / `Esc` | 实时筛选 / 保留过滤 / 清除过滤 |
-| 列显隐（`Alt-H`） | `Space` / `a` / `x` / `↑` `↓` / `Esc` | 勾选一列 / 全选 / 仅首列 / 移动 / 关闭 |
-| 最近表（`Alt-R`） | `↑` `↓` / `Enter` / `Esc` | 选择 / 直达该表 / 关闭 |
-| SQL 补全（`Ctrl-Space`） | `↑` `↓` / `Tab` `Enter` / `Esc` | 选择 / 上屏 / 取消（继续输入会继续筛选；候选标注 `T`/`C`/`K` 并跟随光标上下文） |
-| 帮助 | `↑` `↓` `PgUp` `PgDn` / `Esc` `?` | 滚动 / 关闭 |
-| 确认框 | `Enter` `y` / `Esc` `n` | 执行 / 取消（展示完整 SQL） |
-
-### 底部提示与界面语言
-
-底部那一行不是固定速查表：它只显示**当前谁在接管键盘**最相关的 4–6 个键 —— 连接选择、侧栏、SQL 编辑器、命令行、结果区，或正打开的浮层（帮助、过滤、列显隐、编辑确认……）。键帽高亮显示，`? 帮助` 永远是最后一项，兜底出口永远只差一个按键。窄终端下优先裁剪最次要的提示，裁剪处用 `…` 标记（42 列屏上显示 `↑↓ select connection · … · ? Help`），但绝不会藏掉 `?`。
-
-所有界面文案 —— 底部提示、帮助浮层、确认层、状态栏消息与错误文本 —— 都来自同一张文案表（`src/ui_text.rs`）。默认中文；设置 `DBXT_LANG=en` 即切换英文：
-
-```sh
-DBXT_LANG=en dbxt
-```
-
-`DBXT_LANG` 优先于系统 locale；未设置时读 `LANG` / `LC_ALL` / `LC_MESSAGES`（`zh*` → 中文，否则英文），都没有时内置默认为中文。
-
-### 显示约定
-
-真正的 SQL `NULL` 与空字符串是两个不同的值，dbxt 不会把它们画成同一个样子：
-
-| 值 | 显示方式 |
-| --- | --- |
-| SQL `NULL` | `NULL`，灰色（深灰）斜体 |
-| 空字符串 `''` | `''`，灰色正体 |
-| 字面文本 `NULL` | `NULL`，正常前景色 |
-
-灰色只作用于文本前景，背景始终交给你的终端主题（浅色 / 深色均可），不破坏配色。若终端或字体不支持斜体，斜体会自动降级 —— `NULL` 仍是灰色，依然一眼可辨。设置 `DBXT_NO_ITALIC=1` 可强制只用灰色（例如斜体字形不好读时）。该约定覆盖所有显示位：结果网格、单元格弹层（`v` / `Enter`）、整行详情（`o`）、编辑确认层的旧值与 `INSERT` 预览。空串一律显示为 `''`，因此永远不会与 NULL 混淆。
-
-CSV 导出（`Ctrl-Y`）遵循 RFC 4180 与 DBX：`NULL` 与空串都写成空字段，只有字面文本 `NULL` 会写成 `NULL`。
-
-### 移动端效率（推荐的手机用法）
-
-手机终端很窄，而且任何手势都不能保证被上报。所以 dbxt 不再赌滑动，而是让宽表**能放下**：窄屏下自动压缩列宽，`Enter` 把整行展开成纵向列表，不关心的列可以隐藏（选择按表持久化）。三者合起来基本不需要左右滚动 —— 横滑作为「终端支持则可用」的附加项保留。
-
-**1. 列宽压缩（低于 50 列时默认开启）。** 所有列均分窗格宽度（每列 6–8 格，超长值省略号），尽量多放几列。42 列终端上一张 20 列的表从 3 列可见变 5 列；110 列终端上从 7 列变 11 列。当**所有列都在屏内**时，状态栏显示 `全部 N 列已适配`、底部滚动条自动消失 —— 已经不需要横滚了。`Alt-C` 在任意区域开关，结果区可按 `w`。
-
-**2. 行展开（`Enter`）。** 压缩模式下 `Enter` 把当前行打开为可滚动的 `列 = 值` 列表 —— 所有列、全宽度、每列一行，这是小屏上读被截断单元格的方式。`o` 在任意模式做同样的事，`v`（或非压缩模式下的 `Enter`）仍只弹当前单元格。
-
-**3. 列显隐（`Alt-H`，结果区 `c`）。** `Space` 勾掉一列，`a` 恢复全部，`x` 只留第一列。选择按 `库.表` 记住（写入 `~/.config/dbxt/tui.json`），下次打开同表自动恢复，把一张表压缩到只剩你关心的列 —— 通常足以让横向滚动条彻底消失。
-
-**4. `/` 过滤表名。** 侧栏表很多时，输入表名的几个字母，只留下匹配项（`Enter` 保留过滤，`Esc` 清除）。任何屏幕尺寸下都比滚动快。
-
-**5. `Alt-R`（或 `t`）最近表。** 最近浏览的 5 个 `库.表`，最新在前 —— `Enter` 直达，必要时先切库。取代在侧栏里翻找。
-
-**6. `Ctrl-Space` SQL 补全。** 补全光标处标识符并跟随上下文：`表名.` 后只补该表列名，`FROM` / `JOIN` 后优先表名，`WHERE` / `ON` 后优先列名，匹配大小写不敏感。每个候选带类型标注（`T` 表 / `C` 列 / `K` 关键字）；`Tab` 上屏，`↑`/`↓` 选择，继续输入会继续筛选。
-
-**7. 持久化。** 压缩模式开关、隐藏列集合与排序按 `库.表` 写入 `~/.config/dbxt/tui.json`（可用 `DBXT_CONFIG` 覆盖路径，`DBXT_NO_PERSIST=1` 关闭），重开该表自动恢复。配置缺失、截断或损坏都会被忽略，dbxt 以默认值启动。保存时会与磁盘上的文件合并，因此两个 dbxt 会话（或手工编辑）不会互相覆盖：只写入本会话改动过的 `库.表` 条目，把某张表重置为默认会删除其存储条目，而不是默默保留旧值。
-
-**8. 复制行为 SQL（`y`）。** 为聚焦行生成 `INSERT INTO … VALUES (…)`（含被隐藏的列，NULL / 空串 / 引号转义，二进制列以 `X'…'` 十六进制），经 OSC 52 写入剪贴板 —— 在 tmux 内包一层 DCS 透传。同一段文本始终兜底写入 `~/.cache/dbxt/clipboard.txt`，路径显示在状态栏；不支持 OSC 52 的终端不会报错。
-
-**9. 结果网格搜索（`/`）。** 输入即筛选可见结果行、高亮匹配单元格，标题显示命中数；`n` / `Shift-N` 循环命中，`Esc` 清除。搜索按焦点区分，结果区的 `/` 不会与侧栏表名过滤冲突。
-
-#### 关于 `Ctrl-Shift` 按键
-
-当终端会上报 Shift 修饰键时（kitty 键盘协议、`modifyOtherKeys`、iTerm2），`Ctrl-Shift-C` / `Ctrl-Shift-H` / `Ctrl-Shift-R` 是被支持的。但在传统终端（包括 tmux）里，`Ctrl-Shift-C` 与 `Ctrl-C` 是**同一个字节**（0x03），`Ctrl-Shift-H` 就是 `Ctrl-H`（0x08），`Ctrl-Shift-R` 就是 `Ctrl-R`（0x12）；Shift 根本不在链路上，任何程序都无法区分。所以 dbxt 把这三个视图命令绑在 `Alt-C` / `Alt-H` / `Alt-R`（`Alt` 组合是能被区分送达的），另加结果区裸键 `w` / `c` 与侧栏 `t`。
-
-### 鼠标 / 触屏
-
-终端里的触屏点按以鼠标按下事件传入（终端会上报松开时则在松开时确认），因此触屏设备（包括 Android Termux）和 tmux 鼠标穿透都能用：
-
-- 点击行选中；再次点击同一行确认（连接、浏览数据）
-- 点击单元格把单元格光标移过去；点击脚本中的语句行可下钻
-- 点击侧栏表名选中，再点一次浏览数据；点击数据库行打开数据库列表
-- 点击底部进度条跳转列窗口；点击两端的 `◀` / `▶` 翻一屏列；点击收起条即展开并聚焦该栏
-- 点击区域（编辑器、命令输入、结果）切换焦点
-- 滚轮滚动行（到边自动翻页）；`Shift`/`Alt`/`Ctrl`+滚轮滚动列；横向滚轮与左右**滑动**（触屏上报的那个手势）同样直接滚动列
-
-**手机上的横向滚动（附加项）。** 上面的移动端流程（压缩列宽 + 行展开 + 列显隐）就是为了让你通常不需要横滚。当表仍然比屏幕宽、而终端确实会上报滑动时，dbxt 兼容它见过的所有编码，并提供完全不需要横向滚轮的兜底路径：
-
-- 横向滚轮（`ScrollLeft` / `ScrollRight`，SGR 66/67）**不论焦点在哪个栏**都会横滚列，所以即使你点过侧栏或编辑器，滑动仍然生效；
-- **拖动**（按住左键移动，`Drag(Left)`，SGR 32）被当作滑动，按手指位移横滚（每 2 列位移横滚 1 列，单次事件有上限）。很多手机终端左右滑动上报的就是它，而 R10 之前 dbxt 根本看不到这类事件。纵向为主的拖动不处理（纵向由滚轮负责）；滑动也不再算作点按：结果区的点击改为在**松开时**才确认，手指一动就丢弃；
-- **裸移动**（`Moved`，SGR 35）默认忽略（桌面鼠标会持续产生它）；如果你的终端滑动只上报裸移动，用 `DBXT_DRAG_PAN=any` 启动；
-- `Shift`+滚轮、`Alt`+滚轮与 `Ctrl`+滚轮都横滚列 —— 各终端实际往链路里放哪个修饰位并不一致，所以三个都接受；
-- **`Shift`+`←` / `Shift`+`→` 在任意栏横滚一列** —— 键盘兜底，按住会连滚（编辑器 / 命令行里 `Shift`+方向键仍是选中文本）；
-- `Ctrl-G` 打开**横滚模式**，之后普通纵向滚轮（每个终端都上报的那个手势）改为横滚列，状态栏显示 `横滚 开`；
-- 终端是否在滚轮事件里带上修饰位由它自己决定（有些还会把 `Shift`+滚轮吞去做自己的横向滚动），所以 dbxt 对能看到的每种编码都响应。以下每种编码都在 tmux 里注入原始序列实测过：
-
-| SGR 滚轮按钮（上 / 下） | 终端实际发送的修饰 | 结果区行为 |
-| --- | --- | --- |
-| `64` / `65` | 无 | 滚动行（`Ctrl-G` 横滚模式下改为横滚列） |
-| `68` / `69` | `Shift` | 横滚列 |
-| `72` / `73` | `Alt` | 横滚列 |
-| `80` / `81` | `Ctrl` | 横滚列 |
-| `66` / `67` | 横向滚轮 | 任意栏均横滚列 |
-- 底部条上的 `◀` / `▶` 每点一下横滚一整屏（点按是最可靠的触屏手势），进度条本身也可点按跳转。
-
-在 tmux 下请保持 `set -g mouse on`，外层终端才会上报滑动、tmux 才会转发给 pane。
-
-**滑动仍然无反应时。** 用 `DBXT_MOUSE_DEBUG=1` 启动 dbxt：浮层会显示最近 6 条鼠标事件及它们**到达时的原始序列**（如 `Drag(Left) @(21,11) · SGR \x1b[<32;22;12M`），同样的行也会写入 `$TMPDIR/dbxt-mouse.log`（`DBXT_EVENT_TRACE=<path>` 只写日志、不显浮层）。在手机上滑一下再看浮层：
-
-| 浮层显示 | 含义 |
-| --- | --- |
-| `ScrollLeft` / `ScrollRight` | 终端发的是横向滚轮 —— 横滚直接可用 |
-| `Drag(Left)` | 滑动是「按住拖动」—— dbxt 已处理（默认 `DBXT_DRAG_PAN=button`） |
-| `Moved` | 终端只报裸移动 —— 用 `DBXT_DRAG_PAN=any` 启动 |
-| 什么都没有 | 终端根本没上报滑动（或 tmux 没开 `mouse`）—— 用 `Ctrl`+滚轮、`Shift`+`←`/`→`、`Ctrl-G` 横滚模式或底部 `◀`/`▶` |
-
-按键从不记录，因此连接表单里输入的密码不会泄漏到日志或浮层。
-
-### 交互说明
-
-**连续浏览行。** 表格数据仍按每次 50 行拉取，但键盘感知不到页边界：光标走到页顶/页底时，`↑`/`↓`（和滚轮）会自动加载相邻页，并落在「继续走一步」本该到的行上。`n`/`p` 与 `Ctrl-F`/`Ctrl-B` 整页翻动，同时保持光标的相对行号，不会跳回首行。状态栏常显 `第 3/8 页 · 行 102/400`。
-
-**宽表。** 每个网格都有一个单元格光标。`←`/`→`（或 `h`/`l`）移动光标，可见列窗口随之滚动，当前列的表头高亮。`z` 把首个数据列钉在始终钉住的行号列旁边，这样向右滚动时主键始终可见。`Enter` 弹出聚焦单元格的完整内容，超宽值因此仍然可读。状态栏常显横向位置 `列 1|3-8/21`（钉住 | 滚动），全部列都在屏内时改为 `全部 N 列已适配`。`Shift`/`Alt`/`Ctrl`+滚轮、横向滚轮与左右滑动（拖动）移动的是**列窗口本身**，一格一列，表格会立即响应。下钻后的脚本结果网格同样支持。窄屏下压缩列模式（见《移动端效率》）通常让横滚完全不再必要，`Alt-H` 列选择器再帮你去掉不需要的列。
-
-**编辑不惊奇。** `e` 弹出 diff 式确认层：显示列、旧值、`WHERE` 条件、识别到的主键与**完整生成的 `UPDATE`**，新值可就地输入。`Enter` 执行，`Esc` 取消，`Ctrl-V` 把生成的 `UPDATE` 转入 SQL 编辑器手工修改，`Ctrl-T` 改为加入队列。`i` 同样展示整条 `INSERT` 语句，`Delete` / `Ctrl-D` 在红色确认层展示带条件的 `DELETE … WHERE …`。`WHERE` 取自表主键；无主键的表退化为全部列匹配并在确认层警告。万一生成的写入没有受限的 `WHERE`（或使用 `WHERE 1 = 1`），仍会触发原有的危险语句确认。写入成功后汇报受影响行数并就地重载当前页；失败则原样回显服务端错误。
-
-**事务批量。** 用 `Ctrl-T` 排队多处编辑 —— 状态栏显示 `批量 N 待提交` —— 然后 `Ctrl-S` 弹出确认层展示整段 `BEGIN … COMMIT` 脚本，`Enter` 才在单个事务中执行并汇报影响行数与错误（`Esc` 保留队列，`Ctrl-X` 清空）。这是让一组相关修改原子化、又不必手写脚本的最省事方式。
-
-**失败可见，不静默。** 每次后端调用都有看门狗（元数据 / Redis / MongoDB 为 60 秒，SQL 脚本为 3 分钟）：服务器接受了连接却永不响应时，会给出错误而不是一个永不停止的转圈。调用进行中，标题栏显示转圈，超过 3 秒后附带已用秒数（`⠋ 7s`），慢查询看起来是「在跑」而不是「卡死」。错误以红色、保留头部的形式显示（`✗ list tables: …`），且应用保持完全可响应 —— `?` 仍能打开帮助，`d` 仍能重连。驱动无法列举数据库（但连接可用）不致命：使用配置库并显示黄色 `⚠ …` 提示。剪贴板（OSC 52）在终端不支持时静默降级 —— 文件兜底始终写入。
-
-**过滤与排序。** `f` 打开 `WHERE` 输入框并预填当前列（`"col" = `，按当前方言加引号），一次按键即可起过滤；若已有过滤条件则载入编辑。框内显示语法速查，并注明 MySQL/PG 标识符引号差异。应用过滤会回到第 1 页并保留排序；排序也保留过滤。生效条件显示在标题、状态栏，并以 `⚑` 标在对应列头；`s` 按当前列排序（列头 `▲`/`▼`，黄色），`Ctrl-K` 追加排序键并带序号，`Ctrl-R` 清除过滤。`COUNT(*)` 按表在会话内缓存（键含过滤条件），翻页不再重复统计；任何写入都会清空缓存。
-
-**自适应布局。** `Ctrl-A` 是自动折叠的唯一总开关，**默认关闭**，所有栏保持展开；开启后非焦点的侧栏与编辑器收缩为单行条（如 `▸ users · shop`），把空间让给焦点区。低于 50 列时各栏纵向堆叠（侧栏条 → SQL 编辑器 → 结果）。焦点切换会立即重排布局。`Ctrl-W` 只固定收起/展开当前焦点栏（手动覆盖优先于总开关），`Tab`/`Shift-Tab` 循环切换，`Alt-1`/`Alt-2`/`Alt-3` 直接聚焦，点击收起条即展开并聚焦。当前状态（`自动折叠 开/关`）常显在状态栏。
-
-**数据库切换。** `d` 弹出数据库列表，`Enter` 切换 —— MySQL/PostgreSQL 库、MongoDB 库、Redis 逻辑 db 用同一套手势，取代了窄屏上不可见的 `←`/`→` 盲循环。`r` 原地刷新列表（会话中在别处新建的库无需重连即可出现）。选择浮层而非常驻展开的侧栏树，是因为窄屏布局下侧栏会收缩为单行条；浮层在各种尺寸下表现一致，且能应对很多数据库。当前库仍常驻侧栏（点击它同样打开列表），`←`/`→` 与 Redis 的 `[`/`]` 保留为快捷方式。
-
-**结果标签、EXPLAIN、导出与片段（对齐 DBX）。** 每次执行 SQL 都会把结果存为一个标签，连续 `SELECT` 不再相互覆盖 —— `[` / `]` 切换，标题显示 `结果 2/3`。`Ctrl-P` 把编辑器的 SQL 包上当前方言的 `EXPLAIN`（SQLite 用 `EXPLAIN QUERY PLAN`，MySQL/PostgreSQL/DuckDB 等用 `EXPLAIN`）并以普通网格展示执行计划。`Ctrl-Y` 把当前结果写成 `$HOME` 下的 CSV（`dbxt-export-<表|查询>-<时间戳>.csv`，RFC 4180 引号规则，NULL 导出为空字段）并汇报路径。结果触及 500 行上限时会标记 `已截断`；`Ctrl-N` 用更大的上限重跑同一条语句（500 → 1000 → …，最高 20000）并就地替换该标签。`Ctrl-O` 列出 DBX 为此连接保存的 SQL 片段（`saved_sql_files`），`Enter` 把选中片段插入编辑器；`s` 把编辑器里的 SQL 存回共享库成为新收藏（弹名称输入框，写入 DBX 共享存储，桌面端立即可见），`r` 重新加载。连接在列表与侧栏按数据库家族着色（mysql / redis / mongo / sqlite …），优先使用连接自带颜色；`p` 把某个连接复制到表单（保存时生成新 id；副本不携带 SSH 隧道层）。
-
-## 已知问题
-
-- **多重编码的 CJK 标识符。** 如果某张表 / 库 / 列最初是通过字符集错误的 MySQL 连接（latin1/CP1252）创建的，MySQL 会把 UTF-8 名字的每个字节存成一个独立的 CP1252 字符；经过两次这样的连接写入就会叠两层。DBX 内核只对单元格值和表注释反向修复一层，未处理标识符；dbxt 在**渲染**表名 / 库名 / 列名时反复反向修复，直到名字不再变化，因此无论存了一层还是两层，这类表在侧栏、结果网格表头、表结构、数据库列表和 SQL 补全列表里都会显示为 `保留表`。发给服务端的、以及补全上屏的仍是原始（乱码）名字，所以它在生成的 `UPDATE`/`INSERT` 和 `SHOW CREATE TABLE` 输出里原样出现。以正确 UTF-8 创建的名字显示与读写都不受影响。服务端 `WHERE` 匹配的是**存储字节**，因此对这类数据，过滤要用存储值而不是修复后的显示值。
-- 对没有行数缓存的引擎（如 InnoDB），`COUNT(*)` 是全表扫描；会话缓存和 15 秒超时限制了开销，但超大表的首次统计仍可能较慢。
-- 列宽按当前页内容推算，翻页后可能变化。
-
-## 路线图
-
+- [x] SQL 浏览、编辑、事务、过滤 / 排序、补全、CSV 导出与结果标签
+- [x] Redis key 浏览器与批量 key 操作
+- [x] MongoDB 文档浏览器与文档 CRUD
+- [x] 七个平台的预编译包 —— 目前只有 Linux x86_64 在本机实测，其余未验证
 - [ ] TUI 内编辑 / 删除连接（复制已支持 `p`）
-- [ ] 结果导出为 JSON / XLSX（CSV 已支持 `Ctrl-Y`）
-- [ ] 把 dbxt 执行的 SQL 写回 DBX 共享查询历史（目前只读）
-- [x] schema 感知的 SQL 补全 —— 上下文感知的前缀补全（表名 / 列名 / 关键字，标注 `T`/`C`/`K`）已支持（`Ctrl-Space`）；完整的 JOIN 感知补全仍待做
-- [x] 列宽压缩与列显隐选择跨会话持久化 —— 现按 `库.表` 存入 `~/.config/dbxt/tui.json`（含排序）
-- [ ] 无主键表的 TUI 内结果行编辑（需要稳定的行标识）
-- [ ] 跨页 / 整个结果集的搜索（目前 `/` 只过滤已加载的页）
-- [x] 发布构建：Linux（glibc + 静态 musl）、macOS（Intel / Apple Silicon）、Windows（x86_64）—— 已由发布工作流产出；目前仅 Linux x86_64 验证过
-- [ ] 官方 Android/Termux 构建（目前用静态 aarch64 二进制或源码编译）
+- [ ] 结果导出 JSON / XLSX，以及跨页搜索
+- [ ] 官方 Android/Termux 构建
 
 ## 许可
 
-Apache-2.0，与 DBX 相同。DBX 是 [t8y2](https://github.com/t8y2) 的项目；dbxt 是独立客户端，与 DBX 项目无隶属或背书关系。
+Apache-2.0，与 DBX 相同。dbxt 是基于 [t8y2](https://github.com/t8y2) 的 [DBX](https://github.com/t8y2/dbx) 内核构建的独立客户端；不是 fork，与 DBX 项目无隶属或背书关系。
