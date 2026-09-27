@@ -8,9 +8,17 @@ A keyboard-first terminal UI for databases, built on the [DBX](https://github.co
 
 **Connections** — shared with DBX Desktop
 - Connections live in DBX's own SQLite store (`dbx.db`), so everything you configured there shows up automatically.
-- `c` creates a connection in-TUI, `p` duplicates one into the form, `Enter` connects; rows are colour-coded by database family.
+- `c` creates a connection in-TUI, `e` edits the highlighted one (prefilled, including its SSH tunnel), `p` duplicates one into the form, `Enter` connects; rows are colour-coded by database family.
 - `d` opens a switcher — MySQL databases, PostgreSQL (and other schema-aware engines') **schemas then databases**, MongoDB databases and Redis logical DBs, all one gesture.
 - `o` returns to the picker; `r` reloads the list in place.
+
+**SSH tunnels (jump hosts)**
+- A tunneled connection configured in DBX Desktop works in dbxt unchanged: dbxt passes `transport_layers` straight through to the kernel, so no re-entry is needed.
+- The connection form has an `ssh_tunnel` section: `ssh_host` / `ssh_port` (22) / `ssh_user`, and an `ssh_auth` login method of `password`, `key` (key path + passphrase) or `agent` (SSH agent, optional socket path).
+- `ssh_host` also accepts a `~/.ssh/config` **alias**; the kernel resolves it, including `ProxyJump` (which expands into a multi-hop chain).
+- The tunnel forwards to the connection's own `host:port`; the form shows that target as `远端目标` / `remote target`. To forward somewhere else, change the connection's `host`/`port`.
+- The first connection to an unknown jump host shows a host-key fingerprint dialog (`y`/`Enter` accept & remember, `s` trust for this session only, `n`/`Esc` reject). Accepted keys go to DBX's own `<store-dir>/known_hosts`; `~/.ssh/known_hosts` is read but never written.
+- Tunnel failures are reported by stage: **SSH authentication failed**, **SSH host unreachable**, or **tunnel up but remote database unreachable** — so a wrong password, a wrong bastion address and a closed far-side port are told apart.
 
 **SQL editor & results**
 - Multi-line editor with shell-style `↑`/`↓` history (seeded from DBX's shared query history); `F5` / `Ctrl-J` runs.
@@ -102,6 +110,8 @@ Releases are cut from GitHub Actions: `gh workflow run release.yml` (optionally 
 4. `e` edits a cell, `i` inserts, `Delete` deletes — each shows the full SQL before it runs.
 5. `F5` runs the editor's SQL; `?` opens the full keyboard help.
 
+For a database behind a bastion, press `c`, set `ssh_tunnel` to `y`, fill `ssh_host` / `ssh_user` and the login method, then `Enter` on the save row. The connection now goes dbxt → jump host → database.
+
 ## Keys (the essentials)
 
 The TUI's `?` overlay and `dbxt --help` carry the complete list; this is the short version.
@@ -109,7 +119,9 @@ The TUI's `?` overlay and `dbxt --help` carry the complete list; this is the sho
 | Context | Keys |
 | --- | --- |
 | Global | `?` help · `Tab`/`Shift-Tab` panes · `Alt-1/2/3` focus · `F5`/`Ctrl-J` run · `Ctrl-C` quit |
-| Connections | `↑` `↓` move · `Enter` connect · `c` new · `p` duplicate · `d` database/schema switcher · `o` picker |
+| Connections | `↑` `↓` move · `Enter` connect · `c` new · `e` edit · `p` duplicate · `d` database/schema switcher · `o` picker |
+| Connection form | `↑` `↓`/`Tab` fields · `Enter` edit/toggle/save · `Space` toggle `ssh_tunnel`/`ssl`/`ssh_auth` · `Esc` back |
+| SSH host key | `y`/`Enter` accept & remember · `s` this session only · `n`/`Esc` reject |
 | Sidebar | `↑` `↓` tables · `/` filter · `Enter` browse · `r` structure · `I` import CSV · `t` recent |
 | Results | `↑` `↓` rows · `←` `→` columns · `n`/`p` pages · `Enter`/`v` cell · `e` edit · `i` insert · `Delete` delete |
 | Results (more) | `f` filter · `s` sort · `Ctrl-K` extra sort · `Ctrl-R` clear · `y` copy row · `/` search · `Ctrl-Y` export · `[` `]` tabs |
@@ -121,6 +133,8 @@ The TUI's `?` overlay and `dbxt --help` carry the complete list; this is the sho
 
 Per-table choices (compact widths, hidden columns, sort) are written to `~/.config/dbxt/tui.json`, keyed by `database.table`; `DBXT_CONFIG` overrides the path and `DBXT_NO_PERSIST=1` disables it. `DBXT_LANG=en|zh` selects the UI language (the locale decides when unset), `DBX_DATA_DIR` points dbxt at a different DBX store, and `DBXT_INSTALL_DIR` is the install script's target directory.
 
+The SSH-tunnel unit tests (serialization shape, form mapping, auth/error classification, host-key prompt) run with the normal `cargo test`. Two extra end-to-end tests drive a real tunnel (dbxt → local `sshd` → MySQL) and are skipped unless `DBXT_SSH_TEST=1`; they read `DBXT_SSH_TEST_USER` / `_PASSWORD` / `_KEY`, `DBXT_SSH_TEST_MYSQL_PORT` (default 13306) and `DBXT_SSH_TEST_MYSQL_USER` / `_PASSWORD`.
+
 ## Status & roadmap
 
 Early but usable. Verified end-to-end against real MySQL 8.4, PostgreSQL 16, Redis and MongoDB servers.
@@ -130,8 +144,9 @@ Early but usable. Verified end-to-end against real MySQL 8.4, PostgreSQL 16, Red
 - [x] SQL browsing, editing, transactions, filter/sort, completion, CSV import/export and result tabs
 - [x] Redis key browser with batch key operations
 - [x] MongoDB document browser with document CRUD
+- [x] SSH tunnels (password / key / agent, `~/.ssh/config` aliases and `ProxyJump`) with in-TUI create/edit
 - [x] Prebuilt archives for seven targets — only the Linux x86_64 build has been exercised locally, the others are untested
-- [ ] In-TUI connection editing / deletion (duplication is in via `p`)
+- [ ] In-TUI connection deletion (editing and duplication are in)
 - [ ] Result export to XLSX, and search across pages
 - [ ] Excel (`.xlsx`) import
 - [ ] A dedicated Android/Termux build

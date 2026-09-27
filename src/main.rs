@@ -21,7 +21,13 @@ use crossterm::execute;
 use dbx_core::db::redis_driver::{
     RedisBlob, RedisBlobEncoding, RedisCollectionPage, RedisKeyInfo, RedisValue, RedisValueData,
 };
-use dbx_core::models::connection::{ConnectionConfig, DatabaseType};
+use dbx_core::db::ssh_prompt::{
+    self as ssh_prompt, SshHostKeyNotice, SshHostKeyNoticeKind, SshPromptAnswer, SshPromptEnvelope,
+    SshPromptKind, SshPromptRequest,
+};
+use dbx_core::models::connection::{
+    ConnectionConfig, DatabaseType, SshTunnelConfig, TransportLayerConfig,
+};
 use dbx_core::query::QueryExecutionOptions;
 use dbx_core::sql_dialect::{
     build_count_table_sql, build_table_data_select_sql_with_database, is_schema_aware,
@@ -1883,6 +1889,9 @@ enum Op {
     SaveSnippet(Box<ConnectionConfig>, String, String),
     DatabasesRefresh(Box<ConnectionConfig>),
     AddConn(Box<ConnectionConfig>),
+    /// Replace an existing saved connection (id is preserved). The kernel has no
+    /// UPDATE, so the op removes then re-adds the same id.
+    UpdateConn(Box<ConnectionConfig>),
     /// Read, decode and header-align a CSV against a table's columns, producing
     /// the preview plan.
     ImportPlan {
@@ -2023,6 +2032,12 @@ enum OpResult {
     /// Chunk progress; does not count as the op finishing.
     ImportProgress { done: usize, total: usize },
     ImportDone(Box<ImportReport>),
+    /// A blocking SSH prompt (host-key TOFU / keyboard-interactive) the kernel
+    /// handshake is waiting on. Not an op completion — handled before the
+    /// spinner accounting, like [`OpResult::ImportProgress`].
+    SshPrompt(Box<SshPromptEnvelope>),
+    /// A best-effort host-key notice (changed / rejected / learn failed).
+    SshNotice(Box<SshHostKeyNotice>),
     Error(String),
 }
 
@@ -2151,15 +2166,22 @@ async fn run_op(backend: &LocalBackend, op: Op, tx: &Tx) -> OpResult {
                 databases: vec![cfg.database.clone().unwrap_or_default()],
                 warning: None,
             },
-            Err(e) => OpResult::Databases {
-                databases: vec![cfg.database.clone().unwrap_or_default()],
-                warning: Some(match cfg.database.as_deref() {
-                    Some(db) if !db.is_empty() => {
-                        tf("无法列举数据库（{}），仅使用配置库 {}", &[&(e), &(fix_double_encoding(db))])
+            Err(e) => {
+                let warning = if cfg.has_effective_ssh_tunnels() {
+                    ssh_connect_error_message(&cfg, &e)
+                } else {
+                    match cfg.database.as_deref() {
+                        Some(db) if !db.is_empty() => {
+                            tf("无法列举数据库（{}），仅使用配置库 {}", &[&(e), &(fix_double_encoding(db))])
+                        }
+                        _ => tf("无法列举数据库（{}），将使用连接默认库", &[&(e)]),
                     }
-                    _ => tf("无法列举数据库（{}），将使用连接默认库", &[&(e)]),
-                }),
-            },
+                };
+                OpResult::Databases {
+                    databases: vec![cfg.database.clone().unwrap_or_default()],
+                    warning: Some(warning),
+                }
+            }
         },
         Op::ListSchemas(cfg, db) => {
             // `list_schemas_core` is the kernel's schema enumerator; it hides
@@ -2415,7 +2437,11 @@ async fn run_op(backend: &LocalBackend, op: Op, tx: &Tx) -> OpResult {
                     reload_list,
                 }
             }
-            Err(e) => OpResult::Error(format!("redis: {e}")),
+            Err(e) => OpResult::Error(if cfg.has_effective_ssh_tunnels() {
+                ssh_connect_error_message(&cfg, &e)
+            } else {
+                format!("redis: {e}")
+            }),
         },
         Op::RedisBatchWrite {
             cfg,
@@ -2616,7 +2642,11 @@ async fn run_op(backend: &LocalBackend, op: Op, tx: &Tx) -> OpResult {
                     Ok(s) => s,
                     Err(_) => format!("{:?}",  r.value),
                 }),
-                Err(e) => OpResult::Error(format!("redis: {e}")),
+                Err(e) => OpResult::Error(if cfg.has_effective_ssh_tunnels() {
+                    ssh_connect_error_message(&cfg, &e)
+                } else {
+                    format!("redis: {e}")
+                }),
             }
         }
         Op::Mongo(cfg, db, source) => match dbx_core::mongo_shell::parse(&source) {
@@ -2630,7 +2660,11 @@ async fn run_op(backend: &LocalBackend, op: Op, tx: &Tx) -> OpResult {
                     }
                     OpResult::Mongo(if rows.is_empty() { note_of(&r) } else { rows })
                 }
-                Err(e) => OpResult::Error(format!("mongo: {e}")),
+                Err(e) => OpResult::Error(if cfg.has_effective_ssh_tunnels() {
+                    ssh_connect_error_message(&cfg, &e)
+                } else {
+                    format!("mongo: {e}")
+                }),
             },
             Err(e) => OpResult::Error(tf("mongo parse: {} (例: db.col.find({{}}))", &[&(e)])),
         },
@@ -2718,6 +2752,18 @@ async fn run_op(backend: &LocalBackend, op: Op, tx: &Tx) -> OpResult {
             Ok(saved) => OpResult::Added(tf("已保存: {} ({})", &[&(saved.name), &(saved.db_type.as_str())])),
             Err(e) => OpResult::Error(format!("save: {e}")),
         },
+        Op::UpdateConn(cfg) => {
+            // No kernel UPDATE; drop and re-add the same id. A failure to remove
+            // is not fatal on its own — the add below reports the real problem.
+            let id = cfg.id.clone();
+            let _ = backend.remove_connection_for_mcp(&id).await;
+            match backend.add_connection_for_mcp(*cfg).await {
+                Ok(saved) => {
+                    OpResult::Added(tf("已更新: {} ({})", &[&(saved.name), &(saved.db_type.as_str())]))
+                }
+                Err(e) => OpResult::Error(format!("update: {e}")),
+            }
+        }
         Op::ImportPlan { cfg, db, schema, table, path, gen } => {
             let expanded = expand_home(&path.to_string_lossy());
             let bytes = match std::fs::read(&expanded) {
@@ -2906,6 +2952,75 @@ fn spawn_op(backend: &Arc<LocalBackend>, tx: &Tx, op: Op) {
 
 // ─── app state ───────────────────────────────────────────────────────────────
 
+/// SSH login method offered by the connection form. The string values match
+/// the kernel's [`SshTunnelConfig::auth_method`] so a saved layer round-trips.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum SshAuth {
+    Password,
+    Key,
+    Agent,
+}
+
+impl SshAuth {
+    fn as_str(self) -> &'static str {
+        match self {
+            SshAuth::Password => "password",
+            SshAuth::Key => "key",
+            SshAuth::Agent => "agent",
+        }
+    }
+    fn next(self) -> Self {
+        match self {
+            SshAuth::Password => SshAuth::Key,
+            SshAuth::Key => SshAuth::Agent,
+            SshAuth::Agent => SshAuth::Password,
+        }
+    }
+    /// Map a kernel `auth_method` (possibly empty on legacy layers) back to a
+    /// form value, inferring from the populated credential fields when unset.
+    fn from_layer(layer: &SshTunnelConfig) -> Self {
+        match layer.auth_method.as_str() {
+            "key" | "key+password" => SshAuth::Key,
+            "agent" => SshAuth::Agent,
+            "password" => SshAuth::Password,
+            _ => {
+                if !layer.key_path.trim().is_empty() {
+                    SshAuth::Key
+                } else if layer.use_ssh_agent {
+                    SshAuth::Agent
+                } else {
+                    SshAuth::Password
+                }
+            }
+        }
+    }
+}
+
+/// One focusable row of the new/edit-connection form. The row list is dynamic:
+/// the SSH rows only appear once the tunnel is enabled, and the credential rows
+/// follow the selected auth method.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum FormRow {
+    Name,
+    DbType,
+    Host,
+    Port,
+    Username,
+    Password,
+    Database,
+    Ssl,
+    SshEnabled,
+    SshHost,
+    SshPort,
+    SshUser,
+    SshAuth,
+    SshPassword,
+    SshKeyPath,
+    SshKeyPassphrase,
+    SshAgentSock,
+    Save,
+}
+
 #[derive(Clone)]
 struct ConnForm {
     name: String,
@@ -2916,7 +3031,22 @@ struct ConnForm {
     password: String,
     database: String,
     ssl: bool,
-    field: usize, // 0..8; 7=ssl 8=save
+    // ── SSH tunnel (serialized to `transport_layers`) ──
+    ssh_enabled: bool,
+    ssh_host: String,
+    ssh_port: String,
+    ssh_user: String,
+    ssh_auth: SshAuth,
+    ssh_password: String,
+    ssh_key_path: String,
+    ssh_key_passphrase: String,
+    ssh_agent_sock: String,
+    /// Id of the connection being edited (`e` in the picker); `None` = create.
+    edit_id: Option<String>,
+    field: usize,
+    /// First visible row of the scrollable field list (kept in sync by the
+    /// renderer so a tall form still works on a phone-sized terminal).
+    scroll: usize,
     editing: bool,
     err: String,
 }
@@ -2932,17 +3062,117 @@ impl Default for ConnForm {
             password: String::new(),
             database: String::new(),
             ssl: false,
+            ssh_enabled: false,
+            ssh_host: String::new(),
+            ssh_port: "22".into(),
+            ssh_user: String::new(),
+            ssh_auth: SshAuth::Password,
+            ssh_password: String::new(),
+            ssh_key_path: String::new(),
+            ssh_key_passphrase: String::new(),
+            ssh_agent_sock: String::new(),
+            edit_id: None,
             field: 0,
+            scroll: 0,
             editing: false,
             err: String::new(),
         }
     }
 }
 
-fn form_fields() -> [&'static str; 9] {
-    [
-        "name", "db_type", "host", "port", "username", "password", "database", "ssl", t("保存"),
-    ]
+/// The focusable rows for the current form state, in display order. Labels are
+/// technical keycaps kept identical in both languages (like the base fields).
+fn form_rows(f: &ConnForm) -> Vec<(FormRow, &'static str)> {
+    let mut rows = vec![
+        (FormRow::Name, "name"),
+        (FormRow::DbType, "db_type"),
+        (FormRow::Host, "host"),
+        (FormRow::Port, "port"),
+        (FormRow::Username, "username"),
+        (FormRow::Password, "password"),
+        (FormRow::Database, "database"),
+        (FormRow::Ssl, "ssl"),
+        (FormRow::SshEnabled, "ssh_tunnel"),
+    ];
+    if f.ssh_enabled {
+        rows.push((FormRow::SshHost, "ssh_host"));
+        rows.push((FormRow::SshPort, "ssh_port"));
+        rows.push((FormRow::SshUser, "ssh_user"));
+        rows.push((FormRow::SshAuth, "ssh_auth"));
+        match f.ssh_auth {
+            SshAuth::Password => rows.push((FormRow::SshPassword, "ssh_password")),
+            SshAuth::Key => {
+                rows.push((FormRow::SshKeyPath, "ssh_key"));
+                rows.push((FormRow::SshKeyPassphrase, "ssh_passphrase"));
+            }
+            SshAuth::Agent => rows.push((FormRow::SshAgentSock, "ssh_agent")),
+        }
+    }
+    rows.push((FormRow::Save, t("保存")));
+    rows
+}
+
+/// The editable string behind a text row, if any (toggles return `None`).
+fn form_text_mut(f: &mut ConnForm, row: FormRow) -> Option<&mut String> {
+    match row {
+        FormRow::Name => Some(&mut f.name),
+        FormRow::DbType => Some(&mut f.db_type),
+        FormRow::Host => Some(&mut f.host),
+        FormRow::Port => Some(&mut f.port),
+        FormRow::Username => Some(&mut f.username),
+        FormRow::Password => Some(&mut f.password),
+        FormRow::Database => Some(&mut f.database),
+        FormRow::SshHost => Some(&mut f.ssh_host),
+        FormRow::SshPort => Some(&mut f.ssh_port),
+        FormRow::SshUser => Some(&mut f.ssh_user),
+        FormRow::SshPassword => Some(&mut f.ssh_password),
+        FormRow::SshKeyPath => Some(&mut f.ssh_key_path),
+        FormRow::SshKeyPassphrase => Some(&mut f.ssh_key_passphrase),
+        FormRow::SshAgentSock => Some(&mut f.ssh_agent_sock),
+        FormRow::Ssl | FormRow::SshEnabled | FormRow::SshAuth | FormRow::Save => None,
+    }
+}
+
+/// The first SSH transport layer of a saved connection, if any. Used to prefill
+/// the form when editing / duplicating a tunneled connection.
+fn first_ssh_layer(cfg: &ConnectionConfig) -> Option<&SshTunnelConfig> {
+    cfg.transport_layers.iter().find_map(|layer| match layer {
+        TransportLayerConfig::Ssh(ssh) => Some(ssh),
+        _ => None,
+    })
+}
+
+/// Copy a saved connection into the form (duplicate / edit), including the SSH
+/// tunnel section so a desktop-configured tunnel round-trips through the TUI.
+fn form_from_connection(cfg: &ConnectionConfig, name: String, edit_id: Option<String>) -> ConnForm {
+    let mut form = ConnForm {
+        name,
+        db_type: cfg.db_type.as_str().to_string(),
+        host: cfg.host.clone(),
+        port: if cfg.port == 0 {
+            String::new()
+        } else {
+            cfg.port.to_string()
+        },
+        username: cfg.username.clone(),
+        password: cfg.password.clone(),
+        database: cfg.database.clone().unwrap_or_default(),
+        ssl: cfg.ssl,
+        edit_id,
+        ..ConnForm::default()
+    };
+    if let Some(ssh) = first_ssh_layer(cfg) {
+        form.ssh_enabled = ssh.enabled;
+        form.ssh_host = ssh.host.clone();
+        form.ssh_port = if ssh.port == 0 { "22".into() } else { ssh.port.to_string() };
+        form.ssh_user = ssh.user.clone();
+        form.ssh_auth = SshAuth::from_layer(ssh);
+        form.ssh_password = ssh.password.clone();
+        form.ssh_key_path = ssh.key_path.clone();
+        form.ssh_key_passphrase = ssh.key_passphrase.clone();
+        form.ssh_agent_sock = ssh.ssh_agent_sock_path.clone();
+    }
+    form
 }
 
 #[derive(Default, Clone, Copy)]
@@ -3119,6 +3349,15 @@ impl PanGesture {
 const PANE_SIDEBAR: usize = 0;
 const PANE_EDITOR: usize = 1;
 const PANE_RESULTS: usize = 2;
+
+/// A pending kernel SSH prompt awaiting a TUI answer. The handshake task is
+/// suspended on `responder`; dropping it (or answering) resumes it.
+struct SshPromptState {
+    request: SshPromptRequest,
+    responder: Option<tokio::sync::oneshot::Sender<SshPromptAnswer>>,
+    /// Typed secret for a [`SshPromptKind::SecretInput`] challenge.
+    input: String,
+}
 
 struct App {
     backend: Arc<LocalBackend>,
@@ -3333,6 +3572,11 @@ struct App {
     mongo_dialog: Option<MongoDocDialog>,
 
     form: ConnForm,
+    /// A pending kernel SSH prompt (host-key TOFU / keyboard-interactive) the
+    /// handshake task is suspended on, plus the one-shot responder.
+    ssh_prompt: Option<SshPromptState>,
+    /// Last host-key notice, surfaced in the status line (best-effort).
+    ssh_notice: Option<String>,
 
     // ── CSV import ──
     /// The file-path step, before the CSV is read.
@@ -3745,6 +3989,8 @@ impl App {
             mongo_docs: Vec::new(),
             mongo_dialog: None,
             form: ConnForm::default(),
+            ssh_prompt: None,
+            ssh_notice: None,
             import_prompt: None,
             import_plan: None,
             import_gen: 0,
@@ -3767,6 +4013,33 @@ impl App {
 
 async fn run_app(mut terminal: ratatui::DefaultTerminal, backend: Arc<LocalBackend>) -> Result<()> {
     let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<OpResult>();
+
+    // Bridge the kernel's process-global SSH prompt / notice gateways into the
+    // app's result channel so a host-key TOFU or keyboard-interactive challenge
+    // can be answered in the TUI. Without a gateway the kernel fails closed
+    // (an unknown host key is never trusted), which is the right default but
+    // makes new bastions unusable.
+    let (prompt_tx, mut prompt_rx) = tokio::sync::mpsc::channel::<SshPromptEnvelope>(8);
+    ssh_prompt::install_ssh_prompt_gateway(prompt_tx);
+    let (notice_tx, mut notice_rx) = tokio::sync::mpsc::channel::<SshHostKeyNotice>(8);
+    ssh_prompt::install_ssh_notice_gateway(notice_tx);
+    {
+        let op_tx = tx.clone();
+        tokio::spawn(async move {
+            loop {
+                tokio::select! {
+                    Some(env) = prompt_rx.recv() => {
+                        let _ = op_tx.send(OpResult::SshPrompt(Box::new(env)));
+                    }
+                    Some(notice) = notice_rx.recv() => {
+                        let _ = op_tx.send(OpResult::SshNotice(Box::new(notice)));
+                    }
+                    else => break,
+                }
+            }
+        });
+    }
+
     let mut events = EventStream::new();
     let mut ticker = tokio::time::interval(Duration::from_millis(180));
     ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
@@ -3827,11 +4100,37 @@ async fn run_app(mut terminal: ratatui::DefaultTerminal, backend: Arc<LocalBacke
 }
 
 fn apply_op_result(app: &mut App, res: OpResult, tx: &Tx) {
-    // Chunk progress is an intermediate message: update the readout and leave
-    // the op (and the spinner) in flight.
-    if let OpResult::ImportProgress { done, total } = res {
-        app.import_progress = Some((done, total));
-        app.status = tf("导入 {} / {} 行…", &[&done, &total]);
+    // Intermediate / side-channel messages do not count as an op finishing, so
+    // they are handled before the spinner accounting.
+    if matches!(
+        res,
+        OpResult::ImportProgress { .. } | OpResult::SshPrompt(_) | OpResult::SshNotice(_)
+    ) {
+        match res {
+            OpResult::ImportProgress { done, total } => {
+                app.import_progress = Some((done, total));
+                app.status = tf("导入 {} / {} 行…", &[&done, &total]);
+            }
+            OpResult::SshPrompt(env) => {
+                let kind = env.request.kind;
+                app.ssh_prompt = Some(SshPromptState {
+                    request: env.request,
+                    responder: Some(env.responder),
+                    input: String::new(),
+                });
+                app.status = match kind {
+                    SshPromptKind::HostKeyVerify => t("SSH 主机密钥待确认（y 接受 / n 拒绝）").into(),
+                    SshPromptKind::HostKeyChanged => t("SSH 主机密钥已变化，请确认").into(),
+                    SshPromptKind::SecretInput => t("SSH 服务器要求额外验证").into(),
+                    SshPromptKind::WorkerUploadConsent => t("SSH 请求确认").into(),
+                };
+            }
+            OpResult::SshNotice(notice) => {
+                app.ssh_notice = Some(ssh_notice_text(&notice));
+                app.status = ssh_notice_text(&notice);
+            }
+            _ => unreachable!(),
+        }
         return;
     }
     // Only stop the spinner once every in-flight call has answered.
@@ -4525,6 +4824,8 @@ fn apply_op_result(app: &mut App, res: OpResult, tx: &Tx) {
             app.import_report = Some(rep);
         }
         OpResult::ImportProgress { .. } => {}
+        // Handled before the spinner accounting above; unreachable here.
+        OpResult::SshPrompt(_) | OpResult::SshNotice(_) => {}
         OpResult::Error(e) => {
             app.import_progress = None;
             app.page_pending = false;
@@ -4631,6 +4932,13 @@ fn key(app: &mut App, tx: &Tx, k: KeyEvent) {
         && k.code == KeyCode::Char('c')
     {
         app.quit = true;
+        return;
+    }
+
+    // A blocking SSH prompt (host-key TOFU / keyboard-interactive) is the
+    // topmost modal: the tunnel handshake is suspended on our answer.
+    if app.ssh_prompt.is_some() {
+        ssh_prompt_key(app, k);
         return;
     }
 
@@ -5253,6 +5561,8 @@ fn sidebar_key(app: &mut App, tx: &Tx, k: KeyEvent) {
             }
             // Duplicate the highlighted connection into the form.
             KeyCode::Char('p') => duplicate_connection(app),
+            // Edit the highlighted connection in place (form prefilled).
+            KeyCode::Char('e') => edit_connection(app),
             KeyCode::Char('q') => {
                 app.picker_open = !app.picker_open;
             }
@@ -6231,7 +6541,13 @@ fn connect_selected(app: &mut App, tx: &Tx) {
             app.mongo_page = 0;
             app.set_placeholder();
             app.loading = true;
-            app.status = tf("连接 {} ({})…", &[&(cfg.name), &(cfg.db_type.as_str())]);
+            app.status = match first_ssh_layer(&cfg) {
+                Some(ssh) => tf(
+                    "SSH 连接 {}@{}:{} → {}…",
+                    &[&(ssh.user), &(ssh.host), &(ssh.port), &(cfg.name)],
+                ),
+                None => tf("连接 {} ({})…", &[&(cfg.name), &(cfg.db_type.as_str())]),
+            };
             if app.backend_kind == Backend::Redis {
                 // Redis exposes 16 fixed logical databases; there is nothing to
                 // enumerate, so go straight to the first SCAN page.
@@ -6254,6 +6570,159 @@ fn backend_for_connection(cfg: &ConnectionConfig) -> Backend {
         "redis" | "keydb" | "valkey" => Backend::Redis,
         "mongodb" | "mongo" => Backend::Mongo,
         _ => Backend::Sql,
+    }
+}
+
+/// Does an SSH handshake error mean the credentials were rejected (or unusable)?
+/// The kernel phrases these with `auth failed` / `authentication failed` / a
+/// rejected `remaining_methods` set, or a missing credential / agent.
+fn classify_ssh_auth_error(error: &str) -> bool {
+    let l = error.to_ascii_lowercase();
+    [
+        "authentication failed",
+        "auth failed",
+        "auth probe failed",
+        "password auth",
+        "key auth",
+        "rejected",
+        "no ssh password or key",
+        "ssh-agent",
+        "keyboard-interactive",
+        "failed to load ssh key",
+    ]
+    .iter()
+    .any(|needle| l.contains(needle))
+}
+
+/// Does an SSH handshake error mean the jump host itself could not be reached?
+fn classify_ssh_host_error(error: &str) -> bool {
+    let l = error.to_ascii_lowercase();
+    [
+        "ssh connection failed",
+        "ssh connection timed out",
+        "connection refused",
+        "no route to host",
+        "network is unreachable",
+        "failed to lookup",
+        "name or service not known",
+        "dns error",
+        "connection reset",
+    ]
+    .iter()
+    .any(|needle| l.contains(needle))
+}
+
+/// Does a driver-level (post-handshake) failure mean the forwarded channel
+/// closed — i.e. the far-side database port is not serving? SSH handshake
+/// errors are excluded: those are classified as auth / host failures instead.
+fn classify_ssh_remote_error(error: &str) -> bool {
+    let l = error.to_ascii_lowercase();
+    if l.contains("ssh connection failed")
+        || l.contains("ssh authentication")
+        || l.contains("ssh auth")
+        || l.contains("ssh connection timed out")
+    {
+        return false;
+    }
+    [
+        "connection closed",
+        "connection reset",
+        "unexpected eof",
+        "broken pipe",
+        "input/output error",
+        "os error 104",
+        "os error 32",
+        "server closed the connection",
+        "lost connection",
+    ]
+    .iter()
+    .any(|needle| l.contains(needle))
+}
+
+/// Name the failing stage of an SSH-tunneled connection. The kernel reports the
+/// SSH handshake verbatim; a driver-level failure once the tunnel is up is
+/// usually the *far-side* database endpoint being unreachable from the jump
+/// host, which the raw error hides. Categories: authentication, jump host
+/// unreachable, remote database unreachable.
+fn ssh_connect_error_message(cfg: &ConnectionConfig, error: &str) -> String {
+    let Some(ssh) = first_ssh_layer(cfg) else {
+        return tf("无法列举数据库（{}）", &[&(error)]);
+    };
+    let hop = format!("{}@{}:{}", ssh.user, ssh.host, ssh.port);
+    if classify_ssh_auth_error(error) {
+        return tf("SSH 认证失败（{}）：凭据被拒绝或不可用，请检查密码 / 密钥 / agent", &[&(hop)]);
+    }
+    // Checked before the host category: a closed far-side port surfaces to the
+    // driver as a reset / EOF, which the host matcher would also catch.
+    if classify_ssh_remote_error(error) {
+        return tf(
+            "隧道已建立但远端数据库不可达（{} → {}:{}）：请确认跳板机能访问该地址",
+            &[&(hop), &(cfg.host), &(cfg.port)],
+        );
+    }
+    if classify_ssh_host_error(error) {
+        return tf("SSH 主机不可达（{}）：无法建立连接，请检查地址 / 端口 / 网络", &[&(hop)]);
+    }
+    tf("SSH 隧道连接失败（{}）：{}", &[&(hop), &(error)])
+}
+
+/// Human-readable text for a best-effort host-key notice.
+fn ssh_notice_text(notice: &SshHostKeyNotice) -> String {
+    match notice.kind {
+        SshHostKeyNoticeKind::Changed => tf(
+            "⚠ SSH 主机密钥已变化（{}:{}），可能被中间人攻击",
+            &[&(notice.host), &(notice.port)],
+        ),
+        SshHostKeyNoticeKind::Rejected => {
+            tf("SSH 主机密钥被拒绝（{}:{}）", &[&(notice.host), &(notice.port)])
+        }
+        SshHostKeyNoticeKind::LearnFailed => tf(
+            "SSH 主机密钥已接受但无法保存（{}:{}）：仅本次会话信任",
+            &[&(notice.host), &(notice.port)],
+        ),
+    }
+}
+
+/// Answer a pending kernel SSH prompt. The handshake task is suspended on the
+/// one-shot responder, so answering (or dropping it) resumes it.
+fn ssh_prompt_key(app: &mut App, k: KeyEvent) {
+    let Some(mut state) = app.ssh_prompt.take() else {
+        return;
+    };
+    let answer = match state.request.kind {
+        SshPromptKind::HostKeyVerify | SshPromptKind::HostKeyChanged => match k.code {
+            KeyCode::Enter | KeyCode::Char('y') | KeyCode::Char('Y') => {
+                Some(SshPromptAnswer::Accept { remember: true })
+            }
+            // Trust the key for this session only (do not write known_hosts).
+            KeyCode::Char('s') | KeyCode::Char('S') => Some(SshPromptAnswer::Accept { remember: false }),
+            KeyCode::Esc | KeyCode::Char('n') | KeyCode::Char('N') => Some(SshPromptAnswer::Reject),
+            _ => None,
+        },
+        SshPromptKind::SecretInput => match k.code {
+            KeyCode::Enter => Some(SshPromptAnswer::Secret(state.input.clone())),
+            KeyCode::Esc => Some(SshPromptAnswer::Reject),
+            KeyCode::Backspace => {
+                state.input.pop();
+                None
+            }
+            KeyCode::Char(c) => {
+                state.input.push(c);
+                None
+            }
+            _ => None,
+        },
+        // dbxt does not use the SQLite worker, so this consent is always denied.
+        SshPromptKind::WorkerUploadConsent => Some(SshPromptAnswer::Reject),
+    };
+    match answer {
+        Some(ans) => {
+            if let Some(tx) = state.responder.take() {
+                let _ = tx.send(ans);
+            }
+            app.ssh_prompt = None;
+        }
+        None => app.ssh_prompt = Some(state),
     }
 }
 
@@ -10191,59 +10660,46 @@ fn run_cmd_line(app: &mut App, tx: &Tx) {
 // ── new connection form ──
 
 fn form_key(app: &mut App, tx: &Tx, k: KeyEvent) {
-    let f = &mut app.form;
-    if f.editing {
+    // The row list shrinks when the SSH tunnel is toggled off or the auth method
+    // changes; keep the cursor on a real row.
+    let len = form_rows(&app.form).len().max(1);
+    if app.form.field >= len {
+        app.form.field = len - 1;
+    }
+    let cur = form_rows(&app.form)
+        .get(app.form.field)
+        .map(|r| r.0)
+        .unwrap_or(FormRow::Save);
+
+    if app.form.editing {
         match k.code {
             KeyCode::Enter | KeyCode::Esc => {
                 if k.code == KeyCode::Esc {
-                    // cancel: clear current field
-                    match f.field {
-                        0 => f.name.clear(),
-                        1 => f.db_type = "mysql".into(),
-                        2 => f.host.clear(),
-                        3 => f.port.clear(),
-                        4 => f.username.clear(),
-                        5 => f.password.clear(),
-                        6 => f.database.clear(),
-                        _ => {}
+                    // cancel: clear (or reset) the current field
+                    if let Some(s) = form_text_mut(&mut app.form, cur) {
+                        if cur == FormRow::DbType {
+                            *s = "mysql".into();
+                        } else {
+                            s.clear();
+                        }
                     }
                 }
-                f.editing = false;
+                app.form.editing = false;
             }
-            KeyCode::Backspace => match f.field {
-                0 => {
-                    f.name.pop();
+            KeyCode::Backspace => {
+                if let Some(s) = form_text_mut(&mut app.form, cur) {
+                    s.pop();
                 }
-                1 => {
-                    f.db_type.pop();
+            }
+            KeyCode::Char(c) => {
+                if let Some(s) = form_text_mut(&mut app.form, cur) {
+                    match cur {
+                        FormRow::Port | FormRow::SshPort if !c.is_ascii_digit() => {}
+                        FormRow::DbType => s.push(c.to_ascii_lowercase()),
+                        _ => s.push(c),
+                    }
                 }
-                2 => {
-                    f.host.pop();
-                }
-                3 => {
-                    f.port.pop();
-                }
-                4 => {
-                    f.username.pop();
-                }
-                5 => {
-                    f.password.pop();
-                }
-                6 => {
-                    f.database.pop();
-                }
-                _ => {}
-            },
-            KeyCode::Char(c) => match f.field {
-                0 => f.name.push(c),
-                1 => f.db_type.push(c.to_ascii_lowercase()),
-                2 => f.host.push(c),
-                3 if c.is_ascii_digit() => f.port.push(c),
-                4 => f.username.push(c),
-                5 => f.password.push(c),
-                6 => f.database.push(c),
-                _ => {}
-            },
+            }
             _ => {}
         }
         return;
@@ -10253,23 +10709,102 @@ fn form_key(app: &mut App, tx: &Tx, k: KeyEvent) {
             app.page = Page::Browse;
             app.focus = Focus::Sidebar;
         }
-        KeyCode::Up => f.field = (f.field + form_fields().len() - 1) % form_fields().len(),
-        KeyCode::Down | KeyCode::Tab => f.field = (f.field + 1) % form_fields().len(),
-        KeyCode::Enter => {
-            if f.field == 7 {
-                f.ssl = !f.ssl;
-            } else if f.field == 8 {
-                save_form(app, tx);
-            } else {
-                f.editing = true;
+        KeyCode::Up => app.form.field = (app.form.field + len - 1) % len,
+        KeyCode::Down | KeyCode::Tab => app.form.field = (app.form.field + 1) % len,
+        KeyCode::Enter => match cur {
+            FormRow::Ssl => app.form.ssl = !app.form.ssl,
+            FormRow::SshEnabled => app.form.ssh_enabled = !app.form.ssh_enabled,
+            FormRow::SshAuth => app.form.ssh_auth = app.form.ssh_auth.next(),
+            FormRow::Save => save_form(app, tx),
+            _ => app.form.editing = true,
+        },
+        KeyCode::Char(' ') => match cur {
+            FormRow::Ssl => app.form.ssl = !app.form.ssl,
+            FormRow::SshEnabled => app.form.ssh_enabled = !app.form.ssh_enabled,
+            FormRow::SshAuth => app.form.ssh_auth = app.form.ssh_auth.next(),
+            FormRow::Save => save_form(app, tx),
+            FormRow::Port | FormRow::SshPort => {}
+            _ => {
+                app.form.editing = true;
+                if let Some(s) = form_text_mut(&mut app.form, cur) {
+                    s.push(' ');
+                }
             }
-        }
-        KeyCode::Left | KeyCode::Char('h') => {
-            f.field = (f.field + form_fields().len() - 1) % form_fields().len()
-        }
-        KeyCode::Right | KeyCode::Char('l') => f.field = (f.field + 1) % form_fields().len(),
+        },
+        KeyCode::Left | KeyCode::Char('h') => app.form.field = (app.form.field + len - 1) % len,
+        KeyCode::Right | KeyCode::Char('l') => app.form.field = (app.form.field + 1) % len,
         _ => {}
     }
+}
+
+/// Serialize the SSH section of the form into a kernel [`SshTunnelConfig`].
+/// Returns `Ok(None)` when the tunnel is disabled, and a user-facing message on
+/// a validation failure (the form stays open).
+fn build_ssh_layer(f: &ConnForm) -> Result<Option<SshTunnelConfig>, String> {
+    if !f.ssh_enabled {
+        return Ok(None);
+    }
+    let host = f.ssh_host.trim();
+    if host.is_empty() {
+        return Err(t("SSH 主机必填").into());
+    }
+    let user = f.ssh_user.trim();
+    if user.is_empty() {
+        return Err(t("SSH 用户必填").into());
+    }
+    let port = f.ssh_port.trim().parse::<u16>().unwrap_or(22);
+    if port == 0 {
+        return Err(t("SSH 端口无效（1-65535）").into());
+    }
+    let (password, key_path, key_passphrase, use_ssh_agent, agent_sock) = match f.ssh_auth {
+        SshAuth::Password => {
+            if f.ssh_password.is_empty() {
+                return Err(t("SSH 密码为空（或改用密钥 / agent）").into());
+            }
+            (f.ssh_password.clone(), String::new(), String::new(), false, String::new())
+        }
+        SshAuth::Key => {
+            if f.ssh_key_path.trim().is_empty() {
+                return Err(t("SSH 密钥路径必填").into());
+            }
+            (
+                String::new(),
+                f.ssh_key_path.trim().to_string(),
+                f.ssh_key_passphrase.clone(),
+                false,
+                String::new(),
+            )
+        }
+        SshAuth::Agent => (
+            String::new(),
+            String::new(),
+            String::new(),
+            true,
+            f.ssh_agent_sock.trim().to_string(),
+        ),
+    };
+    Ok(Some(SshTunnelConfig {
+        id: Uuid::new_v4().to_string(),
+        name: if f.name.trim().is_empty() {
+            "SSH".into()
+        } else {
+            format!("{} · SSH", f.name.trim())
+        },
+        enabled: true,
+        host: host.to_string(),
+        port,
+        user: user.to_string(),
+        password,
+        key_path,
+        key_passphrase,
+        connect_timeout_secs: dbx_core::models::connection::default_ssh_connect_timeout_secs(),
+        expose_lan: false,
+        use_ssh_agent,
+        ssh_agent_sock_path: agent_sock,
+        auth_method: f.ssh_auth.as_str().to_string(),
+        allow_exec_channel_proxy: false,
+        profile_id: String::new(),
+    }))
 }
 
 fn save_form(app: &mut App, tx: &Tx) {
@@ -10289,32 +10824,69 @@ fn save_form(app: &mut App, tx: &Tx) {
         .ok()
         .or_else(|| dbx_core::database_manifest::default_port(&db_type))
         .unwrap_or(0);
-    let cfg = match new_connection_config(
-        Uuid::new_v4().to_string(),
-        f.name.trim().to_string(),
-        db_type,
-        f.host.trim().to_string(),
-        port,
-        f.username.trim().to_string(),
-        f.password.clone(),
-        if f.database.trim().is_empty() {
-            None
-        } else {
-            Some(f.database.trim().to_string())
-        },
-        f.ssl,
-        None,
-    ) {
-        Ok(c) => c,
+    let ssh_layer = match build_ssh_layer(&f) {
+        Ok(layer) => layer,
         Err(e) => {
             app.form.err = e;
             return;
         }
     };
+    // Editing preserves fields the form does not expose (colour, notes, visible
+    // databases, driver profile, …) by starting from the saved config.
+    let mut cfg = match f
+        .edit_id
+        .as_ref()
+        .and_then(|id| app.connections.iter().find(|c| &c.id == id).cloned())
+    {
+        Some(existing) => existing,
+        None => match new_connection_config(
+            Uuid::new_v4().to_string(),
+            f.name.trim().to_string(),
+            db_type,
+            f.host.trim().to_string(),
+            port,
+            f.username.trim().to_string(),
+            f.password.clone(),
+            if f.database.trim().is_empty() {
+                None
+            } else {
+                Some(f.database.trim().to_string())
+            },
+            f.ssl,
+            None,
+        ) {
+            Ok(c) => c,
+            Err(e) => {
+                app.form.err = e;
+                return;
+            }
+        },
+    };
+    cfg.name = f.name.trim().to_string();
+    cfg.db_type = db_type;
+    cfg.host = f.host.trim().to_string();
+    cfg.port = port;
+    cfg.username = f.username.trim().to_string();
+    cfg.password = f.password.clone();
+    cfg.database = if f.database.trim().is_empty() {
+        None
+    } else {
+        Some(f.database.trim().to_string())
+    };
+    cfg.ssl = f.ssl;
+    cfg.transport_layers = ssh_layer
+        .into_iter()
+        .map(TransportLayerConfig::Ssh)
+        .collect();
     app.form.err.clear();
     app.loading = true;
     app.status = t("保存连接…").into();
-    app.spawn(tx, Op::AddConn(Box::new(cfg)));
+    let op = if f.edit_id.is_some() {
+        Op::UpdateConn(Box::new(cfg))
+    } else {
+        Op::AddConn(Box::new(cfg))
+    };
+    app.spawn(tx, op);
 }
 
 impl App {
@@ -11934,25 +12506,23 @@ fn duplicate_connection(app: &mut App) {
     let Some(cfg) = app.connections.get(idx).cloned() else {
         return;
     };
-    app.form = ConnForm {
-        name: tf("{} (副本)", &[&(cfg.name)]),
-        db_type: cfg.db_type.as_str().to_string(),
-        host: cfg.host.clone(),
-        port: if cfg.port == 0 {
-            String::new()
-        } else {
-            cfg.port.to_string()
-        },
-        username: cfg.username.clone(),
-        password: cfg.password.clone(),
-        database: cfg.database.clone().unwrap_or_default(),
-        ssl: cfg.ssl,
-        field: 0,
-        editing: false,
-        err: String::new(),
-    };
+    app.form = form_from_connection(&cfg, tf("{} (副本)", &[&(cfg.name)]), None);
     app.page = Page::NewConn;
     app.status = tf("复制连接 {} · 改参数后 Enter 保存", &[&(cfg.name)]);
+}
+
+/// `e` in the connection picker: open the selected connection in the form
+/// (including its SSH tunnel section) and update it in place on save.
+fn edit_connection(app: &mut App) {
+    let Some(idx) = app.conn_list.selected() else {
+        return;
+    };
+    let Some(cfg) = app.connections.get(idx).cloned() else {
+        return;
+    };
+    app.form = form_from_connection(&cfg, cfg.name.clone(), Some(cfg.id.clone()));
+    app.page = Page::NewConn;
+    app.status = tf("编辑连接 {} · Enter 保存", &[&(cfg.name)]);
 }
 
 // ─── rendering ───────────────────────────────────────────────────────────────
@@ -12058,6 +12628,9 @@ fn ui(f: &mut Frame, app: &mut App) {
     }
     if let Some(confirm) = app.confirm.clone() {
         render_confirm(f, f.area(), &confirm);
+    }
+    if app.ssh_prompt.is_some() {
+        render_ssh_prompt(f, f.area(), app);
     }
     if app.mouse_debug {
         render_mouse_debug(f, f.area(), app);
@@ -12339,6 +12912,7 @@ type Hint = (&'static str, &'static str);
 #[derive(Clone, Copy, PartialEq, Debug)]
 enum FooterView {
     Confirm,
+    SshPrompt,
     EditDialog,
     Help,
     ImportReport,
@@ -12382,6 +12956,8 @@ struct FooterCtx {
 fn footer_ctx(app: &App) -> FooterCtx {
     let view = if app.confirm.is_some() {
         FooterView::Confirm
+    } else if app.ssh_prompt.is_some() {
+        FooterView::SshPrompt
     } else if app.edit_dialog.is_some() {
         FooterView::EditDialog
     } else if app.help_open {
@@ -12514,18 +13090,24 @@ fn footer_hints_ctx(ctx: FooterCtx) -> Vec<Hint> {
             ("Esc", t("关闭")),
         ],
         FooterView::Confirm => vec![("Enter/y", t("执行")), ("Esc/n", t("取消"))],
+        FooterView::SshPrompt => vec![
+            ("y/Enter", t("接受并记住")),
+            ("s", t("仅本次")),
+            ("n/Esc", t("拒绝")),
+        ],
         FooterView::ConnPicker => vec![
             ("↑↓", t("选择连接")),
             ("Enter", t("连接")),
             ("c", t("新建")),
+            ("e", t("编辑")),
             ("p", t("复制")),
             ("q", t("显隐")),
         ],
         FooterView::NewConn => vec![
-            ("↑↓", t("字段")),
-            ("Enter", t("编辑/保存")),
+            ("↑↓/Tab", t("字段")),
+            ("Enter", t("编辑/切换/保存")),
+            ("Space", t("切换")),
             ("Esc", t("返回")),
-            ("ssl", t("切换")),
         ],
         FooterView::RedisKeys => vec![
             ("↑↓", t("key")),
@@ -14007,15 +14589,52 @@ fn render_redis_sidebar(f: &mut Frame, area: Rect, app: &App, lines: &mut Vec<Li
     );
 }
 
+/// Rendered value of one form row (passwords masked).
+fn form_row_value(f: &ConnForm, row: FormRow) -> String {
+    match row {
+        FormRow::Name => f.name.clone(),
+        FormRow::DbType => f.db_type.clone(),
+        FormRow::Host => f.host.clone(),
+        FormRow::Port => f.port.clone(),
+        FormRow::Username => f.username.clone(),
+        FormRow::Password => "*".repeat(f.password.chars().count()),
+        FormRow::Database => f.database.clone(),
+        FormRow::Ssl => if f.ssl { "y" } else { "n" }.to_string(),
+        FormRow::SshEnabled => if f.ssh_enabled { "y" } else { "n" }.to_string(),
+        FormRow::SshHost => f.ssh_host.clone(),
+        FormRow::SshPort => f.ssh_port.clone(),
+        FormRow::SshUser => f.ssh_user.clone(),
+        FormRow::SshAuth => f.ssh_auth.as_str().to_string(),
+        FormRow::SshPassword => "*".repeat(f.ssh_password.chars().count()),
+        FormRow::SshKeyPath => f.ssh_key_path.clone(),
+        FormRow::SshKeyPassphrase => "*".repeat(f.ssh_key_passphrase.chars().count()),
+        FormRow::SshAgentSock => f.ssh_agent_sock.clone(),
+        FormRow::Save => {
+            if f.edit_id.is_some() {
+                t("↵ 更新连接").to_string()
+            } else {
+                t("↵ 保存连接").to_string()
+            }
+        }
+    }
+}
+
 fn render_form(f: &mut Frame, area: Rect, app: &mut App) {
-    let form = app.form.clone();    let box_w = if app.layout_mode == LayoutMode::Narrow {
+    let form = app.form.clone();
+    let rows = form_rows(&form);
+    let box_w = if app.layout_mode == LayoutMode::Narrow {
         area.width.saturating_sub(2)
     } else {
         52.min(area.width.saturating_sub(4))
     };
-    let box_h = (form_fields().len() as u16 + 6).min(area.height.saturating_sub(2));
-    let x = area.x + (area.width.saturating_sub(box_w)) / 2;
-    let y = area.y + (area.height.saturating_sub(box_h)) / 2;
+    // Two lines are reserved below the fields for the error / type hint.
+    let reserved: u16 = 2;
+    let want_h = (rows.len() as u16).saturating_add(reserved + 2);
+    let box_h = want_h
+        .min(area.height.saturating_sub(2))
+        .max(3.min(area.height));
+    let x = area.x + area.width.saturating_sub(box_w) / 2;
+    let y = area.y + area.height.saturating_sub(box_h) / 2;
     let box_area = Rect {
         x,
         y,
@@ -14023,54 +14642,77 @@ fn render_form(f: &mut Frame, area: Rect, app: &mut App) {
         height: box_h,
     };
 
+    let inner_h = box_h.saturating_sub(2);
+    let visible = inner_h.saturating_sub(reserved).max(1) as usize;
+    let active = form.field.min(rows.len().saturating_sub(1));
+    let mut scroll = form.scroll.min(rows.len().saturating_sub(visible));
+    if active < scroll {
+        scroll = active;
+    }
+    if active >= scroll + visible {
+        scroll = active + 1 - visible;
+    }
+    app.form.scroll = scroll;
+
     let mut lines: Vec<Line> = Vec::new();
-    let vals = [
-        form.name.clone(),
-        form.db_type.clone(),
-        form.host.clone(),
-        form.port.clone(),
-        form.username.clone(),
-        "*".repeat(form.password.chars().count()),
-        form.database.clone(),
-        if form.ssl { "y".into() } else { "n".into() },
-        String::new(),
-    ];
-    for (i, label) in form_fields().iter().enumerate() {
-        let active = i == form.field;
-        let value = if i == 8 {
-            t("↵ 保存连接").to_string()
-        } else if form.editing && active {
-            format!("{}▏",  vals[i])
-        } else {
-            vals[i].clone()
-        };
-        let marker = if active { "▸ " } else { "  " };
-        let style = if active {
-            Style::default()
-                .fg(Color::Green)
-                .add_modifier(Modifier::BOLD)
+    let end = (scroll + visible).min(rows.len());
+    for (i, (row, label)) in rows.iter().enumerate().take(end).skip(scroll) {
+        let (row, label) = (*row, *label);
+        let is_active = i == active;
+        let mut value = form_row_value(&form, row);
+        if form.editing && is_active {
+            value.push('▏');
+        }
+        let marker = if is_active { "▸ " } else { "  " };
+        let style = if is_active {
+            Style::default().fg(Color::Green).add_modifier(Modifier::BOLD)
         } else {
             Style::default()
         };
         lines.push(Line::from(Span::styled(
-            format!("{marker}{label:10} {value}"),
+            format!("{marker}{label:16} {value}"),
             style,
         )));
+        // The kernel forwards the tunnel to the connection's own host:port —
+        // there is no separate remote-target field in TransportLayerConfig, so
+        // it is shown (and overridden by editing host/port above).
+        if row == FormRow::SshAuth && form.ssh_enabled {
+            let target_port = if form.port.trim().is_empty() {
+                "?".to_string()
+            } else {
+                form.port.trim().to_string()
+            };
+            lines.push(Line::from(Span::styled(
+                format!(
+                    "  {:<16} {}:{}",
+                    t("远端目标"),
+                    form.host.trim(),
+                    target_port
+                ),
+                Style::default().fg(Color::DarkGray),
+            )));
+        }
     }
     if !form.err.is_empty() {
         lines.push(Line::from(Span::styled(
-            format!("✗ {}",  form.err),
+            format!("✗ {}", form.err),
             Style::default().fg(Color::Red),
         )));
+    } else {
+        lines.push(Line::from(Span::styled(
+            "types: mysql postgres sqlite redis mongodb clickhouse sqlserver …",
+            Style::default().fg(Color::DarkGray),
+        )));
     }
-    lines.push(Line::from(Span::styled(
-        "types: mysql postgres sqlite redis mongodb clickhouse sqlserver …",
-        Style::default().fg(Color::DarkGray),
-    )));
 
+    let title = if form.edit_id.is_some() {
+        t(" 编辑连接 ")
+    } else {
+        t(" 新建连接 ")
+    };
     let block = Block::default()
         .borders(Borders::ALL)
-        .title(t(" 新建连接 "))
+        .title(title)
         .border_set(border::ROUNDED)
         .border_style(Style::default().fg(Color::Green));
     f.render_widget(Clear, box_area);
@@ -15042,8 +15684,18 @@ const HELP_ROWS: &[(&str, &str)] = &[
     ("— 连接选择 —", ""),
     ("↑ ↓ / Enter", "选择 / 连接"),
     ("c", "新建连接"),
+    ("e", "编辑选中连接（含 SSH 隧道，预填表单）"),
     ("p", "复制连接（预填表单）"),
     ("q", "折叠 / 展开连接列表"),
+    ("— 连接表单 —", ""),
+    ("↑ ↓ / Tab", "切换字段（开启 ssh_tunnel 后自动展开 SSH 段）"),
+    ("Enter", "编辑字段 / 切换开关 / 保存连接"),
+    ("Space", "切换 ssh_tunnel / ssl / 登录方式"),
+    ("ssh_tunnel", "开启 SSH 跳板隧道（ssh_host / ssh_port / ssh_user / 登录方式）"),
+    ("登录方式", "password / key（密钥路径 + 口令）/ agent（SSH_AUTH_SOCK）"),
+    ("远端目标", "隧道转发目标 = 连接的 host:port（改 host / port 即改目标）"),
+    ("~/.ssh/config", "ssh_host 可填别名；ProxyJump 自动展开为多跳"),
+    ("SSH 主机密钥", "首次连接弹出指纹确认（y 接受并记住 / s 仅本次 / n 拒绝）"),
     ("— 侧栏 —", ""),
     ("↑ ↓", "移动表列表"),
     ("/", "过滤表名（输入即筛选，Enter 保留，Esc 清除）"),
@@ -15249,6 +15901,104 @@ fn render_confirm(f: &mut Frame, area: Rect, confirm: &Confirm) {
         ))
         .border_set(border::THICK)
         .border_style(Style::default().fg(Color::Red));
+    f.render_widget(Paragraph::new(lines).block(block), box_area);
+}
+
+/// The blocking SSH prompt dialog (host-key TOFU / keyboard-interactive).
+fn render_ssh_prompt(f: &mut Frame, area: Rect, app: &mut App) {
+    let Some(state) = app.ssh_prompt.as_ref() else {
+        return;
+    };
+    let w = {
+        let avail = area.width.saturating_sub(4);
+        if avail < 30 {
+            area.width
+        } else {
+            avail.min(76)
+        }
+    };
+    let req = &state.request;
+    let mut lines: Vec<Line> = Vec::new();
+    let (title, color) = match req.kind {
+        SshPromptKind::HostKeyVerify => (t(" SSH 主机密钥确认 "), Color::Cyan),
+        SshPromptKind::HostKeyChanged => (t(" ⚠ SSH 主机密钥已变化 "), Color::Red),
+        SshPromptKind::SecretInput => (t(" SSH 需要验证 "), Color::Cyan),
+        SshPromptKind::WorkerUploadConsent => (t(" SSH 请求确认 "), Color::Cyan),
+    };
+    lines.push(Line::from(Span::styled(
+        tf("主机 {}:{}", &[&(req.host), &(req.port)]),
+        Style::default().add_modifier(Modifier::BOLD),
+    )));
+    match req.kind {
+        SshPromptKind::HostKeyVerify | SshPromptKind::HostKeyChanged => {
+            if let Some(kt) = req.key_type.as_deref() {
+                lines.push(Line::from(tf("密钥类型 {}", &[&(kt)])));
+            }
+            if let Some(fp) = req.fingerprint.as_deref() {
+                lines.push(Line::from(Span::styled(
+                    tf("指纹 {}", &[&(fp)]),
+                    Style::default().fg(Color::Yellow),
+                )));
+            }
+            if let Some(prev) = req.previous_fingerprint.as_deref() {
+                lines.push(Line::from(Span::styled(
+                    tf("原指纹 {}", &[&(prev)]),
+                    Style::default().fg(Color::Red),
+                )));
+            }
+            lines.push(Line::from(""));
+            lines.push(Line::from(Span::styled(
+                t("核对该指纹后再继续；仅在你确认这是目标主机时才接受"),
+                Style::default().fg(Color::DarkGray),
+            )));
+            lines.push(Line::from(Span::styled(
+                t("y/Enter 接受并记住 · s 仅本次会话 · n/Esc 拒绝"),
+                Style::default().fg(Color::Yellow),
+            )));
+        }
+        SshPromptKind::SecretInput => {
+            if let Some(prompt) = req.prompt.as_deref() {
+                for l in prompt.lines() {
+                    lines.push(Line::from(l.to_string()));
+                }
+            }
+            let shown = if req.echo {
+                state.input.clone()
+            } else {
+                "*".repeat(state.input.chars().count())
+            };
+            lines.push(Line::from(""));
+            lines.push(Line::from(Span::styled(
+                format!("> {shown}▏"),
+                Style::default()
+                    .fg(Color::Green)
+                    .add_modifier(Modifier::BOLD),
+            )));
+            lines.push(Line::from(Span::styled(
+                t("Enter 提交 · Esc 取消"),
+                Style::default().fg(Color::Yellow),
+            )));
+        }
+        SshPromptKind::WorkerUploadConsent => {
+            lines.push(Line::from(
+                req.prompt.clone().unwrap_or_default(),
+            ));
+            lines.push(Line::from(Span::styled(
+                t("Enter/y 允许 · Esc/n 取消"),
+                Style::default().fg(Color::Yellow),
+            )));
+        }
+    }
+    let h = (lines.len() as u16 + 2)
+        .min(area.height)
+        .max(3.min(area.height));
+    let box_area = centered_overlay(area, w, h);
+    f.render_widget(Clear, box_area);
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .title(Span::styled(title, Style::default().fg(color).add_modifier(Modifier::BOLD)))
+        .border_set(border::THICK)
+        .border_style(Style::default().fg(color));
     f.render_widget(Paragraph::new(lines).block(block), box_area);
 }
 
@@ -15945,6 +16695,7 @@ mod tests {
             app.redis_prompt = None;
             app.mongo_dialog = None;
             app.confirm = None;
+            app.ssh_prompt = None;
             app.edit_dialog = None;
             app.completion = None;
             app.cell_popup = None;
@@ -16135,6 +16886,39 @@ mod tests {
             ("table-prompt", Box::new(|a| a.table_prompt = Some(TextArea::default()))),
             ("result-filter", Box::new(|a| a.result_filter = Some(TextArea::default()))),
             ("filter-prompt", Box::new(|a| a.filter_prompt = Some(TextArea::default()))),
+            (
+                "ssh-hostkey",
+                Box::new(|a| {
+                    let (tx, _rx) = tokio::sync::oneshot::channel();
+                    a.ssh_prompt = Some(SshPromptState {
+                        request: ssh_prompt::host_key_changed_request(
+                            "jump.example.com",
+                            22,
+                            Some("ssh-ed25519".into()),
+                            Some("SHA256:new".into()),
+                            Some("SHA256:old".into()),
+                        ),
+                        responder: Some(tx),
+                        input: String::new(),
+                    });
+                }),
+            ),
+            (
+                "ssh-secret",
+                Box::new(|a| {
+                    let (tx, _rx) = tokio::sync::oneshot::channel();
+                    a.ssh_prompt = Some(SshPromptState {
+                        request: ssh_prompt::secret_input_request(
+                            "jump.example.com",
+                            22,
+                            "Verification code".into(),
+                            false,
+                        ),
+                        responder: Some(tx),
+                        input: "123456".into(),
+                    });
+                }),
+            ),
         ];
 
         for (name, set) in &cases {
@@ -16156,6 +16940,45 @@ mod tests {
         for (w, h) in [(40u16, 12u16), (250, 70), (20, 6), (1, 1)] {
             draw(&mut app, w, h);
         }
+    }
+
+    /// The SSH-expanded form must render (and scroll) at phone and desktop sizes
+    /// for every auth method, with the forward target shown and the save row
+    /// reachable by moving the cursor.
+    #[test]
+    fn ssh_form_renders_and_scrolls_at_extreme_sizes() {
+        let mut app = test_app();
+        app.page = Page::NewConn;
+        app.form = password_ssh_form();
+        for auth in [SshAuth::Password, SshAuth::Key, SshAuth::Agent] {
+            app.form.ssh_auth = auth;
+            for (w, h) in [(40u16, 12u16), (30, 20), (80, 24), (20, 6), (1, 1)] {
+                draw(&mut app, w, h);
+            }
+        }
+        // With the cursor on the auth row the SSH section (and forward target)
+        // shows. A tall-enough terminal is needed for the row to be on screen.
+        app.form.ssh_auth = SshAuth::Password;
+        let auth_idx = form_rows(&app.form)
+            .iter()
+            .position(|(r, _)| *r == FormRow::SshAuth)
+            .unwrap();
+        app.form.field = auth_idx;
+        app.form.scroll = 0;
+        let top = draw(&mut app, 60, 24).join("\n");
+        let flat_top: String = top.chars().filter(|c| !c.is_whitespace()).collect();
+        assert!(
+            flat_top.contains("10.0.0.5:3306"),
+            "forward target missing:\n{top}"
+        );
+        // Moving to the last row scrolls the save button into view.
+        app.form.field = form_rows(&app.form).len() - 1;
+        let bottom = draw(&mut app, 60, 14).join("\n");
+        let flat_bottom: String = bottom.chars().filter(|c| !c.is_whitespace()).collect();
+        assert!(
+            flat_bottom.contains("保存连接"),
+            "save row not scrolled into view:\n{bottom}"
+        );
     }
 
     /// `y` in a Redis / Mongo grid must copy the focused row even when a result
@@ -19023,5 +19846,484 @@ mod tests {
         assert!(!diff.iter().any(|l| l.contains("age")), "unchanged fields are omitted");
         assert!(!diff.iter().any(|l| l.contains("_id")), "_id is never part of the diff");
         assert!(mongo_doc_diff(&old, &old, 10).is_empty());
+    }
+
+    // ── R27: SSH tunnel ──
+
+    fn password_ssh_form() -> ConnForm {
+        ConnForm {
+            name: "prod".into(),
+            host: "10.0.0.5".into(),
+            port: "3306".into(),
+            ssh_enabled: true,
+            ssh_host: "jump.example.com".into(),
+            ssh_port: "2222".into(),
+            ssh_user: "ops".into(),
+            ssh_auth: SshAuth::Password,
+            ssh_password: "s3cret".into(),
+            ..ConnForm::default()
+        }
+    }
+
+    /// The serialized layer must match the kernel's `TransportLayerConfig`
+    /// shape exactly (`{"type":"ssh", …}`) so the desktop can read it back.
+    #[test]
+    fn ssh_layer_serializes_to_the_kernel_shape() {
+        let layer = build_ssh_layer(&password_ssh_form()).unwrap().unwrap();
+        let v = serde_json::to_value(TransportLayerConfig::Ssh(layer)).unwrap();
+        assert_eq!(v["type"], "ssh");
+        assert_eq!(v["enabled"], true);
+        assert_eq!(v["host"], "jump.example.com");
+        assert_eq!(v["port"], 2222);
+        assert_eq!(v["user"], "ops");
+        assert_eq!(v["password"], "s3cret");
+        assert_eq!(v["auth_method"], "password");
+        assert_eq!(v["key_path"], "");
+        assert_eq!(v["use_ssh_agent"], false);
+        // Kernel defaults: 5 s connect timeout, no LAN exposure.
+        assert_eq!(v["connect_timeout_secs"], 5);
+        assert_eq!(v["expose_lan"], false);
+        // Empty / false optional fields are skipped, matching the desktop writer.
+        assert!(v.get("profile_id").is_none());
+        assert!(v.get("allow_exec_channel_proxy").is_none());
+    }
+
+    #[test]
+    fn ssh_auth_method_maps_key_and_agent() {
+        let mut f = password_ssh_form();
+        f.ssh_auth = SshAuth::Key;
+        f.ssh_key_path = "~/.ssh/id_ed25519".into();
+        f.ssh_key_passphrase = "pp".into();
+        let layer = build_ssh_layer(&f).unwrap().unwrap();
+        assert_eq!(layer.auth_method, "key");
+        assert_eq!(layer.key_path, "~/.ssh/id_ed25519");
+        assert_eq!(layer.key_passphrase, "pp");
+        assert!(layer.password.is_empty(), "key auth must not carry a password");
+        assert!(!layer.use_ssh_agent);
+
+        f.ssh_auth = SshAuth::Agent;
+        f.ssh_agent_sock = "~/.ssh/agent.sock".into();
+        let layer = build_ssh_layer(&f).unwrap().unwrap();
+        assert_eq!(layer.auth_method, "agent");
+        assert!(layer.use_ssh_agent);
+        assert_eq!(layer.ssh_agent_sock_path, "~/.ssh/agent.sock");
+        assert!(layer.key_path.is_empty() && layer.password.is_empty());
+    }
+
+    #[test]
+    fn ssh_form_validation_requires_host_user_and_credential() {
+        let mut f = ConnForm {
+            ssh_enabled: true,
+            ..ConnForm::default()
+        };
+        assert!(build_ssh_layer(&f).is_err(), "host is required");
+        f.ssh_host = "jump".into();
+        assert!(build_ssh_layer(&f).is_err(), "user is required");
+        f.ssh_user = "ops".into();
+        assert!(build_ssh_layer(&f).is_err(), "password auth needs a password");
+        f.ssh_password = "pw".into();
+        assert!(build_ssh_layer(&f).unwrap().is_some());
+        // Port defaults to 22 when blank; a disabled tunnel yields no layer.
+        f.ssh_port = String::new();
+        assert_eq!(build_ssh_layer(&f).unwrap().unwrap().port, 22);
+        f.ssh_enabled = false;
+        assert!(build_ssh_layer(&f).unwrap().is_none());
+    }
+
+    /// A `~/.ssh/config` alias is stored verbatim — the kernel resolves it
+    /// (including `ProxyJump`) at connect time, not the TUI.
+    #[test]
+    fn ssh_alias_host_is_stored_verbatim() {
+        let mut f = password_ssh_form();
+        f.ssh_host = "prod-bastion".into();
+        assert_eq!(build_ssh_layer(&f).unwrap().unwrap().host, "prod-bastion");
+    }
+
+    /// A saved tunnel must survive a JSON round-trip through the connection
+    /// config (the desktop's storage format) and prefill the edit form.
+    #[test]
+    fn ssh_tunnel_round_trips_and_prefills_the_form() {
+        let mut cfg = test_conn("mysql");
+        cfg.host = "db.internal".into();
+        cfg.port = 3306;
+        cfg.transport_layers = vec![TransportLayerConfig::Ssh(SshTunnelConfig {
+            id: "layer-1".into(),
+            name: "bastion".into(),
+            enabled: true,
+            host: "jump".into(),
+            port: 22,
+            user: "ops".into(),
+            password: "pw".into(),
+            key_path: String::new(),
+            key_passphrase: String::new(),
+            connect_timeout_secs: 5,
+            expose_lan: false,
+            use_ssh_agent: false,
+            ssh_agent_sock_path: String::new(),
+            auth_method: "password".into(),
+            allow_exec_channel_proxy: false,
+            profile_id: String::new(),
+        })];
+        let json = serde_json::to_string(&cfg).unwrap();
+        let back: ConnectionConfig = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.transport_layers, cfg.transport_layers);
+
+        let form = form_from_connection(&back, back.name.clone(), Some(back.id.clone()));
+        assert!(form.ssh_enabled);
+        assert_eq!(form.ssh_host, "jump");
+        assert_eq!(form.ssh_port, "22");
+        assert_eq!(form.ssh_user, "ops");
+        assert_eq!(form.ssh_auth, SshAuth::Password);
+        assert_eq!(form.ssh_password, "pw");
+        assert_eq!(form.edit_id.as_deref(), Some("id-mysql"));
+        // Rebuilding from the prefilled form keeps the tunnel usable.
+        let rebuilt = build_ssh_layer(&form).unwrap().unwrap();
+        assert_eq!(rebuilt.host, "jump");
+        assert_eq!(rebuilt.auth_method, "password");
+    }
+
+    /// A legacy layer with an empty `auth_method` is inferred from which
+    /// credential field is populated.
+    #[test]
+    fn ssh_auth_infers_from_legacy_layer_fields() {
+        let mut layer = SshTunnelConfig {
+            id: String::new(),
+            name: String::new(),
+            enabled: true,
+            host: "jump".into(),
+            port: 22,
+            user: "ops".into(),
+            password: String::new(),
+            key_path: "~/.ssh/id_rsa".into(),
+            key_passphrase: String::new(),
+            connect_timeout_secs: 5,
+            expose_lan: false,
+            use_ssh_agent: false,
+            ssh_agent_sock_path: String::new(),
+            auth_method: String::new(),
+            allow_exec_channel_proxy: false,
+            profile_id: String::new(),
+        };
+        assert_eq!(SshAuth::from_layer(&layer), SshAuth::Key);
+        layer.key_path.clear();
+        layer.use_ssh_agent = true;
+        assert_eq!(SshAuth::from_layer(&layer), SshAuth::Agent);
+        layer.use_ssh_agent = false;
+        layer.password = "pw".into();
+        assert_eq!(SshAuth::from_layer(&layer), SshAuth::Password);
+    }
+
+    #[test]
+    fn ssh_error_classification_distinguishes_categories() {
+        assert!(classify_ssh_auth_error(
+            "SSH password auth failed: rejected (remaining_methods=...)"
+        ));
+        assert!(classify_ssh_auth_error(
+            "SSH authentication failed: both key and password were rejected"
+        ));
+        assert!(classify_ssh_auth_error(
+            "No SSH password or key provided, and ssh-agent has no identities"
+        ));
+        assert!(!classify_ssh_auth_error(
+            "SSH connection failed: Connection refused (os error 111)"
+        ));
+        assert!(classify_ssh_host_error(
+            "SSH connection failed: Connection refused (os error 111)"
+        ));
+        assert!(classify_ssh_host_error("SSH connection timed out (5s)"));
+        assert!(!classify_ssh_host_error(
+            "SSH password auth failed: rejected (remaining_methods=...)"
+        ));
+        // A post-handshake driver teardown means the far-side port is closed…
+        assert!(classify_ssh_remote_error(
+            "MySQL connection failed: Input/output error: connection closed"
+        ));
+        assert!(classify_ssh_remote_error("unexpected EOF"));
+        // …but an SSH handshake failure is never a remote-database problem.
+        assert!(!classify_ssh_remote_error(
+            "SSH connection failed: Connection reset by peer (os error 104)"
+        ));
+        assert!(!classify_ssh_remote_error(
+            "SSH authentication failed: both key and password were rejected"
+        ));
+    }
+
+    #[test]
+    fn form_rows_expand_with_ssh_and_auth_method() {
+        let mut f = ConnForm::default();
+        let base = form_rows(&f);
+        assert!(base.iter().any(|(r, _)| *r == FormRow::SshEnabled));
+        assert!(!base.iter().any(|(r, _)| *r == FormRow::SshHost));
+        assert_eq!(base.last().map(|(r, _)| *r), Some(FormRow::Save));
+
+        f.ssh_enabled = true;
+        let password = form_rows(&f);
+        assert!(password.iter().any(|(r, _)| *r == FormRow::SshHost));
+        assert!(password.iter().any(|(r, _)| *r == FormRow::SshPassword));
+        assert!(!password.iter().any(|(r, _)| *r == FormRow::SshKeyPath));
+
+        f.ssh_auth = SshAuth::Key;
+        let key = form_rows(&f);
+        assert!(key.iter().any(|(r, _)| *r == FormRow::SshKeyPath));
+        assert!(key.iter().any(|(r, _)| *r == FormRow::SshKeyPassphrase));
+        assert!(!key.iter().any(|(r, _)| *r == FormRow::SshPassword));
+
+        f.ssh_auth = SshAuth::Agent;
+        let agent = form_rows(&f);
+        assert!(agent.iter().any(|(r, _)| *r == FormRow::SshAgentSock));
+        assert_eq!(agent.last().map(|(r, _)| *r), Some(FormRow::Save));
+    }
+
+    #[test]
+    fn ssh_host_key_prompt_answers_and_resumes_the_handshake() {
+        let mut app = test_app();
+        let (tx, mut rx) = tokio::sync::oneshot::channel();
+        app.ssh_prompt = Some(SshPromptState {
+            request: ssh_prompt::host_key_verify_request(
+                "jump",
+                22,
+                Some("ssh-ed25519".into()),
+                Some("SHA256:abc".into()),
+            ),
+            responder: Some(tx),
+            input: String::new(),
+        });
+        ssh_prompt_key(&mut app, KeyEvent::new(KeyCode::Char('y'), KeyModifiers::NONE));
+        assert!(app.ssh_prompt.is_none());
+        assert!(matches!(
+            rx.try_recv(),
+            Ok(SshPromptAnswer::Accept { remember: true })
+        ));
+
+        let (tx, mut rx) = tokio::sync::oneshot::channel();
+        app.ssh_prompt = Some(SshPromptState {
+            request: ssh_prompt::host_key_verify_request("jump", 22, None, None),
+            responder: Some(tx),
+            input: String::new(),
+        });
+        ssh_prompt_key(&mut app, KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+        assert!(matches!(rx.try_recv(), Ok(SshPromptAnswer::Reject)));
+    }
+
+    #[test]
+    fn ssh_secret_prompt_collects_typed_input() {
+        let mut app = test_app();
+        let (tx, mut rx) = tokio::sync::oneshot::channel();
+        app.ssh_prompt = Some(SshPromptState {
+            request: ssh_prompt::secret_input_request("jump", 22, "code".into(), false),
+            responder: Some(tx),
+            input: String::new(),
+        });
+        for c in "123456".chars() {
+            ssh_prompt_key(&mut app, KeyEvent::new(KeyCode::Char(c), KeyModifiers::NONE));
+        }
+        ssh_prompt_key(&mut app, KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        assert!(matches!(rx.try_recv(), Ok(SshPromptAnswer::Secret(s)) if s == "123456"));
+    }
+
+    /// The SSH prompt is modal and must swallow keys before the page handler.
+    #[test]
+    fn ssh_prompt_is_modal() {
+        let mut app = test_app();
+        app.page = Page::Browse;
+        let (tx, _rx) = tokio::sync::oneshot::channel();
+        app.ssh_prompt = Some(SshPromptState {
+            request: ssh_prompt::host_key_verify_request("jump", 22, None, None),
+            responder: Some(tx),
+            input: String::new(),
+        });
+        let (otx, _orx) = tokio::sync::mpsc::unbounded_channel::<OpResult>();
+        // `q` would normally toggle the connection list; while the prompt is up
+        // it must be ignored (the prompt only answers y/s/n/Esc).
+        key(&mut app, &otx, KeyEvent::new(KeyCode::Char('q'), KeyModifiers::NONE));
+        assert!(app.ssh_prompt.is_some());
+    }
+
+    /// Real end-to-end tunnel: dbxt → local sshd (jump host) → MySQL on
+    /// 127.0.0.1. Gated on `DBXT_SSH_TEST=1` because it needs a reachable sshd
+    /// and a MySQL server; the two auth methods are both exercised.
+    ///
+    /// Env: `DBXT_SSH_TEST_USER` (dbxtjump), `DBXT_SSH_TEST_PASSWORD`,
+    /// `DBXT_SSH_TEST_KEY` (key file), `DBXT_SSH_TEST_MYSQL_PORT` (13306),
+    /// `DBXT_SSH_TEST_MYSQL_USER` (root), `DBXT_SSH_TEST_MYSQL_PASSWORD`.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn ssh_tunnel_end_to_end_through_local_jump_host() {
+        if std::env::var("DBXT_SSH_TEST").ok().as_deref() != Some("1") {
+            eprintln!("skipping ssh_tunnel_end_to_end: set DBXT_SSH_TEST=1 (needs a local sshd + MySQL)");
+            return;
+        }
+        let ssh_user = std::env::var("DBXT_SSH_TEST_USER").unwrap_or_else(|_| "dbxtjump".into());
+        let ssh_password =
+            std::env::var("DBXT_SSH_TEST_PASSWORD").unwrap_or_else(|_| "dbxt-jump-Pw1".into());
+        let ssh_key =
+            std::env::var("DBXT_SSH_TEST_KEY").unwrap_or_else(|_| "/tmp/dbxt-ssh-test/id_ed25519".into());
+        let mysql_port: u16 = std::env::var("DBXT_SSH_TEST_MYSQL_PORT")
+            .ok()
+            .and_then(|p| p.parse().ok())
+            .unwrap_or(13306);
+        let mysql_user = std::env::var("DBXT_SSH_TEST_MYSQL_USER").unwrap_or_else(|_| "root".into());
+        let mysql_password =
+            std::env::var("DBXT_SSH_TEST_MYSQL_PASSWORD").unwrap_or_else(|_| "dbxt-test".into());
+
+        // Auto-accept the host key so the test also exercises the gateway path
+        // (the kernel fails closed when no gateway is installed).
+        let (prompt_tx, mut prompt_rx) = tokio::sync::mpsc::channel::<SshPromptEnvelope>(4);
+        ssh_prompt::install_ssh_prompt_gateway(prompt_tx);
+        tokio::spawn(async move {
+            while let Some(env) = prompt_rx.recv().await {
+                let answer = match env.request.kind {
+                    SshPromptKind::HostKeyVerify | SshPromptKind::HostKeyChanged => {
+                        SshPromptAnswer::Accept { remember: true }
+                    }
+                    _ => SshPromptAnswer::Reject,
+                };
+                let _ = env.responder.send(answer);
+            }
+        });
+
+        let dir = std::env::temp_dir().join(format!("dbxt-ssh-e2e-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let backend = LocalBackend::open(&dir.join("dbx.db")).await.unwrap();
+
+        for auth in [SshAuth::Key, SshAuth::Password] {
+            let mut cfg = new_connection_config(
+                format!("ssh-e2e-{}", auth.as_str()),
+                format!("ssh-e2e-{}", auth.as_str()),
+                parse_database_type("mysql").unwrap(),
+                "127.0.0.1".into(),
+                mysql_port,
+                mysql_user.clone(),
+                mysql_password.clone(),
+                Some("shop".into()),
+                false,
+                None,
+            )
+            .unwrap();
+            cfg.transport_layers = vec![TransportLayerConfig::Ssh(SshTunnelConfig {
+                id: format!("layer-{}", auth.as_str()),
+                name: "local-jump".into(),
+                enabled: true,
+                host: "127.0.0.1".into(),
+                port: 22,
+                user: ssh_user.clone(),
+                password: if auth == SshAuth::Password { ssh_password.clone() } else { String::new() },
+                key_path: if auth == SshAuth::Key { ssh_key.clone() } else { String::new() },
+                key_passphrase: String::new(),
+                connect_timeout_secs: 5,
+                expose_lan: false,
+                use_ssh_agent: false,
+                ssh_agent_sock_path: String::new(),
+                auth_method: auth.as_str().to_string(),
+                allow_exec_channel_proxy: false,
+                profile_id: String::new(),
+            })];
+            // The kernel resolves the tunnel through the connection's cached
+            // config, so persist it first (as the TUI's save flow does).
+            backend.add_connection_for_mcp(cfg.clone()).await.unwrap();
+            let dbs = backend.list_databases(&cfg).await;
+            assert!(dbs.is_ok(), "{} auth failed through the tunnel: {:?}", auth.as_str(), dbs);
+            let dbs = dbs.unwrap();
+            assert!(
+                dbs.iter().any(|d| d == "shop"),
+                "{} auth: expected the `shop` database, got {dbs:?}",
+                auth.as_str()
+            );
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The three SSH failure categories must be told apart from the raw error:
+    /// authentication, jump host unreachable, and remote database unreachable.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn ssh_tunnel_error_paths_are_classified() {
+        if std::env::var("DBXT_SSH_TEST").ok().as_deref() != Some("1") {
+            eprintln!("skipping ssh_tunnel_error_paths: set DBXT_SSH_TEST=1 (needs a local sshd + MySQL)");
+            return;
+        }
+        let ssh_user = std::env::var("DBXT_SSH_TEST_USER").unwrap_or_else(|_| "dbxtjump".into());
+        let ssh_password =
+            std::env::var("DBXT_SSH_TEST_PASSWORD").unwrap_or_else(|_| "dbxt-jump-Pw1".into());
+        let mysql_port: u16 = std::env::var("DBXT_SSH_TEST_MYSQL_PORT")
+            .ok()
+            .and_then(|p| p.parse().ok())
+            .unwrap_or(13306);
+
+        let (prompt_tx, mut prompt_rx) = tokio::sync::mpsc::channel::<SshPromptEnvelope>(4);
+        ssh_prompt::install_ssh_prompt_gateway(prompt_tx);
+        tokio::spawn(async move {
+            while let Some(env) = prompt_rx.recv().await {
+                let answer = match env.request.kind {
+                    SshPromptKind::HostKeyVerify | SshPromptKind::HostKeyChanged => {
+                        SshPromptAnswer::Accept { remember: true }
+                    }
+                    _ => SshPromptAnswer::Reject,
+                };
+                let _ = env.responder.send(answer);
+            }
+        });
+
+        let dir = std::env::temp_dir().join(format!("dbxt-ssh-err-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let backend = LocalBackend::open(&dir.join("dbx.db")).await.unwrap();
+
+        let mk = |id: &str, ssh_port: u16, db_port: u16, ssh_pw: &str| -> ConnectionConfig {
+            let mut cfg = new_connection_config(
+                id.into(),
+                id.into(),
+                parse_database_type("mysql").unwrap(),
+                "127.0.0.1".into(),
+                db_port,
+                "root".into(),
+                "dbxt-test".into(),
+                None,
+                false,
+                None,
+            )
+            .unwrap();
+            cfg.transport_layers = vec![TransportLayerConfig::Ssh(SshTunnelConfig {
+                id: format!("layer-{id}"),
+                name: "local-jump".into(),
+                enabled: true,
+                host: "127.0.0.1".into(),
+                port: ssh_port,
+                user: ssh_user.clone(),
+                password: ssh_pw.into(),
+                key_path: String::new(),
+                key_passphrase: String::new(),
+                connect_timeout_secs: 5,
+                expose_lan: false,
+                use_ssh_agent: false,
+                ssh_agent_sock_path: String::new(),
+                auth_method: "password".into(),
+                allow_exec_channel_proxy: false,
+                profile_id: String::new(),
+            })];
+            cfg
+        };
+
+        // 1. Wrong SSH password → authentication failure.
+        let bad_pw = mk("e2e-bad-pw", 22, mysql_port, "definitely-wrong");
+        backend.add_connection_for_mcp(bad_pw.clone()).await.unwrap();
+        let err = backend.list_databases(&bad_pw).await.unwrap_err();
+        assert!(classify_ssh_auth_error(&err), "raw: {err}");
+        let msg = ssh_connect_error_message(&bad_pw, &err);
+        assert!(msg.contains("SSH 认证失败"), "{msg}");
+
+        // 2. Wrong SSH port → jump host unreachable.
+        let bad_host = mk("e2e-bad-host", 2223, mysql_port, &ssh_password);
+        backend.add_connection_for_mcp(bad_host.clone()).await.unwrap();
+        let err = backend.list_databases(&bad_host).await.unwrap_err();
+        assert!(classify_ssh_host_error(&err), "raw: {err}");
+        let msg = ssh_connect_error_message(&bad_host, &err);
+        assert!(msg.contains("SSH 主机不可达"), "{msg}");
+
+        // 3. Tunnel up, wrong DB port → remote database unreachable.
+        let bad_db = mk("e2e-bad-db", 22, 13399, &ssh_password);
+        backend.add_connection_for_mcp(bad_db.clone()).await.unwrap();
+        let err = backend.list_databases(&bad_db).await.unwrap_err();
+        let msg = ssh_connect_error_message(&bad_db, &err);
+        assert!(msg.contains("远端数据库不可达"), "raw err: {err}; msg: {msg}");
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

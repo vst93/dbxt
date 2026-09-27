@@ -798,6 +798,46 @@ pub static ALL_KEYS: &[&str] = &[
     "加载 {} 数据…",
     "{} · schema {} · d 切换",
     "无法列举 schema（{}），按默认命名空间浏览",
+    // ── R27: SSH tunnel ──
+    "已更新: {} ({})",
+    "SSH 主机密钥待确认（y 接受 / n 拒绝）",
+    "SSH 主机密钥已变化，请确认",
+    "SSH 服务器要求额外验证",
+    "SSH 请求确认",
+    "SSH 连接 {}@{}:{} → {}…",
+    "无法列举数据库（{}）",
+    "SSH 认证失败（{}）：凭据被拒绝或不可用，请检查密码 / 密钥 / agent",
+    "SSH 主机不可达（{}）：无法建立连接，请检查地址 / 端口 / 网络",
+    "隧道已建立但远端数据库不可达（{} → {}:{}）：请确认跳板机能访问该地址",
+    "SSH 隧道连接失败（{}）：{}",
+    "⚠ SSH 主机密钥已变化（{}:{}），可能被中间人攻击",
+    "SSH 主机密钥被拒绝（{}:{}）",
+    "SSH 主机密钥已接受但无法保存（{}:{}）：仅本次会话信任",
+    "SSH 主机必填",
+    "SSH 用户必填",
+    "SSH 端口无效（1-65535）",
+    "SSH 密码为空（或改用密钥 / agent）",
+    "SSH 密钥路径必填",
+    "编辑连接 {} · Enter 保存",
+    "接受并记住",
+    "仅本次",
+    "拒绝",
+    "编辑/切换/保存",
+    "↵ 更新连接",
+    "远端目标",
+    " 编辑连接 ",
+    " SSH 主机密钥确认 ",
+    " ⚠ SSH 主机密钥已变化 ",
+    " SSH 需要验证 ",
+    " SSH 请求确认 ",
+    "主机 {}:{}",
+    "密钥类型 {}",
+    "指纹 {}",
+    "原指纹 {}",
+    "核对该指纹后再继续；仅在你确认这是目标主机时才接受",
+    "y/Enter 接受并记住 · s 仅本次会话 · n/Esc 拒绝",
+    "Enter 提交 · Esc 取消",
+    "Enter/y 允许 · Esc/n 取消",
 ];
 
 /// The Chinese → English table. Keys must match the source literals exactly.
@@ -1466,6 +1506,85 @@ fn en_of(zh: &'static str) -> Option<&'static str> {
         "{} · schema {} · d 切换" => Some("{} · schema {} · d to switch"),
         "无法列举 schema（{}），按默认命名空间浏览" => {
             Some("Cannot list schemas ({}); browsing the default namespace")
+        }
+        // ── R27: SSH tunnel ──
+        "已更新: {} ({})" => Some("Updated: {} ({})"),
+        "SSH 主机密钥待确认（y 接受 / n 拒绝）" => Some("SSH host key awaiting confirmation (y accept / n reject)"),
+        "SSH 主机密钥已变化，请确认" => Some("SSH host key changed — please confirm"),
+        "SSH 服务器要求额外验证" => Some("The SSH server requires additional verification"),
+        "SSH 请求确认" => Some("SSH requests confirmation"),
+        "SSH 连接 {}@{}:{} → {}…" => Some("SSH connect {}@{}:{} → {}…"),
+        "无法列举数据库（{}）" => Some("Cannot list databases ({})"),
+        "SSH 认证失败（{}）：凭据被拒绝或不可用，请检查密码 / 密钥 / agent" => {
+            Some("SSH authentication failed ({}): credentials rejected or unusable — check the password / key / agent")
+        }
+        "SSH 主机不可达（{}）：无法建立连接，请检查地址 / 端口 / 网络" => {
+            Some("SSH host unreachable ({}): cannot connect — check the address / port / network")
+        }
+        "隧道已建立但远端数据库不可达（{} → {}:{}）：请确认跳板机能访问该地址" => {
+            Some("Tunnel is up but the remote database is unreachable ({} → {}:{}): make sure the jump host can reach it")
+        }
+        "SSH 隧道连接失败（{}）：{}" => Some("SSH tunnel connection failed ({}): {}"),
+        "⚠ SSH 主机密钥已变化（{}:{}），可能被中间人攻击" => {
+            Some("⚠ SSH host key changed for {}:{} — possible man-in-the-middle")
+        }
+        "SSH 主机密钥被拒绝（{}:{}）" => Some("SSH host key rejected ({}:{})"),
+        "SSH 主机密钥已接受但无法保存（{}:{}）：仅本次会话信任" => {
+            Some("SSH host key accepted but could not be saved ({}:{}): trusted for this session only")
+        }
+        "SSH 主机必填" => Some("SSH host is required"),
+        "SSH 用户必填" => Some("SSH user is required"),
+        "SSH 端口无效（1-65535）" => Some("Invalid SSH port (1-65535)"),
+        "SSH 密码为空（或改用密钥 / agent）" => Some("SSH password is empty (or use a key / agent)"),
+        "SSH 密钥路径必填" => Some("SSH key path is required"),
+        "编辑连接 {} · Enter 保存" => Some("Edit connection {} · Enter to save"),
+        "接受并记住" => Some("accept & remember"),
+        "仅本次" => Some("this session"),
+        "拒绝" => Some("reject"),
+        "编辑/切换/保存" => Some("edit/toggle/save"),
+        "↵ 更新连接" => Some("↵ Update connection"),
+        "远端目标" => Some("remote target"),
+        " 编辑连接 " => Some(" Edit connection "),
+        " SSH 主机密钥确认 " => Some(" SSH host key verification "),
+        " ⚠ SSH 主机密钥已变化 " => Some(" ⚠ SSH host key changed "),
+        " SSH 需要验证 " => Some(" SSH verification required "),
+        " SSH 请求确认 " => Some(" SSH confirmation requested "),
+        "主机 {}:{}" => Some("Host {}:{}"),
+        "密钥类型 {}" => Some("Key type {}"),
+        "指纹 {}" => Some("Fingerprint {}"),
+        "原指纹 {}" => Some("Previous fingerprint {}"),
+        "核对该指纹后再继续；仅在你确认这是目标主机时才接受" => {
+            Some("Compare this fingerprint before continuing; accept only if you recognize the host")
+        }
+        "y/Enter 接受并记住 · s 仅本次会话 · n/Esc 拒绝" => {
+            Some("y/Enter accept & remember · s this session only · n/Esc reject")
+        }
+        "Enter 提交 · Esc 取消" => Some("Enter submit · Esc cancel"),
+        "Enter/y 允许 · Esc/n 取消" => Some("Enter/y allow · Esc/n cancel"),
+        // Help overlay: connection form / SSH tunnel.
+        "编辑选中连接（含 SSH 隧道，预填表单）" => Some("Edit the selected connection (incl. its SSH tunnel; form prefilled)"),
+        "— 连接表单 —" => Some("— Connection form —"),
+        "切换字段（开启 ssh_tunnel 后自动展开 SSH 段）" => {
+            Some("Move between fields (enabling ssh_tunnel expands the SSH section)")
+        }
+        "编辑字段 / 切换开关 / 保存连接" => Some("Edit field / toggle switch / save connection"),
+        "切换 ssh_tunnel / ssl / 登录方式" => Some("Toggle ssh_tunnel / ssl / login method"),
+        "开启 SSH 跳板隧道（ssh_host / ssh_port / ssh_user / 登录方式）" => {
+            Some("Enable an SSH jump-host tunnel (ssh_host / ssh_port / ssh_user / login method)")
+        }
+        "登录方式" => Some("Login method"),
+        "password / key（密钥路径 + 口令）/ agent（SSH_AUTH_SOCK）" => {
+            Some("password / key (key path + passphrase) / agent (SSH_AUTH_SOCK)")
+        }
+        "隧道转发目标 = 连接的 host:port（改 host / port 即改目标）" => {
+            Some("Tunnel forward target = the connection's host:port (edit host/port to change it)")
+        }
+        "ssh_host 可填别名；ProxyJump 自动展开为多跳" => {
+            Some("ssh_host accepts a ~/.ssh/config alias; ProxyJump expands into multiple hops")
+        }
+        "SSH 主机密钥" => Some("SSH host key"),
+        "首次连接弹出指纹确认（y 接受并记住 / s 仅本次 / n 拒绝）" => {
+            Some("First connect shows a fingerprint prompt (y accept & remember / s this session / n reject)")
         }
         _ => None,
     }

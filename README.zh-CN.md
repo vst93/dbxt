@@ -8,9 +8,17 @@
 
 **连接管理** —— 与 DBX 桌面端共享
 - 连接存放在 DBX 自己的 SQLite 存储（`dbx.db`）里，你在桌面端配置过的连接自动可见。
-- `c` 在 TUI 内新建连接，`p` 复制到表单，`Enter` 连接；连接按数据库家族着色。
+- `c` 在 TUI 内新建连接，`e` 编辑选中的连接（预填表单，含 SSH 隧道），`p` 复制到表单，`Enter` 连接；连接按数据库家族着色。
 - `d` 弹出切换层 —— MySQL 库、PostgreSQL（及其他支持 schema 的引擎）先 schema 后库、MongoDB 库、Redis 逻辑 db 同一套手势。
 - `o` 返回连接选择，`r` 原地刷新列表。
+
+**SSH 隧道（跳板机）**
+- 在 DBX 桌面端配好的带隧道连接在 dbxt 里直接可用：dbxt 把 `transport_layers` 原样透传给内核，无需重新录入。
+- 连接表单新增 `ssh_tunnel` 段：`ssh_host` / `ssh_port`（22）/ `ssh_user`，以及 `ssh_auth` 登录方式 —— `password`、`key`（密钥路径 + 口令）或 `agent`（SSH agent，可填 socket 路径）。
+- `ssh_host` 支持 `~/.ssh/config` **别名**；由内核解析，含 `ProxyJump`（自动展开为多跳）。
+- 隧道转发到连接自身的 `host:port`，表单以 `远端目标` 显示；需要改转发目标就改连接的 `host` / `port`。
+- 首次连接未知跳板机弹出主机密钥指纹确认（`y`/`Enter` 接受并记住，`s` 仅本次会话，`n`/`Esc` 拒绝）。已接受的密钥写入 DBX 自己的 `<存储目录>/known_hosts`；`~/.ssh/known_hosts` 只读不写。
+- 隧道失败按阶段明确报错：**SSH 认证失败**、**SSH 主机不可达**、**隧道已建立但远端数据库不可达** —— 密码错误、堡垒机地址错误、对端端口不通三者互不混淆。
 
 **SQL 编辑与结果**
 - 多行编辑器，shell 风格 `↑`/`↓` 历史（从 DBX 共享查询历史初始化）；`F5` / `Ctrl-J` 执行。
@@ -102,6 +110,8 @@ cargo install --git https://github.com/vst93/dbxt
 4. `e` 编辑单元格、`i` 插入、`Delete` 删除 —— 每次执行前展示完整 SQL。
 5. `F5` 执行编辑器 SQL；`?` 打开完整快捷键帮助。
 
+数据库在堡垒机后面时：按 `c`，把 `ssh_tunnel` 设为 `y`，填写 `ssh_host` / `ssh_user` 与登录方式，光标移到保存行按 `Enter`。此后连接链路为 dbxt → 跳板机 → 数据库。
+
 ## 快捷键速查
 
 完整列表在 TUI 的 `?` 浮层与 `dbxt --help` 中；这里只列核心键。
@@ -109,7 +119,9 @@ cargo install --git https://github.com/vst93/dbxt
 | 场景 | 按键 |
 | --- | --- |
 | 全局 | `?` 帮助 · `Tab`/`Shift-Tab` 切栏 · `Alt-1/2/3` 聚焦 · `F5`/`Ctrl-J` 执行 · `Ctrl-C` 退出 |
-| 连接 | `↑` `↓` 移动 · `Enter` 连接 · `c` 新建 · `p` 复制 · `d` 数据库/schema 切换 · `o` 返回选择 |
+| 连接 | `↑` `↓` 移动 · `Enter` 连接 · `c` 新建 · `e` 编辑 · `p` 复制 · `d` 数据库/schema 切换 · `o` 返回选择 |
+| 连接表单 | `↑` `↓`/`Tab` 切换字段 · `Enter` 编辑/切换/保存 · `Space` 切换 `ssh_tunnel`/`ssl`/`ssh_auth` · `Esc` 返回 |
+| SSH 主机密钥 | `y`/`Enter` 接受并记住 · `s` 仅本次会话 · `n`/`Esc` 拒绝 |
 | 侧栏 | `↑` `↓` 表 · `/` 过滤 · `Enter` 浏览 · `r` 表结构 · `I` 导入 CSV · `t` 最近表 |
 | 结果区 | `↑` `↓` 行 · `←` `→` 列 · `n`/`p` 翻页 · `Enter`/`v` 单元格 · `e` 编辑 · `i` 插入 · `Delete` 删除 |
 | 结果区（续） | `f` 过滤 · `s` 排序 · `Ctrl-K` 追加排序 · `Ctrl-R` 清除 · `y` 复制行 · `/` 搜索 · `Ctrl-Y` 导出 · `[` `]` 标签 |
@@ -121,6 +133,8 @@ cargo install --git https://github.com/vst93/dbxt
 
 按表偏好（列宽压缩、隐藏列、排序）写入 `~/.config/dbxt/tui.json`，以 `库.表` 为键；`DBXT_CONFIG` 可覆盖路径，`DBXT_NO_PERSIST=1` 可关闭。`DBXT_LANG=en|zh` 选择界面语言（未设置时由 locale 决定），`DBX_DATA_DIR` 指定其他 DBX 存储，`DBXT_INSTALL_DIR` 是安装脚本的目标目录。
 
+SSH 隧道的单测（序列化形状、表单映射、认证/错误分类、主机密钥提示）随 `cargo test` 运行。另有两个端到端测试会驱动真实隧道（dbxt → 本机 `sshd` → MySQL），默认跳过，需 `DBXT_SSH_TEST=1` 开启；它们读取 `DBXT_SSH_TEST_USER` / `_PASSWORD` / `_KEY`、`DBXT_SSH_TEST_MYSQL_PORT`（默认 13306）与 `DBXT_SSH_TEST_MYSQL_USER` / `_PASSWORD`。
+
 ## 状态与路线图
 
 早期但已可用。已对真实 MySQL 8.4、PostgreSQL 16、Redis 和 MongoDB 端到端实测。
@@ -130,8 +144,9 @@ cargo install --git https://github.com/vst93/dbxt
 - [x] SQL 浏览、编辑、事务、过滤 / 排序、补全、CSV 导入 / 导出与结果标签
 - [x] Redis key 浏览器与批量 key 操作
 - [x] MongoDB 文档浏览器与文档 CRUD
+- [x] SSH 隧道（密码 / 密钥 / agent，`~/.ssh/config` 别名与 `ProxyJump`），TUI 内可新建与编辑
 - [x] 七个平台的预编译包 —— 目前只有 Linux x86_64 在本机实测，其余未验证
-- [ ] TUI 内编辑 / 删除连接（复制已支持 `p`）
+- [ ] TUI 内删除连接（编辑与复制已支持）
 - [ ] 结果导出 XLSX，以及跨页搜索
 - [ ] Excel（`.xlsx`）导入
 - [ ] 官方 Android/Termux 构建
