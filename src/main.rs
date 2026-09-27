@@ -1229,6 +1229,11 @@ struct RedisScanState {
     total: u64,
     /// Request generation, so a stale page cannot clobber a fresh scan.
     gen: u64,
+    /// A page request is in flight. `n` (load more) is ignored while set, so two
+    /// concurrent requests cannot both start from the same cursor and append the
+    /// same page twice (a fresh scan resets `cursor` to 0, so pressing `n` before
+    /// its reply used to duplicate the first page).
+    pending: bool,
 }
 
 impl Default for RedisScanState {
@@ -1240,6 +1245,7 @@ impl Default for RedisScanState {
             pattern: "*".to_string(),
             total: 0,
             gen: 0,
+            pending: false,
         }
     }
 }
@@ -3476,6 +3482,152 @@ async fn main() -> Result<()> {
     res
 }
 
+impl App {
+    /// Build the initial application state. Split out of `run_app` so the
+    /// render/key layers can be exercised headlessly in tests.
+    fn new(
+        backend: Arc<LocalBackend>,
+        config: TuiConfig,
+        config_path: Option<PathBuf>,
+        mouse_debug: bool,
+        trace_path: Option<PathBuf>,
+        drag_pan: DragPan,
+    ) -> Self {
+        let config_compact = config.compact;
+        let mut app = Self {
+            backend,
+            page: Page::Browse,
+            focus: Focus::Sidebar,
+            quit: false,
+            connections: Vec::new(),
+            conn_list: ListState::default(),
+            picker_open: true,
+            selected: None,
+            databases: Vec::new(),
+            db_index: 0,
+            tables: Vec::new(),
+            table_list: ListState::default(),
+            tables_all: Vec::new(),
+            table_filter: String::new(),
+            table_prompt: None,
+            columns: Vec::new(),
+            ddl: None,
+            struct_view: StructView::Fields,
+            ddl_scroll: 0,
+            editor: TextArea::default(),
+            history: Vec::new(),
+            history_idx: None,
+            history_draft: String::new(),
+            grid: None,
+            grid_kind: GridKind::Query,
+            page_state: None,
+            script: None,
+            sel: 0,
+            col_offset: 0,
+            col_cursor: 0,
+            vis_cols: 0,
+            grid_max_cell: 44,
+            freeze_first: true,
+            cell_popup: None,
+            row_popup: None,
+            compact: config_compact,
+            col_hidden: HashSet::new(),
+            col_picker_open: false,
+            col_picker_list: ListState::default(),
+            grid_full: None,
+            recent_tables: Vec::new(),
+            recent_open: false,
+            recent_list: ListState::default(),
+            pending_open_table: None,
+            completion: None,
+            config,
+            config_path,
+            result_filter: None,
+            result_needle: String::new(),
+            result_rows: Vec::new(),
+            last_sql: None,
+            filter_prompt: None,
+            edit_dialog: None,
+            pending_write: false,
+            pending_write_msg: None,
+            batch: Vec::new(),
+            pane_override: [None; 3],
+            auto_collapse: false,
+            help_open: false,
+            help_scroll: 0,
+            pan_mode: false,
+            drag_pan,
+            gesture: PanGesture::default(),
+            pending_tap: None,
+            mouse_debug,
+            mouse_log: VecDeque::new(),
+            trace_path,
+            last_event: None,
+            result_tabs: Vec::new(),
+            result_tab: 0,
+            query_more: None,
+            snippet_open: false,
+            snippet_list: ListState::default(),
+            snippets: Vec::new(),
+            snippet_name: None,
+            table_meta: None,
+            count_cache: HashMap::new(),
+            pending_sel: None,
+            pending_focus: None,
+            page_pending: false,
+            page_gen: 0,
+            db_picker_open: false,
+            db_list: ListState::default(),
+            pending_table: None,
+            grid_gutter: 0,
+            grid_frozen: 0,
+            grid_widths: Vec::new(),
+            grid_avail: 0,
+            confirm: None,
+            loading: true,
+            // The initial `ListConnections` below is the one call not spawned through
+            // `App::spawn`, so it is pre-counted here.
+            pending_ops: 1,
+            loading_since: Some(Instant::now()),
+            spinner: 0,
+            status: t("加载连接…").into(),
+            backend_kind: Backend::Sql,
+            cmd_input: TextArea::default(),
+            cmd_output: Vec::new(),
+            redis_db: 0,
+            redis_scan: RedisScanState::default(),
+            redis_list: ListState::default(),
+            redis_value: None,
+            redis_prompt: None,
+            redis_selected: HashSet::new(),
+            redis_anchor: None,
+            redis_pending_batch: None,
+            mongo_page: 0,
+            mongo_filter: String::new(),
+            mongo_gen: 0,
+            mongo_docs: Vec::new(),
+            mongo_dialog: None,
+            form: ConnForm::default(),
+            import_prompt: None,
+            import_plan: None,
+            import_gen: 0,
+            import_scroll: 0,
+            import_progress: None,
+            import_report: None,
+            export_open: false,
+            export_list: ListState::default(),
+            export_pending: None,
+            export_path: None,
+            layout_mode: LayoutMode::Mid,
+            term_h: 0,
+            rects: Rects::default(),
+        };
+        app.editor.set_placeholder_text(t("SQL … (Ctrl-J / F5 执行 · ↑ 历史)"));
+        app.set_placeholder();
+        app
+    }
+}
+
 async fn run_app(mut terminal: ratatui::DefaultTerminal, backend: Arc<LocalBackend>) -> Result<()> {
     let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<OpResult>();
     let mut events = EventStream::new();
@@ -3496,138 +3648,15 @@ async fn run_app(mut terminal: ratatui::DefaultTerminal, backend: Arc<LocalBacke
         .as_deref()
         .map(TuiConfig::load)
         .unwrap_or_default();
-    let config_compact = config.compact;
 
-    let mut app = App {
-        backend: backend.clone(),
-        page: Page::Browse,
-        focus: Focus::Sidebar,
-        quit: false,
-        connections: Vec::new(),
-        conn_list: ListState::default(),
-        picker_open: true,
-        selected: None,
-        databases: Vec::new(),
-        db_index: 0,
-        tables: Vec::new(),
-        table_list: ListState::default(),
-        tables_all: Vec::new(),
-        table_filter: String::new(),
-        table_prompt: None,
-        columns: Vec::new(),
-        ddl: None,
-        struct_view: StructView::Fields,
-        ddl_scroll: 0,
-        editor: TextArea::default(),
-        history: Vec::new(),
-        history_idx: None,
-        history_draft: String::new(),
-        grid: None,
-        grid_kind: GridKind::Query,
-        page_state: None,
-        script: None,
-        sel: 0,
-        col_offset: 0,
-        col_cursor: 0,
-        vis_cols: 0,
-        grid_max_cell: 44,
-        freeze_first: true,
-        cell_popup: None,
-        row_popup: None,
-        compact: config_compact,
-        col_hidden: HashSet::new(),
-        col_picker_open: false,
-        col_picker_list: ListState::default(),
-        grid_full: None,
-        recent_tables: Vec::new(),
-        recent_open: false,
-        recent_list: ListState::default(),
-        pending_open_table: None,
-        completion: None,
+    let mut app = App::new(
+        backend.clone(),
         config,
         config_path,
-        result_filter: None,
-        result_needle: String::new(),
-        result_rows: Vec::new(),
-        last_sql: None,
-        filter_prompt: None,
-        edit_dialog: None,
-        pending_write: false,
-        pending_write_msg: None,
-        batch: Vec::new(),
-        pane_override: [None; 3],
-        auto_collapse: false,
-        help_open: false,
-        help_scroll: 0,
-        pan_mode: false,
-        drag_pan: DragPan::from_env(),
-        gesture: PanGesture::default(),
-        pending_tap: None,
         mouse_debug,
-        mouse_log: VecDeque::new(),
         trace_path,
-        last_event: None,
-        result_tabs: Vec::new(),
-        result_tab: 0,
-        query_more: None,
-        snippet_open: false,
-        snippet_list: ListState::default(),
-        snippets: Vec::new(),
-        snippet_name: None,
-        table_meta: None,
-        count_cache: HashMap::new(),
-        pending_sel: None,
-        pending_focus: None,
-        page_pending: false,
-        page_gen: 0,
-        db_picker_open: false,
-        db_list: ListState::default(),
-        pending_table: None,
-        grid_gutter: 0,
-        grid_frozen: 0,
-        grid_widths: Vec::new(),
-        grid_avail: 0,
-        confirm: None,
-        loading: true,
-        // The initial `ListConnections` below is the one call not spawned through
-        // `App::spawn`, so it is pre-counted here.
-        pending_ops: 1,
-        loading_since: Some(Instant::now()),
-        spinner: 0,
-        status: t("加载连接…").into(),
-        backend_kind: Backend::Sql,
-        cmd_input: TextArea::default(),
-        cmd_output: Vec::new(),
-        redis_db: 0,
-        redis_scan: RedisScanState::default(),
-        redis_list: ListState::default(),
-        redis_value: None,
-        redis_prompt: None,
-        redis_selected: HashSet::new(),
-        redis_anchor: None,
-        redis_pending_batch: None,
-        mongo_page: 0,
-        mongo_filter: String::new(),
-        mongo_gen: 0,
-        mongo_docs: Vec::new(),
-        mongo_dialog: None,
-        form: ConnForm::default(),
-        import_prompt: None,
-        import_plan: None,
-        import_gen: 0,
-        import_scroll: 0,
-        import_progress: None,
-        import_report: None,
-        export_open: false,
-        export_list: ListState::default(),
-        export_pending: None,
-        export_path: None,
-        layout_mode: LayoutMode::Mid,
-        term_h: 0,
-        rects: Rects::default(),
-    };
-    app.editor.set_placeholder_text(t("SQL … (Ctrl-J / F5 执行 · ↑ 历史)"));
-    app.set_placeholder();
+        DragPan::from_env(),
+    );
 
     // Pre-counted by `pending_ops: 1` in the initializer above.
     spawn_op(&backend, &tx, Op::ListConnections);
@@ -3967,6 +3996,7 @@ fn apply_op_result(app: &mut App, res: OpResult, tx: &Tx) {
             if gen != app.redis_scan.gen {
                 return;
             }
+            app.redis_scan.pending = false;
             if append {
                 app.redis_scan.keys.extend(keys);
             } else {
@@ -4262,6 +4292,12 @@ fn apply_op_result(app: &mut App, res: OpResult, tx: &Tx) {
         OpResult::ImportDone(rep) => {
             let table = rep.table.clone();
             app.import_progress = None;
+            // An import writes rows, so every cached COUNT(*) is now suspect —
+            // including the target table's own entry when the import came from
+            // the sidebar while a different table was open. Reloading the
+            // browsed table refills the entry it needs; the rest are dropped so
+            // a later open re-runs the COUNT instead of trusting a stale total.
+            app.count_cache.clear();
             app.status = if rep.ok() {
                 tf(
                     "✓ 导入完成 · 成功 {} 行 · 跳过 {} 行 · {}ms",
@@ -4300,6 +4336,9 @@ fn apply_op_result(app: &mut App, res: OpResult, tx: &Tx) {
             app.pending_focus = None;
             app.pending_write = false;
             app.pending_write_msg = None;
+            // A failed scan must not leave the key list permanently unable to
+            // load another page.
+            app.redis_scan.pending = false;
             app.status = format!("✗ {e}");
         }
     }
@@ -5756,6 +5795,16 @@ fn full_grid(app: &App) -> Option<Grid> {
     app.grid_full.clone()
 }
 
+/// The focused row read from the unfiltered grid. An active result search keeps
+/// a display→source row map, so the row must come from `full_grid` — reading it
+/// from the on-screen (filtered) grid with the full-grid index would fail or
+/// copy the wrong row.
+fn focused_full_row(app: &App) -> Option<Vec<Val>> {
+    let grid = full_grid(app)?;
+    let idx = app.full_row_index()?;
+    grid.rows.get(idx).cloned()
+}
+
 /// True when the results pane is showing a browsable table (not a query result,
 /// structure list or script).
 fn in_table_data_view(app: &App) -> bool {
@@ -5909,12 +5958,15 @@ fn start_redis_scan(app: &mut App, tx: &Tx, reset: bool) {
         app.redis_scan.cursor = 0;
         app.redis_scan.exhausted = false;
         app.redis_scan.gen = app.redis_scan.gen.wrapping_add(1);
-    } else if app.redis_scan.exhausted {
+    } else if app.redis_scan.exhausted || app.redis_scan.pending {
+        // A page is already in flight: a second request would start from the
+        // same cursor and append a duplicate page (the fresh-scan race).
         return;
     }
     let gen = app.redis_scan.gen;
     let cursor = app.redis_scan.cursor;
     let pattern = app.redis_scan.pattern.clone();
+    app.redis_scan.pending = true;
     app.loading = true;
     app.spawn(
         tx,
@@ -6736,15 +6788,7 @@ fn run_redis_write(
 /// `y` in a Redis value / Mongo document grid: copy the focused row as tab-
 /// separated text (OSC52 clipboard, with the file fallback).
 fn copy_redis_row(app: &mut App) {
-    let Some(grid) = active_grid(app) else {
-        app.status = t("没有可复制的行").into();
-        return;
-    };
-    let Some(orig) = app.full_row_index() else {
-        app.status = t("没有可复制的行").into();
-        return;
-    };
-    let Some(row) = grid.rows.get(orig) else {
+    let Some(row) = focused_full_row(app) else {
         app.status = t("没有可复制的行").into();
         return;
     };
@@ -11361,44 +11405,39 @@ fn ui(f: &mut Frame, app: &mut App) {
     if app.page == Page::Browse && app.picker_open && app.selected.is_none() {
         render_conn_picker(f, f.area(), app);
     }
+    // Overlays are drawn lowest-precedence first so the topmost one on screen is
+    // the one the key router actually owns (see `footer_ctx`, which lists the
+    // same order).
+    if app.col_picker_open {
+        render_col_picker(f, f.area(), app);
+    }
+    if app.recent_open {
+        render_recent_tables(f, f.area(), app);
+    }
+    if app.table_prompt.is_some() {
+        render_table_filter(f, f.area(), app);
+    }
+    if app.mongo_dialog.is_some() {
+        render_mongo_dialog(f, f.area(), app);
+    }
+    if app.redis_prompt.is_some() {
+        render_redis_prompt(f, f.area(), app);
+    }
     if app.db_picker_open {
         render_db_picker(f, f.area(), app);
     }
     if app.snippet_open {
         render_snippets(f, f.area(), app);
     }
-    if app.recent_open {
-        render_recent_tables(f, f.area(), app);
-    }
-    if app.col_picker_open {
-        render_col_picker(f, f.area(), app);
-    }
-    if app.table_prompt.is_some() {
-        render_table_filter(f, f.area(), app);
-    }
-    if app.result_filter.is_some() {
-        render_result_filter(f, f.area(), app);
-    }
     if app.snippet_name.is_some() {
         render_snippet_name(f, f.area(), app);
     }
-    if let Some(confirm) = app.confirm.clone() {
-        render_confirm(f, f.area(), &confirm);
+    // The completion popup sits just under the editor, over whatever is below.
+    if app.completion.is_some() {
+        render_completion(f, app);
     }
-    if app.import_prompt.is_some() {
-        render_import_prompt(f, f.area(), app);
-    }
-    if app.import_plan.is_some() {
-        render_import_plan(f, f.area(), app);
-    }
-    if app.import_report.is_some() {
-        render_import_report(f, f.area(), app);
-    }
-    if app.export_open {
-        render_export(f, f.area(), app);
-    }
-    if app.export_path.is_some() {
-        render_export_path(f, f.area(), app);
+    if app.result_filter.is_some() {
+        render_result_filter(f, f.area(), app);
     }
     if let Some(popup) = app.cell_popup.clone() {
         render_text_popup(f, f.area(), &popup.title, &popup.lines, popup.scroll);
@@ -11409,21 +11448,29 @@ fn ui(f: &mut Frame, app: &mut App) {
     if app.filter_prompt.is_some() {
         render_filter_prompt(f, f.area(), app);
     }
-    if app.redis_prompt.is_some() {
-        render_redis_prompt(f, f.area(), app);
+    if app.export_open {
+        render_export(f, f.area(), app);
     }
-    if app.mongo_dialog.is_some() {
-        render_mongo_dialog(f, f.area(), app);
+    if app.export_path.is_some() {
+        render_export_path(f, f.area(), app);
     }
-    if app.edit_dialog.is_some() {
-        render_edit_dialog(f, f.area(), app);
+    if app.import_prompt.is_some() {
+        render_import_prompt(f, f.area(), app);
+    }
+    if app.import_plan.is_some() {
+        render_import_plan(f, f.area(), app);
+    }
+    if app.import_report.is_some() {
+        render_import_report(f, f.area(), app);
     }
     if app.help_open {
         render_help(f, f.area(), app);
     }
-    // The completion popup sits just under the editor, over whatever is below.
-    if app.completion.is_some() {
-        render_completion(f, app);
+    if app.edit_dialog.is_some() {
+        render_edit_dialog(f, f.area(), app);
+    }
+    if let Some(confirm) = app.confirm.clone() {
+        render_confirm(f, f.area(), &confirm);
     }
     if app.mouse_debug {
         render_mouse_debug(f, f.area(), app);
@@ -11699,20 +11746,26 @@ type Hint = (&'static str, &'static str);
 /// Overlays take precedence over the page, exactly like the key router.
 #[derive(Clone, Copy, PartialEq, Debug)]
 enum FooterView {
+    Confirm,
+    EditDialog,
     Help,
-    TablePrompt,
+    ImportReport,
+    ImportPlan,
+    ImportPrompt,
+    ExportPath,
+    ExportPicker,
+    FilterPrompt,
+    Popup,
     ResultFilter,
-    Recent,
-    ColPicker,
     Completion,
     SnippetName,
     Snippets,
-    FilterPrompt,
-    Popup,
-    EditDialog,
-    MongoDoc,
     DbPicker,
-    Confirm,
+    RedisPrompt,
+    MongoDoc,
+    TablePrompt,
+    Recent,
+    ColPicker,
     ConnPicker,
     NewConn,
     RedisKeys,
@@ -11730,35 +11783,51 @@ struct FooterCtx {
     has_connection: bool,
 }
 
+/// Pick the footer group from the app state. The order mirrors the key router
+/// exactly (`key` checks confirm / edit-dialog before `browse_key`, and
+/// `browse_key` checks its overlays in the order below), so the footer can never
+/// describe a different surface than the one the keyboard is actually on.
 fn footer_ctx(app: &App) -> FooterCtx {
-    let view = if app.help_open {
+    let view = if app.confirm.is_some() {
+        FooterView::Confirm
+    } else if app.edit_dialog.is_some() {
+        FooterView::EditDialog
+    } else if app.help_open {
         FooterView::Help
-    } else if app.table_prompt.is_some() {
-        FooterView::TablePrompt
+    } else if app.import_report.is_some() {
+        FooterView::ImportReport
+    } else if app.import_plan.is_some() {
+        FooterView::ImportPlan
+    } else if app.import_prompt.is_some() {
+        FooterView::ImportPrompt
+    } else if app.export_path.is_some() {
+        FooterView::ExportPath
+    } else if app.export_open {
+        FooterView::ExportPicker
+    } else if app.filter_prompt.is_some() {
+        FooterView::FilterPrompt
+    } else if app.row_popup.is_some() || app.cell_popup.is_some() {
+        FooterView::Popup
     } else if app.result_filter.is_some() {
         FooterView::ResultFilter
-    } else if app.recent_open {
-        FooterView::Recent
-    } else if app.col_picker_open {
-        FooterView::ColPicker
     } else if app.completion.is_some() {
         FooterView::Completion
     } else if app.snippet_name.is_some() {
         FooterView::SnippetName
     } else if app.snippet_open {
         FooterView::Snippets
-    } else if app.filter_prompt.is_some() {
-        FooterView::FilterPrompt
-    } else if app.row_popup.is_some() || app.cell_popup.is_some() {
-        FooterView::Popup
-    } else if app.edit_dialog.is_some() {
-        FooterView::EditDialog
-    } else if app.mongo_dialog.is_some() {
-        FooterView::MongoDoc
     } else if app.db_picker_open {
         FooterView::DbPicker
-    } else if app.confirm.is_some() {
-        FooterView::Confirm
+    } else if app.redis_prompt.is_some() {
+        FooterView::RedisPrompt
+    } else if app.mongo_dialog.is_some() {
+        FooterView::MongoDoc
+    } else if app.table_prompt.is_some() {
+        FooterView::TablePrompt
+    } else if app.recent_open {
+        FooterView::Recent
+    } else if app.col_picker_open {
+        FooterView::ColPicker
     } else if app.page == Page::NewConn {
         FooterView::NewConn
     } else if app.picker_open && app.selected.is_none() {
@@ -11785,6 +11854,26 @@ fn footer_ctx(app: &App) -> FooterCtx {
 fn footer_hints_ctx(ctx: FooterCtx) -> Vec<Hint> {
     let mut v: Vec<Hint> = match ctx.view {
         FooterView::Help => vec![("↑↓", t("滚动")), ("Esc", t("关闭"))],
+        // R20–R22 overlays: import / export / Redis input dialogs. Without
+        // these arms the footer fell through to the page's group while an
+        // overlay owned the keyboard.
+        FooterView::ImportPrompt => vec![("Enter", t("预览")), ("Esc", t("取消"))],
+        FooterView::ImportPlan => vec![
+            ("Enter", t("导入")),
+            ("m", t("追加/覆盖")),
+            ("s", t("出错处理")),
+            ("↑↓", t("滚动")),
+            ("Esc", t("取消")),
+        ],
+        FooterView::ImportReport => vec![("Enter/Esc", t("关闭"))],
+        FooterView::ExportPicker => vec![
+            ("↑↓", t("选择")),
+            ("Enter", t("确定")),
+            ("1-6", t("快选")),
+            ("Esc", t("取消")),
+        ],
+        FooterView::ExportPath => vec![("Enter", t("导出")), ("Esc", t("取消"))],
+        FooterView::RedisPrompt => vec![("Enter", t("确认")), ("Esc", t("取消"))],
         FooterView::TablePrompt | FooterView::ResultFilter => {
             vec![("Enter", t("保留")), ("Esc", t("清除"))]
         }
@@ -12546,7 +12635,10 @@ fn render_grid(f: &mut Frame, area: Rect, app: &mut App, grid: &Grid, kind: Grid
     app.rects.hbar_prev = Rect::default();
     app.rects.hbar_next = Rect::default();
     let scrollable_total = ncols.saturating_sub(frozen);
-    if visible > 0 && scrollable_total > visible && inner_w >= 16 {
+    // The bar sits on the bottom border, so a zero-height results pane (a tiny
+    // terminal squeezes the pane to nothing) has no row to draw it on and
+    // `area.height - 1` would underflow.
+    if visible > 0 && scrollable_total > visible && inner_w >= 16 && area.height > 0 {
         let win_start = off.saturating_sub(frozen);
         let pin = match frozen {
             0 => String::new(),
@@ -13384,15 +13476,45 @@ fn render_form(f: &mut Frame, area: Rect, app: &mut App) {
     f.render_widget(Paragraph::new(lines).block(block), box_area);
 }
 
+/// Height and top offset for a list / picker overlay so it always fits inside
+/// `area`. `Clear` (and every ratatui widget) panics when asked to draw outside
+/// the buffer, and a tiny terminal makes the naive `area.height - 2` shrink
+/// below the three-row border minimum, so the box is clamped to the area here.
+/// Center a `w × h` overlay box inside `area`, clamping both dimensions to the
+/// area first. ratatui's widgets (and `Clear` in particular) panic when asked to
+/// draw outside the buffer, and a tiny terminal can make a fixed overlay taller
+/// than the screen, so every centered overlay goes through here.
+fn centered_overlay(area: Rect, w: u16, h: u16) -> Rect {
+    let w = w.min(area.width);
+    let h = h.min(area.height);
+    let x = area.x + area.width.saturating_sub(w) / 2;
+    let y = area.y + area.height.saturating_sub(h) / 2;
+    Rect {
+        x,
+        y,
+        width: w,
+        height: h,
+    }
+}
+
+fn overlay_list_box(rows: usize, area: Rect) -> (u16, u16) {
+    if area.height == 0 {
+        return (area.y, 0);
+    }
+    let want = (rows as u16).saturating_add(2);
+    let h = want.min(area.height).max(3.min(area.height));
+    let y = area.y + area.height.saturating_sub(h) / 2;
+    (y, h)
+}
+
 fn render_conn_picker(f: &mut Frame, area: Rect, app: &mut App) {
     let w = area.width.min(if app.layout_mode == LayoutMode::Narrow {
         area.width
     } else {
         56
     });
-    let h = (app.connections.len() as u16 + 2).clamp(3, area.height.saturating_sub(2));
+    let (y, h) = overlay_list_box(app.connections.len(), area);
     let x = area.x + (area.width.saturating_sub(w)) / 2;
-    let y = area.y + 1;
     let box_area = Rect {
         x,
         y,
@@ -13445,9 +13567,8 @@ fn render_db_picker(f: &mut Frame, area: Rect, app: &mut App) {
     } else {
         46
     });
-    let h = (entries.len() as u16 + 2).clamp(3, area.height.saturating_sub(2));
+    let (y, h) = overlay_list_box(entries.len(), area);
     let x = area.x + (area.width.saturating_sub(w)) / 2;
-    let y = area.y + (area.height.saturating_sub(h)) / 2;
     let box_area = Rect {
         x,
         y,
@@ -13510,9 +13631,8 @@ fn render_snippets(f: &mut Frame, area: Rect, app: &mut App) {
     } else {
         60
     });
-    let h = (app.snippets.len() as u16 + 2).clamp(3, area.height.saturating_sub(2));
+    let (y, h) = overlay_list_box(app.snippets.len(), area);
     let x = area.x + (area.width.saturating_sub(w)) / 2;
-    let y = area.y + (area.height.saturating_sub(h)) / 2;
     let box_area = Rect {
         x,
         y,
@@ -13571,9 +13691,8 @@ fn render_col_picker(f: &mut Frame, area: Rect, app: &mut App) {
     } else {
         52
     });
-    let h = (grid.columns.len() as u16 + 2).clamp(3, area.height.saturating_sub(2));
+    let (y, h) = overlay_list_box(grid.columns.len(), area);
     let x = area.x + (area.width.saturating_sub(w)) / 2;
-    let y = area.y + (area.height.saturating_sub(h)) / 2;
     let box_area = Rect {
         x,
         y,
@@ -13637,9 +13756,8 @@ fn render_recent_tables(f: &mut Frame, area: Rect, app: &mut App) {
     } else {
         54
     });
-    let h = (app.recent_tables.len() as u16 + 2).clamp(3, area.height.saturating_sub(2));
+    let (y, h) = overlay_list_box(app.recent_tables.len(), area);
     let x = area.x + (area.width.saturating_sub(w)) / 2;
-    let y = area.y + (area.height.saturating_sub(h)) / 2;
     let box_area = Rect {
         x,
         y,
@@ -13849,15 +13967,8 @@ fn render_text_popup(f: &mut Frame, area: Rect, title: &str, lines: &[PopupLine]
     let total = body.len();
     let max_h = area.height.saturating_sub(4).max(3);
     let h = ((total as u16) + 2).min(max_h);
-    let inner_h = h.saturating_sub(2) as usize;
-    let x = area.x + (area.width.saturating_sub(w)) / 2;
-    let y = area.y + (area.height.saturating_sub(h)) / 2;
-    let box_area = Rect {
-        x,
-        y,
-        width: w,
-        height: h,
-    };
+    let box_area = centered_overlay(area, w, h);
+    let inner_h = box_area.height.saturating_sub(2) as usize;
     f.render_widget(Clear, box_area);
     let max_scroll = total.saturating_sub(inner_h).min(u16::MAX as usize) as u16;
     let scroll = scroll.min(max_scroll);
@@ -13963,14 +14074,7 @@ fn render_edit_dialog(f: &mut Frame, area: Rect, app: &mut App) {
             }
             let header_h = header_lines.len() as u16;
             let h = (header_h + 3 + 1 + 2).min(area.height);
-            let x = area.x + (area.width.saturating_sub(w)) / 2;
-            let y = area.y + (area.height.saturating_sub(h)) / 2;
-            let box_area = Rect {
-                x,
-                y,
-                width: w,
-                height: h,
-            };
+            let box_area = centered_overlay(area, w, h);
             f.render_widget(Clear, box_area);
             let block = Block::default()
                 .borders(Borders::ALL)
@@ -14074,14 +14178,7 @@ fn render_edit_dialog(f: &mut Frame, area: Rect, app: &mut App) {
                 Style::default().fg(Color::DarkGray),
             )));
             let h = (lines.len() as u16 + 2).min(area.height);
-            let x = area.x + (area.width.saturating_sub(w)) / 2;
-            let y = area.y + (area.height.saturating_sub(h)) / 2;
-            let box_area = Rect {
-                x,
-                y,
-                width: w,
-                height: h,
-            };
+            let box_area = centered_overlay(area, w, h);
             f.render_widget(Clear, box_area);
             let block = Block::default()
                 .borders(Borders::ALL)
@@ -14108,14 +14205,7 @@ fn render_redis_prompt(f: &mut Frame, area: Rect, app: &mut App) {
         }
     };
     let h = 7.min(area.height);
-    let x = area.x + (area.width.saturating_sub(w)) / 2;
-    let y = area.y + (area.height.saturating_sub(h)) / 2;
-    let box_area = Rect {
-        x,
-        y,
-        width: w,
-        height: h,
-    };
+    let box_area = centered_overlay(area, w, h);
     f.render_widget(Clear, box_area);
     let title = app
         .redis_prompt
@@ -14186,14 +14276,7 @@ fn render_mongo_dialog(f: &mut Frame, area: Rect, app: &mut App) {
         }
     };
     let h = area.height.saturating_sub(2).max(5);
-    let x = area.x + (area.width.saturating_sub(w)) / 2;
-    let y = area.y + (area.height.saturating_sub(h)) / 2;
-    let box_area = Rect {
-        x,
-        y,
-        width: w,
-        height: h,
-    };
+    let box_area = centered_overlay(area, w, h);
     f.render_widget(Clear, box_area);
     let title = match d.mode {
         MongoDocMode::Edit => tf(
@@ -14269,14 +14352,7 @@ fn render_filter_prompt(f: &mut Frame, area: Rect, app: &mut App) {
         }
     };
     let h = 7.min(area.height);
-    let x = area.x + (area.width.saturating_sub(w)) / 2;
-    let y = area.y + (area.height.saturating_sub(h)) / 2;
-    let box_area = Rect {
-        x,
-        y,
-        width: w,
-        height: h,
-    };
+    let box_area = centered_overlay(area, w, h);
     f.render_widget(Clear, box_area);
     let title = if app.grid_kind == GridKind::MongoDocs {
         t(" MongoDB 过滤 (JSON) · Enter 应用 · Esc 取消 · 留空清除 ")
@@ -14440,7 +14516,7 @@ const HELP_ROWS: &[(&str, &str)] = &[
     ("Del / x / m", "批量删除 / 设 TTL / 前缀重命名选中 key（均确认）"),
     ("y", "复制选中的 key 名（每行一个）"),
     ("value: e x m Del", "编辑 string·hash 字段 / TTL / 重命名 / 删除 key（均确认）"),
-    ("value 内 n", "大集合继续加载 200 项"),
+    ("value: n", "大集合继续加载 200 项"),
     ("— MongoDB 文档浏览器 —", ""),
     ("Enter", "浏览 collection 文档（JSON 网格）"),
     ("n / p", "文档翻页"),
@@ -14467,15 +14543,8 @@ fn render_help(f: &mut Frame, area: Rect, app: &mut App) {
     };
     let max_h = area.height.saturating_sub(2).max(3);
     let h = (HELP_ROWS.len() as u16 + 2).min(max_h);
-    let inner_h = h.saturating_sub(2) as usize;
-    let x = area.x + (area.width.saturating_sub(w)) / 2;
-    let y = area.y + (area.height.saturating_sub(h)) / 2;
-    let box_area = Rect {
-        x,
-        y,
-        width: w,
-        height: h,
-    };
+    let box_area = centered_overlay(area, w, h);
+    let inner_h = box_area.height.saturating_sub(2) as usize;
     f.render_widget(Clear, box_area);
     let total = HELP_ROWS.len();
     let max_scroll = total.saturating_sub(inner_h) as u16;
@@ -14494,7 +14563,7 @@ fn render_help(f: &mut Frame, area: Rect, app: &mut App) {
             } else {
                 Line::from(vec![
                     Span::styled(
-                        format!("{:<key_w$}", k),
+                        format!("{:<key_w$}", t(k)),
                         Style::default().fg(Color::Yellow),
                     ),
                     Span::raw(t(d)),
@@ -14532,14 +14601,7 @@ fn render_confirm(f: &mut Frame, area: Rect, confirm: &Confirm) {
     // reasons + blank + SQL + blank + hint, plus the two border rows
     let needed = confirm.reasons.len() + sql_lines.len() + 5;
     let h = needed.min(max_h).max(3) as u16;
-    let x = area.x + (area.width.saturating_sub(w)) / 2;
-    let y = area.y + (area.height.saturating_sub(h)) / 2;
-    let box_area = Rect {
-        x,
-        y,
-        width: w,
-        height: h,
-    };
+    let box_area = centered_overlay(area, w, h);
     f.render_widget(Clear, box_area);
 
     let mut lines: Vec<Line> = Vec::new();
@@ -14552,7 +14614,7 @@ fn render_confirm(f: &mut Frame, area: Rect, confirm: &Confirm) {
         )));
     }
     lines.push(Line::from(""));
-    let sql_room = (h as usize).saturating_sub(confirm.reasons.len() + 5);
+    let sql_room = (box_area.height as usize).saturating_sub(confirm.reasons.len() + 5);
     let truncated = sql_lines.len() > sql_room;
     let shown_sql = if truncated {
         sql_room.saturating_sub(1)
@@ -14600,14 +14662,7 @@ fn render_import_prompt(f: &mut Frame, area: Rect, app: &mut App) {
         }
     };
     let h = 7.min(area.height);
-    let x = area.x + (area.width.saturating_sub(w)) / 2;
-    let y = area.y + (area.height.saturating_sub(h)) / 2;
-    let box_area = Rect {
-        x,
-        y,
-        width: w,
-        height: h,
-    };
+    let box_area = centered_overlay(area, w, h);
     f.render_widget(Clear, box_area);
     let block = Block::default()
         .borders(Borders::ALL)
@@ -14813,15 +14868,8 @@ fn render_import_plan(f: &mut Frame, area: Rect, app: &mut App) {
     let total = body.len();
     let max_h = area.height.saturating_sub(2).max(3);
     let h = ((total as u16) + 2).min(max_h);
-    let inner_h = h.saturating_sub(2) as usize;
-    let x = area.x + (area.width.saturating_sub(w)) / 2;
-    let y = area.y + (area.height.saturating_sub(h)) / 2;
-    let box_area = Rect {
-        x,
-        y,
-        width: w,
-        height: h,
-    };
+    let box_area = centered_overlay(area, w, h);
+    let inner_h = box_area.height.saturating_sub(2) as usize;
     f.render_widget(Clear, box_area);
     let max_scroll = total.saturating_sub(inner_h).min(u16::MAX as usize) as u16;
     let scroll = app.import_scroll.min(max_scroll);
@@ -14939,14 +14987,7 @@ fn render_import_report(f: &mut Frame, area: Rect, app: &mut App) {
     let total = body.len();
     let max_h = area.height.saturating_sub(4).max(3);
     let h = ((total as u16) + 2).min(max_h);
-    let x = area.x + (area.width.saturating_sub(w)) / 2;
-    let y = area.y + (area.height.saturating_sub(h)) / 2;
-    let box_area = Rect {
-        x,
-        y,
-        width: w,
-        height: h,
-    };
+    let box_area = centered_overlay(area, w, h);
     f.render_widget(Clear, box_area);
     let style = if rep.ok() {
         Style::default().fg(Color::Green)
@@ -14982,14 +15023,7 @@ fn render_export(f: &mut Frame, area: Rect, app: &mut App) {
         }
     };
     let h = (EXPORT_FORMATS.len() as u16 + 3).min(area.height);
-    let x = area.x + (area.width.saturating_sub(w)) / 2;
-    let y = area.y + (area.height.saturating_sub(h)) / 2;
-    let box_area = Rect {
-        x,
-        y,
-        width: w,
-        height: h,
-    };
+    let box_area = centered_overlay(area, w, h);
     f.render_widget(Clear, box_area);
     let rows = active_grid(app).map(|g| g.rows.len()).unwrap_or(0);
     let title = if rows > EXPORT_SLOW_ROWS {
@@ -15039,14 +15073,7 @@ fn render_export_path(f: &mut Frame, area: Rect, app: &mut App) {
         }
     };
     let h = 7.min(area.height);
-    let x = area.x + (area.width.saturating_sub(w)) / 2;
-    let y = area.y + (area.height.saturating_sub(h)) / 2;
-    let box_area = Rect {
-        x,
-        y,
-        width: w,
-        height: h,
-    };
+    let box_area = centered_overlay(area, w, h);
     f.render_widget(Clear, box_area);
     let block = Block::default()
         .borders(Borders::ALL)
@@ -15091,6 +15118,587 @@ fn render_export_path(f: &mut Frame, area: Rect, app: &mut App) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A `LocalBackend` on a throwaway store so the render / key layers can be
+    /// exercised headlessly. Opened once per test process and shared; the tests
+    /// below never spawn an op, they only render.
+    fn test_backend() -> Arc<LocalBackend> {
+        use std::sync::OnceLock;
+        static B: OnceLock<Arc<LocalBackend>> = OnceLock::new();
+        B.get_or_init(|| {
+            let dir =
+                std::env::temp_dir().join(format!("dbxt-render-test-{}", std::process::id()));
+            let _ = std::fs::create_dir_all(&dir);
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("tokio runtime");
+            Arc::new(
+                rt.block_on(LocalBackend::open(&dir.join("dbx.db")))
+                    .expect("open test backend"),
+            )
+        })
+        .clone()
+    }
+
+    fn test_app() -> App {
+        App::new(
+            test_backend(),
+            TuiConfig::default(),
+            None,
+            false,
+            None,
+            DragPan::Off,
+        )
+    }
+
+    /// A connection config for a given driver, used to exercise the Redis / Mongo
+    /// view selection without opening a real socket.
+    fn test_conn(db_type: &str) -> ConnectionConfig {
+        new_connection_config(
+            format!("id-{db_type}"),
+            format!("test-{db_type}"),
+            parse_database_type(db_type).unwrap(),
+            "127.0.0.1".into(),
+            1,
+            "u".into(),
+            "p".into(),
+            None,
+            false,
+            None,
+        )
+        .unwrap()
+    }
+
+    /// Draw the whole UI into a headless buffer. Returns the rendered text rows
+    /// so a test can assert what actually reached the screen.
+    fn draw(app: &mut App, w: u16, h: u16) -> Vec<String> {
+        use ratatui::backend::TestBackend;
+        use ratatui::Terminal;
+        let mut term = Terminal::new(TestBackend::new(w.max(1), h.max(1))).unwrap();
+        term.draw(|f| ui(f, app)).unwrap();
+        let buf = term.backend().buffer();
+        (0..buf.area.height)
+            .map(|y| {
+                (0..buf.area.width)
+                    .map(|x| buf.cell((x, y)).map(|c| c.symbol()).unwrap_or(" "))
+                    .collect::<String>()
+            })
+            .collect()
+    }
+
+    fn sample_grid() -> Grid {
+        Grid {
+            columns: (0..8).map(|i| format!("column_{i}")).collect(),
+            rows: (0..4)
+                .map(|r| {
+                    (0..8)
+                        .map(|c| Val::Text(format!("r{r}c{c}")))
+                        .collect::<Vec<_>>()
+                })
+                .collect(),
+            note: String::new(),
+        }
+    }
+
+    #[test]
+    fn extreme_sizes_do_not_panic() {
+        let mut app = test_app();
+        app.grid_kind = GridKind::TableData;
+        app.set_grid(sample_grid());
+        app.focus = Focus::Preview;
+        // 40×12 (phone-ish), 250×70 (huge), and a few degenerate heights where
+        // the results pane is squeezed to zero rows.
+        for (w, h) in [(40u16, 12u16), (250, 70), (20, 6), (40, 2), (18, 1), (1, 1)] {
+            draw(&mut app, w, h);
+        }
+    }
+
+    fn redis_sample_view() -> RedisValueView {
+        let hash = RedisValue {
+            key_display: "app:user:42".into(),
+            key_raw: base64_encode(b"app:user:42"),
+            ttl: 60,
+            redis_type: "hash".into(),
+            data: RedisValueData::Hash {
+                items: (0..30)
+                    .map(|i| dbx_core::db::redis_driver::RedisHashItem {
+                        field: RedisBlob {
+                            raw_base64: base64_encode(format!("field_{i}").as_bytes()),
+                            encoding: RedisBlobEncoding::Utf8,
+                        },
+                        value: RedisBlob {
+                            raw_base64: base64_encode(format!("value_{i}").as_bytes()),
+                            encoding: RedisBlobEncoding::Utf8,
+                        },
+                        field_ttl: Some(-1),
+                    })
+                    .collect(),
+                total: 30,
+                scan_cursor: Some(30),
+            },
+        };
+        redis_value_view(hash)
+    }
+
+    /// The R20–R22 views (Redis key list / value grid, Mongo document grid) at the
+    /// two acceptance sizes plus degenerate ones. The Redis sidebar is long enough
+    /// to need SCAN paging, the value grid is wide enough to need the horizontal
+    /// scrollbar, and the Mongo grid has nested-object cells.
+    #[test]
+    fn redis_and_mongo_views_render_at_extreme_sizes() {
+        let sizes = [(40u16, 12u16), (250, 70), (20, 6), (40, 2), (1, 1)];
+        let mut app = test_app();
+        app.picker_open = false;
+        app.selected = Some(test_conn("redis"));
+        app.backend_kind = Backend::Redis;
+        app.redis_scan.keys = (0..40)
+            .map(|i| RedisKeyInfo {
+                key_display: format!("app:key:{i}"),
+                key_raw: base64_encode(format!("app:key:{i}").as_bytes()),
+                key_type: "hash".into(),
+                ttl: -1,
+                size: 12,
+                value_preview: String::new(),
+            })
+            .collect();
+        app.redis_scan.total = 40;
+        app.redis_scan.exhausted = false;
+        app.focus = Focus::Sidebar;
+        for (w, h) in sizes {
+            draw(&mut app, w, h);
+        }
+
+        let view = redis_sample_view();
+        app.grid_kind = GridKind::RedisValue;
+        app.set_grid(view.grid.clone());
+        app.redis_value = Some(view);
+        app.focus = Focus::Preview;
+        for (w, h) in sizes {
+            draw(&mut app, w, h);
+        }
+
+        let docs: Vec<serde_json::Value> = (0..30)
+            .map(|i| {
+                serde_json::json!({
+                    "_id": i,
+                    "name": format!("n{i}"),
+                    "nested": {"a": 1, "b": "x"},
+                    "tags": [1, 2, 3],
+                })
+            })
+            .collect();
+        app.backend_kind = Backend::Mongo;
+        app.selected = Some(test_conn("mongodb"));
+        app.grid_kind = GridKind::MongoDocs;
+        app.set_grid(mongo_docs_grid(&docs));
+        app.mongo_docs = docs;
+        app.page_state = Some(PageState {
+            table: "coll".into(),
+            table_type: None,
+            page: 0,
+            page_size: MONGO_PAGE,
+            total: Some(30),
+            has_next: false,
+            filter: String::new(),
+            order_by: None,
+        });
+        for (w, h) in sizes {
+            draw(&mut app, w, h);
+        }
+    }
+
+    /// One overlay fixture for [`overlays_render_at_extreme_sizes`].
+    type OverlayCase = (&'static str, Box<dyn Fn(&mut App)>);
+
+    /// Every modal overlay that can sit over a browse page, rendered at the two
+    /// acceptance sizes and at a degenerate one. `Clear` panics on an out-of-
+    /// bounds rect, so this is the guard for the whole overlay family.
+    #[test]
+    fn overlays_render_at_extreme_sizes() {
+        let sizes = [(40u16, 12u16), (250, 70), (20, 6), (1, 1)];
+        let mut app = test_app();
+        app.picker_open = false;
+        app.selected = Some(test_conn("mysql"));
+        app.backend_kind = Backend::Sql;
+        app.grid_kind = GridKind::TableData;
+        app.set_grid(sample_grid());
+        app.focus = Focus::Preview;
+
+        let reset = |app: &mut App| {
+            app.help_open = false;
+            app.export_open = false;
+            app.export_path = None;
+            app.export_pending = None;
+            app.import_prompt = None;
+            app.import_plan = None;
+            app.import_report = None;
+            app.redis_prompt = None;
+            app.mongo_dialog = None;
+            app.confirm = None;
+            app.edit_dialog = None;
+            app.completion = None;
+            app.cell_popup = None;
+            app.row_popup = None;
+            app.db_picker_open = false;
+            app.col_picker_open = false;
+            app.recent_open = false;
+            app.snippet_open = false;
+            app.snippet_name = None;
+            app.table_prompt = None;
+            app.result_filter = None;
+            app.filter_prompt = None;
+        };
+
+        let cases: Vec<OverlayCase> = vec![
+            ("help", Box::new(|a| a.help_open = true)),
+            ("export-picker", Box::new(|a| a.export_open = true)),
+            (
+                "export-path",
+                Box::new(|a| {
+                    a.export_pending = Some(ExportPending {
+                        format: ExportFormat::Csv,
+                        table: None,
+                    });
+                    a.export_path = Some(TextArea::default());
+                }),
+            ),
+            (
+                "import-prompt",
+                Box::new(|a| {
+                    a.import_prompt = Some(ImportPrompt {
+                        input: TextArea::default(),
+                        table: "t".into(),
+                        db: "d".into(),
+                        error: None,
+                    })
+                }),
+            ),
+            (
+                "import-plan",
+                Box::new(|a| {
+                    a.import_plan = Some(Box::new(ImportPlan {
+                        path: PathBuf::from("/tmp/x.csv"),
+                        file_size: 123,
+                        encoding: "UTF-8".into(),
+                        delimiter: ',',
+                        headers: vec!["a".into(), "b".into()],
+                        rows: vec![vec!["1".into(), "2".into()]],
+                        table: "t".into(),
+                        db: "d".into(),
+                        columns: vec![ImportCol {
+                            name: "a".into(),
+                            src: Some(0),
+                            ty: ColType::Int,
+                            data_type: "int".into(),
+                        }],
+                        extra: Vec::new(),
+                        missing: vec!["b".into()],
+                        mode: ImportMode::Append,
+                        on_error: ImportOnError::Stop,
+                        error: None,
+                    }))
+                }),
+            ),
+            (
+                "import-report",
+                Box::new(|a| {
+                    a.import_report = Some(Box::new(ImportReport {
+                        table: "t".into(),
+                        mode: ImportMode::Append,
+                        total: 1,
+                        inserted: 1,
+                        skipped: vec![(1, "bad".into())],
+                        aborted: None,
+                        elapsed_ms: 5,
+                    }))
+                }),
+            ),
+            (
+                "redis-prompt",
+                Box::new(|a| {
+                    a.redis_prompt = Some(RedisPrompt {
+                        kind: RedisPromptKind::Rename,
+                        title: "t".into(),
+                        key_display: "k".into(),
+                        key_raw: "aw==".into(),
+                        field: String::new(),
+                        batch: Vec::new(),
+                        input: TextArea::default(),
+                    })
+                }),
+            ),
+            (
+                "mongo-dialog",
+                Box::new(|a| {
+                    a.mongo_dialog = Some(MongoDocDialog {
+                        mode: MongoDocMode::Insert,
+                        db: "d".into(),
+                        collection: "c".into(),
+                        original: serde_json::json!({}),
+                        id: String::new(),
+                        editor: TextArea::from(vec!["{", "}"]),
+                        error: None,
+                    })
+                }),
+            ),
+            (
+                "confirm",
+                Box::new(|a| {
+                    a.confirm = Some(Confirm {
+                        sql: "DELETE FROM t".into(),
+                        reasons: vec!["no WHERE".into()],
+                        refresh: false,
+                        clear_batch: false,
+                        redis: None,
+                        mongo: None,
+                    })
+                }),
+            ),
+            (
+                "edit-dialog",
+                Box::new(|a| {
+                    a.edit_dialog = Some(EditDialog {
+                        kind: EditKind::Update,
+                        cfg: Box::new(test_conn("mysql")),
+                        db: "d".into(),
+                        table: "t".into(),
+                        column: "c".into(),
+                        data_type: Some("int".into()),
+                        old: Val::Text("1".into()),
+                        new_input: TextArea::default(),
+                        where_clause: "id = 1".into(),
+                        keys: vec!["id".into()],
+                        no_pk: false,
+                        insert_sql: String::new(),
+                        insert_preview: Vec::new(),
+                    })
+                }),
+            ),
+            (
+                "completion",
+                Box::new(|a| {
+                    a.completion = Some(Completion {
+                        items: vec![CompletionItem {
+                            text: "users".into(),
+                            kind: 'T',
+                        }],
+                        sel: 0,
+                        replace: 0,
+                    })
+                }),
+            ),
+            (
+                "cell-popup",
+                Box::new(|a| {
+                    a.cell_popup = Some(CellPopup {
+                        title: "cell".into(),
+                        lines: vec![PopupLine {
+                            text: "x".into(),
+                            style: Style::default(),
+                        }],
+                        scroll: 0,
+                    })
+                }),
+            ),
+            (
+                "row-popup",
+                Box::new(|a| {
+                    a.row_popup = Some(RowPopup {
+                        title: "row".into(),
+                        lines: vec![PopupLine {
+                            text: "x".into(),
+                            style: Style::default(),
+                        }],
+                        scroll: 0,
+                    })
+                }),
+            ),
+            ("db-picker", Box::new(|a| a.db_picker_open = true)),
+            ("col-picker", Box::new(|a| a.col_picker_open = true)),
+            ("recent", Box::new(|a| a.recent_open = true)),
+            ("snippets", Box::new(|a| a.snippet_open = true)),
+            ("snippet-name", Box::new(|a| a.snippet_name = Some(TextArea::default()))),
+            ("table-prompt", Box::new(|a| a.table_prompt = Some(TextArea::default()))),
+            ("result-filter", Box::new(|a| a.result_filter = Some(TextArea::default()))),
+            ("filter-prompt", Box::new(|a| a.filter_prompt = Some(TextArea::default()))),
+        ];
+
+        for (name, set) in &cases {
+            reset(&mut app);
+            set(&mut app);
+            for (w, h) in sizes {
+                draw(&mut app, w, h);
+            }
+            let _ = name;
+        }
+    }
+
+    /// The new-connection form on its own page, at tiny sizes (it clamps its own
+    /// box, so this is the regression guard for that path).
+    #[test]
+    fn new_connection_form_renders_at_extreme_sizes() {
+        let mut app = test_app();
+        app.page = Page::NewConn;
+        for (w, h) in [(40u16, 12u16), (250, 70), (20, 6), (1, 1)] {
+            draw(&mut app, w, h);
+        }
+    }
+
+    /// `y` in a Redis / Mongo grid must copy the focused row even when a result
+    /// search is active: the search keeps a display→source map, and reading the
+    /// row from the filtered grid with the full-grid index used to fail.
+    #[test]
+    fn focused_row_survives_an_active_result_search() {
+        let mut app = test_app();
+        app.grid_kind = GridKind::Query;
+        app.set_grid(Grid {
+            columns: vec!["name".into()],
+            rows: vec![
+                vec![Val::Text("ada".into())],
+                vec![Val::Text("admin".into())],
+                vec![Val::Text("bob".into())],
+            ],
+            note: String::new(),
+        });
+        assert_eq!(focused_full_row(&app).unwrap()[0].text(), "ada");
+
+        app.result_needle = "admin".into();
+        app.rebuild_view();
+        app.sel = 0;
+        assert_eq!(app.grid.as_ref().unwrap().rows.len(), 1);
+        assert_eq!(focused_full_row(&app).unwrap()[0].text(), "admin");
+
+        // A broader search (two matches) still resolves the cursor's row.
+        app.result_needle = "a".into();
+        app.rebuild_view();
+        app.sel = 1;
+        assert_eq!(focused_full_row(&app).unwrap()[0].text(), "admin");
+    }
+
+    /// `n` before the first SCAN page lands must not queue a second request from
+    /// the same cursor: that used to append the first page twice (the fresh-scan
+    /// race). The `pending` flag makes the second call a no-op until the reply.
+    #[test]
+    fn redis_load_more_is_ignored_while_a_page_is_in_flight() {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        rt.block_on(async {
+            let (tx, _rx) = tokio::sync::mpsc::unbounded_channel::<OpResult>();
+            let mut app = test_app();
+            app.selected = Some(test_conn("redis"));
+            app.backend_kind = Backend::Redis;
+            start_redis_scan(&mut app, &tx, true);
+            assert!(app.redis_scan.pending, "a reset scan is in flight");
+            let spawned = app.pending_ops;
+            start_redis_scan(&mut app, &tx, false);
+            assert_eq!(app.pending_ops, spawned, "the second `n` must not spawn");
+            // The reply releases the guard...
+            app.redis_scan.pending = false;
+            // ...and a reset always supersedes (bumps gen) and re-arms it.
+            start_redis_scan(&mut app, &tx, true);
+            assert!(app.redis_scan.pending);
+        });
+    }
+
+    /// A >1 MB text cell and a binary column in all six export formats: none may
+    /// panic, and the binary column must become a hex literal in the INSERT
+    /// formats so the row round-trips instead of being mangled as a string.
+    #[test]
+    fn export_handles_huge_and_binary_cells_in_every_format() {
+        let mut app = test_app();
+        app.selected = Some(test_conn("mysql"));
+        app.table_meta = Some(TableMeta {
+            table: "t".into(),
+            columns: vec![
+                ColumnInfo {
+                    name: "id".into(),
+                    data_type: "int".into(),
+                    ..Default::default()
+                },
+                ColumnInfo {
+                    name: "payload".into(),
+                    data_type: "longblob".into(),
+                    ..Default::default()
+                },
+                ColumnInfo {
+                    name: "big".into(),
+                    data_type: "text".into(),
+                    ..Default::default()
+                },
+            ],
+        });
+        let huge = "x".repeat(1_100_000);
+        let grid = Grid {
+            columns: vec!["id".into(), "payload".into(), "big".into()],
+            rows: vec![vec![
+                Val::Text("1".into()),
+                Val::Text("\u{0}\u{1}raw".into()),
+                Val::Text(huge.clone()),
+            ]],
+            note: String::new(),
+        };
+        for format in EXPORT_FORMATS {
+            let out = render_export_content(&app, &grid, *format, Some("t"));
+            assert!(!out.is_empty(), "{format:?} produced nothing");
+        }
+        // The blob column is copied as `X'…'`, never as a quoted string.
+        let insert = render_export_content(&app, &grid, ExportFormat::Insert, Some("t"));
+        assert!(insert.contains("X'0001726177'"), "{insert}");
+        // The 1 MB text cell survives verbatim in CSV and Markdown.
+        let csv = render_export_content(&app, &grid, ExportFormat::Csv, Some("t"));
+        assert!(csv.contains(&huge));
+        let md = render_export_content(&app, &grid, ExportFormat::Markdown, Some("t"));
+        assert!(md.contains(&huge));
+    }
+
+    /// An import writes rows, so the session COUNT(*) cache must be dropped —
+    /// otherwise a table browsed before the import (imported into from the
+    /// sidebar) would show a stale total on its next open.
+    #[test]
+    fn import_done_invalidates_the_count_cache() {
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel::<OpResult>();
+        let mut app = test_app();
+        app.count_cache.insert("d\u{1}t\u{1}".into(), 5);
+        app.import_progress = Some((1, 1));
+        let rep = ImportReport {
+            table: "t".into(),
+            mode: ImportMode::Append,
+            total: 1,
+            inserted: 1,
+            skipped: Vec::new(),
+            aborted: None,
+            elapsed_ms: 1,
+        };
+        apply_op_result(&mut app, OpResult::ImportDone(Box::new(rep)), &tx);
+        assert!(app.count_cache.is_empty(), "stale COUNT(*) survived an import");
+        assert!(app.import_progress.is_none());
+        assert!(app.import_report.is_some());
+    }
+
+    #[test]
+    fn grid_at_zero_height_does_not_panic() {
+        // The results pane can be squeezed to zero rows on a tiny terminal; the
+        // horizontal scrollbar is drawn on the bottom border and must not do
+        // `area.height - 1` arithmetic on a zero-height area.
+        use ratatui::backend::TestBackend;
+        use ratatui::Terminal;
+        let mut app = test_app();
+        let grid = sample_grid();
+        let mut term = Terminal::new(TestBackend::new(40, 10)).unwrap();
+        term.draw(|f| {
+            let area = Rect {
+                x: 0,
+                y: 0,
+                width: 40,
+                height: 0,
+            };
+            render_grid(f, area, &mut app, &grid, GridKind::TableData, " t ");
+        })
+        .unwrap();
+    }
 
     #[test]
     fn short_message_is_untouched() {
@@ -16706,6 +17314,32 @@ mod tests {
         // No connection yet → the picker group, never the table group.
         let no_conn = keys(FooterView::Browse, Focus::Sidebar, false);
         assert!(no_conn.contains(&"c") && !no_conn.contains(&"/"));
+        // R20–R22 overlays have their own groups (the footer used to leak the
+        // page group while these owned the keyboard).
+        assert_eq!(
+            keys(FooterView::ImportPrompt, Focus::Preview, true),
+            vec!["Enter", "Esc", "?"]
+        );
+        assert_eq!(
+            keys(FooterView::ImportPlan, Focus::Preview, true),
+            vec!["Enter", "m", "s", "↑↓", "Esc", "?"]
+        );
+        assert_eq!(
+            keys(FooterView::ImportReport, Focus::Preview, true),
+            vec!["Enter/Esc", "?"]
+        );
+        assert_eq!(
+            keys(FooterView::ExportPicker, Focus::Preview, true),
+            vec!["↑↓", "Enter", "1-6", "Esc", "?"]
+        );
+        assert_eq!(
+            keys(FooterView::ExportPath, Focus::Preview, true),
+            vec!["Enter", "Esc", "?"]
+        );
+        assert_eq!(
+            keys(FooterView::RedisPrompt, Focus::Preview, true),
+            vec!["Enter", "Esc", "?"]
+        );
         // Every group ends with the pinned help key.
         for view in [
             FooterView::Help,
@@ -16715,6 +17349,25 @@ mod tests {
             FooterView::NewConn,
             FooterView::ColPicker,
             FooterView::Snippets,
+            FooterView::ImportPrompt,
+            FooterView::ImportPlan,
+            FooterView::ImportReport,
+            FooterView::ExportPicker,
+            FooterView::ExportPath,
+            FooterView::RedisPrompt,
+            FooterView::RedisKeys,
+            FooterView::RedisValue,
+            FooterView::MongoDocs,
+            FooterView::MongoDoc,
+            FooterView::Popup,
+            FooterView::FilterPrompt,
+            FooterView::DbPicker,
+            FooterView::Recent,
+            FooterView::Completion,
+            FooterView::SnippetName,
+            FooterView::ConnPicker,
+            FooterView::TablePrompt,
+            FooterView::ResultFilter,
         ] {
             let h = footer_hints_ctx(FooterCtx {
                 view,
@@ -16723,6 +17376,75 @@ mod tests {
             });
             assert_eq!(h.last().unwrap().0, "?", "{view:?}");
         }
+    }
+
+    /// The footer group must follow the *keyboard* owner. Each overlay is set on
+    /// a real `App` and `footer_ctx` must name it, mirroring the key router.
+    #[test]
+    fn footer_view_tracks_every_overlay() {
+        let mut app = test_app();
+        // Fresh app: no connection, picker open.
+        assert_eq!(footer_ctx(&app).view, FooterView::ConnPicker);
+
+        app.help_open = true;
+        assert_eq!(footer_ctx(&app).view, FooterView::Help);
+        app.help_open = false;
+
+        app.export_open = true;
+        assert_eq!(footer_ctx(&app).view, FooterView::ExportPicker);
+        app.export_open = false;
+
+        app.export_path = Some(TextArea::default());
+        assert_eq!(footer_ctx(&app).view, FooterView::ExportPath);
+        app.export_path = None;
+
+        app.import_prompt = Some(ImportPrompt {
+            input: TextArea::default(),
+            table: "t".into(),
+            db: "d".into(),
+            error: None,
+        });
+        assert_eq!(footer_ctx(&app).view, FooterView::ImportPrompt);
+        app.import_prompt = None;
+
+        app.import_report = Some(Box::new(ImportReport {
+            table: "t".into(),
+            mode: ImportMode::Append,
+            total: 1,
+            inserted: 1,
+            skipped: Vec::new(),
+            aborted: None,
+            elapsed_ms: 1,
+        }));
+        assert_eq!(footer_ctx(&app).view, FooterView::ImportReport);
+        app.import_report = None;
+
+        app.redis_prompt = Some(RedisPrompt {
+            kind: RedisPromptKind::Pattern,
+            title: "t".into(),
+            key_display: String::new(),
+            key_raw: String::new(),
+            field: String::new(),
+            batch: Vec::new(),
+            input: TextArea::default(),
+        });
+        assert_eq!(footer_ctx(&app).view, FooterView::RedisPrompt);
+        app.redis_prompt = None;
+
+        // `confirm` is checked first in `key`, so it must win over a browse
+        // overlay that happens to be open underneath it.
+        app.export_open = true;
+        app.confirm = Some(Confirm {
+            sql: "DELETE FROM t".into(),
+            reasons: Vec::new(),
+            refresh: false,
+            clear_batch: false,
+            redis: None,
+            mongo: None,
+        });
+        assert_eq!(footer_ctx(&app).view, FooterView::Confirm);
+        app.confirm = None;
+        app.export_open = false;
     }
 
     #[test]
@@ -16777,6 +17499,102 @@ mod tests {
             );
         }
         assert!(ui_text::ALL_KEYS.len() > 300);
+    }
+
+    /// Scan the real source for `t("…")` / `tf("…")` call sites and require an
+    /// English translation for each Chinese literal. The `ALL_KEYS` list is only
+    /// as good as its manual upkeep; this reads the call sites themselves, so a
+    /// new overlay added without a table entry fails the build instead of
+    /// silently falling back to Chinese under `DBXT_LANG=en`.
+    #[test]
+    fn every_call_site_has_english() {
+        let src = include_str!("main.rs");
+        let cjk = |s: &str| s.chars().any(|c| ('\u{4e00}'..='\u{9fff}').contains(&c));
+        let chars: Vec<char> = src.chars().collect();
+        let mut missing: Vec<String> = Vec::new();
+        let mut checked = 0usize;
+        let mut i = 0usize;
+        while i < chars.len() {
+            // A `t(` or `tf(` call: `t` not part of a longer identifier.
+            let prev_ok = i == 0 || !(chars[i - 1].is_ascii_alphanumeric() || chars[i - 1] == '_');
+            let after = if chars[i] == 't' && chars.get(i + 1) == Some(&'(') {
+                Some(i + 2)
+            } else if chars[i] == 't' && chars.get(i + 1) == Some(&'f') && chars.get(i + 2) == Some(&'(') {
+                Some(i + 3)
+            } else {
+                None
+            };
+            if let Some(mut j) = after {
+                if prev_ok {
+                    while j < chars.len() && chars[j].is_whitespace() {
+                        j += 1;
+                    }
+                    if chars.get(j) == Some(&'"') {
+                        let mut lit = String::new();
+                        let mut k = j + 1;
+                        while k < chars.len() {
+                            match chars[k] {
+                                '\\' if k + 1 < chars.len() => {
+                                    let e = chars[k + 1];
+                                    lit.push(match e {
+                                        'n' => '\n',
+                                        't' => '\t',
+                                        'r' => '\r',
+                                        other => other,
+                                    });
+                                    k += 2;
+                                }
+                                '"' => break,
+                                c => {
+                                    lit.push(c);
+                                    k += 1;
+                                }
+                            }
+                        }
+                        checked += 1;
+                        let leaked: &'static str = Box::leak(lit.clone().into_boxed_str());
+                        if cjk(&lit) && ui_text::t_lang(leaked, ui_text::Lang::En) == lit.as_str() {
+                            missing.push(lit);
+                        }
+                        i = k;
+                    }
+                }
+            }
+            i += 1;
+        }
+        // Guard against a broken scanner silently checking nothing.
+        assert!(checked > 400, "scanner only saw {checked} call sites");
+        assert!(
+            missing.is_empty(),
+            "{} t()/tf() literals have no English translation: {missing:#?}",
+            missing.len()
+        );
+    }
+
+    /// The `?` help cheat-sheet is data, not literal `t()` calls, so it needs its
+    /// own guard: every description must translate, and every keycap must stay
+    /// language-neutral (the key column is printed verbatim in both languages).
+    #[test]
+    fn help_rows_are_translated_and_keycaps_are_neutral() {
+        let cjk = |s: &str| s.chars().any(|c| ('\u{4e00}'..='\u{9fff}').contains(&c));
+        for (key, desc) in HELP_ROWS {
+            // The key column is rendered through `t` as well, so a CJK label
+            // (a section header or a descriptive row) must have an English form.
+            if cjk(key) {
+                assert_ne!(
+                    ui_text::t_lang(key, ui_text::Lang::En),
+                    *key,
+                    "help key {key:?} has no English translation"
+                );
+            }
+            if !desc.is_empty() {
+                assert_ne!(
+                    ui_text::t_lang(desc, ui_text::Lang::En),
+                    *desc,
+                    "help description {desc:?} has no English translation"
+                );
+            }
+        }
     }
 
     #[test]
