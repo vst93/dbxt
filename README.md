@@ -77,7 +77,7 @@ A keyboard-first terminal UI for databases, built on the [DBX](https://github.co
 - `e` edits a document in a JSON editor (`_id` immutable, field-level diff), `i` inserts, `Del` deletes by `_id` — every write confirmed, page reloaded in place.
 
 **Efficiency & experience**
-- `?` opens a keyboard cheat-sheet from anywhere; every overlay closes with `Esc`.
+- `?` opens a context mini cheat-sheet from anywhere (top keys for the surface under the cursor, single screen, no scrolling); a second `?` opens the full cheat-sheet, and the footer adapts its hint count to the terminal width. Every overlay closes with `Esc`.
 - `Ctrl-A` auto-collapses unfocused panes and `Ctrl-W` pins one; below 50 columns the panes stack vertically.
 - `Alt-C` compacts column widths, `Alt-V` hides columns, `Alt-R` jumps to a recent table, `Alt-H` opens the query history — choices persist per `database.table`.
 - Mouse and touch work: click to select, click again to confirm; the wheel scrolls, `Shift`/`Alt`/`Ctrl`+wheel pans columns.
@@ -128,7 +128,7 @@ Releases are cut from GitHub Actions: `gh workflow run release.yml` (optionally 
 2. Pick a connection (`↑` `↓` + `Enter`), or press `c` to create one.
 3. `Enter` on a table to browse it; `/` filters the table list, `d` switches database.
 4. `e` edits a cell, `i` inserts, `Delete` deletes — each shows the full SQL before it runs.
-5. `F5` runs the editor's SQL; `?` opens the full keyboard help.
+5. `F5` runs the editor's SQL; `?` opens a context mini cheat-sheet (again for the full help).
 
 For a database behind a bastion, press `c`, set `ssh_tunnel` to `y`, fill `ssh_host` / `ssh_user` and the login method, then `Enter` on the save row. The connection now goes dbxt → jump host → database.
 
@@ -138,17 +138,17 @@ The TUI's `?` overlay and `dbxt --help` carry the complete list; this is the sho
 
 | Context | Keys |
 | --- | --- |
-| Global | `?` help · `Tab`/`Shift-Tab` panes · `Alt-1/2/3` focus · `F5`/`Ctrl-J` run · `Ctrl-C` quit |
+| Global | `?` context mini cheat-sheet (a second `?` opens the full help) · `Tab`/`Shift-Tab` panes · `Alt-1/2/3` focus · `F5`/`Ctrl-J` run · `Ctrl-C` quit |
 | Connections | `↑` `↓` move · `Enter` connect · `c` new · `e` edit · `p` duplicate · `s` sort (name/type/colour) · `x` delete · `d` database/schema switcher · `o` picker |
 | Import / export | `Alt-E` export every connection as JSON (`p` include passwords w/ red confirm · `y` copy to clipboard) · `Alt-I` import a dbxt / DBeaver / Navicat file (`s` skip · `r` overwrite w/ red confirm · `b` keep both · `Space` toggle · `d` per row) |
 | Connection form | `↑` `↓`/`Tab` fields · `Enter` edit/toggle/save · `Space` toggle `ssh_tunnel`/`ssl`/`ssh_auth`, cycle the `color` palette · `Esc` back |
 | SSH host key | `y`/`Enter` accept & remember · `s` this session only · `n`/`Esc` reject |
-| Sidebar | `↑` `↓` tables · `/` filter · `Enter` browse · `r` structure · `I` import CSV · `t` recent |
+| Sidebar | `↑` `↓` tables · `1-9` jump to the Nth connection/table · `3j`/`3k` count prefix (move 3) · `/` filter · `Enter` browse · `r` structure · `I` import CSV · `t` recent |
 | Editor | `Alt-H` history panel · `Alt-G` global search · `Alt-L` run `.sql` file · `Alt-F` format/compress · `Ctrl-U` undo format · `Alt-/` complete · `F5`/`Ctrl-J` run · `↑` `↓` history |
 | Schema diff | `Alt-D` diff current table vs a chosen table (`c` picks another connection) · `Shift+Alt-D` diff two databases' tables · `Tab` columns/indexes/ALTER · `y` copy summary · `g` generate ALTER · `Esc` close |
 | Data compare | `Alt-K` compare two tables' rows by primary key (`c` picks another connection) · `m` switch schema/data · `w` WHERE · `Tab` summary/only-src/only-tgt/diff · `Enter` expand a diff row · `y` summary · `g` sync SQL · `Esc` close |
 | Data transfer | `Alt-T` copy structure/rows to another connection (`o` overwrite w/ red confirm · `m` mode · `w`/`l` WHERE/LIMIT · `i` indexes · `a` auto-increment · `s` stop/skip) · step ① connection · step ② db/schema/table · step ③ options · `g` summary · `b` browse target · `Esc` abort |
-| Results | `↑` `↓` rows · `←` `→` columns · `n`/`p` pages · `Enter`/`v` cell · `e` edit · `i` insert · `Delete` delete |
+| Results | `↑` `↓` rows · `←` `→` columns · `n`/`p` pages (`5n` = 5 pages) · `gd`/`gt` structure/data · `Enter`/`v` cell · `e` edit · `i` insert · `Delete` delete |
 | Results (more) | `f` filter · `s` sort · `Ctrl-K` extra sort · `Ctrl-R` clear · `y` copy row · `/` search · `Ctrl-Y` export · `[` `]` tabs |
 | Redis | `Space` select · `a` all · `Del`/`x`/`m` batch delete/TTL/rename · `/` MATCH · `n` more · `e` edit · `Enter` value |
 | MongoDB | `e` edit · `i` insert · `Del` delete · `f` filter · `n`/`p` pages · `r` indexes |

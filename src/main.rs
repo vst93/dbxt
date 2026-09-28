@@ -8970,6 +8970,19 @@ struct App {
 
     layout_mode: LayoutMode,
     term_h: u16,
+    /// Terminal width captured each frame. Overlay titles and the results header
+    /// read it to pick a compressed layout on narrow screens (<56 cols).
+    term_w: u16,
+    /// `?` opens a context mini cheat-sheet first (`help_mini`), and a second `?`
+    /// (or `Enter`) widens it to the full `help_open` overlay.
+    help_mini: bool,
+    /// Pending second key of a `gd` / `gt` (goto definition / goto data) chord.
+    pending_g: bool,
+    /// Vim-style count prefix: the digits typed before a motion (`5n`, `3j`).
+    /// Flushed to a direct list jump when no motion follows within
+    /// [`COUNT_JUMP_TIMEOUT`].
+    count_buf: String,
+    count_deadline: Option<Instant>,
     rects: Rects,
 }
 
@@ -9429,6 +9442,11 @@ impl App {
             conn_import_plan: None,
             layout_mode: LayoutMode::Mid,
             term_h: 0,
+            term_w: 0,
+            help_mini: false,
+            pending_g: false,
+            count_buf: String::new(),
+            count_deadline: None,
             rects: Rects::default(),
         };
         app.editor.set_placeholder_text(t("SQL … (Ctrl-J / F5 执行 · ↑ 历史)"));
@@ -9518,6 +9536,14 @@ async fn run_app(mut terminal: ratatui::DefaultTerminal, backend: Arc<LocalBacke
             _ = ticker.tick() => {
                 if app.loading {
                     app.spinner = app.spinner.wrapping_add(1);
+                }
+                // A digit typed without a following motion becomes a direct list
+                // jump once the short grace window closes.
+                if app
+                    .count_deadline
+                    .is_some_and(|deadline| Instant::now() >= deadline)
+                {
+                    flush_count(&mut app, &tx);
                 }
             }
         }
@@ -11008,6 +11034,9 @@ fn reset_overlays_for_backend_switch(app: &mut App) {
     app.mongo_dialog = None;
     app.redis_prompt = None;
     app.help_open = false;
+    app.help_mini = false;
+    app.pending_g = false;
+    app.clear_count();
     app.db_picker_open = false;
     app.history_open = false;
     app.history_filter = None;
@@ -11204,6 +11233,10 @@ fn browse_key(app: &mut App, tx: &Tx, k: KeyEvent) {
         help_key(app, k);
         return;
     }
+    if app.help_mini {
+        help_mini_key(app, k);
+        return;
+    }
     // CSV import and result export overlays (newest, so checked before the rest).
     if app.import_report.is_some() {
         import_report_key(app, k);
@@ -11395,6 +11428,23 @@ fn browse_key(app: &mut App, tx: &Tx, k: KeyEvent) {
                 return;
             }
             _ => {}
+        }
+    }
+
+    // The `g` chord (`gd` / `gt`) is resolved before the global `?` / `d`
+    // shortcuts: `gd` reaches the results pane instead of opening the database
+    // picker, and any other key clears a stale pending `g`.
+    if app.pending_g {
+        match k.code {
+            KeyCode::Char('d') | KeyCode::Char('t') if k.modifiers.is_empty() => {
+                preview_key(app, tx, k);
+                return;
+            }
+            KeyCode::Esc => {
+                app.pending_g = false;
+                return;
+            }
+            _ => app.pending_g = false,
         }
     }
 
@@ -11783,9 +11833,147 @@ fn db_picker_apply(app: &mut App, tx: &Tx, idx: usize) {
     }
 }
 
-// ── sidebar: connection picker or table browser ──
+// ── vim-style count prefix (`5n`, `3j`) + numeric direct jump ──
 
+/// A bare digit waits this long for a motion key before it is taken as a direct
+/// list jump (`3` → third item). Kept short so a jump still feels immediate.
+const COUNT_JUMP_TIMEOUT: Duration = Duration::from_millis(350);
+
+/// Parse a count buffer into a repetition count (`None` for empty / zero).
+fn parse_count(buf: &str) -> Option<u32> {
+    if buf.is_empty() {
+        return None;
+    }
+    match buf.parse::<u32>() {
+        Ok(0) | Err(_) => None,
+        Ok(n) => Some(n),
+    }
+}
+
+/// Target index for a direct `N` jump in a list of `len` items: 1-based, clamped
+/// to the last item. `None` when the list is empty.
+fn count_jump_index(count: u32, len: usize) -> Option<usize> {
+    if len == 0 || count == 0 {
+        return None;
+    }
+    Some(((count as usize) - 1).min(len - 1))
+}
+
+/// True for the keys a count may prefix in every pane (the common motions).
+fn count_motion(code: KeyCode) -> bool {
+    matches!(
+        code,
+        KeyCode::Up
+            | KeyCode::Down
+            | KeyCode::PageUp
+            | KeyCode::PageDown
+            | KeyCode::Home
+            | KeyCode::End
+            | KeyCode::Char('j')
+            | KeyCode::Char('k')
+    )
+}
+
+/// Shared pre-dispatch for the panes that accept a count. Returns `true` when the
+/// key was fully consumed (a buffered digit, or Esc cancelling a pending count);
+/// `false` lets the caller handle the key normally, after flushing a pending
+/// count as a direct list jump when `is_motion` is false.
+fn count_pre(app: &mut App, tx: &Tx, k: KeyEvent, is_motion: bool) -> bool {
+    if let KeyCode::Char(c @ '1'..='9') = k.code {
+        if k.modifiers.is_empty() && app.count_buf.len() < 4 {
+            app.count_buf.push(c);
+            app.count_deadline = Some(Instant::now() + COUNT_JUMP_TIMEOUT);
+            app.status = format!("{}·", app.count_buf);
+            return true;
+        }
+    }
+    if app.count_active() {
+        if k.code == KeyCode::Esc {
+            app.clear_count();
+            app.status = t("已取消计数").into();
+            return true;
+        }
+        if !is_motion {
+            flush_count(app, tx);
+        }
+    }
+    false
+}
+
+/// Consume a pending count as a repetition count (1 when none is buffered).
+fn take_count(app: &mut App) -> u32 {
+    let n = parse_count(&app.count_buf).unwrap_or(1);
+    app.clear_count();
+    n
+}
+
+/// Apply a count whose motion key never arrived: a bare `N` jumps to the Nth
+/// item of the sidebar list (connections, or the tables of the current
+/// connection). Called from the event-loop tick and by [`count_pre`].
+fn flush_count(app: &mut App, tx: &Tx) {
+    let Some(n) = parse_count(&app.count_buf) else {
+        app.clear_count();
+        return;
+    };
+    app.clear_count();
+    let _ = tx;
+    if app.focus != Focus::Sidebar {
+        return;
+    }
+    let picker = app.selected.is_none();
+    let len = if picker {
+        app.connections.len()
+    } else if app.backend_kind == Backend::Sql {
+        app.tables.len()
+    } else {
+        return;
+    };
+    if let Some(i) = count_jump_index(n, len) {
+        if picker {
+            app.conn_list.select(Some(i));
+        } else {
+            app.table_list.select(Some(i));
+        }
+        app.status = tf("跳转 {}/{}", &[&(i + 1), &(len)]);
+    }
+}
+
+/// Move a list cursor by a (possibly counted) number of items, clamped to the
+/// list bounds.
+fn list_step(state: &mut ListState, len: usize, step: usize, forward: bool) {
+    if len == 0 {
+        return;
+    }
+    let cur = state.selected().unwrap_or(0);
+    let i = if forward {
+        (cur + step).min(len - 1)
+    } else {
+        cur.saturating_sub(step)
+    };
+    state.select(Some(i));
+}
+
+impl App {
+    /// True while digits are buffered as a count prefix.
+    fn count_active(&self) -> bool {
+        !self.count_buf.is_empty()
+    }
+
+    /// Drop any pending count prefix.
+    fn clear_count(&mut self) {
+        self.count_buf.clear();
+        self.count_deadline = None;
+    }
+}
+
+// ── sidebar: connection picker or table browser ──
 fn sidebar_key(app: &mut App, tx: &Tx, k: KeyEvent) {
+    // A leading digit is a count prefix: with a motion it repeats it, alone it
+    // jumps to the Nth connection / table. Text inputs are handled above this
+    // dispatch, so a filter prompt still receives digits as text.
+    if count_pre(app, tx, k, count_motion(k.code)) {
+        return;
+    }
     // no connection selected yet → picker mode
     if app.selected.is_none() {
         match k.code {
@@ -11830,27 +12018,38 @@ fn sidebar_key(app: &mut App, tx: &Tx, k: KeyEvent) {
             KeyCode::Tab => {
                 app.focus = Focus::Editor;
             }
-            KeyCode::Up => {
+            KeyCode::Up | KeyCode::Char('k') => {
                 let n = app.connections.len();
-                if n > 0 {
-                    let i = app
-                        .conn_list
-                        .selected()
-                        .map(|i| i.saturating_sub(1))
-                        .unwrap_or(0);
-                    app.conn_list.select(Some(i));
+                let step = take_count(app) as usize;
+                list_step(&mut app.conn_list, n, step, false);
+            }
+            KeyCode::Down | KeyCode::Char('j') => {
+                let n = app.connections.len();
+                let step = take_count(app) as usize;
+                list_step(&mut app.conn_list, n, step, true);
+            }
+            KeyCode::Home => {
+                take_count(app);
+                if !app.connections.is_empty() {
+                    app.conn_list.select(Some(0));
                 }
             }
-            KeyCode::Down => {
+            KeyCode::End => {
+                take_count(app);
                 let n = app.connections.len();
                 if n > 0 {
-                    let i = app
-                        .conn_list
-                        .selected()
-                        .map(|i| (i + 1).min(n - 1))
-                        .unwrap_or(0);
-                    app.conn_list.select(Some(i));
+                    app.conn_list.select(Some(n - 1));
                 }
+            }
+            KeyCode::PageUp => {
+                let n = app.connections.len();
+                let step = 10 * take_count(app) as usize;
+                list_step(&mut app.conn_list, n, step, false);
+            }
+            KeyCode::PageDown => {
+                let n = app.connections.len();
+                let step = 10 * take_count(app) as usize;
+                list_step(&mut app.conn_list, n, step, true);
             }
             KeyCode::Enter => {
                 connect_selected(app, tx);
@@ -11940,20 +12139,26 @@ fn sidebar_key(app: &mut App, tx: &Tx, k: KeyEvent) {
             }
             KeyCode::Up | KeyCode::Char('k') => {
                 let n = app.redis_scan.keys.len();
+                let step = take_count(app) as usize;
                 if n > 0 {
-                    let i = app.redis_list.selected().map(|i| i.saturating_sub(1)).unwrap_or(0);
+                    let i = app.redis_list.selected().unwrap_or(0).saturating_sub(step);
                     app.redis_list.select(Some(i));
                 }
             }
             KeyCode::Down | KeyCode::Char('j') => {
                 let n = app.redis_scan.keys.len();
+                let step = take_count(app) as usize;
                 if n > 0 {
                     let cur = app.redis_list.selected().unwrap_or(0);
-                    if cur + 1 >= n && !app.redis_scan.exhausted {
-                        // At the last loaded key: pull the next page, keeping the cursor.
-                        start_redis_scan(app, tx, false);
+                    if cur + step >= n && !app.redis_scan.exhausted {
+                        if step == 1 {
+                            // At the last loaded key: pull the next page, keeping the cursor.
+                            start_redis_scan(app, tx, false);
+                        } else {
+                            app.redis_list.select(Some(n - 1));
+                        }
                     } else {
-                        app.redis_list.select(Some((cur + 1).min(n - 1)));
+                        app.redis_list.select(Some((cur + step).min(n - 1)));
                     }
                 }
             }
@@ -11995,27 +12200,38 @@ fn sidebar_key(app: &mut App, tx: &Tx, k: KeyEvent) {
         KeyCode::Char('/') => open_table_filter(app),
         // `t` — jump straight to one of the last five browsed tables.
         KeyCode::Char('t') => open_recent_tables(app),
-        KeyCode::Up => {
+        KeyCode::Up | KeyCode::Char('k') => {
             let n = app.tables.len();
-            if n > 0 {
-                let i = app
-                    .table_list
-                    .selected()
-                    .map(|i| i.saturating_sub(1))
-                    .unwrap_or(0);
-                app.table_list.select(Some(i));
+            let step = take_count(app) as usize;
+            list_step(&mut app.table_list, n, step, false);
+        }
+        KeyCode::Down | KeyCode::Char('j') => {
+            let n = app.tables.len();
+            let step = take_count(app) as usize;
+            list_step(&mut app.table_list, n, step, true);
+        }
+        KeyCode::Home => {
+            take_count(app);
+            if !app.tables.is_empty() {
+                app.table_list.select(Some(0));
             }
         }
-        KeyCode::Down => {
+        KeyCode::End => {
+            take_count(app);
             let n = app.tables.len();
             if n > 0 {
-                let i = app
-                    .table_list
-                    .selected()
-                    .map(|i| (i + 1).min(n - 1))
-                    .unwrap_or(0);
-                app.table_list.select(Some(i));
+                app.table_list.select(Some(n - 1));
             }
+        }
+        KeyCode::PageUp => {
+            let n = app.tables.len();
+            let step = 10 * take_count(app) as usize;
+            list_step(&mut app.table_list, n, step, false);
+        }
+        KeyCode::PageDown => {
+            let n = app.tables.len();
+            let step = 10 * take_count(app) as usize;
+            list_step(&mut app.table_list, n, step, true);
         }
         KeyCode::Enter => open_table_data(app, tx),
         // ←/→ (and h/l) stay as a fast shortcut; `d` is the discoverable list.
@@ -12399,20 +12615,35 @@ fn screen_move(app: &mut App, tx: &Tx, dir: i32) {
 /// Explicit page turn (`n`/`p`/Ctrl-F/Ctrl-B): keep the cursor at the same
 /// relative row so the view does not jump back to the top.
 fn page_turn(app: &mut App, tx: &Tx, forward: bool) {
+    page_turn_by(app, tx, forward, 1);
+}
+
+/// Page-turn repeated `times` (vim counts such as `5n`). A grid without a
+/// `page_state` falls back to screen scrolling, which is also repeated.
+fn page_turn_by(app: &mut App, tx: &Tx, forward: bool, times: u32) {
+    if times == 0 {
+        return;
+    }
     let Some(ps) = app.page_state.clone() else {
-        screen_move(app, tx, if forward { 1 } else { -1 });
+        for _ in 0..times {
+            screen_move(app, tx, if forward { 1 } else { -1 });
+        }
         return;
     };
-    if forward && !ps.has_next {
-        app.status = t("已经是最后一页").into();
-        return;
+    if forward {
+        if !ps.has_next {
+            app.status = t("已经是最后一页").into();
+            return;
+        }
+        goto_page(app, tx, ps.page + times as usize, Some(app.sel));
+    } else {
+        if ps.page == 0 {
+            app.status = t("已经是第一页").into();
+            return;
+        }
+        let target = ps.page.saturating_sub(times as usize);
+        goto_page(app, tx, target, Some(app.sel));
     }
-    if !forward && ps.page == 0 {
-        app.status = t("已经是第一页").into();
-        return;
-    }
-    let target = if forward { ps.page + 1 } else { ps.page - 1 };
-    goto_page(app, tx, target, Some(app.sel));
 }
 
 fn reload_tables(app: &mut App, tx: &Tx) {
@@ -13445,7 +13676,8 @@ fn mouse(app: &mut App, tx: &Tx, m: MouseEvent) {
         || app.col_picker_open
         || app.recent_open
         || app.table_prompt.is_some()
-        || app.help_open;
+        || app.help_open
+        || app.help_mini;
     match m.kind {
         MouseEventKind::ScrollUp | MouseEventKind::ScrollDown => {
             let up = m.kind == MouseEventKind::ScrollUp;
@@ -13471,6 +13703,9 @@ fn mouse(app: &mut App, tx: &Tx, m: MouseEvent) {
                 } else {
                     app.help_scroll.saturating_add(1)
                 };
+                return;
+            }
+            if app.help_mini {
                 return;
             }
             if overlay_open {
@@ -14829,6 +15064,45 @@ fn preview_key(app: &mut App, tx: &Tx, k: KeyEvent) {
     }
     let screen = viewport_rows(app) as u16;
     let ddl = app.struct_view == StructView::Ddl && app.ddl.is_some();
+    // Vim-style count prefix and the `g` chord are handled before the search /
+    // scroll layers so `5n` pages five times and `gd` / `gt` switch views.
+    if count_pre(
+        app,
+        tx,
+        k,
+        count_motion(k.code) || matches!(k.code, KeyCode::Char('n') | KeyCode::Char('p')),
+    ) {
+        return;
+    }
+    if app.pending_g {
+        match k.code {
+            KeyCode::Char('d') if k.modifiers.is_empty() => {
+                app.pending_g = false;
+                if app.selected_table().is_none() {
+                    app.status = t("先选中一张表").into();
+                } else {
+                    app.status = t("g d → 表结构").into();
+                    load_structure(app, tx);
+                }
+                return;
+            }
+            KeyCode::Char('t') if k.modifiers.is_empty() => {
+                app.pending_g = false;
+                if app.selected_table().is_none() {
+                    app.status = t("先选中一张表").into();
+                } else {
+                    app.status = t("g t → 表数据").into();
+                    open_table_data(app, tx);
+                }
+                return;
+            }
+            KeyCode::Esc => {
+                app.pending_g = false;
+                return;
+            }
+            _ => app.pending_g = false,
+        }
+    }
     // Esc clears an active result search before it does anything else. This
     // applies to the top-level grid and to a drilled script result; only the
     // script *list* has no search to clear.
@@ -14871,6 +15145,7 @@ fn preview_key(app: &mut App, tx: &Tx, k: KeyEvent) {
         KeyCode::Char('[') => switch_result_tab(app, -1),
         KeyCode::Char(']') => switch_result_tab(app, 1),
         KeyCode::Char('t') => {
+            // `gt` is the goto-data chord; bare `t` keeps toggling fields / DDL.
             if app.ddl.is_some() {
                 app.struct_view = match app.struct_view {
                     StructView::Fields => StructView::Ddl,
@@ -14878,6 +15153,11 @@ fn preview_key(app: &mut App, tx: &Tx, k: KeyEvent) {
                 };
                 app.ddl_scroll = 0;
             }
+        }
+        // `g` starts the `gd` (goto structure) / `gt` (goto data) chord.
+        KeyCode::Char('g') => {
+            app.pending_g = true;
+            app.status = t("g… d=表结构 t=表数据").into();
         }
         KeyCode::Char('s') => sort_column(app, tx, false),
         KeyCode::Char('f') => open_filter_prompt(app),
@@ -14900,17 +15180,23 @@ fn preview_key(app: &mut App, tx: &Tx, k: KeyEvent) {
             };
         }
         KeyCode::Up | KeyCode::Char('k') => {
+            let times = take_count(app);
             if ddl {
-                app.ddl_scroll = app.ddl_scroll.saturating_sub(1);
+                app.ddl_scroll = app.ddl_scroll.saturating_sub(times as u16);
             } else {
-                move_cursor(app, tx, -1);
+                for _ in 0..times {
+                    move_cursor(app, tx, -1);
+                }
             }
         }
         KeyCode::Down | KeyCode::Char('j') => {
+            let times = take_count(app);
             if ddl {
-                app.ddl_scroll = app.ddl_scroll.saturating_add(1);
+                app.ddl_scroll = app.ddl_scroll.saturating_add(times as u16);
             } else {
-                move_cursor(app, tx, 1);
+                for _ in 0..times {
+                    move_cursor(app, tx, 1);
+                }
             }
         }
         KeyCode::Left | KeyCode::Char('h') => {
@@ -14924,25 +15210,33 @@ fn preview_key(app: &mut App, tx: &Tx, k: KeyEvent) {
             }
         }
         KeyCode::PageUp => {
+            let times = take_count(app) as u16;
             if ddl {
-                app.ddl_scroll = app.ddl_scroll.saturating_sub(screen);
+                app.ddl_scroll = app.ddl_scroll.saturating_sub(screen * times);
             } else {
-                screen_move(app, tx, -1);
+                for _ in 0..times {
+                    screen_move(app, tx, -1);
+                }
             }
         }
         KeyCode::PageDown => {
+            let times = take_count(app) as u16;
             if ddl {
-                app.ddl_scroll = app.ddl_scroll.saturating_add(screen);
+                app.ddl_scroll = app.ddl_scroll.saturating_add(screen * times);
             } else {
-                screen_move(app, tx, 1);
+                for _ in 0..times {
+                    screen_move(app, tx, 1);
+                }
             }
         }
         KeyCode::Home => {
+            take_count(app);
             if !ddl {
                 app.sel = 0;
             }
         }
         KeyCode::End => {
+            take_count(app);
             if !ddl {
                 let n = result_row_count(app);
                 if n > 0 {
@@ -14951,20 +15245,27 @@ fn preview_key(app: &mut App, tx: &Tx, k: KeyEvent) {
             }
         }
         KeyCode::Char('n') => {
+            let times = take_count(app);
             if app.result_needle.trim().is_empty() {
-                page_turn(app, tx, true);
+                page_turn_by(app, tx, true, times);
             } else {
-                search_move(app, 1);
+                for _ in 0..times {
+                    search_move(app, 1);
+                }
             }
         }
         KeyCode::Char('N') => {
+            take_count(app);
             if app.result_needle.trim().is_empty() {
                 app.status = t("先按 / 搜索结果，再用 n/N 跳转命中").into();
             } else {
                 search_move(app, -1);
             }
         }
-        KeyCode::Char('p') => page_turn(app, tx, false),
+        KeyCode::Char('p') => {
+            let times = take_count(app);
+            page_turn_by(app, tx, false, times);
+        }
         KeyCode::Enter => {
             if let Some(s) = &app.script {
                 if s.drilled.is_none() {
@@ -15030,13 +15331,21 @@ fn popup_key(app: &mut App, k: KeyEvent, target: PopupTarget) {
 }
 
 fn open_help(app: &mut App) {
-    app.help_open = true;
+    // Progressive discovery: the first `?` shows a context mini cheat-sheet that
+    // always fits one screen; a second `?` (or Enter) widens it to the full
+    // scrollable help. This is the cheap path on a small terminal where the full
+    // overlay needs scrolling.
+    app.help_mini = true;
+    app.help_open = false;
     app.help_scroll = 0;
 }
 
 fn help_key(app: &mut App, k: KeyEvent) {
     match k.code {
-        KeyCode::Esc | KeyCode::Char('q') | KeyCode::Char('?') => app.help_open = false,
+        KeyCode::Esc | KeyCode::Char('q') | KeyCode::Char('?') => {
+            app.help_open = false;
+            app.help_mini = false;
+        }
         KeyCode::Up | KeyCode::Char('k') => {
             app.help_scroll = app.help_scroll.saturating_sub(1)
         }
@@ -15045,6 +15354,20 @@ fn help_key(app: &mut App, k: KeyEvent) {
         }
         KeyCode::PageUp => app.help_scroll = app.help_scroll.saturating_sub(8),
         KeyCode::PageDown => app.help_scroll = app.help_scroll.saturating_add(8),
+        _ => {}
+    }
+}
+
+/// The mini cheat-sheet's key handler: `?` / Enter promotes to the full overlay,
+/// Esc (or `q`) closes.
+fn help_mini_key(app: &mut App, k: KeyEvent) {
+    match k.code {
+        KeyCode::Char('?') | KeyCode::Enter => {
+            app.help_mini = false;
+            app.help_open = true;
+            app.help_scroll = 0;
+        }
+        KeyCode::Esc | KeyCode::Char('q') => app.help_mini = false,
         _ => {}
     }
 }
@@ -15456,6 +15779,10 @@ fn history_key(app: &mut App, tx: &Tx, k: KeyEvent) {
         return;
     }
     let n = app.history_view.len();
+    // Vim count prefix: `3j` moves the cursor three entries.
+    if count_pre(app, tx, k, count_motion(k.code)) {
+        return;
+    }
     let step = |app: &mut App, delta: i32| {
         if n == 0 {
             return;
@@ -15470,16 +15797,30 @@ fn history_key(app: &mut App, tx: &Tx, k: KeyEvent) {
             app.history_filter = None;
             app.status = t("已关闭查询历史").into();
         }
-        KeyCode::Up | KeyCode::Char('k') => step(app, -1),
-        KeyCode::Down | KeyCode::Char('j') => step(app, 1),
-        KeyCode::PageUp => step(app, -10),
-        KeyCode::PageDown => step(app, 10),
+        KeyCode::Up | KeyCode::Char('k') => {
+            let times = take_count(app) as i32;
+            step(app, -times);
+        }
+        KeyCode::Down | KeyCode::Char('j') => {
+            let times = take_count(app) as i32;
+            step(app, times);
+        }
+        KeyCode::PageUp => {
+            let times = take_count(app) as i32;
+            step(app, -10 * times);
+        }
+        KeyCode::PageDown => {
+            let times = take_count(app) as i32;
+            step(app, 10 * times);
+        }
         KeyCode::Home => {
+            take_count(app);
             if n > 0 {
                 app.history_list.select(Some(0));
             }
         }
         KeyCode::End => {
+            take_count(app);
             if n > 0 {
                 app.history_list.select(Some(n - 1));
             }
@@ -22427,6 +22768,7 @@ fn ui(f: &mut Frame, app: &mut App) {
     let (w, h) = (f.area().width, f.area().height);
     app.layout_mode = layout_mode(w);
     app.term_h = h;
+    app.term_w = w;
     app.rects = Rects::default();
 
     let header_h = if h < 14 { 0 } else { 1 };
@@ -22569,6 +22911,9 @@ fn ui(f: &mut Frame, app: &mut App) {
     }
     if app.help_open {
         render_help(f, f.area(), app);
+    }
+    if app.help_mini {
+        render_help_mini(f, f.area(), app);
     }
     if app.edit_dialog.is_some() {
         render_edit_dialog(f, f.area(), app);
@@ -22892,6 +23237,7 @@ enum FooterView {
     SshPrompt,
     EditDialog,
     Help,
+    HelpMini,
     ImportReport,
     ImportPlan,
     ImportPrompt,
@@ -22950,6 +23296,13 @@ struct FooterCtx {
 /// `browse_key` checks its overlays in the order below), so the footer can never
 /// describe a different surface than the one the keyboard is actually on.
 fn footer_ctx(app: &App) -> FooterCtx {
+    footer_ctx_inner(app, true)
+}
+
+/// Build the footer context, optionally ignoring the help layers. The mini
+/// cheat-sheet needs the context *under* itself (it is not a real surface), so
+/// it calls this with `include_help = false` to learn what `?` was pressed over.
+fn footer_ctx_inner(app: &App, include_help: bool) -> FooterCtx {
     let view = if app.confirm.is_some() {
         FooterView::Confirm
     } else if app.ssh_prompt.is_some() {
@@ -22958,8 +23311,10 @@ fn footer_ctx(app: &App) -> FooterCtx {
         FooterView::EditDialog
     } else if app.history_confirm.is_some() {
         FooterView::Confirm
-    } else if app.help_open {
+    } else if include_help && app.help_open {
         FooterView::Help
+    } else if include_help && app.help_mini {
+        FooterView::HelpMini
     } else if app.import_report.is_some() {
         FooterView::ImportReport
     } else if app.import_plan.is_some() {
@@ -23058,6 +23413,10 @@ fn footer_ctx(app: &App) -> FooterCtx {
 fn footer_hints_ctx(ctx: FooterCtx) -> Vec<Hint> {
     let mut v: Vec<Hint> = match ctx.view {
         FooterView::Help => vec![("↑↓", t("滚动")), ("Esc", t("关闭"))],
+        FooterView::HelpMini => vec![
+            ("Enter/?", t("全部键位")),
+            ("Esc", t("关闭")),
+        ],
         // R20–R22 overlays: import / export / Redis input dialogs. Without
         // these arms the footer fell through to the page's group while an
         // overlay owned the keyboard.
@@ -23288,6 +23647,7 @@ fn footer_hints_ctx(ctx: FooterCtx) -> Vec<Hint> {
                 ("r", t("结构")),
                 ("d", t("切库")),
                 ("Tab", t("SQL")),
+                ("1-9", t("直跳")),
             ],
             Focus::Editor => vec![
                 ("Ctrl-J", t("运行")),
@@ -23313,6 +23673,7 @@ fn footer_hints_ctx(ctx: FooterCtx) -> Vec<Hint> {
                 ("y", t("复制INSERT")),
                 ("f", t("过滤")),
                 ("/", t("搜索")),
+                ("gd/gt", t("结构/数据")),
             ],
         },
     };
@@ -23330,47 +23691,87 @@ fn hint_width(h: &Hint) -> usize {
     disp_width(h.0) + 1 + disp_width(h.1)
 }
 
-/// Choose which leading hints fit in `width` while always keeping the pinned
-/// final hint (`?` help). Returns the chosen leading hints and whether anything
-/// was dropped (so the caller can draw the `…` marker).
+/// Information-density tier for the footer, chosen from the terminal width.
+/// Small screens get only the highest-frequency keys so the line never has to
+/// cut a hint in half (and never silently loses its escape hatch).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum FooterTier {
+    Mini,    // < 60 cols
+    Compact, // 60..99
+    Full,    // >= 100
+}
+
+fn footer_tier(width: usize) -> FooterTier {
+    if width < 60 {
+        FooterTier::Mini
+    } else if width < 100 {
+        FooterTier::Compact
+    } else {
+        FooterTier::Full
+    }
+}
+
+/// Maximum number of leading hints a tier shows, or `None` for "show them all".
+fn footer_tier_cap(tier: FooterTier) -> Option<usize> {
+    match tier {
+        FooterTier::Mini => Some(4),
+        FooterTier::Compact => Some(6),
+        FooterTier::Full => None,
+    }
+}
+
+/// The pinned final hint. When the tier hid some keys the label invites a second
+/// look (`? 更多`) rather than merely naming the help overlay.
+fn footer_help_hint(more: bool) -> Hint {
+    if more {
+        ("?", t("更多"))
+    } else {
+        ("?", t("帮助"))
+    }
+}
+
+/// Choose which leading hints to show in `width`. The width tier caps the count
+/// (4 / 6 / all); within the cap hints are appended while they fit, so a single
+/// hint is never split. Returns the chosen hints and whether any were hidden
+/// (the pinned help hint then reads `? 更多`).
 fn footer_select<'a>(hints: &'a [Hint], width: usize) -> (Vec<&'a Hint>, bool) {
     let (help, lead) = hints.split_last().expect("footer always has a hint");
-    // Reserve the help hint plus two " · " separators and the `…` marker.
+    let cap = footer_tier_cap(footer_tier(width));
+    // Reserve the pinned help hint plus the separators on either side of it.
     let mut budget = width.saturating_sub(hint_width(help) + 5);
     let mut chosen: Vec<&'a Hint> = Vec::new();
-    let mut dropped = false;
-    for h in lead {
+    let mut hidden = false;
+    for (i, h) in lead.iter().enumerate() {
+        if cap.is_some_and(|c| i >= c) {
+            hidden = true;
+            break;
+        }
         let w = hint_width(h);
         if w + 3 <= budget {
             budget -= w + 3;
             chosen.push(h);
         } else {
-            dropped = true;
+            hidden = true;
             break;
         }
     }
-    (chosen, dropped)
+    (chosen, hidden)
 }
 
 #[cfg(test)]
 /// Display width of the rendered footer line for a chosen set, used by tests.
-/// Mirrors exactly what [`render_footer`] draws: the chosen hints, an optional
-/// `…` marker, the pinned help hint, and one `" · "` separator per gap.
-fn footer_line_width(chosen: &[&Hint], help: &Hint, dropped: bool) -> usize {
-    let mut w: usize = chosen.iter().map(|h| hint_width(h)).sum();
-    w += hint_width(help);
-    let mut tokens = chosen.len() + 1; // chosen hints + help
-    if dropped {
-        tokens += 1;
-        w += 1; // the "…" glyph
-    }
-    w + tokens.saturating_sub(1) * 3
+/// Mirrors exactly what [`render_footer`] draws: the chosen hints, the pinned
+/// help hint (whose label depends on `more`), and one `" · "` per gap.
+fn footer_line_width(chosen: &[&Hint], more: bool) -> usize {
+    let help = footer_help_hint(more);
+    let w: usize = chosen.iter().map(|h| hint_width(h)).sum::<usize>() + hint_width(&help);
+    w + chosen.len() * 3
 }
 
 fn render_footer(f: &mut Frame, area: Rect, app: &App) {
     let hints = footer_hints(app);
-    let (chosen, dropped) = footer_select(&hints, area.width as usize);
-    let help = hints.last().expect("footer always has a hint");
+    let (chosen, more) = footer_select(&hints, area.width as usize);
+    let help = footer_help_hint(more);
     let mut spans: Vec<Span> = Vec::new();
     let sep = Span::styled(" · ", Style::default().fg(Color::DarkGray));
     let key_style = Style::default()
@@ -23383,12 +23784,6 @@ fn render_footer(f: &mut Frame, area: Rect, app: &App) {
         }
         spans.push(Span::styled(h.0, key_style));
         spans.push(Span::styled(format!(" {}", h.1), desc_style));
-    }
-    if dropped {
-        if !spans.is_empty() {
-            spans.push(sep.clone());
-        }
-        spans.push(Span::styled("…", desc_style));
     }
     if !spans.is_empty() {
         spans.push(sep);
@@ -23678,12 +24073,39 @@ fn search_marker(app: &App) -> String {
     }
 }
 
+/// Compressed table-browser title for a narrow terminal: table name, page
+/// number and the filter / search marks survive; everything else is dropped.
+fn narrow_table_title(app: &App, ps: &PageState) -> String {
+    let table = fix_double_encoding(&qualified_display(&ps.schema, &ps.table));
+    let mut marks = String::new();
+    if !app.result_needle.trim().is_empty() {
+        marks.push('🔍');
+    }
+    if !ps.filter.trim().is_empty() {
+        marks.push('⚑');
+    }
+    let marks = if marks.is_empty() {
+        String::new()
+    } else {
+        format!(" {marks}")
+    };
+    tf(" {}.{}{} · p{} ", &[&fix_double_encoding(&app.current_db()), &table, &marks, &(ps.page + 1)])
+}
+
 fn grid_title(app: &App) -> String {
+    // On a narrow terminal the title is clipped by the pane, so keep only the
+    // three essentials — table name, page number, filter/search marks — and drop
+    // the row range, note and next-page hint. `term_w == 0` (tests) is treated as
+    // wide so the full title is exercised.
+    let narrow = app.term_w > 0 && app.term_w < 56;
     match app.grid_kind {
         GridKind::TableData => {
             let Some(ps) = &app.page_state else {
                 return t(" 结果 ").into();
             };
+            if narrow {
+                return narrow_table_title(app, ps);
+            }
             let rows = app.grid.as_ref().map(|g| g.rows.len()).unwrap_or(0);
             let offset = ps.page * ps.page_size;
             let total = total_label(ps);
@@ -23725,6 +24147,9 @@ fn grid_title(app: &App) -> String {
             let Some(ps) = &app.page_state else {
                 return t(" 文档 ").into();
             };
+            if narrow {
+                return narrow_table_title(app, ps);
+            }
             let rows = app.grid.as_ref().map(|g| g.rows.len()).unwrap_or(0);
             let offset = ps.page * ps.page_size;
             let total = ps.total.map(|t| tf("共 {} 个", &[&(t)])).unwrap_or_else(|| t("总数未知").into());
@@ -24888,8 +25313,42 @@ fn render_form(f: &mut Frame, area: Rect, app: &mut App) {
 /// area first. ratatui's widgets (and `Clear` in particular) panic when asked to
 /// draw outside the buffer, and a tiny terminal can make a fixed overlay taller
 /// than the screen, so every centered overlay goes through here.
-fn centered_overlay(area: Rect, w: u16, h: u16) -> Rect {
-    let w = w.min(area.width);
+/// Shared overlay width. On a narrow terminal the box takes the whole width so
+/// it stays readable; otherwise it keeps a two-column margin on each side and is
+/// capped at `max`. This one helper keeps every overlay's width policy uniform
+/// (and is the single place the small-screen fallback is tuned).
+fn overlay_width(area_width: u16, max: u16, min_avail: u16) -> u16 {
+    let avail = area_width.saturating_sub(4);
+    if avail < min_avail {
+        area_width
+    } else {
+        avail.min(max)
+    }
+}
+
+/// Build an overlay title from a `prefix`, a list of key hints and a `suffix`,
+/// dropping whole hints when they do not fit so a title is never cut mid-key.
+/// This is the overlay-title counterpart of [`footer_select`]: key hints survive
+/// longest, and the border is never clipped through the middle of a hint.
+fn overlay_hint_title(width: u16, prefix: &str, hints: &[Hint], suffix: &str) -> String {
+    let budget = width.saturating_sub(2) as usize;
+    let mut out = prefix.to_string();
+    let mut used = disp_width(&out) + disp_width(suffix);
+    for (key, desc) in hints {
+        let piece = format!(" · {key} {desc}");
+        let pw = disp_width(&piece);
+        if used + pw <= budget {
+            out.push_str(&piece);
+            used += pw;
+        } else {
+            break;
+        }
+    }
+    out.push_str(suffix);
+    out
+}
+
+fn centered_overlay(area: Rect, w: u16, h: u16) -> Rect {    let w = w.min(area.width);
     let h = h.min(area.height);
     let x = area.x + area.width.saturating_sub(w) / 2;
     let y = area.y + area.height.saturating_sub(h) / 2;
@@ -24952,7 +25411,22 @@ fn render_conn_picker(f: &mut Frame, area: Rect, app: &mut App) {
         .block(
             Block::default()
                 .borders(Borders::ALL)
-                .title(t(" 连接 · ↑↓ Enter · c 新建 · p 复制 · s 排序 · x 删除 · q 隐藏 "))
+                // Key hints are added whole, so a narrow picker drops the least
+                // important ones instead of clipping `s 排序` into `s…`.
+                .title(overlay_hint_title(
+                    box_area.width,
+                    &format!(" {} ", t("连接")),
+                    &[
+                        ("↑↓", t("选择连接")),
+                        ("Enter", t("连接")),
+                        ("c", t("新建")),
+                        ("p", t("复制")),
+                        ("s", t("排序")),
+                        ("x", t("删除")),
+                        ("q", t("显隐")),
+                    ],
+                    " ",
+                ))
                 .border_set(border::ROUNDED),
         )
         .highlight_style(
@@ -26269,14 +26743,7 @@ fn render_data_diff(f: &mut Frame, area: Rect, app: &mut App) {
 
 /// The optional data-compare `WHERE` input.
 fn render_data_where(f: &mut Frame, area: Rect, app: &mut App) {
-    let w = {
-        let avail = area.width.saturating_sub(4);
-        if avail < 24 {
-            area.width
-        } else {
-            avail.min(74)
-        }
-    };
+    let w = overlay_width(area.width, 74, 24);
     let h = 7.min(area.height);
     let box_area = centered_overlay(area, w, h);
     f.render_widget(Clear, box_area);
@@ -27072,14 +27539,7 @@ fn render_snippet_name(f: &mut Frame, area: Rect, app: &mut App) {
 
 /// Shared scrollable text popup used for both cell values and row details.
 fn render_text_popup(f: &mut Frame, area: Rect, title: &str, lines: &[PopupLine], scroll: u16) {
-    let w = {
-        let avail = area.width.saturating_sub(4);
-        if avail < 24 {
-            area.width
-        } else {
-            avail.min(88)
-        }
-    };
+    let w = overlay_width(area.width, 88, 24);
     let inner_w = w.saturating_sub(4).max(1) as usize;
     // Wrap each logical line on its own so the style that marks NULL / ''
     // survives across physical rows.
@@ -27117,14 +27577,7 @@ fn render_edit_dialog(f: &mut Frame, area: Rect, app: &mut App) {
     let Some(d) = app.edit_dialog.clone() else {
         return;
     };
-    let w = {
-        let avail = area.width.saturating_sub(4);
-        if avail < 34 {
-            area.width
-        } else {
-            avail.min(78)
-        }
-    };
+    let w = overlay_width(area.width, 78, 34);
     let inner_w = w.saturating_sub(4).max(1) as usize;
 
     match d.kind {
@@ -27324,14 +27777,7 @@ fn render_edit_dialog(f: &mut Frame, area: Rect, app: &mut App) {
 }
 
 fn render_redis_prompt(f: &mut Frame, area: Rect, app: &mut App) {
-    let w = {
-        let avail = area.width.saturating_sub(4);
-        if avail < 24 {
-            area.width
-        } else {
-            avail.min(74)
-        }
-    };
+    let w = overlay_width(area.width, 74, 24);
     let h = 7.min(area.height);
     let box_area = centered_overlay(area, w, h);
     f.render_widget(Clear, box_area);
@@ -27395,14 +27841,7 @@ fn render_mongo_dialog(f: &mut Frame, area: Rect, app: &mut App) {
     let Some(d) = app.mongo_dialog.clone() else {
         return;
     };
-    let w = {
-        let avail = area.width.saturating_sub(4);
-        if avail < 34 {
-            area.width
-        } else {
-            avail.min(86)
-        }
-    };
+    let w = overlay_width(area.width, 86, 34);
     let h = area.height.saturating_sub(2).max(5);
     let box_area = centered_overlay(area, w, h);
     f.render_widget(Clear, box_area);
@@ -27471,14 +27910,7 @@ fn render_mongo_dialog(f: &mut Frame, area: Rect, app: &mut App) {
 }
 
 fn render_filter_prompt(f: &mut Frame, area: Rect, app: &mut App) {
-    let w = {
-        let avail = area.width.saturating_sub(4);
-        if avail < 24 {
-            area.width
-        } else {
-            avail.min(74)
-        }
-    };
+    let w = overlay_width(area.width, 74, 24);
     let h = 7.min(area.height);
     let box_area = centered_overlay(area, w, h);
     f.render_widget(Clear, box_area);
@@ -27592,6 +28024,8 @@ const HELP_ROWS: &[(&str, &str)] = &[
     ("密码", "导出默认不含密码（p 显式开启）；DBeaver / Navicat 密码加密，不解析，导入后标「需补密码」"),
     ("— 侧栏 —", ""),
     ("↑ ↓", "移动表列表"),
+    ("1-9", "直跳第 N 个连接 / 表"),
+    ("3 j / 3 k", "计数前缀：下 / 上移动 3 项（侧栏 / 结果 / 历史通用）"),
     ("/", "过滤表名（输入即筛选，Enter 保留，Esc 清除）"),
     ("t", "最近表浮层（Enter 直达）"),
     ("Enter", "浏览表数据"),
@@ -27605,7 +28039,7 @@ const HELP_ROWS: &[(&str, &str)] = &[
     ("— 结果（表格浏览）—", ""),
     ("↑ ↓ / j k", "行光标（到边自动翻页）"),
     ("PgUp / PgDn", "整屏滚动，跨页衔接"),
-    ("n / p", "下一页 / 上一页"),
+    ("n / p", "下一页 / 上一页（可计数：5 n = 翻 5 页）"),
     ("Ctrl-F / Ctrl-B", "下一页 / 上一页"),
     ("大表翻页", "有主键时按主键续读（keyset），翻页耗时与页深无关"),
     ("行数上限", "50 万行以上的表显示 >50万，不再每页 COUNT"),
@@ -27641,6 +28075,7 @@ const HELP_ROWS: &[(&str, &str)] = &[
     ("c / Alt-V", "列显隐浮层（空格勾选 / a 全选 / x 仅首列，按 库.表 记住）"),
     ("Alt-R", "最近表直达浮层"),
     ("t", "字段 ↔ DDL（表结构）"),
+    ("g d / g t", "跳表结构视图 / 回表数据"),
     ("Esc", "收起结果 / 关闭浮层"),
     ("— 编辑确认层 —", ""),
     ("Enter", "执行（UPDATE / INSERT，SQL 全文可见）"),
@@ -27735,12 +28170,7 @@ const HELP_ROWS: &[(&str, &str)] = &[
 /// columns instead of the old 64. Narrow terminals keep the previous fallback:
 /// all but 4 columns, or the whole area when even that is too small.
 fn help_overlay_width(area_width: u16) -> u16 {
-    let avail = area_width.saturating_sub(4);
-    if avail < 30 {
-        area_width
-    } else {
-        avail.min(96)
-    }
+    overlay_width(area_width, 96, 30)
 }
 
 /// Width of the help key column. Wide layouts get 24 columns so long chords and
@@ -27796,9 +28226,67 @@ fn render_help(f: &mut Frame, area: Rect, app: &mut App) {
     f.render_widget(Clear, box_area);
     let max_scroll = total.saturating_sub(inner_h) as u16;
     let scroll = app.help_scroll.min(max_scroll);
-    let title = tf(" 快捷键 · {}/{} · ↑↓ 滚动 · Esc 关闭 ", &[&((scroll as usize + inner_h).min(total)), &(total)]);
+    let title = if box_area.width < 56 {
+        // Narrow: the footer already carries the scroll/close hints, so the
+        // title only names the sheet and its position.
+        tf(" 快捷键 · {}/{} ", &[&((scroll as usize + inner_h).min(total)), &(total)])
+    } else {
+        tf(" 快捷键 · {}/{} · ↑↓ 滚动 · Esc 关闭 ", &[&((scroll as usize + inner_h).min(total)), &(total)])
+    };
     f.render_widget(
         Paragraph::new(lines).scroll((scroll, 0)).block(
+            Block::default()
+                .borders(Borders::ALL)
+                .title(title)
+                .border_set(border::THICK)
+                .border_style(Style::default().fg(Color::Cyan)),
+        ),
+        box_area,
+    );
+}
+
+/// The context mini cheat-sheet: at most ten keys for the surface that owns the
+/// keyboard right now, sized to fit one screen so it never scrolls. `?` again
+/// widens it to [`render_help`].
+fn render_help_mini(f: &mut Frame, area: Rect, app: &mut App) {
+    // Reuse the footer's context-aware group for the surface *under* the mini
+    // sheet; drop the pinned `?` hint and cap at ten.
+    let hints: Vec<Hint> = footer_hints_ctx(footer_ctx_inner(app, false))
+        .into_iter()
+        .filter(|h| h.0 != "?")
+        .take(10)
+        .collect();
+    let key_w = hints
+        .iter()
+        .map(|h| disp_width(h.0))
+        .max()
+        .unwrap_or(4)
+        .min(12);
+    let mut lines: Vec<Line<'static>> = Vec::with_capacity(hints.len());
+    for (key, desc) in &hints {
+        lines.push(Line::from(vec![
+            Span::styled(
+                format!("{:<key_w$}  ", key),
+                Style::default().fg(Color::Yellow),
+            ),
+            Span::raw(*desc),
+        ]));
+    }
+    if lines.is_empty() {
+        lines.push(Line::from(t("当前上下文没有快捷操作")));
+    }
+    let max_h = area.height.saturating_sub(2).max(3);
+    let h = (lines.len() as u16 + 2).min(max_h);
+    let w = overlay_width(area.width, 64, 30);
+    let box_area = centered_overlay(area, w, h);
+    f.render_widget(Clear, box_area);
+    let title = if box_area.width < 60 {
+        tf(" 快捷键 · {} 项 ", &[&(hints.len())])
+    } else {
+        tf(" 快捷键 · 当前上下文 · {} 项 · ? 全部 · Esc 关闭 ", &[&(hints.len())])
+    };
+    f.render_widget(
+        Paragraph::new(lines).block(
             Block::default()
                 .borders(Borders::ALL)
                 .title(title)
@@ -27812,14 +28300,7 @@ fn render_help(f: &mut Frame, area: Rect, app: &mut App) {
 /// The red layer for deleting a saved connection. Deliberately explicit that
 /// only the connection config is removed, never the database's data.
 fn render_conn_confirm(f: &mut Frame, area: Rect, cc: &ConnConfirm) {
-    let w = {
-        let avail = area.width.saturating_sub(4);
-        if avail < 30 {
-            area.width
-        } else {
-            avail.min(72)
-        }
-    };
+    let w = overlay_width(area.width, 72, 30);
     let lines = vec![
         Line::from(Span::styled(
             tf("将删除连接 {} ({})", &[&cc.name, &cc.db_type]),
@@ -27857,14 +28338,7 @@ fn render_confirm(f: &mut Frame, area: Rect, confirm: &Confirm) {
         render_conn_confirm(f, area, cc);
         return;
     }
-    let w = {
-        let avail = area.width.saturating_sub(4);
-        if avail < 30 {
-            area.width
-        } else {
-            avail.min(72)
-        }
-    };
+    let w = overlay_width(area.width, 72, 30);
     let inner_w = w.saturating_sub(4) as usize;
     // Keep the statement's own line structure so a multi-line UPDATE / DELETE /
     // BEGIN … COMMIT stays readable; nothing is run from a summary alone.
@@ -27927,14 +28401,7 @@ fn render_ssh_prompt(f: &mut Frame, area: Rect, app: &mut App) {
     let Some(state) = app.ssh_prompt.as_ref() else {
         return;
     };
-    let w = {
-        let avail = area.width.saturating_sub(4);
-        if avail < 30 {
-            area.width
-        } else {
-            avail.min(76)
-        }
-    };
+    let w = overlay_width(area.width, 76, 30);
     let req = &state.request;
     let mut lines: Vec<Line> = Vec::new();
     let (title, color) = match req.kind {
@@ -28023,14 +28490,7 @@ fn render_ssh_prompt(f: &mut Frame, area: Rect, app: &mut App) {
 // ── CSV import overlays ──────────────────────────────────────────────────────
 
 fn render_import_prompt(f: &mut Frame, area: Rect, app: &mut App) {
-    let w = {
-        let avail = area.width.saturating_sub(4);
-        if avail < 24 {
-            area.width
-        } else {
-            avail.min(78)
-        }
-    };
+    let w = overlay_width(area.width, 78, 24);
     let h = 7.min(area.height);
     let box_area = centered_overlay(area, w, h);
     f.render_widget(Clear, box_area);
@@ -28342,14 +28802,7 @@ fn render_import_report(f: &mut Frame, area: Rect, app: &mut App) {
         style: warn,
     });
 
-    let w = {
-        let avail = area.width.saturating_sub(4);
-        if avail < 24 {
-            area.width
-        } else {
-            avail.min(84)
-        }
-    };
+    let w = overlay_width(area.width, 84, 24);
     let inner_w = w.saturating_sub(4).max(1) as usize;
     let body: Vec<Line> = lines
         .iter()
@@ -28390,14 +28843,7 @@ fn render_import_report(f: &mut Frame, area: Rect, app: &mut App) {
 // ── export overlays ──────────────────────────────────────────────────────────
 
 fn render_export(f: &mut Frame, area: Rect, app: &mut App) {
-    let w = {
-        let avail = area.width.saturating_sub(4);
-        if avail < 30 {
-            area.width
-        } else {
-            avail.min(76)
-        }
-    };
+    let w = overlay_width(area.width, 76, 30);
     let h = (EXPORT_FORMATS.len() as u16 + 3).min(area.height);
     let box_area = centered_overlay(area, w, h);
     f.render_widget(Clear, box_area);
@@ -28440,14 +28886,7 @@ fn render_export_path(f: &mut Frame, area: Rect, app: &mut App) {
         return;
     };
     let fmt = pending.format;
-    let w = {
-        let avail = area.width.saturating_sub(4);
-        if avail < 24 {
-            area.width
-        } else {
-            avail.min(78)
-        }
-    };
+    let w = overlay_width(area.width, 78, 24);
     let h = 7.min(area.height);
     let box_area = centered_overlay(area, w, h);
     f.render_widget(Clear, box_area);
@@ -28537,14 +28976,7 @@ fn render_conn_export(f: &mut Frame, area: Rect, app: &mut App) {
     if area.width < 12 || area.height < 4 {
         return;
     }
-    let w = {
-        let avail = area.width.saturating_sub(4);
-        if avail < 30 {
-            area.width
-        } else {
-            avail.min(82)
-        }
-    };
+    let w = overlay_width(area.width, 82, 30);
     let h = 11.min(area.height).max(4);
     let box_area = centered_overlay(area, w, h);
     f.render_widget(Clear, box_area);
@@ -28677,14 +29109,7 @@ fn render_conn_import_prompt(f: &mut Frame, area: Rect, app: &mut App) {
     if area.width < 16 || area.height < 3 {
         return;
     }
-    let w = {
-        let avail = area.width.saturating_sub(4);
-        if avail < 30 {
-            area.width
-        } else {
-            avail.min(86)
-        }
-    };
+    let w = overlay_width(area.width, 86, 30);
     let h = 4.min(area.height);
     let box_area = centered_overlay(area, w, h);
     f.render_widget(Clear, box_area);
@@ -28722,14 +29147,7 @@ fn render_conn_import_plan(f: &mut Frame, area: Rect, app: &mut App) {
     if area.width < 16 || area.height < 5 {
         return;
     }
-    let w = {
-        let avail = area.width.saturating_sub(4);
-        if avail < 40 {
-            area.width
-        } else {
-            avail.min(96)
-        }
-    };
+    let w = overlay_width(area.width, 96, 40);
     let body_h = (rows_n as u16 + 5).min(area.height.saturating_sub(2)).max(3);
     let box_area = centered_overlay(area, w, body_h);
     f.render_widget(Clear, box_area);
@@ -29082,6 +29500,9 @@ mod tests {
 
         let reset = |app: &mut App| {
             app.help_open = false;
+            app.help_mini = false;
+            app.pending_g = false;
+            app.clear_count();
             app.export_open = false;
             app.export_path = None;
             app.export_pending = None;
@@ -29118,6 +29539,7 @@ mod tests {
 
         let cases: Vec<OverlayCase> = vec![
             ("help", Box::new(|a| a.help_open = true)),
+            ("help-mini", Box::new(|a| a.help_mini = true)),
             ("export-picker", Box::new(|a| a.export_open = true)),
             (
                 "export-path",
@@ -33065,25 +33487,456 @@ mod tests {
             ("/", "search"),
             ("?", "help"),
         ];
-        let help = *hints.last().unwrap();
+        // `?` is pinned: always present and always last in the source list.
+        assert_eq!(*hints.last().unwrap(), ("?", "help"));
         for width in [42usize, 60, 80, 110] {
-            let (chosen, dropped) = footer_select(&hints, width);
-            // `? 帮助` is pinned: always present and always last.
-            assert_eq!(*hints.last().unwrap(), ("?", "help"));
-            let line_w = footer_line_width(&chosen, &help, dropped);
+            let (chosen, more) = footer_select(&hints, width);
+            let line_w = footer_line_width(&chosen, more);
             assert!(
                 line_w <= width,
                 "width {width}: line {line_w} chosen {chosen:?}"
             );
-            if dropped {
-                assert!(chosen.len() < hints.len() - 1);
-            }
+            assert!(!chosen.is_empty(), "width {width}: kept nothing");
         }
-        // Very narrow: only the help hint and the `…` marker survive.
-        let (chosen, dropped) = footer_select(&hints, 10);
+        // Very narrow: nothing but the pinned help hint survives.
+        let (chosen, more) = footer_select(&hints, 10);
         assert!(chosen.is_empty());
-        assert!(dropped);
-        assert!(footer_line_width(&chosen, &help, dropped) <= 10);
+        assert!(more);
+        assert!(footer_line_width(&chosen, more) <= 10);
+    }
+
+    /// The width tiers cap the hint count so a small screen only shows the
+    /// highest-frequency keys and says `? 更多` instead of truncating a hint.
+    #[test]
+    fn footer_tiers_cap_hints_by_width() {
+        assert_eq!(footer_tier(40), FooterTier::Mini);
+        assert_eq!(footer_tier(59), FooterTier::Mini);
+        assert_eq!(footer_tier(60), FooterTier::Compact);
+        assert_eq!(footer_tier(99), FooterTier::Compact);
+        assert_eq!(footer_tier(100), FooterTier::Full);
+        assert_eq!(footer_tier_cap(FooterTier::Mini), Some(4));
+        assert_eq!(footer_tier_cap(FooterTier::Compact), Some(6));
+        assert_eq!(footer_tier_cap(FooterTier::Full), None);
+
+        // Short hints so each tier's width is reached: a narrow footer shows at
+        // most 4 hints, a mid one at most 6, a wide one all of them.
+        let hints: Vec<Hint> = [
+            "a", "b", "c", "d", "e", "f", "g", "h", "i", "j", "k", "l",
+        ]
+        .into_iter()
+        .map(|key| (key, "d"))
+        .chain(std::iter::once(("?", "help")))
+        .collect();
+        let (mini, more) = footer_select(&hints, 42);
+        assert!(mini.len() <= 4, "mini chose {} hints", mini.len());
+        assert!(more);
+        let (mid, more) = footer_select(&hints, 80);
+        assert!(mid.len() <= 6, "mid chose {} hints", mid.len());
+        assert!(more);
+        let (full, more) = footer_select(&hints, 120);
+        assert_eq!(full.len(), 12);
+        assert!(!more);
+        // The pinned hint's label flips to `更多` when anything is hidden.
+        assert_eq!(footer_help_hint(true).1, t("更多"));
+        assert_eq!(footer_help_hint(false).1, t("帮助"));
+    }
+
+    /// `?` opens a context mini sheet first; a second `?` promotes to the full,
+    /// scrollable help; Esc closes whichever layer is on top.
+    #[test]
+    fn mini_help_is_progressive_and_context_aware() {
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel::<OpResult>();
+        let mut app = test_app();
+        app.picker_open = false;
+        app.selected = Some(test_conn("mysql"));
+        app.backend_kind = Backend::Sql;
+        app.focus = Focus::Preview;
+        app.grid_kind = GridKind::TableData;
+        app.set_grid(sample_grid());
+        let q = || KeyEvent::new(KeyCode::Char('?'), KeyModifiers::NONE);
+
+        key(&mut app, &tx, q());
+        assert!(app.help_mini && !app.help_open, "first ? opens the mini sheet");
+        assert_eq!(footer_ctx(&app).view, FooterView::HelpMini);
+        // The mini rows come from the current context, capped at ten and never
+        // including the pinned `?` hint itself.
+        let mini_rows: Vec<Hint> = footer_hints_ctx(footer_ctx_inner(&app, false))
+            .into_iter()
+            .filter(|h| h.0 != "?")
+            .take(10)
+            .collect();
+        assert!(!mini_rows.is_empty());
+        assert!(mini_rows.len() <= 10);
+        assert!(mini_rows.iter().any(|h| h.0 == "e"), "results-pane group");
+
+        key(&mut app, &tx, q());
+        assert!(app.help_open && !app.help_mini, "second ? opens full help");
+        key(&mut app, &tx, q());
+        assert!(!app.help_open && !app.help_mini, "third ? closes");
+
+        // Esc on the mini layer closes it without ever showing the full list.
+        key(&mut app, &tx, q());
+        assert!(app.help_mini);
+        key(&mut app, &tx, KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+        assert!(!app.help_mini && !app.help_open);
+    }
+
+    /// An overlay title drops whole key hints (never half a hint) as the box
+    /// narrows.
+    #[test]
+    fn overlay_hint_title_drops_whole_hints() {
+        let hints: Vec<Hint> = vec![("a", "x"), ("b", "y"), ("c", "z")];
+        assert_eq!(
+            overlay_hint_title(60, " T ", &hints, " "),
+            " T  · a x · b y · c z "
+        );
+        let narrow = overlay_hint_title(14, " T ", &hints, " ");
+        assert!(narrow.starts_with(" T  · a x"), "{narrow}");
+        assert!(!narrow.contains("b y"), "split hint: {narrow}");
+        // Even when nothing fits, the prefix and suffix survive.
+        assert_eq!(overlay_hint_title(6, " T ", &hints, " "), " T  ");
+    }
+
+    #[test]
+    fn count_prefix_parses_and_jumps() {        assert_eq!(parse_count(""), None);
+        assert_eq!(parse_count("0"), None);
+        assert_eq!(parse_count("5"), Some(5));
+        assert_eq!(parse_count("12"), Some(12));
+        assert_eq!(count_jump_index(1, 10), Some(0));
+        assert_eq!(count_jump_index(3, 10), Some(2));
+        assert_eq!(count_jump_index(3, 2), Some(1), "clamped to the last item");
+        assert_eq!(count_jump_index(3, 0), None);
+        assert!(count_motion(KeyCode::Char('j')));
+        assert!(count_motion(KeyCode::Down));
+        assert!(!count_motion(KeyCode::Char('n')), "paging is per-context");
+    }
+
+    /// `3j` moves three rows, a bare digit flushes to a direct jump, and Esc
+    /// cancels a pending count. Digits in a text input are never hijacked.
+    #[test]
+    fn count_prefix_drives_lists_without_hijacking_inputs() {
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel::<OpResult>();
+        let mut app = test_app();
+        app.picker_open = false;
+        app.selected = Some(test_conn("mysql"));
+        app.backend_kind = Backend::Sql;
+        app.focus = Focus::Sidebar;
+        app.tables = (0..10)
+            .map(|i| TableInfo {
+                name: format!("t{i}"),
+                table_type: "TABLE".into(),
+                comment: None,
+                parent_schema: None,
+                parent_name: None,
+            })
+            .collect();
+        app.table_list.select(Some(0));
+        let digit = |c: char| KeyEvent::new(KeyCode::Char(c), KeyModifiers::NONE);
+
+        key(&mut app, &tx, digit('3'));
+        assert_eq!(app.count_buf, "3");
+        key(&mut app, &tx, KeyEvent::new(KeyCode::Char('j'), KeyModifiers::NONE));
+        assert_eq!(app.table_list.selected(), Some(3));
+        assert!(app.count_buf.is_empty(), "the count is consumed by the motion");
+
+        // A bare digit flushes as a jump to the Nth item.
+        key(&mut app, &tx, digit('6'));
+        flush_count(&mut app, &tx);
+        assert_eq!(app.table_list.selected(), Some(5));
+
+        // Esc cancels a pending count without moving.
+        key(&mut app, &tx, digit('9'));
+        key(&mut app, &tx, KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+        assert!(app.count_buf.is_empty());
+        assert_eq!(app.table_list.selected(), Some(5));
+
+        // The editor keeps digits as text: the count buffer stays empty.
+        app.focus = Focus::Editor;
+        key(&mut app, &tx, digit('7'));
+        assert!(app.count_buf.is_empty());
+        assert!(app.editor.lines().join("").contains('7'));
+    }
+
+    /// `gd` shows the structure view, `gt` returns to the data grid.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn gd_gt_switch_between_structure_and_data() {
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel::<OpResult>();
+        let mut app = test_app();
+        app.picker_open = false;
+        app.selected = Some(test_conn("mysql"));
+        app.backend_kind = Backend::Sql;
+        app.focus = Focus::Preview;
+        app.tables = vec![TableInfo {
+            name: "t1".into(),
+            table_type: "TABLE".into(),
+            comment: None,
+            parent_schema: None,
+            parent_name: None,
+        }];
+        app.table_list.select(Some(0));
+        app.grid_kind = GridKind::TableData;
+        app.set_grid(sample_grid());
+
+        key(&mut app, &tx, KeyEvent::new(KeyCode::Char('g'), KeyModifiers::NONE));
+        assert!(app.pending_g);
+        key(&mut app, &tx, KeyEvent::new(KeyCode::Char('d'), KeyModifiers::NONE));
+        assert!(!app.pending_g);
+        assert!(app.status.contains("结构"), "status: {}", app.status);
+
+        key(&mut app, &tx, KeyEvent::new(KeyCode::Char('g'), KeyModifiers::NONE));
+        key(&mut app, &tx, KeyEvent::new(KeyCode::Char('t'), KeyModifiers::NONE));
+        assert!(app.page_state.is_some(), "gt loads the table data page");
+
+        // A pending `g` must not survive an unrelated key: `?` opens help and
+        // clears the chord instead of being swallowed.
+        key(&mut app, &tx, KeyEvent::new(KeyCode::Char('g'), KeyModifiers::NONE));
+        assert!(app.pending_g);
+        key(&mut app, &tx, KeyEvent::new(KeyCode::Char('?'), KeyModifiers::NONE));
+        assert!(app.help_mini && !app.pending_g, "? wins over a stale g");
+        key(&mut app, &tx, KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+    }
+
+    /// A narrow results pane keeps only the table name, page number and the
+    /// filter / search marks in its title.
+    #[test]
+    fn narrow_grid_title_keeps_the_three_essentials() {
+        let mut app = test_app();
+        app.backend_kind = Backend::Sql;
+        app.selected = Some(test_conn("mysql"));
+        app.grid_kind = GridKind::TableData;
+        app.term_w = 42;
+        app.page_state = Some(PageState {
+            table: "items".into(),
+            schema: "public".into(),
+            table_type: Some("TABLE".into()),
+            page: 2,
+            page_size: PAGE_SIZE,
+            total: Some(1234),
+            total_lower_bound: false,
+            has_next: true,
+            filter: "id > 5".into(),
+            order_by: None,
+            keyset: None,
+        });
+        let title = grid_title(&app);
+        assert!(title.contains("items"), "table name kept: {title}");
+        assert!(title.contains("p3"), "page number kept: {title}");
+        assert!(title.contains('⚑'), "filter mark kept: {title}");
+        assert!(!title.contains("第"), "verbose page label dropped: {title}");
+        // A wide terminal keeps the full descriptive title.
+        app.term_w = 120;
+        let wide = grid_title(&app);
+        assert!(wide.contains("items") && wide.contains("第 3 页"), "{wide}");
+    }
+
+    /// Esc semantics audit: every modal overlay closes on Esc and every text
+    /// input abandons its edit (the field goes back to `None`). The list mirrors
+    /// the `browse_key` router order so a new overlay that forgets Esc shows up
+    /// here as a failure rather than a silent regression.
+    #[test]
+    fn esc_closes_or_abandons_every_overlay() {
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel::<OpResult>();
+        let esc = KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE);
+        let ta = || Some(TextArea::default());
+        let line = || PopupLine {
+            text: "x".into(),
+            style: Style::default(),
+        };
+        let diff_picker = || DiffPicker {
+            mode: DiffPickMode::Table,
+            kind: DiffKind::Schema,
+            stage: DiffPickStage::Lists,
+            list: ListState::default(),
+            src_entries: vec!["a".into()],
+            entries: vec!["a".into()],
+            target_conn: None,
+            target_db: String::new(),
+            target_schema: String::new(),
+            loading: false,
+            comparing: false,
+            where_input: String::new(),
+            gen: 0,
+        };
+        type Opener = Box<dyn Fn(&mut App)>;
+        type Check = Box<dyn Fn(&App) -> bool>;
+        let cases: Vec<(&str, Opener, Check)> = vec![
+            (
+                "help-mini",
+                Box::new(|a| a.help_mini = true),
+                Box::new(|a| !a.help_mini && !a.help_open),
+            ),
+            (
+                "help-full",
+                Box::new(|a| a.help_open = true),
+                Box::new(|a| !a.help_open),
+            ),
+            (
+                "export-picker",
+                Box::new(|a| a.export_open = true),
+                Box::new(|a| !a.export_open),
+            ),
+            (
+                "export-path (input)",
+                Box::new(move |a| a.export_path = ta()),
+                Box::new(|a| a.export_path.is_none()),
+            ),
+            (
+                "filter-prompt (input)",
+                Box::new(move |a| a.filter_prompt = ta()),
+                Box::new(|a| a.filter_prompt.is_none()),
+            ),
+            (
+                "result-filter (input)",
+                Box::new(move |a| a.result_filter = ta()),
+                Box::new(|a| a.result_filter.is_none()),
+            ),
+            (
+                "table-filter (input)",
+                Box::new(move |a| a.table_prompt = ta()),
+                Box::new(|a| a.table_prompt.is_none()),
+            ),
+            (
+                "history-filter (input)",
+                Box::new(move |a| a.history_filter = ta()),
+                Box::new(|a| a.history_filter.is_none()),
+            ),
+            (
+                "search-input (input)",
+                Box::new(move |a| a.search_input = ta()),
+                Box::new(|a| a.search_input.is_none()),
+            ),
+            (
+                "file-load-prompt (input)",
+                Box::new(move |a| a.file_load_prompt = ta()),
+                Box::new(|a| a.file_load_prompt.is_none()),
+            ),
+            (
+                "data-where (input)",
+                Box::new(move |a| a.data_where = ta()),
+                Box::new(|a| a.data_where.is_none()),
+            ),
+            (
+                "snippet-name (input)",
+                Box::new(move |a| a.snippet_name = ta()),
+                Box::new(|a| a.snippet_name.is_none()),
+            ),
+            (
+                "conn-import-path (input)",
+                Box::new(move |a| a.conn_import_path = ta()),
+                Box::new(|a| a.conn_import_path.is_none()),
+            ),
+            (
+                "recent",
+                Box::new(|a| a.recent_open = true),
+                Box::new(|a| !a.recent_open),
+            ),
+            (
+                "col-picker",
+                Box::new(|a| a.col_picker_open = true),
+                Box::new(|a| !a.col_picker_open),
+            ),
+            (
+                "db-picker",
+                Box::new(|a| a.db_picker_open = true),
+                Box::new(|a| !a.db_picker_open),
+            ),
+            (
+                "snippets",
+                Box::new(|a| a.snippet_open = true),
+                Box::new(|a| !a.snippet_open),
+            ),
+            (
+                "history",
+                Box::new(|a| a.history_open = true),
+                Box::new(|a| !a.history_open),
+            ),
+            (
+                "search",
+                Box::new(|a| a.search_open = true),
+                Box::new(|a| !a.search_open),
+            ),
+            (
+                "cell-popup",
+                Box::new(move |a| {
+                    a.cell_popup = Some(CellPopup {
+                        title: "c".into(),
+                        lines: vec![line()],
+                        scroll: 0,
+                    })
+                }),
+                Box::new(|a| a.cell_popup.is_none()),
+            ),
+            (
+                "row-popup",
+                Box::new(move |a| {
+                    a.row_popup = Some(RowPopup {
+                        title: "r".into(),
+                        lines: vec![line()],
+                        scroll: 0,
+                    })
+                }),
+                Box::new(|a| a.row_popup.is_none()),
+            ),
+            (
+                "confirm",
+                Box::new(|a| {
+                    a.confirm = Some(Confirm {
+                        sql: "delete from t".into(),
+                        reasons: Vec::new(),
+                        refresh: false,
+                        clear_batch: false,
+                        conn: None,
+                        redis: None,
+                        mongo: None,
+                    })
+                }),
+                Box::new(|a| a.confirm.is_none()),
+            ),
+            (
+                "history-confirm",
+                Box::new(|a| {
+                    a.history_confirm = Some(HistoryConfirm {
+                        id: "1".into(),
+                        sql: "select 1".into(),
+                    })
+                }),
+                Box::new(|a| a.history_confirm.is_none()),
+            ),
+            (
+                "diff-picker",
+                Box::new(move |a| a.diff_picker = Some(diff_picker())),
+                Box::new(|a| a.diff_picker.is_none()),
+            ),
+            (
+                "import-prompt (input)",
+                Box::new(|a| {
+                    a.import_prompt = Some(ImportPrompt {
+                        input: TextArea::default(),
+                        table: "t".into(),
+                        schema: String::new(),
+                        db: "d".into(),
+                        error: None,
+                    })
+                }),
+                Box::new(|a| a.import_prompt.is_none()),
+            ),
+            (
+                "transfer-wizard",
+                Box::new(|a| a.transfer = Some(Box::new(transfer_wizard_fixture()))),
+                Box::new(|a| a.transfer.is_none()),
+            ),
+        ];
+
+        for (name, open, closed) in cases {
+            let mut app = test_app();
+            app.picker_open = false;
+            app.selected = Some(test_conn("mysql"));
+            app.backend_kind = Backend::Sql;
+            app.focus = Focus::Preview;
+            open(&mut app);
+            key(&mut app, &tx, esc);
+            assert!(closed(&app), "{name}: Esc did not close / abandon");
+        }
     }
 
     #[test]
@@ -33198,6 +34051,12 @@ mod tests {
         app.help_open = true;
         assert_eq!(footer_ctx(&app).view, FooterView::Help);
         app.help_open = false;
+
+        app.help_mini = true;
+        assert_eq!(footer_ctx(&app).view, FooterView::HelpMini);
+        // The mini sheet looks *through* itself to the surface below.
+        assert_eq!(footer_ctx_inner(&app, false).view, FooterView::ConnPicker);
+        app.help_mini = false;
 
         app.export_open = true;
         assert_eq!(footer_ctx(&app).view, FooterView::ExportPicker);
