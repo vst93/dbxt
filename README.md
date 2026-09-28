@@ -24,7 +24,7 @@ A keyboard-first terminal UI for databases, built on the [DBX](https://github.co
 
 **SQL editor & results**
 - Multi-line editor with shell-style `↑`/`↓` history (seeded from DBX's shared query history); `F5` / `Ctrl-J` runs. Every run is written back into that shared history (connection, database, timing, success flag), so the recall list and the `Alt-H` panel also cover the statements you ran here.
-- `Ctrl-Space` completes identifiers from context (tables / columns / keywords, tagged `T`/`C`/`K`); `Tab` accepts.
+- `Alt-/` completes identifiers from context (tables / columns / keywords, tagged `T`/`C`/`K`); `Tab` accepts. (`Ctrl-Space` still works as a compatibility alias, but it clashes with input-method switching, so it is no longer advertised.)
 - `Alt-H` opens the **query-history panel** (latest 300 statements, newest first, unique SQL): each row shows the time, the statement's first line and the source connection. `↑`/`↓`/`PgUp`/`PgDn` move, `Enter` recalls the statement into the editor (cursor at the end), `f` favourites / unfavourites it in DBX's `saved_sql_files`, `y` copies the whole statement, `Del` deletes one entry behind a red confirmation (history only — never database data), and `/` filters by statement text (case-insensitive substring). The focused statement is previewed, wrapped, below the list.
 - `Alt-F` formats the editor's SQL — keywords upper-cased, main clauses on their own line, `JOIN` on its own line, two-space indent, whitespace collapsed — while leaving string literals, quoted identifiers, comments and function names (`count(`) untouched. Pressing it again compresses a formatted statement back to one line (idempotent toggle); `Ctrl-U` undoes the reformat.
 - Every run keeps its own result tab (`[` / `]`); execution time and affected rows are shown.
@@ -128,7 +128,7 @@ The TUI's `?` overlay and `dbxt --help` carry the complete list; this is the sho
 | Connection form | `↑` `↓`/`Tab` fields · `Enter` edit/toggle/save · `Space` toggle `ssh_tunnel`/`ssl`/`ssh_auth`, cycle the `color` palette · `Esc` back |
 | SSH host key | `y`/`Enter` accept & remember · `s` this session only · `n`/`Esc` reject |
 | Sidebar | `↑` `↓` tables · `/` filter · `Enter` browse · `r` structure · `I` import CSV · `t` recent |
-| Editor | `Alt-H` history panel · `Alt-F` format/compress · `Ctrl-U` undo format · `Ctrl-Space` complete · `F5`/`Ctrl-J` run · `↑` `↓` history |
+| Editor | `Alt-H` history panel · `Alt-F` format/compress · `Ctrl-U` undo format · `Alt-/` complete · `F5`/`Ctrl-J` run · `↑` `↓` history |
 | Results | `↑` `↓` rows · `←` `→` columns · `n`/`p` pages · `Enter`/`v` cell · `e` edit · `i` insert · `Delete` delete |
 | Results (more) | `f` filter · `s` sort · `Ctrl-K` extra sort · `Ctrl-R` clear · `y` copy row · `/` search · `Ctrl-Y` export · `[` `]` tabs |
 | Redis | `Space` select · `a` all · `Del`/`x`/`m` batch delete/TTL/rename · `/` MATCH · `n` more · `e` edit · `Enter` value |

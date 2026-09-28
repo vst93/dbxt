@@ -1355,7 +1355,7 @@ struct RedisPrompt {
     batch: Vec<(String, String)>,
 }
 
-/// SQL prefix-completion popup in the editor (Ctrl-Space). Tab / Enter accept,
+/// SQL prefix-completion popup in the editor (Alt-/). Tab / Enter accept,
 /// Esc cancels; typing keeps refining the candidate list.
 #[derive(Clone)]
 struct CompletionItem {
@@ -4256,7 +4256,7 @@ struct App {
     recent_list: ListState,
     /// A `(schema, table)` to open as soon as the (new) table list arrives.
     pending_open_table: Option<(String, String)>,
-    /// SQL prefix-completion popup in the editor (Ctrl-Space).
+    /// SQL prefix-completion popup in the editor (Alt-/).
     completion: Option<Completion>,
 
     // ── persistent preferences (db.table granularity) ──
@@ -8571,8 +8571,12 @@ fn editor_key(app: &mut App, tx: &Tx, k: KeyEvent) {
     }
     match (k.modifiers, k.code) {
         (m, KeyCode::Char('j')) if m.contains(KeyModifiers::CONTROL) => run_current(app, tx),
-        // Ctrl-Space (some terminals send NUL): table / column / keyword prefix
-        // completion at the cursor.
+        // Alt-/ : table / column / keyword prefix completion at the cursor.
+        // Chosen over Ctrl-Space because that combination is claimed by the
+        // input-method switcher in fcitx5/ibus and on Windows.
+        (KeyModifiers::ALT, KeyCode::Char('/')) => open_completion(app),
+        // Ctrl-Space remains as an unadvertised compatibility alias; some
+        // terminals deliver it as NUL, which is the legacy path below.
         (m, KeyCode::Char(' ')) if m.contains(KeyModifiers::CONTROL) => open_completion(app),
         (m, KeyCode::Null) if m.contains(KeyModifiers::CONTROL) || m.is_empty() => {
             open_completion(app)
@@ -10375,7 +10379,7 @@ fn table_filter_key(app: &mut App, k: KeyEvent) {
     }
 }
 
-// ── SQL prefix completion (Ctrl-Space) ──
+// ── SQL prefix completion (Alt-/) ──
 
 /// Keywords offered alongside table / column names. Small on purpose: a TUI
 /// completion is a shortcut for long identifiers, not a SQL parser.
@@ -14887,7 +14891,7 @@ fn footer_hints_ctx(ctx: FooterCtx) -> Vec<Hint> {
             ],
             Focus::Editor => vec![
                 ("Ctrl-J", t("运行")),
-                ("Ctrl-Space", t("补全")),
+                ("Alt-/", t("补全")),
                 ("Enter", t("换行")),
                 ("↑↓", t("历史")),
                 ("Tab", t("下一区")),
@@ -17714,7 +17718,7 @@ const HELP_ROWS: &[(&str, &str)] = &[
     ("Alt-H", "查询历史面板（最近 300 条：时间 / 摘要 / 来源连接）"),
     ("Alt-F", "格式化当前 SQL（关键字大写 / 子句换行）；再按压缩为单行"),
     ("Ctrl-U", "撤销上一次 Alt-F 格式化"),
-    ("Ctrl-Space", "SQL 前缀补全（表名 T / 列名 C / 关键字 K，Tab 上屏）"),
+    ("Alt-/", "SQL 前缀补全（表名 T / 列名 C / 关键字 K，Tab 上屏）"),
     ("补全上下文", "表名. 后只补该表列名；FROM/JOIN 后优先表名；WHERE/ON 后优先列名"),
     ("↑ ↓", "历史（首行 / 末行）"),
     ("Esc", "回到侧栏"),
@@ -20489,7 +20493,7 @@ mod tests {
             "Ctrl-D",
             "Ctrl-V",
             "Ctrl-T",
-            "Ctrl-Space",
+            "Alt-/",
         ] {
             assert!(
                 keys.iter().any(|k| k.contains(needle)),
@@ -21016,6 +21020,38 @@ mod tests {
         ta.delete_str(n);
         ta.insert_str("users");
         assert_eq!(ta.lines(), ["select * from users"]);
+    }
+
+    /// R30c: `Alt-/` opens the completion popup and `Tab` accepts it. The old
+    /// `Ctrl-Space` chord stays as a compatibility alias (it clashes with input-
+    /// method switching), and the bare-NUL legacy path still opens completion.
+    #[test]
+    fn alt_slash_opens_completion_and_tab_accepts() {
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel::<OpResult>();
+        let table = || TableInfo {
+            name: "users".into(),
+            table_type: "TABLE".into(),
+            comment: None,
+            parent_schema: None,
+            parent_name: None,
+        };
+        let open = |mods: KeyModifiers, code: KeyCode| {
+            let (tx, _rx) = tokio::sync::mpsc::unbounded_channel::<OpResult>();
+            let mut app = test_app();
+            app.tables_all = vec![table()];
+            app.set_editor_text("select * from us");
+            editor_key(&mut app, &tx, KeyEvent::new(code, mods));
+            app
+        };
+        // Primary key: Alt-/ opens, then Tab accepts the first candidate.
+        let mut app = open(KeyModifiers::ALT, KeyCode::Char('/'));
+        assert!(app.completion.is_some(), "Alt-/ should open completion");
+        editor_key(&mut app, &tx, KeyEvent::new(KeyCode::Tab, KeyModifiers::empty()));
+        assert!(app.completion.is_none(), "Tab should accept the completion");
+        assert_eq!(app.editor.lines(), ["select * from users"]);
+        // Compatibility aliases still open the popup.
+        assert!(open(KeyModifiers::CONTROL, KeyCode::Char(' ')).completion.is_some());
+        assert!(open(KeyModifiers::empty(), KeyCode::Null).completion.is_some());
     }
 
     // ── R13: copy row as INSERT ──
@@ -21741,7 +21777,7 @@ mod tests {
         let sidebar = keys(FooterView::Browse, Focus::Sidebar, true);
         assert!(sidebar.contains(&"/") && sidebar.contains(&"r") && sidebar.contains(&"Tab"));
         let editor = keys(FooterView::Browse, Focus::Editor, true);
-        assert!(editor.contains(&"Ctrl-J") && editor.contains(&"Ctrl-Space"));
+        assert!(editor.contains(&"Ctrl-J") && editor.contains(&"Alt-/"));
         let preview = keys(FooterView::Browse, Focus::Preview, true);
         assert!(preview.contains(&"↑↓") && preview.contains(&"e") && preview.contains(&"y"));
         // No connection yet → the picker group, never the table group.
