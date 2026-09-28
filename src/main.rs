@@ -9,6 +9,7 @@ use ui_text::{t, tf};
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::io::{BufWriter, IsTerminal, Write};
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -90,9 +91,24 @@ const OP_WATCHDOG_SQL: Duration = Duration::from_secs(180);
 /// fast, but a very wide 20k-row result on a slow filesystem still deserves a
 /// generous ceiling rather than the generic 60 s fallback.
 const OP_WATCHDOG_EXPORT: Duration = Duration::from_secs(600);
+/// The global search walks every table (one bounded query each), so it is the
+/// longest-running op; the per-statement driver timeout still caps each query.
+const OP_WATCHDOG_SEARCH: Duration = Duration::from_secs(600);
 /// Buffered writer size for a streaming export (1 MiB keeps syscalls rare while
 /// bounding the memory held above the OS page cache).
 const EXPORT_BUF_BYTES: usize = 1 << 20;
+/// Default per-table scan ceiling for the global search (`Alt-G`): one
+/// `SELECT … LIMIT n` per table, so even a wide table answers quickly.
+/// `DBXT_SEARCH_SCAN_LIMIT` overrides it.
+const DEFAULT_SEARCH_SCAN_LIMIT: usize = 1000;
+/// Default table-size ceiling for the global search. A table estimated above
+/// this many rows is skipped (and reported) rather than full-scanned;
+/// `DBXT_SEARCH_MAX_ROWS` overrides it.
+const DEFAULT_SEARCH_MAX_ROWS: u64 = 1_000_000;
+/// Cap on the number of hits the global-search overlay retains.
+const SEARCH_MAX_HITS: usize = 500;
+/// A `.sql` file larger than this warns before its script is executed.
+const FILE_LOAD_WARN_BYTES: u64 = 2 * 1024 * 1024;
 
 // ─── pages & focus ───────────────────────────────────────────────────────────
 
@@ -2146,6 +2162,236 @@ fn detect_danger(statement: &str) -> Option<String> {
     }
 }
 
+// ─── global database search (Alt-G) ───────────────────────
+
+/// Parse a positive integer env override, falling back to `default` for a
+/// missing, unparsable or non-positive value (so `DBXT_SEARCH_SCAN_LIMIT=0`
+/// cannot disable the LIMIT guard).
+fn parse_positive_usize(raw: Option<&str>, default: usize) -> usize {
+    raw.and_then(|v| v.trim().parse::<usize>().ok())
+        .filter(|&n| n > 0)
+        .unwrap_or(default)
+}
+
+fn parse_positive_u64(raw: Option<&str>, default: u64) -> u64 {
+    raw.and_then(|v| v.trim().parse::<u64>().ok())
+        .filter(|&n| n > 0)
+        .unwrap_or(default)
+}
+
+/// The active per-table scan ceiling (env override or built-in default).
+fn search_scan_limit() -> usize {
+    parse_positive_usize(
+        std::env::var("DBXT_SEARCH_SCAN_LIMIT").ok().as_deref(),
+        DEFAULT_SEARCH_SCAN_LIMIT,
+    )
+}
+
+/// The active table-size skip threshold (env override or built-in default).
+fn search_max_rows() -> u64 {
+    parse_positive_u64(
+        std::env::var("DBXT_SEARCH_MAX_ROWS").ok().as_deref(),
+        DEFAULT_SEARCH_MAX_ROWS,
+    )
+}
+
+/// Engines driven by MySQL's `information_schema` (MySQL / MariaDB are the same
+/// driver in dbx-core). The global search is gated on this plus PostgreSQL.
+fn is_mysql_family(db_type: &str) -> bool {
+    matches!(db_type.to_ascii_lowercase().as_str(), "mysql" | "mariadb")
+}
+
+/// Whether a declared column type holds searchable text. Only character types
+/// are scanned: numbers / dates / binary never match a LIKE, and a LIKE on a
+/// numeric column is a type error on PostgreSQL.
+fn is_text_search_column(data_type: &str) -> bool {
+    let base = base_type(data_type);
+    // An array (`text[]`) is not scalar text; skip rather than risk a cast.
+    if base.ends_with("[]") {
+        return false;
+    }
+    matches!(
+        base.as_str(),
+        "char"
+            | "varchar"
+            | "character"
+            | "nchar"
+            | "nvarchar"
+            | "text"
+            | "tinytext"
+            | "mediumtext"
+            | "longtext"
+            | "citext"
+            | "clob"
+            | "nclob"
+            | "string"
+            | "name"
+    )
+}
+
+/// Escape a search term into a `LIKE` pattern. `!` is the escape character (not
+/// a backslash) so the same pattern works under MySQL and PostgreSQL regardless
+/// of their string-literal and `LIKE`-escape differences.
+fn search_like_pattern(needle: &str) -> String {
+    let mut out = String::with_capacity(needle.len() + 2);
+    out.push('%');
+    for c in needle.chars() {
+        if matches!(c, '!' | '%' | '_') {
+            out.push('!');
+        }
+        out.push(c);
+    }
+    out.push('%');
+    out
+}
+
+/// The dialect's case-insensitive text operator: PostgreSQL's `LIKE` is
+/// case-sensitive so it gets `ILIKE`; MySQL's default collation and SQLite's
+/// `LIKE` already fold case.
+fn search_like_op(db_type: DatabaseType) -> &'static str {
+    if is_postgres_family(db_type.as_str()) {
+        "ILIKE"
+    } else {
+        "LIKE"
+    }
+}
+
+/// One `SELECT *` per table with an `OR` of `LIKE`s over its text columns,
+/// capped by `limit` so a scan never streams a whole table.
+fn build_search_scan_sql(
+    db_type: DatabaseType,
+    schema: &str,
+    table: &str,
+    columns: &[String],
+    needle: &str,
+    limit: usize,
+) -> String {
+    let q = |name: &str| quote_table_identifier(Some(db_type), name);
+    let op = search_like_op(db_type);
+    let pattern = sql_literal(&search_like_pattern(needle));
+    let conds: Vec<String> = columns
+        .iter()
+        .map(|c| format!("{} {} {} ESCAPE '!'",  q(c),  op,  pattern))
+        .collect();
+    format!(
+        "SELECT * FROM {} WHERE {} LIMIT {}",
+        table_ref(db_type, schema, table),
+        conds.join(" OR "),
+        limit
+    )
+}
+
+/// Cheap, approximate per-table row estimate used only to decide whether a
+/// table is too big to scan. Never a `COUNT(*)`: that would itself be the full
+/// scan the guard exists to avoid.
+fn build_search_estimates_sql(db_type: DatabaseType, schema: &str) -> String {
+    if is_postgres_family(db_type.as_str()) {
+        let ns = if schema.trim().is_empty() {
+            "public"
+        } else {
+            schema
+        };
+        let ns = sql_literal(ns);
+        format!(
+            "SELECT c.relname AS table_name, GREATEST(c.reltuples, 0)::bigint AS row_estimate \
+             FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace \
+             WHERE n.nspname = {} AND c.relkind IN ('r','p')",
+            ns
+        )
+    } else {
+        // MySQL / MariaDB: `table_rows` is approximate for InnoDB but only used
+        // as a skip heuristic; a NULL / unknown count scans the table.
+        "SELECT table_name, table_rows AS row_estimate FROM information_schema.tables \
+         WHERE table_schema = DATABASE()"
+            .to_string()
+    }
+}
+
+/// Turn the row-estimate result into `table → estimated rows`.
+fn parse_search_estimates(rows: &[Vec<serde_json::Value>]) -> HashMap<String, u64> {
+    let mut out = HashMap::new();
+    for row in rows {
+        let Some(name) = row.first().and_then(|v| v.as_str()) else {
+            continue;
+        };
+        let est = row
+            .get(1)
+            .and_then(|v| match v {
+                serde_json::Value::Number(n) => {
+                    n.as_u64().or_else(|| n.as_f64().map(|f| f.max(0.0) as u64))
+                }
+                serde_json::Value::String(s) => s.trim().parse().ok(),
+                _ => None,
+            })
+            .unwrap_or(0);
+        out.insert(name.to_string(), est);
+    }
+    out
+}
+
+/// A table whose estimate exceeds the threshold is skipped instead of scanned.
+/// `None` (an unknown count) always scans.
+fn search_skip_reason(estimate: Option<u64>, max_rows: u64) -> Option<u64> {
+    match estimate {
+        Some(n) if n > max_rows => Some(n),
+        _ => None,
+    }
+}
+
+/// Build the `WHERE` predicate that re-locates a hit's row: the primary key when
+/// the table has one, otherwise the matched column's value. Null keys are
+/// dropped; `1 = 1` is the last resort.
+fn search_hit_filter(
+    db_type: DatabaseType,
+    columns: &[String],
+    vals: &[Val],
+    dtypes: &HashMap<String, String>,
+    pk: &[String],
+    matched_col: &str,
+) -> String {
+    let q = |name: &str| quote_table_identifier(Some(db_type), name);
+    let keys: Vec<&String> = if pk.is_empty() {
+        columns.iter().filter(|c| c.as_str() == matched_col).collect()
+    } else {
+        pk.iter().collect()
+    };
+    let mut conds: Vec<String> = Vec::new();
+    for k in keys {
+        let Some(ci) = columns.iter().position(|c| c == k) else {
+            continue;
+        };
+        let Some(v) = vals.get(ci) else {
+            continue;
+        };
+        if matches!(v, Val::Null) {
+            continue;
+        }
+        conds.push(format!(
+            "{} = {}",
+            q(k),
+            val_literal(v, dtypes.get(k).map(|s| s.as_str()))
+        ));
+    }
+    if conds.is_empty() {
+        "1 = 1".to_string()
+    } else {
+        conds.join(" AND ")
+    }
+}
+
+/// One global-search hit: enough to show it, copy the matched value, and jump
+/// back to the owning row.
+#[derive(Clone, Debug, PartialEq)]
+struct SearchHit {
+    schema: String,
+    table: String,
+    column: String,
+    /// The full cell value that matched.
+    matched: String,
+    /// `WHERE` predicate (without the keyword) that locates the row again.
+    filter: String,
+}
+
 // ─── async ops ───────────────────────────────────────────────────────────────
 
 enum Op {
@@ -2281,6 +2527,19 @@ enum Op {
     /// Stream a result set to a file on a background thread, so a large export
     /// never freezes the UI and never holds the whole document in memory.
     Export(Box<ExportJob>),
+    /// Scan every text column of every table on one database / schema for a
+    /// term, reporting progress between tables. `cancel` lets the UI abort
+    /// between tables.
+    GlobalSearch {
+        cfg: Box<ConnectionConfig>,
+        db: String,
+        schema: String,
+        needle: String,
+        scan_limit: usize,
+        max_rows: u64,
+        gen: u64,
+        cancel: Arc<AtomicBool>,
+    },
 }
 
 impl Op {
@@ -2293,6 +2552,7 @@ impl Op {
             Op::Query(..) => OP_WATCHDOG_SQL,
             Op::Import(_) => OP_WATCHDOG_IMPORT,
             Op::Export(_) => OP_WATCHDOG_EXPORT,
+            Op::GlobalSearch { .. } => OP_WATCHDOG_SEARCH,
             _ => OP_WATCHDOG_FALLBACK,
         }
     }
@@ -2434,6 +2694,25 @@ enum OpResult {
         bytes: u64,
         elapsed_ms: u128,
         error: Option<String>,
+    },
+    /// Intermediate global-search progress; like [`OpResult::ImportProgress`] it
+    /// does not count as the op finishing.
+    SearchProgress {
+        gen: u64,
+        done: usize,
+        total: usize,
+    },
+    /// A global search finished. `skipped` lists tables too large to scan.
+    SearchDone {
+        gen: u64,
+        hits: Vec<SearchHit>,
+        skipped: Vec<(String, u64)>,
+        tables: usize,
+        truncated: bool,
+    },
+    /// A global search was aborted between tables (Esc).
+    SearchCancelled {
+        gen: u64,
     },
     /// A blocking SSH prompt (host-key TOFU / keyboard-interactive) the kernel
     /// handshake is waiting on. Not an op completion — handled before the
@@ -3575,6 +3854,149 @@ async fn run_op(backend: &LocalBackend, op: Op, tx: &Tx) -> OpResult {
                 Err(e) => OpResult::Error(format!("export: {e}")),
             }
         }
+        Op::GlobalSearch {
+            cfg,
+            db,
+            schema,
+            needle,
+            scan_limit,
+            max_rows,
+            gen,
+            cancel,
+        } => {
+            run_global_search(
+                backend, &cfg, &db, &schema, &needle, scan_limit, max_rows, gen, &cancel, tx,
+            )
+            .await
+        }
+    }
+}
+
+/// The global-search worker: enumerate tables, skip the big ones, then scan each
+/// remaining table's text columns with one bounded query. Progress is streamed
+/// back between tables so the overlay can show `done/total`, and the shared
+/// `cancel` flag aborts before the next table.
+#[allow(clippy::too_many_arguments)]
+async fn run_global_search(
+    backend: &LocalBackend,
+    cfg: &ConnectionConfig,
+    db: &str,
+    schema: &str,
+    needle: &str,
+    scan_limit: usize,
+    max_rows: u64,
+    gen: u64,
+    cancel: &AtomicBool,
+    tx: &Tx,
+) -> OpResult {
+    let tables = match backend.list_tables(cfg, db, schema).await {
+        Ok(t) => t,
+        Err(e) => return OpResult::Error(format!("search: list tables: {e}")),
+    };
+    // Base tables only: a view is usually a join, so scanning it duplicates its
+    // underlying tables and can be far more expensive.
+    let tables: Vec<TableInfo> = tables
+        .into_iter()
+        .filter(|t| !t.table_type.to_ascii_uppercase().contains("VIEW"))
+        .collect();
+    let total = tables.len();
+    // Approximate counts, best effort: a failure just means "scan anyway".
+    let estimates: HashMap<String, u64> =
+        match backend
+            .execute_query(cfg, db, &build_search_estimates_sql(cfg.db_type, schema), None, Some(20))
+            .await
+        {
+            Ok(r) => parse_search_estimates(&r.rows),
+            Err(_) => HashMap::new(),
+        };
+    let needle_lower = needle.to_lowercase();
+    let mut hits: Vec<SearchHit> = Vec::new();
+    let mut skipped: Vec<(String, u64)> = Vec::new();
+    let mut truncated = false;
+    for (i, table) in tables.iter().enumerate() {
+        if cancel.load(Ordering::Relaxed) {
+            let _ = tx.send(OpResult::SearchProgress { gen, done: i, total });
+            return OpResult::SearchCancelled { gen };
+        }
+        let _ = tx.send(OpResult::SearchProgress { gen, done: i, total });
+        if let Some(est) = search_skip_reason(estimates.get(&table.name).copied(), max_rows) {
+            skipped.push((table.name.clone(), est));
+            continue;
+        }
+        let columns = match backend.get_columns(cfg, db, schema, &table.name).await {
+            Ok(c) => c,
+            Err(_) => continue,
+        };
+        let text_cols: Vec<String> = columns
+            .iter()
+            .filter(|c| is_text_search_column(&c.data_type))
+            .map(|c| c.name.clone())
+            .collect();
+        if text_cols.is_empty() {
+            continue;
+        }
+        let pk: Vec<String> = columns
+            .iter()
+            .filter(|c| c.is_primary_key)
+            .map(|c| c.name.clone())
+            .collect();
+        let dtypes: HashMap<String, String> = columns
+            .iter()
+            .map(|c| (c.name.clone(), c.data_type.clone()))
+            .collect();
+        let sql =
+            build_search_scan_sql(cfg.db_type, schema, &table.name, &text_cols, needle, scan_limit);
+        let Ok(r) = backend
+            .execute_query(cfg, db, &sql, Some(scan_limit.max(1)), Some(60))
+            .await
+        else {
+            continue;
+        };
+        let col_names = r.columns.clone();
+        // Only columns that are actually text participate in matching, so a
+        // numeric column returned by `SELECT *` is never mis-flagged.
+        let text_set: HashSet<&str> = text_cols.iter().map(|s| s.as_str()).collect();
+        for row in &r.rows {
+            if truncated {
+                break;
+            }
+            let vals: Vec<Val> = row.iter().map(value_to_val).collect();
+            for (ci, cname) in col_names.iter().enumerate() {
+                if !text_set.contains(cname.as_str()) {
+                    continue;
+                }
+                let Some(v) = vals.get(ci) else {
+                    continue;
+                };
+                let text = v.text();
+                // NULL and the empty string are skipped, and the needle can
+                // never be a substring of an empty cell anyway.
+                if text.is_empty() || !text.to_lowercase().contains(&needle_lower) {
+                    continue;
+                }
+                hits.push(SearchHit {
+                    schema: schema.to_string(),
+                    table: table.name.clone(),
+                    column: cname.clone(),
+                    matched: text.to_string(),
+                    filter: search_hit_filter(
+                        cfg.db_type, &col_names, &vals, &dtypes, &pk, cname,
+                    ),
+                });
+                if hits.len() >= SEARCH_MAX_HITS {
+                    truncated = true;
+                    break;
+                }
+            }
+        }
+    }
+    let _ = tx.send(OpResult::SearchProgress { gen, done: total, total });
+    OpResult::SearchDone {
+        gen,
+        hits,
+        skipped,
+        tables: total,
+        truncated,
     }
 }
 
@@ -4256,6 +4678,9 @@ struct App {
     recent_list: ListState,
     /// A `(schema, table)` to open as soon as the (new) table list arrives.
     pending_open_table: Option<(String, String)>,
+    /// A `WHERE` predicate to apply when the next table opens (a search-hit
+    /// jump). Cleared once consumed by `open_table_data`.
+    pending_table_filter: Option<String>,
     /// SQL prefix-completion popup in the editor (Alt-/).
     completion: Option<Completion>,
 
@@ -4273,6 +4698,28 @@ struct App {
     result_rows: Vec<usize>,
     /// Last SQL sent to the backend, used to guess a table for `y`.
     last_sql: Option<String>,
+
+    // ── global database search (Alt-G) ──
+    /// The modal search-term input.
+    search_input: Option<TextArea<'static>>,
+    /// Committed term (kept for the overlay title / rescan).
+    search_query: String,
+    /// Results overlay open (the list owns the keyboard).
+    search_open: bool,
+    search_list: ListState,
+    search_hits: Vec<SearchHit>,
+    /// `(done, total)` tables while a scan runs.
+    search_progress: Option<(usize, usize)>,
+    /// A scan is in flight.
+    search_running: bool,
+    /// Tables skipped as too large: `(table, estimate)`.
+    search_skipped: Vec<(String, u64)>,
+    /// Monotonic scan id; only the newest reply lands.
+    search_gen: u64,
+    /// Cancellation flag shared with the running scan (Esc aborts).
+    search_cancel: Arc<AtomicBool>,
+    /// True when the hit list was capped at [`SEARCH_MAX_HITS`].
+    search_truncated: bool,
 
     // WHERE filter prompt (modal text input)
     filter_prompt: Option<TextArea<'static>>,
@@ -4762,6 +5209,7 @@ impl App {
             recent_open: false,
             recent_list: ListState::default(),
             pending_open_table: None,
+            pending_table_filter: None,
             completion: None,
             config,
             config_path,
@@ -4769,6 +5217,17 @@ impl App {
             result_needle: String::new(),
             result_rows: Vec::new(),
             last_sql: None,
+            search_input: None,
+            search_query: String::new(),
+            search_open: false,
+            search_list: ListState::default(),
+            search_hits: Vec::new(),
+            search_progress: None,
+            search_running: false,
+            search_skipped: Vec::new(),
+            search_gen: 0,
+            search_cancel: Arc::new(AtomicBool::new(false)),
+            search_truncated: false,
             filter_prompt: None,
             edit_dialog: None,
             pending_write: false,
@@ -4948,9 +5407,21 @@ fn apply_op_result(app: &mut App, res: OpResult, tx: &Tx) {
     // they are handled before the spinner accounting.
     if matches!(
         res,
-        OpResult::ImportProgress { .. } | OpResult::SshPrompt(_) | OpResult::SshNotice(_)
+        OpResult::ImportProgress { .. }
+            | OpResult::SshPrompt(_)
+            | OpResult::SshNotice(_)
+            | OpResult::SearchProgress { .. }
     ) {
         match res {
+            OpResult::SearchProgress { gen, done, total } => {
+                if gen == app.search_gen {
+                    app.search_progress = Some((done, total));
+                    app.status = tf(
+                        "全库搜索「{}」· {}/{} 表…",
+                        &[&(app.search_query), &(done), &(total)],
+                    );
+                }
+            }
             OpResult::ImportProgress { done, total } => {
                 app.import_progress = Some((done, total));
                 app.status = tf("导入 {} / {} 行…", &[&done, &total]);
@@ -5748,8 +6219,62 @@ fn apply_op_result(app: &mut App, res: OpResult, tx: &Tx) {
                 );
             }
         }
+        OpResult::SearchDone {
+            gen,
+            hits,
+            skipped,
+            tables,
+            truncated,
+        } => {
+            // A reply for a superseded scan (the user re-ran or the connection
+            // changed) must not overwrite the current results.
+            if gen != app.search_gen {
+                return;
+            }
+            app.search_running = false;
+            app.search_progress = None;
+            let n = hits.len();
+            app.search_hits = hits;
+            app.search_skipped = skipped;
+            app.search_truncated = truncated;
+            if n > 0 {
+                app.search_list.select(Some(0));
+            } else {
+                app.search_list.select(None);
+            }
+            let skip_n = app.search_skipped.len();
+            let cap = if truncated {
+                tf(" · 已达上限 {}", &[&SEARCH_MAX_HITS])
+            } else {
+                String::new()
+            };
+            let skip = if skip_n > 0 {
+                tf(" · 跳过 {} 张大表", &[&skip_n])
+            } else {
+                String::new()
+            };
+            if n == 0 {
+                app.status = tf(
+                    "全库搜索「{}」· 无命中（扫描 {} 表{}）",
+                    &[&(app.search_query), &(tables), &(skip)],
+                );
+            } else {
+                app.status = tf(
+                    "全库搜索「{}」· {} 命中{}{} · Enter 定位 · y 复制",
+                    &[&(app.search_query), &(n), &(cap), &(skip)],
+                );
+            }
+        }
+        OpResult::SearchCancelled { gen } => {
+            if gen != app.search_gen {
+                return;
+            }
+            app.search_running = false;
+            app.search_progress = None;
+            app.status = t("已中止全库搜索（保留已扫描的部分结果）").into();
+        }
         // Handled before the spinner accounting above; unreachable here.
-        OpResult::SshPrompt(_) | OpResult::SshNotice(_) => {}
+        OpResult::SshPrompt(_) | OpResult::SshNotice(_) | OpResult::SearchProgress { .. } => {}
         OpResult::Error(e) => {
             app.import_progress = None;
             app.page_pending = false;
@@ -5757,6 +6282,8 @@ fn apply_op_result(app: &mut App, res: OpResult, tx: &Tx) {
             app.pending_focus = None;
             app.pending_write = false;
             app.pending_write_msg = None;
+            app.search_running = false;
+            app.search_progress = None;
             // A failed scan must not leave the key list permanently unable to
             // load another page.
             app.redis_scan.pending = false;
@@ -5906,6 +6433,9 @@ fn key(app: &mut App, tx: &Tx, k: KeyEvent) {
         app.db_picker_open = false;
         app.history_open = false;
         app.history_filter = None;
+        app.search_open = false;
+        app.search_input = None;
+        app.search_cancel.store(true, Ordering::Relaxed);
         app.set_placeholder();
         return;
     }
@@ -6120,6 +6650,17 @@ fn browse_key(app: &mut App, tx: &Tx, k: KeyEvent) {
         return;
     }
 
+    // Global database search (Alt-G): the term input and results overlay are
+    // both modal.
+    if app.search_input.is_some() {
+        search_input_key(app, tx, k);
+        return;
+    }
+    if app.search_open {
+        search_key(app, tx, k);
+        return;
+    }
+
     // Recent-table overlay (Ctrl-Shift-R) is modal.
     if app.recent_open {
         recent_key(app, tx, k);
@@ -6268,6 +6809,11 @@ fn browse_key(app: &mut App, tx: &Tx, k: KeyEvent) {
             }
             KeyCode::Char('h') | KeyCode::Char('H') => {
                 open_history(app, tx);
+                return;
+            }
+            // Alt-G: scan every table's text columns for a term.
+            KeyCode::Char('g') | KeyCode::Char('G') => {
+                open_global_search(app);
                 return;
             }
             _ => {}
@@ -6798,6 +7344,7 @@ fn open_table_data(app: &mut App, tx: &Tx) {
         app.pending_focus = Some(Focus::Preview);
         app.result_needle.clear();
         app.result_filter = None;
+        app.pending_table_filter = None;
         remember_recent_table(app, &app.current_db(), "", &table.0);
         open_mongo_collection(app, tx);
         return;
@@ -6817,6 +7364,8 @@ fn open_table_data(app: &mut App, tx: &Tx) {
     app.table_meta = None;
     app.result_needle.clear();
     app.result_filter = None;
+    // A search-hit jump stashes a pre-filter here; consume it once.
+    let initial_filter = app.pending_table_filter.take().unwrap_or_default();
     let cur_db = app.current_db();
     let cur_schema = app.schema.clone();
     remember_recent_table(app, &cur_db, &cur_schema, &table.0);
@@ -6841,14 +7390,24 @@ fn open_table_data(app: &mut App, tx: &Tx) {
         page_size: PAGE_SIZE,
         total: None,
         has_next: false,
-        filter: String::new(),
+        filter: initial_filter.clone(),
         order_by: order_by.clone(),
     });
     app.loading = true;
-    app.status = tf(
-        "加载 {} 数据…",
-        &[&(qualified_display(&fix_double_encoding(&schema), &fix_double_encoding(&table.0)))],
-    );
+    app.status = if initial_filter.is_empty() {
+        tf(
+            "加载 {} 数据…",
+            &[&(qualified_display(&fix_double_encoding(&schema), &fix_double_encoding(&table.0)))],
+        )
+    } else {
+        tf(
+            "定位 {} · 过滤 {}",
+            &[
+                &(qualified_display(&fix_double_encoding(&schema), &fix_double_encoding(&table.0))),
+                &(truncate_disp(&one_line(&initial_filter), 48)),
+            ],
+        )
+    };
     // Column metadata powers the `e`/`i` templates (primary-key detection).
     app.spawn(
         tx,
@@ -6861,7 +7420,7 @@ fn open_table_data(app: &mut App, tx: &Tx) {
     );
     let known = app
         .count_cache
-        .get(&count_cache_key(&app.current_db(), &schema, &table.0, ""))
+        .get(&count_cache_key(&app.current_db(), &schema, &table.0, &initial_filter))
         .copied();
     app.page_gen += 1;
     let gen = app.page_gen;
@@ -6875,7 +7434,7 @@ fn open_table_data(app: &mut App, tx: &Tx) {
             table_type: Some(table.1),
             page: 0,
             page_size: PAGE_SIZE,
-            filter: String::new(),
+            filter: initial_filter,
             order_by,
             known_total: known,
             gen,
@@ -10292,6 +10851,189 @@ fn history_confirm_key(app: &mut App, tx: &Tx, k: KeyEvent) {
         KeyCode::Esc | KeyCode::Char('n') | KeyCode::Char('N') => {
             app.history_confirm = None;
             app.status = t("已取消").into();
+        }
+        _ => {}
+    }
+}
+
+// ── global database search (Alt-G) ──
+
+/// Open the global-search term prompt. Redis / Mongo have no information schema
+/// to enumerate, so the feature is SQL-only and says so.
+fn open_global_search(app: &mut App) {
+    if app.backend_kind != Backend::Sql {
+        app.status = t("全库搜索仅支持 SQL（MySQL / PostgreSQL）").into();
+        return;
+    }
+    let Some(cfg) = app.selected.clone() else {
+        app.status = t("✗ 未选择连接").into();
+        return;
+    };
+    if is_postgres_family(cfg.db_type.as_str()) || is_mysql_family(cfg.db_type.as_str()) {
+        let mut ta = TextArea::default();
+        ta.set_placeholder_text(t("搜索词（所有表的文本列，大小写不敏感）"));
+        app.search_input = Some(ta);
+        app.status = tf("全库搜索 {} · 输入搜索词 · Enter 开始 · Esc 取消", &[&(cfg.name)]);
+    } else {
+        app.status = t("全库搜索仅支持 MySQL / PostgreSQL 连接").into();
+    }
+}
+
+fn search_input_key(app: &mut App, tx: &Tx, k: KeyEvent) {
+    match k.code {
+        KeyCode::Enter => {
+            let needle = app
+                .search_input
+                .as_ref()
+                .map(|t| t.lines().join(" ").trim().to_string())
+                .unwrap_or_default();
+            app.search_input = None;
+            if needle.is_empty() {
+                app.status = t("搜索词不能为空").into();
+                return;
+            }
+            start_global_search(app, tx, needle);
+        }
+        KeyCode::Esc => {
+            app.search_input = None;
+            app.status = t("已取消全库搜索").into();
+        }
+        _ => {
+            if let Some(t) = app.search_input.as_mut() {
+                t.input(k);
+            }
+        }
+    }
+}
+
+/// Kick off a background scan, cancelling any previous one. Results land in the
+/// overlay as they arrive and can be aborted with Esc.
+fn start_global_search(app: &mut App, tx: &Tx, needle: String) {
+    let Some(cfg) = app.selected.clone() else {
+        app.status = t("✗ 未选择连接").into();
+        return;
+    };
+    // Cancel the previous scan before replacing the shared flag.
+    app.search_cancel.store(true, Ordering::Relaxed);
+    app.search_gen += 1;
+    let gen = app.search_gen;
+    let cancel = Arc::new(AtomicBool::new(false));
+    app.search_cancel = cancel.clone();
+    app.search_query = needle.clone();
+    app.search_hits.clear();
+    app.search_skipped.clear();
+    app.search_truncated = false;
+    app.search_list.select(None);
+    app.search_running = true;
+    app.search_progress = Some((0, 0));
+    app.search_open = true;
+    app.status = tf("全库搜索「{}」…", &[&needle]);
+    app.loading = true;
+    app.spawn(
+        tx,
+        Op::GlobalSearch {
+            cfg: Box::new(cfg),
+            db: app.current_db(),
+            schema: app.schema.clone(),
+            needle,
+            scan_limit: search_scan_limit(),
+            max_rows: search_max_rows(),
+            gen,
+            cancel,
+        },
+    );
+}
+
+fn search_selected_hit(app: &App) -> Option<&SearchHit> {
+    let sel = app.search_list.selected()?;
+    app.search_hits.get(sel)
+}
+
+/// Copy the focused hit's matched value, and record the status.
+fn search_copy_hit(app: &mut App) {
+    let Some(hit) = search_selected_hit(app) else {
+        app.status = t("没有可复制的命中").into();
+        return;
+    };
+    let text = hit.matched.clone();
+    let n = text.chars().count();
+    match clipboard_copy(&text) {
+        Some(p) => app.status = tf("✓ 已复制命中值（{} 字符）· 兜底 {}", &[&n, &(p.display())]),
+        None => app.status = tf("✓ 已复制命中值（{} 字符）· OSC52 剪贴板", &[&n]),
+    }
+}
+
+/// Enter on a hit: open its table and pre-filter to the row that matched.
+fn open_search_hit(app: &mut App, tx: &Tx, hit: &SearchHit) {
+    let label = qualified_display(&hit.schema, &hit.table);
+    let found = app.tables.iter().position(|t| t.name == hit.table);
+    app.search_open = false;
+    app.search_input = None;
+    app.pending_table_filter = Some(hit.filter.clone());
+    match found {
+        Some(pos) => {
+            app.table_list.select(Some(pos));
+            app.status = tf("定位 {} 的命中行…", &[&(fix_double_encoding(&label))]);
+            open_table_data(app, tx);
+        }
+        None => {
+            // The sidebar list is stale; refresh and open once it lands.
+            app.pending_open_table = Some((hit.schema.clone(), hit.table.clone()));
+            app.status = tf("加载表列表后定位 {}…", &[&(fix_double_encoding(&label))]);
+            spawn_table_list(app, tx);
+        }
+    }
+}
+
+fn search_key(app: &mut App, tx: &Tx, k: KeyEvent) {
+    let n = app.search_hits.len();
+    let step = |app: &mut App, delta: i32| {
+        if n == 0 {
+            return;
+        }
+        let cur = app.search_list.selected().unwrap_or(0) as i32;
+        let next = (cur + delta).clamp(0, n as i32 - 1) as usize;
+        app.search_list.select(Some(next));
+    };
+    match k.code {
+        KeyCode::Esc | KeyCode::Char('q') => {
+            if app.search_running {
+                app.search_cancel.store(true, Ordering::Relaxed);
+                app.status = t("正在中止全库搜索…").into();
+            } else {
+                app.search_open = false;
+                app.status = t("已关闭全库搜索").into();
+            }
+        }
+        KeyCode::Up | KeyCode::Char('k') => step(app, -1),
+        KeyCode::Down | KeyCode::Char('j') => step(app, 1),
+        KeyCode::PageUp => step(app, -10),
+        KeyCode::PageDown => step(app, 10),
+        KeyCode::Home => {
+            if n > 0 {
+                app.search_list.select(Some(0));
+            }
+        }
+        KeyCode::End => {
+            if n > 0 {
+                app.search_list.select(Some(n - 1));
+            }
+        }
+        KeyCode::Char('y') => search_copy_hit(app),
+        KeyCode::Char('r') => {
+            if app.search_query.trim().is_empty() {
+                app.status = t("没有可重搜的关键词").into();
+            } else {
+                let q = app.search_query.clone();
+                start_global_search(app, tx, q);
+            }
+        }
+        KeyCode::Enter => {
+            let Some(hit) = search_selected_hit(app).cloned() else {
+                app.status = t("没有可定位的命中").into();
+                return;
+            };
+            open_search_hit(app, tx, &hit);
         }
         _ => {}
     }
@@ -14251,6 +14993,13 @@ fn ui(f: &mut Frame, app: &mut App) {
         // footer stay visible — `y`/`f`/`Del` feedback lands on the status line.
         render_history_panel(f, chunks[1], app);
     }
+    if app.search_open {
+        // Same content-area confinement as the history panel.
+        render_search_panel(f, chunks[1], app);
+    }
+    if app.search_input.is_some() {
+        render_search_input(f, f.area(), app);
+    }
     if app.table_prompt.is_some() {
         render_table_filter(f, f.area(), app);
     }
@@ -14640,6 +15389,8 @@ enum FooterView {
     TablePrompt,
     HistoryFilter,
     History,
+    SearchInput,
+    Search,
     Recent,
     ColPicker,
     ConnPicker,
@@ -14708,6 +15459,10 @@ fn footer_ctx(app: &App) -> FooterCtx {
         FooterView::HistoryFilter
     } else if app.history_open {
         FooterView::History
+    } else if app.search_input.is_some() {
+        FooterView::SearchInput
+    } else if app.search_open {
+        FooterView::Search
     } else if app.recent_open {
         FooterView::Recent
     } else if app.col_picker_open {
@@ -14770,6 +15525,14 @@ fn footer_hints_ctx(ctx: FooterCtx) -> Vec<Hint> {
             ("Del", t("删除")),
             ("/", t("搜索")),
             ("Esc", t("关闭")),
+        ],
+        FooterView::SearchInput => vec![("Enter", t("搜索")), ("Esc", t("取消"))],
+        FooterView::Search => vec![
+            ("↑↓", t("选择")),
+            ("Enter", t("定位")),
+            ("y", t("复制命中")),
+            ("r", t("重搜")),
+            ("Esc", t("中止/关闭")),
         ],
         FooterView::Recent => vec![
             ("↑↓", t("选择")),
@@ -17006,6 +17769,173 @@ fn render_history_confirm(f: &mut Frame, area: Rect, hc: &HistoryConfirm) {
 }
 
 /// The `/` table-name filter prompt, drawn as a one-line box at the bottom.
+/// Highlight every case-insensitive occurrence of `needle` inside `text`. Used
+/// by the global-search list so a hit is visible at a glance.
+fn search_highlight(
+    text: &str,
+    needle: &str,
+    base: Style,
+    hit: Style,
+) -> Vec<Span<'static>> {
+    let nchars = needle.chars().count();
+    if nchars == 0 {
+        return vec![Span::styled(text.to_string(), base)];
+    }
+    let nlow = needle.to_lowercase();
+    let chars: Vec<char> = text.chars().collect();
+    let mut spans: Vec<Span<'static>> = Vec::new();
+    let mut plain = String::new();
+    let mut i = 0usize;
+    while i < chars.len() {
+        let rest: String = chars[i..].iter().collect();
+        if i + nchars <= chars.len() && rest.to_lowercase().starts_with(&nlow) {
+            if !plain.is_empty() {
+                spans.push(Span::styled(std::mem::take(&mut plain), base));
+            }
+            let matched: String = chars[i..i + nchars].iter().collect();
+            spans.push(Span::styled(matched, hit));
+            i += nchars;
+        } else {
+            plain.push(chars[i]);
+            i += 1;
+        }
+    }
+    if !plain.is_empty() {
+        spans.push(Span::styled(plain, base));
+    }
+    if spans.is_empty() {
+        spans.push(Span::styled(String::new(), base));
+    }
+    spans
+}
+
+/// The global-search overlay (`Alt-G`): one row per hit with the table / column
+/// and the matched value (needle highlighted). A running scan shows `done/total`.
+fn render_search_panel(f: &mut Frame, area: Rect, app: &mut App) {
+    if area.width < 10 || area.height < 5 {
+        return;
+    }
+    let w = if area.width > 108 {
+        104
+    } else {
+        area.width.saturating_sub(2).max(8)
+    };
+    let h = area.height.saturating_sub(1).max(3);
+    let box_area = centered_overlay(area, w, h);
+    f.render_widget(Clear, box_area);
+
+    let done = app.search_hits.len();
+    let progress = app
+        .search_progress
+        .map(|(d, total)| tf(" · {}/{} 表", &[&d, &total]))
+        .unwrap_or_default();
+    let cap = if app.search_truncated {
+        tf(" · 上限 {}", &[&SEARCH_MAX_HITS])
+    } else {
+        String::new()
+    };
+    let skip = if app.search_skipped.is_empty() {
+        String::new()
+    } else {
+        tf(" · 跳过 {}", &[&(app.search_skipped.len())])
+    };
+    let title = tf(
+        " 全库搜索「{}」· {} 命中{}{}{} · Enter 定位 · y 复制 · r 重搜 · Esc 关 ",
+        &[&(app.search_query), &done, &cap, &skip, &progress],
+    );
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_set(border::ROUNDED)
+        .border_style(Style::default().fg(Color::Magenta))
+        .title(Span::styled(title, Style::default().fg(Color::Magenta)));
+    let inner = block.inner(box_area);
+    f.render_widget(block, box_area);
+    if inner.width < 4 || inner.height < 1 {
+        return;
+    }
+
+    if app.search_hits.is_empty() {
+        let msg = if app.search_running {
+            tf("扫描中…{}", &[&progress])
+        } else {
+            t("（没有命中）").to_string()
+        };
+        f.render_widget(
+            Paragraph::new(Line::from(Span::styled(msg, Style::default().fg(Color::DarkGray)))),
+            inner,
+        );
+        return;
+    }
+
+    let list_w = inner.width as usize;
+    let items: Vec<ListItem> = app
+        .search_hits
+        .iter()
+        .map(|hit| {
+            let loc = format!(
+                "{}.{}",
+                qualified_display(&hit.schema, &hit.table),
+                hit.column
+            );
+            let loc = truncate_disp(&loc, (list_w / 3).clamp(8, 40));
+            let matched = truncate_disp(&one_line(&hit.matched), list_w.saturating_sub(loc.chars().count() + 3).max(8));
+            let mut spans = vec![
+                Span::styled(
+                    loc,
+                    Style::default()
+                        .fg(Color::Cyan)
+                        .add_modifier(Modifier::BOLD),
+                ),
+                Span::raw(" "),
+            ];
+            spans.extend(search_highlight(
+                &matched,
+                &app.search_query,
+                Style::default().fg(Color::White),
+                Style::default()
+                    .fg(Color::Yellow)
+                    .add_modifier(Modifier::BOLD),
+            ));
+            ListItem::new(Line::from(spans))
+        })
+        .collect();
+    let list = List::new(items).highlight_style(
+        Style::default()
+            .bg(Color::DarkGray)
+            .add_modifier(Modifier::BOLD),
+    );
+    f.render_stateful_widget(list, inner, &mut app.search_list);
+}
+
+/// The global-search term prompt, drawn as a one-line box at the bottom.
+fn render_search_input(f: &mut Frame, area: Rect, app: &mut App) {
+    if area.height < 3 || area.width < 12 {
+        return;
+    }
+    let w = area.width.saturating_sub(4).max(20).min(area.width);
+    let h = 3.min(area.height);
+    let x = area.x + (area.width.saturating_sub(w)) / 2;
+    let y = area.y + area.height.saturating_sub(h + 1);
+    let box_area = Rect {
+        x,
+        y,
+        width: w,
+        height: h,
+    };
+    f.render_widget(Clear, box_area);
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .title(tf(" 全库搜索 · {} · Enter 开始 · Esc 取消 ", &[&(app.selected_name())]))
+        .border_set(border::ROUNDED)
+        .border_style(Style::default().fg(Color::Magenta));
+    let inner = block.inner(box_area);
+    f.render_widget(block, box_area);
+    if let Some(ta) = app.search_input.as_mut() {
+        ta.set_block(Block::default());
+        f.render_widget(&*ta, inner);
+    }
+}
+
 fn render_table_filter(f: &mut Frame, area: Rect, app: &mut App) {
     let w = area.width.saturating_sub(4).max(20).min(area.width);
     let h = 3.min(area.height);
@@ -17719,6 +18649,11 @@ const HELP_ROWS: &[(&str, &str)] = &[
     ("Alt-F", "格式化当前 SQL（关键字大写 / 子句换行）；再按压缩为单行"),
     ("Ctrl-U", "撤销上一次 Alt-F 格式化"),
     ("Alt-/", "SQL 前缀补全（表名 T / 列名 C / 关键字 K，Tab 上屏）"),
+    ("— 全库搜索（Alt-G）—", ""),
+    ("Alt-G", "全库搜索：扫描当前连接所有表的文本列（每表 LIMIT，大表跳过）"),
+    ("↑ ↓ / Enter", "选择命中 / 跳到该表并定位到命中行"),
+    ("y / r", "复制命中值 / 以同一关键词重搜"),
+    ("Esc", "关闭；扫描中按一下中止（保留已扫描结果）"),
     ("补全上下文", "表名. 后只补该表列名；FROM/JOIN 后优先表名；WHERE/ON 后优先列名"),
     ("↑ ↓", "历史（首行 / 末行）"),
     ("Esc", "回到侧栏"),
@@ -18729,6 +19664,8 @@ mod tests {
             app.table_prompt = None;
             app.result_filter = None;
             app.filter_prompt = None;
+            app.search_open = false;
+            app.search_input = None;
         };
 
         let cases: Vec<OverlayCase> = vec![
@@ -18903,6 +19840,25 @@ mod tests {
             ("db-picker", Box::new(|a| a.db_picker_open = true)),
             ("col-picker", Box::new(|a| a.col_picker_open = true)),
             ("recent", Box::new(|a| a.recent_open = true)),
+            (
+                "search",
+                Box::new(|a| {
+                    a.search_query = "ali".into();
+                    a.search_hits = vec![SearchHit {
+                        schema: "public".into(),
+                        table: "users".into(),
+                        column: "name".into(),
+                        matched: "Alice".into(),
+                        filter: "id = 1".into(),
+                    }];
+                    a.search_list.select(Some(0));
+                    a.search_open = true;
+                }),
+            ),
+            (
+                "search-input",
+                Box::new(|a| a.search_input = Some(TextArea::from(["ali"]))),
+            ),
             (
                 "history",
                 Box::new(|a| {
@@ -21170,6 +22126,188 @@ mod tests {
         assert!(!is_binary_type("text"));
     }
 
+    #[test]
+    fn text_search_column_detection() {
+        for ty in [
+            "char(2)",
+            "varchar(255)",
+            "character varying(80)",
+            "TEXT",
+            "mediumtext",
+            "nvarchar(20)",
+            "citext",
+        ] {
+            assert!(is_text_search_column(ty), "{ty} should be searchable text");
+        }
+        // Numbers, dates, binary and arrays are never LIKE-scanned.
+        for ty in [
+            "int",
+            "bigint",
+            "numeric(10,2)",
+            "date",
+            "timestamp with time zone",
+            "blob",
+            "bytea",
+            "varbinary(16)",
+            "text[]",
+            "jsonb",
+        ] {
+            assert!(!is_text_search_column(ty), "{ty} must not be scanned as text");
+        }
+    }
+
+    #[test]
+    fn search_like_pattern_escapes_wildcards() {
+        assert_eq!(search_like_pattern("abc"), "%abc%");
+        // `%` / `_` / the escape char itself are all escaped with `!`.
+        assert_eq!(search_like_pattern("a%b"), "%a!%b%");
+        assert_eq!(search_like_pattern("a_b"), "%a!_b%");
+        assert_eq!(search_like_pattern("a!b"), "%a!!b%");
+    }
+
+    #[test]
+    fn search_scan_sql_is_dialect_and_schema_aware() {
+        let pg = parse_database_type("postgres").unwrap();
+        let my = parse_database_type("mysql").unwrap();
+        let cols = vec!["name".to_string(), "note".to_string()];
+        // PostgreSQL: ILIKE (case-insensitive), double quotes, schema-qualified.
+        let sql = build_search_scan_sql(pg, "public", "users", &cols, "ali", 500);
+        assert!(sql.contains("\"public\".\"users\""), "{sql}");
+        assert!(sql.contains("\"name\" ILIKE '%ali%' ESCAPE '!'"), "{sql}");
+        assert!(sql.contains(" OR "), "{sql}");
+        assert!(sql.ends_with("LIMIT 500"), "{sql}");
+        // MySQL: LIKE, backticks, no schema layer.
+        let sql = build_search_scan_sql(my, "", "users", &cols, "ali", 1000);
+        assert!(sql.contains("`users`"), "{sql}");
+        assert!(sql.contains("`name` LIKE '%ali%' ESCAPE '!'"), "{sql}");
+        assert!(!sql.contains("ILIKE"), "{sql}");
+        assert!(sql.ends_with("LIMIT 1000"), "{sql}");
+    }
+
+    #[test]
+    fn search_scan_sql_escapes_quotes_in_the_needle() {
+        let my = parse_database_type("mysql").unwrap();
+        let cols = vec!["c".to_string()];
+        let sql = build_search_scan_sql(my, "", "t", &cols, "O'Brien", 10);
+        assert!(sql.contains("'%O''Brien%'"), "{sql}");
+    }
+
+    #[test]
+    fn search_estimates_sql_is_dialect_aware() {
+        let pg = parse_database_type("postgres").unwrap();
+        let my = parse_database_type("mysql").unwrap();
+        let sql = build_search_estimates_sql(pg, "inv");
+        assert!(sql.contains("pg_class") && sql.contains("reltuples"), "{sql}");
+        assert!(sql.contains("'inv'"), "{sql}");
+        let sql = build_search_estimates_sql(my, "");
+        assert!(sql.contains("information_schema.tables"), "{sql}");
+        assert!(sql.contains("DATABASE()"), "{sql}");
+    }
+
+    #[test]
+    fn search_skip_reason_boundaries() {
+        let max = 1_000_000u64;
+        assert_eq!(search_skip_reason(None, max), None);
+        assert_eq!(search_skip_reason(Some(0), max), None);
+        // Exactly at the ceiling still scans; one over is skipped.
+        assert_eq!(search_skip_reason(Some(max), max), None);
+        assert_eq!(search_skip_reason(Some(max + 1), max), Some(max + 1));
+    }
+
+    #[test]
+    fn parse_positive_overrides_reject_zero_and_garbage() {
+        assert_eq!(parse_positive_usize(Some("2500"), 1000), 2500);
+        assert_eq!(parse_positive_usize(Some(" 2500 "), 1000), 2500);
+        // A zero / negative / garbage override keeps the safe default.
+        assert_eq!(parse_positive_usize(Some("0"), 1000), 1000);
+        assert_eq!(parse_positive_usize(Some("-5"), 1000), 1000);
+        assert_eq!(parse_positive_usize(Some("x"), 1000), 1000);
+        assert_eq!(parse_positive_usize(None, 1000), 1000);
+        assert_eq!(parse_positive_u64(Some("2000000"), 1_000_000), 2_000_000);
+        assert_eq!(parse_positive_u64(Some("0"), 1_000_000), 1_000_000);
+    }
+
+    fn search_vals(columns: &[&str]) -> (Vec<String>, Vec<Val>) {
+        (
+            columns.iter().map(|s| s.to_string()).collect(),
+            columns.iter().map(|s| Val::Text((*s).into())).collect(),
+        )
+    }
+
+    #[test]
+    fn search_hit_filter_prefers_the_primary_key() {
+        let my = parse_database_type("mysql").unwrap();
+        let (columns, vals) = search_vals(&["id", "name"]);
+        let mut dtypes = HashMap::new();
+        dtypes.insert("id".to_string(), "int".to_string());
+        dtypes.insert("name".to_string(), "varchar(20)".to_string());
+        // Primary key wins, and a numeric key stays unquoted.
+        let f = search_hit_filter(my, &columns, &vals, &dtypes, &["id".to_string()], "name");
+        assert_eq!(f, "`id` = 'id'");
+        // Without a primary key the matched column's value is used.
+        let f = search_hit_filter(my, &columns, &vals, &dtypes, &[], "name");
+        assert_eq!(f, "`name` = 'name'");
+    }
+
+    #[test]
+    fn search_hit_filter_falls_back_to_one_equals_one() {
+        let pg = parse_database_type("postgres").unwrap();
+        let columns = vec!["name".to_string()];
+        let vals = vec![Val::Null];
+        let dtypes = HashMap::new();
+        let f = search_hit_filter(pg, &columns, &vals, &dtypes, &[], "name");
+        assert_eq!(f, "1 = 1");
+    }
+
+    #[test]
+    fn parse_search_estimates_reads_numbers_and_strings() {
+        let rows = vec![
+            vec![serde_json::json!("a"), serde_json::json!(12)],
+            vec![serde_json::json!("b"), serde_json::json!("340")],
+            vec![serde_json::json!("c"), serde_json::Value::Null],
+        ];
+        let m = parse_search_estimates(&rows);
+        assert_eq!(m.get("a").copied(), Some(12));
+        assert_eq!(m.get("b").copied(), Some(340));
+        assert_eq!(m.get("c").copied(), Some(0));
+    }
+
+    #[test]
+    fn global_search_is_sql_only_and_modal() {
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut app = test_app();
+        app.picker_open = false;
+        app.selected = Some(test_conn("mysql"));
+        app.backend_kind = Backend::Sql;
+        open_global_search(&mut app);
+        assert!(app.search_input.is_some(), "the term prompt should open");
+        // Esc closes the prompt without starting a scan.
+        key(&mut app, &tx, KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+        assert!(app.search_input.is_none());
+        assert!(!app.search_open);
+
+        // Redis / Mongo have no information schema, so the feature declines.
+        app.backend_kind = Backend::Redis;
+        open_global_search(&mut app);
+        assert!(app.search_input.is_none());
+    }
+
+    #[test]
+    fn esc_aborts_a_running_search_before_closing_it() {
+        let mut app = test_app();
+        app.search_open = true;
+        app.search_running = true;
+        app.search_query = "ali".into();
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        search_key(&mut app, &tx, KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+        assert!(app.search_cancel.load(Ordering::Relaxed));
+        assert!(app.search_open, "the overlay stays until the scan stops");
+        // Once stopped, Esc closes it.
+        app.search_running = false;
+        search_key(&mut app, &tx, KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+        assert!(!app.search_open);
+    }
+
     fn column(name: &str, ty: &str, nullable: bool, default: Option<&str>, extra: Option<&str>) -> ColumnInfo {
         ColumnInfo {
             name: name.into(),
@@ -21837,6 +22975,8 @@ mod tests {
             FooterView::ConnPicker,
             FooterView::TablePrompt,
             FooterView::ResultFilter,
+            FooterView::Search,
+            FooterView::SearchInput,
         ] {
             let h = footer_hints_ctx(FooterCtx {
                 view,
@@ -21901,6 +23041,13 @@ mod tests {
         });
         assert_eq!(footer_ctx(&app).view, FooterView::RedisPrompt);
         app.redis_prompt = None;
+
+        app.search_input = Some(TextArea::default());
+        assert_eq!(footer_ctx(&app).view, FooterView::SearchInput);
+        app.search_input = None;
+        app.search_open = true;
+        assert_eq!(footer_ctx(&app).view, FooterView::Search);
+        app.search_open = false;
 
         // `confirm` is checked first in `key`, so it must win over a browse
         // overlay that happens to be open underneath it.
