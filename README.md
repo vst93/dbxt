@@ -14,6 +14,12 @@ A keyboard-first terminal UI for databases, built on the [DBX](https://github.co
 - `d` opens a switcher — MySQL databases, PostgreSQL (and other schema-aware engines') **schemas then databases**, MongoDB databases and Redis logical DBs, all one gesture.
 - `o` returns to the picker; `r` reloads the list in place.
 
+**Connection import, export & migration (`Alt-E` / `Alt-I`)**
+- `Alt-E` exports **every** saved connection as a self-describing JSON bundle (`format` / `version` / `connections[]`, default `~/dbxt-connections.json`). Passwords are **excluded by default**; `p` enables them behind a red plaintext-warning confirmation, and `y` copies the JSON to the clipboard instead of writing a file. The status line reports the destination and the count.
+- `Alt-I` imports connections from a path; the format is auto-detected — the dbxt bundle, a DBeaver `data-sources.json` (the standard `~/.local/share/DBeaverData/workspace6/General/.dbeaver/data-sources.json`), or a Navicat `.ncx` XML export. A preview lists every connection (name / engine / host / SSH / colour / `needs password`), flags same-name collisions, and lists drivers that could not be mapped (skipped).
+- Duplicate names are resolved per row or in bulk: `s` skip, `r` overwrite (matched by name, behind a red confirmation because the existing config is deleted first), `b` keep both (`name-imported`); `Space` toggles a row, `d` cycles its policy, `Enter` imports. Every write goes through `LocalBackend`, so imported connections are immediately usable (connect and verify as usual).
+- **DBeaver** provider / driver ids map to dbxt engines (`mysql8`→`mysql`, `postgresql`→`postgres`, `mariadb`, `duckdb`, `mongodb`, `sqlserver`, …) and the `ssh-tunnel` block becomes a real SSH layer. **Navicat** `.ncx` XML is parsed with a tolerant hand-written scanner (child elements or attributes). Passwords in both stores are encrypted with keys dbxt does not have, so they are never read — imported rows are marked `needs password` and the completion status counts them.
+
 **SSH tunnels (jump hosts)**
 - A tunneled connection configured in DBX Desktop works in dbxt unchanged: dbxt passes `transport_layers` straight through to the kernel, so no re-entry is needed.
 - The connection form has an `ssh_tunnel` section: `ssh_host` / `ssh_port` (22) / `ssh_user`, and an `ssh_auth` login method of `password`, `key` (key path + passphrase) or `agent` (SSH agent, optional socket path).
@@ -134,6 +140,7 @@ The TUI's `?` overlay and `dbxt --help` carry the complete list; this is the sho
 | --- | --- |
 | Global | `?` help · `Tab`/`Shift-Tab` panes · `Alt-1/2/3` focus · `F5`/`Ctrl-J` run · `Ctrl-C` quit |
 | Connections | `↑` `↓` move · `Enter` connect · `c` new · `e` edit · `p` duplicate · `s` sort (name/type/colour) · `x` delete · `d` database/schema switcher · `o` picker |
+| Import / export | `Alt-E` export every connection as JSON (`p` include passwords w/ red confirm · `y` copy to clipboard) · `Alt-I` import a dbxt / DBeaver / Navicat file (`s` skip · `r` overwrite w/ red confirm · `b` keep both · `Space` toggle · `d` per row) |
 | Connection form | `↑` `↓`/`Tab` fields · `Enter` edit/toggle/save · `Space` toggle `ssh_tunnel`/`ssl`/`ssh_auth`, cycle the `color` palette · `Esc` back |
 | SSH host key | `y`/`Enter` accept & remember · `s` this session only · `n`/`Esc` reject |
 | Sidebar | `↑` `↓` tables · `/` filter · `Enter` browse · `r` structure · `I` import CSV · `t` recent |

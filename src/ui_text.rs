@@ -971,6 +971,143 @@ pub static ALL_KEYS: &[&str] = &[
 /// The Chinese → English table. Keys must match the source literals exactly.
 fn en_of(zh: &'static str) -> Option<&'static str> {
     match zh {
+        // ── connection bundle import / export (Alt-E / Alt-I) ──
+        "跳过" => Some("skip"),
+        "都要" => Some("keep both"),
+        "重·跳过" => Some("dup·skip"),
+        "重·覆盖" => Some("dup·overwrite"),
+        "重·另存" => Some("dup·save as"),
+        "不是 DBeaver data-sources.json（缺少 connections 对象）" => {
+            Some("not a DBeaver data-sources.json (no `connections` object)")
+        }
+        "文件为空" => Some("file is empty"),
+        "未找到 Navicat 连接节点（<Connection>）" => {
+            Some("no Navicat connection node found (<Connection>)")
+        }
+        "JSON 解析失败: {}" => Some("JSON parse failed: {}"),
+        "无法识别的连接文件（dbxt / DBeaver / Navicat）" => {
+            Some("unrecognized connection file (dbxt / DBeaver / Navicat)")
+        }
+        "未知驱动" => Some("unknown driver"),
+        "不支持的驱动: {}" => Some("unsupported driver: {}"),
+        "导入失败: {}" => Some("import failed: {}"),
+        "导入 {} 条" => Some("imported {}"),
+        "跳过重复 {}" => Some("skipped {} duplicates"),
+        "{} 条需补密码" => Some("{} need a password"),
+        "没有可导出的连接" => Some("no connections to export"),
+        "导出 {} 条连接 · Enter 导出 · y 复制 · p 含密码 · Esc 取消" => {
+            Some("Export {} connections · Enter export · y copy · p passwords · Esc cancel")
+        }
+        "连接文件路径（dbxt / DBeaver data-sources.json / Navicat .ncx，支持 ~）" => {
+            Some("Connection file path (dbxt / DBeaver data-sources.json / Navicat .ncx, ~ ok)")
+        }
+        "导入连接 · 输入文件路径 · Enter 预览 · Esc 取消" => {
+            Some("Import connections · enter a file path · Enter preview · Esc cancel")
+        }
+        "✓ 已复制 {} 条连接 JSON（{} 字节）· 兜底 {}" => {
+            Some("✓ Copied {} connections as JSON ({} bytes) · fallback {}")
+        }
+        "✓ 已复制 {} 条连接 JSON（{} 字节）" => Some("✓ Copied {} connections as JSON ({} bytes)"),
+        "✓ 已导出 {} 条连接（含明文密码）→ {}" => {
+            Some("✓ Exported {} connections (plaintext passwords) → {}")
+        }
+        "✓ 已导出 {} 条连接 → {}" => Some("✓ Exported {} connections → {}"),
+        "⚠ 已开启含密码导出：明文密码将写入文件，请妥善保管" => {
+            Some("⚠ Password export on: plaintext passwords will be written — keep the file safe")
+        }
+        "已取消含密码导出" => Some("Password export cancelled"),
+        "已关闭含密码导出" => Some("Password export off"),
+        "⚠ 含密码导出：明文密码将写入文件 · Enter 确认 / Esc 取消" => {
+            Some("⚠ Password export: plaintext passwords will be written · Enter confirm / Esc cancel")
+        }
+        "已取消导入连接" => Some("Connection import cancelled"),
+        "{} 格式 · {} 条待导入 · {} 条同名 · 跳过 {} 个未知驱动 · Enter 导入" => {
+            Some("{} format · {} to import · {} same-name · skipping {} unknown drivers · Enter to import")
+        }
+        "⚠ 覆盖同名连接：导入时先删除原有配置" => {
+            Some("⚠ Overwriting same-name connections: existing configs are deleted on import")
+        }
+        "已取消覆盖" => Some("Overwrite cancelled"),
+        "重复策略：跳过" => Some("Duplicate policy: skip"),
+        "重复策略：都要（加后缀 {}）" => Some("Duplicate policy: keep both (suffix {})"),
+        "⚠ 覆盖同名连接：将先删除原有配置 · Enter 确认 / Esc 取消" => {
+            Some("⚠ Overwrite same-name connections: existing configs are deleted · Enter confirm / Esc cancel")
+        }
+        "没有同名连接" => Some("no same-name connections"),
+        "⚠ 覆盖同名连接 {} · Enter 确认 / Esc 取消" => {
+            Some("⚠ Overwrite same-name connection {} · Enter confirm / Esc cancel")
+        }
+        "没有可导入的连接（跳过重复 {}）" => {
+            Some("no connections to import (skipped {} duplicates)")
+        }
+        "没有可导入的连接" => Some("no connections to import"),
+        "导入 {} 条连接…" => Some("Importing {} connections…"),
+        "含密码" => Some("passwords"),
+        "复制 JSON" => Some("copy JSON"),
+        "路径" => Some("path"),
+        "跳过/覆盖/都存" => Some("skip/overwrite/both"),
+        "逐条" => Some("per row"),
+        "需补密码" => Some("needs password"),
+        " ⚠ 含密码导出确认 · Enter 确认 · Esc 取消 " => {
+            Some(" ⚠ Confirm password export · Enter confirm · Esc cancel ")
+        }
+        " 导出连接 · {} 条 · Enter 导出 · y 复制 · p 密码 · Esc " => {
+            Some(" Export connections · {} · Enter export · y copy · p passwords · Esc ")
+        }
+        "⚠ 开启后密码将以明文写入 JSON 文件。" => {
+            Some("⚠ Passwords will be written to the JSON file in plaintext.")
+        }
+        "请勿提交到版本库，导出后及时删除该文件。" => {
+            Some("Do not commit it to version control; delete the file after use.")
+        }
+        "Enter / y 确认开启 · Esc / n 取消" => Some("Enter / y enable · Esc / n cancel"),
+        "Enter 导出到文件" => Some("Enter export to file"),
+        "y 复制 JSON 到剪贴板 · p 切换密码 · i 导入连接 · Esc 取消" => {
+            Some("y copy JSON · p toggle passwords · i import · Esc cancel")
+        }
+        " 导入连接 · 输入文件路径 · Enter 预览 · Esc 取消 " => {
+            Some(" Import connections · enter a file path · Enter preview · Esc cancel ")
+        }
+        " 导入连接 · {} · {} · {} 条 " => Some(" Import connections · {} · {} · {} "),
+        "全部同名连接" => Some("all same-name connections"),
+        "该同名连接" => Some("this same-name connection"),
+        "⚠ 覆盖 {}：将先删除原有配置再写入。" => {
+            Some("⚠ Overwrite {}: the existing config is deleted first.")
+        }
+        "数据库数据不受影响，仅替换保存的连接配置。" => {
+            Some("Database data is untouched; only the saved connection config is replaced.")
+        }
+        "Enter / y 确认覆盖 · Esc / n 取消" => Some("Enter / y confirm overwrite · Esc / n cancel"),
+        "跳过未知驱动: {}" => Some("Skipped unknown drivers: {}"),
+        "↑↓ 选择 · Space 勾选 · s/r/b 跳过/覆盖/都存 · d 逐条 · Enter 导入 · Esc 取消" => {
+            Some("↑↓ select · Space toggle · s/r/b skip/overwrite/both · d per row · Enter import · Esc cancel")
+        }
+        // ── Alt-E / Alt-I help section ──
+        "— 连接导入 / 导出（Alt-E / Alt-I）—" => {
+            Some("— Connection import / export (Alt-E / Alt-I) —")
+        }
+        "预览 s/r/b" => Some("preview s/r/b"),
+        "预览 Space / d" => Some("preview Space / d"),
+        "密码" => Some("passwords"),
+        "导出全部连接为 JSON 包（默认 ~/dbxt-connections.json）" => {
+            Some("Export every connection as a JSON bundle (default ~/dbxt-connections.json)")
+        }
+        "Enter 写文件 · y 复制 JSON 到剪贴板 · p 切换含密码导出（红色确认）" => {
+            Some("Enter writes a file · y copies JSON · p toggles password export (red confirm)")
+        }
+        "导入连接：自动识别 dbxt JSON / DBeaver data-sources.json / Navicat .ncx" => {
+            Some("Import connections: auto-detects dbxt JSON / DBeaver data-sources.json / Navicat .ncx")
+        }
+        "同名策略：s 跳过 · r 覆盖（红色确认，按 name 匹配） · b 都存（名加 -imported）" => {
+            Some("Same-name policy: s skip · r overwrite (red confirm, matches by name) · b keep both (name + -imported)")
+        }
+        "Space 勾选/取消该条 · d 逐条循环 跳过/覆盖/都存 · Enter 导入" => {
+            Some("Space toggles the row · d cycles its policy · Enter imports")
+        }
+        "导出默认不含密码（p 显式开启）；DBeaver / Navicat 密码加密，不解析，导入后标「需补密码」" => {
+            Some("Passwords are excluded by default (p enables them); DBeaver / Navicat passwords are encrypted, never parsed, and marked \"needs password\" after import")
+        }
+
         " Redis db · ↑↓ Enter · Esc 关 " => Some(" Redis db · ↑↓ Enter · Esc close "),
         " SQL 片段 · {} 个 · Enter 插入 · r 刷新 · Esc 关 " => Some(" SQL snippets · {} · Enter insert · r refresh · Esc close "),
         " WHERE 过滤 · Enter 应用 · Esc 取消 · 留空清除 " => Some(" WHERE filter · Enter apply · Esc cancel · empty clears "),

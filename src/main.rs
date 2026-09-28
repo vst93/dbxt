@@ -5263,6 +5263,14 @@ enum Op {
     /// (possibly cross-dialect). Streams [`OpResult::TransferProgress`] between
     /// batches and aborts when `cancel` is set (keeping the committed batches).
     DataTransfer(Box<TransferJob>),
+    /// Add (and optionally replace-first) a batch of imported connections.
+    /// `skipped` / `needs_password` are carried through so the completion status
+    /// can report the duplicate-skip count and the “password missing” count.
+    ImportConns {
+        items: Vec<(Option<String>, Box<ConnectionConfig>)>,
+        skipped: usize,
+        needs_password: usize,
+    },
 }
 
 impl Op {
@@ -5406,6 +5414,15 @@ enum OpResult {
     SnippetSaved(String),
     DatabasesRefresh(Vec<String>),
     Added(String),
+    /// A batch connection import finished: the saved configs (so the picker can
+    /// be refreshed without a round trip) plus the duplicate-skip count, the
+    /// “password missing” count and any per-connection errors.
+    ConnsImported {
+        saved: Vec<ConnectionConfig>,
+        skipped: usize,
+        needs_password: usize,
+        failed: Vec<String>,
+    },
     /// A CSV preview plan (may carry a content error the preview displays).
     ImportPlan { gen: u64, plan: Box<ImportPlan> },
     /// The plan could not be built (unreadable file, no columns): routed back to
@@ -6614,6 +6631,22 @@ async fn run_op(backend: &LocalBackend, op: Op, tx: &Tx) -> OpResult {
             Ok(false) => OpResult::Error(tf("连接不存在: {}", &[&name])),
             Err(e) => OpResult::Error(format!("delete: {e}")),
         },
+        Op::ImportConns { items, skipped, needs_password } => {
+            let mut saved: Vec<ConnectionConfig> = Vec::new();
+            let mut failed: Vec<String> = Vec::new();
+            for (replace_id, cfg) in items {
+                // An overwrite is remove-then-add with the same id (the kernel
+                // has no UPDATE), mirroring [`Op::UpdateConn`].
+                if let Some(id) = replace_id {
+                    let _ = backend.remove_connection_for_mcp(&id).await;
+                }
+                match backend.add_connection_for_mcp(*cfg).await {
+                    Ok(conn) => saved.push(conn),
+                    Err(e) => failed.push(e.to_string()),
+                }
+            }
+            OpResult::ConnsImported { saved, skipped, needs_password, failed }
+        }
         Op::ImportPlan { cfg, db, schema, table, path, gen } => {
             let expanded = expand_home(&path.to_string_lossy());
             let bytes = match std::fs::read(&expanded) {
@@ -8927,6 +8960,14 @@ struct App {
     /// The destination prompt (blank = clipboard, else a file path).
     export_path: Option<TextArea<'static>>,
 
+    // ── connection import / export (Alt-E / Alt-I) ──
+    /// The `Alt-E` bundle export overlay (destination, passwords, confirm).
+    conn_export: Option<Box<ConnExport>>,
+    /// The `Alt-I` file-path prompt, before the bundle is read.
+    conn_import_path: Option<TextArea<'static>>,
+    /// The parsed preview / duplicate-resolution layer.
+    conn_import_plan: Option<Box<ConnImportPlan>>,
+
     layout_mode: LayoutMode,
     term_h: u16,
     rects: Rects,
@@ -9383,6 +9424,9 @@ impl App {
             export_list: ListState::default(),
             export_pending: None,
             export_path: None,
+            conn_export: None,
+            conn_import_path: None,
+            conn_import_plan: None,
             layout_mode: LayoutMode::Mid,
             term_h: 0,
             rects: Rects::default(),
@@ -10263,6 +10307,24 @@ fn apply_op_result(app: &mut App, res: OpResult, tx: &Tx) {
             app.picker_open = true;
             app.loading = true;
             app.spawn(tx, Op::ListConnections);
+        }
+        OpResult::ConnsImported { saved, skipped, needs_password, failed } => {
+            // Merge the saved configs in place (an overwrite keeps the same id,
+            // so it replaces its old row) rather than re-listing, so the import
+            // summary is not clobbered by the list status message.
+            let added = saved.len();
+            for cfg in saved {
+                match app.connections.iter().position(|c| c.id == cfg.id) {
+                    Some(i) => app.connections[i] = cfg,
+                    None => app.connections.push(cfg),
+                }
+            }
+            sort_connection_list(&mut app.connections, app.conn_sort);
+            app.picker_open = app.selected.is_none();
+            let n = app.connections.len();
+            let sel = app.conn_list.selected().unwrap_or(0).min(n.saturating_sub(1));
+            app.conn_list.select((n > 0).then_some(sel));
+            app.status = conn_import_status(added, skipped, needs_password, &failed);
         }
         OpResult::ImportPlan { gen, plan } => {
             if gen != app.import_gen {
@@ -11172,6 +11234,19 @@ fn browse_key(app: &mut App, tx: &Tx, k: KeyEvent) {
         export_key(app, k);
         return;
     }
+    // Connection bundle import / export (Alt-E / Alt-I) are modal overlays.
+    if app.conn_export.is_some() {
+        conn_export_key(app, k);
+        return;
+    }
+    if app.conn_import_path.is_some() {
+        conn_import_path_key(app, k);
+        return;
+    }
+    if app.conn_import_plan.is_some() {
+        conn_import_plan_key(app, tx, k);
+        return;
+    }
     if app.filter_prompt.is_some() {
         filter_prompt_key(app, tx, k);
         return;
@@ -11464,6 +11539,16 @@ fn browse_key(app: &mut App, tx: &Tx, k: KeyEvent) {
             // connection (cross-dialect supported).
             KeyCode::Char('t') | KeyCode::Char('T') => {
                 open_transfer_wizard(app);
+                return;
+            }
+            // Alt-E: export every saved connection as a JSON bundle.
+            KeyCode::Char('e') | KeyCode::Char('E') => {
+                open_conn_export(app);
+                return;
+            }
+            // Alt-I: import connections from a dbxt / DBeaver / Navicat file.
+            KeyCode::Char('i') | KeyCode::Char('I') => {
+                open_conn_import(app);
                 return;
             }
             _ => {}
@@ -21096,6 +21181,1109 @@ fn import_report_key(app: &mut App, k: KeyEvent) {
     }
 }
 
+// ── connection bundle import / export (Alt-E / Alt-I) ───────────────────────
+//
+// dbxt keeps its connections in DBX's shared store. This section moves that
+// list in and out as a self-describing JSON bundle and migrates the two
+// dominant third-party formats (DBeaver `data-sources.json`, Navicat `.ncx`
+// XML). Every write goes through `LocalBackend`; no file is touched behind its
+// back. Passwords are excluded by default on export and are never decrypted
+// from the DBeaver / Navicat stores (their ciphers are not ours to break).
+
+/// Destination offered by the `Alt-E` overlay.
+const CONN_EXPORT_DEFAULT_PATH: &str = "~/dbxt-connections.json";
+/// Schema version of the dbxt connection bundle.
+const CONN_BUNDLE_VERSION: u32 = 1;
+/// Suffix appended to a duplicate name under the “both” policy.
+const CONN_IMPORT_SUFFIX: &str = "-imported";
+
+/// Which tool produced the bundle being imported.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum ConnSource {
+    Dbxt,
+    DBeaver,
+    Navicat,
+}
+
+impl ConnSource {
+    fn label(self) -> &'static str {
+        match self {
+            ConnSource::Dbxt => "dbxt",
+            ConnSource::DBeaver => "DBeaver",
+            ConnSource::Navicat => "Navicat",
+        }
+    }
+}
+
+/// Duplicate-name resolution for one imported connection.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum DupPolicy {
+    /// Leave the existing connection untouched.
+    Skip,
+    /// Replace it (remove-then-add, same id).
+    Overwrite,
+    /// Import alongside it as `name-imported`.
+    Both,
+}
+
+impl DupPolicy {
+    fn label(self) -> &'static str {
+        match self {
+            DupPolicy::Skip => t("跳过"),
+            DupPolicy::Overwrite => t("覆盖"),
+            DupPolicy::Both => t("都要"),
+        }
+    }
+    fn marker(self) -> &'static str {
+        match self {
+            DupPolicy::Skip => t("重·跳过"),
+            DupPolicy::Overwrite => t("重·覆盖"),
+            DupPolicy::Both => t("重·另存"),
+        }
+    }
+    fn next(self) -> Self {
+        match self {
+            DupPolicy::Skip => DupPolicy::Overwrite,
+            DupPolicy::Overwrite => DupPolicy::Both,
+            DupPolicy::Both => DupPolicy::Skip,
+        }
+    }
+}
+
+/// The SSH tunnel of a normalized imported connection.
+#[derive(Clone, Default, Debug)]
+struct ImportSsh {
+    host: String,
+    port: u16,
+    user: String,
+    password: Option<String>,
+    key_path: Option<String>,
+    passphrase: Option<String>,
+    use_agent: bool,
+    agent_sock: Option<String>,
+    auth_method: String,
+}
+
+/// A connection parsed from any supported format, before it becomes a
+/// [`ConnectionConfig`]. `db_type` is `None` when the source driver did not map.
+#[derive(Clone, Default, Debug)]
+struct ImportConn {
+    name: String,
+    /// Raw driver / provider / connection type, for the skipped list.
+    driver: String,
+    db_type: Option<String>,
+    host: String,
+    port: Option<u16>,
+    user: String,
+    password: Option<String>,
+    database: Option<String>,
+    ssl: bool,
+    color: Option<String>,
+    ssh: Option<ImportSsh>,
+    /// True for DBeaver / Navicat, whose passwords are encrypted upstream.
+    needs_password: bool,
+}
+
+/// One selectable row of the import preview.
+#[derive(Clone, Debug)]
+struct ConnImportRow {
+    conn: ImportConn,
+    /// The name collides with an existing saved connection.
+    dup: bool,
+    policy: DupPolicy,
+    selected: bool,
+}
+
+/// Which scope a pending overwrite confirmation applies to.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum ConnOverwriteScope {
+    All,
+    Row(usize),
+}
+
+/// The parsed, previewed import awaiting confirmation.
+#[derive(Clone, Debug)]
+struct ConnImportPlan {
+    source: ConnSource,
+    origin: String,
+    rows: Vec<ConnImportRow>,
+    /// Drivers that did not map to a dbxt engine: `driver · name`.
+    skipped: Vec<String>,
+    cursor: usize,
+    /// The red overwrite confirmation, when one is pending.
+    confirm: Option<ConnOverwriteScope>,
+}
+
+/// The `Alt-E` export overlay state.
+struct ConnExport {
+    path: TextArea<'static>,
+    /// 0 = path, 1 = password toggle, 2 = export action.
+    field: usize,
+    editing: bool,
+    include_passwords: bool,
+    /// Red confirmation shown before enabling password export.
+    confirm_pw: bool,
+}
+
+fn json_str(v: Option<&serde_json::Value>) -> Option<String> {
+    v.and_then(|v| v.as_str())
+        .map(str::to_string)
+        .filter(|s| !s.is_empty())
+}
+
+fn value_to_port(v: &serde_json::Value) -> Option<u16> {
+    match v {
+        serde_json::Value::Number(n) => n.as_u64().and_then(|x| u16::try_from(x).ok()),
+        serde_json::Value::String(s) => s.trim().parse::<u16>().ok(),
+        _ => None,
+    }
+}
+
+/// Truthy for bools and the string spellings DBeaver / Navicat use.
+fn value_truthy(v: Option<&serde_json::Value>) -> bool {
+    match v {
+        Some(serde_json::Value::Bool(b)) => *b,
+        Some(serde_json::Value::Number(n)) => n.as_i64().unwrap_or(0) != 0,
+        Some(serde_json::Value::String(s)) => {
+            let s = s.trim().to_ascii_lowercase();
+            matches!(
+                s.as_str(),
+                "true" | "1" | "yes" | "on" | "require" | "required" | "verify-ca" | "verify-full"
+            )
+        }
+        _ => false,
+    }
+}
+
+/// First non-empty string among `names` in a JSON object.
+fn cfg_str(m: &serde_json::Map<String, serde_json::Value>, names: &[&str]) -> Option<String> {
+    names.iter().find_map(|n| json_str(m.get(*n)))
+}
+
+/// `jdbc:mysql://host:3306/shop?x=1` → `shop`. A URL without a `host:port/db`
+/// shape (e.g. `jdbc:duckdb:/tmp/x.duckdb`) yields `None` rather than a bogus
+/// path fragment.
+fn database_from_jdbc_url(url: &str) -> Option<String> {
+    let after = url.split_once("://")?.1;
+    let path = after.split('/').nth(1)?;
+    let path = path.split(['?', ';']).next().unwrap_or(path);
+    if path.is_empty() {
+        None
+    } else {
+        Some(path.to_string())
+    }
+}
+
+fn normalize_driver_key(raw: &str) -> String {
+    raw.trim()
+        .to_ascii_lowercase()
+        .chars()
+        .filter(|c| c.is_ascii_alphanumeric() || *c == '-')
+        .collect()
+}
+
+/// Map a DBeaver provider / Navicat connection type to a dbxt engine name.
+/// Canonical dbxt names pass straight through; the alias table covers the
+/// foreign spellings (`postgresql`, `mariadb`, `mysql8`, …).
+fn map_driver_to_db_type(raw: &str) -> Option<&'static str> {
+    let key = normalize_driver_key(raw);
+    if key.is_empty() {
+        return None;
+    }
+    if let Ok(dt) = parse_database_type(&key) {
+        return Some(dt.as_str());
+    }
+    let trimmed = key.trim_end_matches(|c: char| c.is_ascii_digit());
+    let trimmed = trimmed.trim_end_matches("jdbc").trim_end_matches('-');
+    map_driver_alias(&key).or_else(|| map_driver_alias(trimmed))
+}
+
+fn map_driver_alias(key: &str) -> Option<&'static str> {
+    Some(match key {
+        "mysql" | "mariadb" | "mysql5" | "mysql8" | "mysqlconnector" => "mysql",
+        "postgresql" | "pgsql" | "pg" | "postgresql9" | "postgresql10" | "postgresql11"
+        | "postgresql12" | "postgresql13" | "postgresql14" | "postgresql15" | "postgresql16" => "postgres",
+        "sqlite3" => "sqlite",
+        "mssql" | "jtds" | "sqlserver2005" | "sqlserver2008" | "sqlserver2012" | "sqlserver2014"
+        | "sqlserver2016" | "sqlserver2017" | "sqlserver2019" | "sqlserver2022" | "microsoftsqlserver" => "sqlserver",
+        "oracleoci" | "oraclethin" => "oracle",
+        "presto" | "prestodb" | "prestosql" => "prestosql",
+        "hive2" | "hivejdbc" | "hiveserver2" => "hive",
+        "dm" | "dm8" | "dameng8" => "dameng",
+        "kingbasees" | "kingbase8" | "kingbasev8" => "kingbase",
+        "manticore" => "manticoresearch",
+        "ucanaccess" | "msaccess" => "access",
+        "oceanbase" => "oceanbase-oracle",
+        "sparksql" => "spark",
+        _ => return None,
+    })
+}
+
+fn ssh_export_value(ssh: &SshTunnelConfig, include_passwords: bool) -> serde_json::Value {
+    let mut m = serde_json::Map::new();
+    m.insert("host".into(), serde_json::json!(ssh.host));
+    m.insert("port".into(), serde_json::json!(ssh.port));
+    m.insert("user".into(), serde_json::json!(ssh.user));
+    if !ssh.auth_method.is_empty() {
+        m.insert("auth_method".into(), serde_json::json!(ssh.auth_method));
+    }
+    if ssh.use_ssh_agent {
+        m.insert("use_agent".into(), serde_json::json!(true));
+    }
+    if !ssh.ssh_agent_sock_path.is_empty() {
+        m.insert("agent_sock".into(), serde_json::json!(ssh.ssh_agent_sock_path));
+    }
+    if !ssh.key_path.is_empty() {
+        m.insert("key_path".into(), serde_json::json!(ssh.key_path));
+    }
+    if include_passwords {
+        if !ssh.password.is_empty() {
+            m.insert("password".into(), serde_json::json!(ssh.password));
+        }
+        if !ssh.key_passphrase.is_empty() {
+            m.insert("key_passphrase".into(), serde_json::json!(ssh.key_passphrase));
+        }
+    }
+    serde_json::Value::Object(m)
+}
+
+fn connection_export_value(cfg: &ConnectionConfig, include_passwords: bool) -> serde_json::Value {
+    let mut m = serde_json::Map::new();
+    m.insert("name".into(), serde_json::json!(cfg.name));
+    m.insert("db_type".into(), serde_json::json!(cfg.db_type.as_str()));
+    m.insert("host".into(), serde_json::json!(cfg.host));
+    m.insert("port".into(), serde_json::json!(cfg.port));
+    m.insert("user".into(), serde_json::json!(cfg.username));
+    if include_passwords {
+        m.insert("password".into(), serde_json::json!(cfg.password));
+    }
+    if let Some(db) = &cfg.database {
+        m.insert("database".into(), serde_json::json!(db));
+    }
+    m.insert("ssl".into(), serde_json::json!(cfg.ssl));
+    if let Some(color) = &cfg.color {
+        if !color.is_empty() {
+            m.insert("color".into(), serde_json::json!(color));
+        }
+    }
+    if let Some(ssh) = first_ssh_layer(cfg) {
+        m.insert("ssh".into(), ssh_export_value(ssh, include_passwords));
+    }
+    serde_json::Value::Object(m)
+}
+
+/// Serialize the whole connection list into the self-describing dbxt bundle.
+fn conn_bundle_json(conns: &[ConnectionConfig], include_passwords: bool) -> String {
+    let value = serde_json::json!({
+        "format": "dbxt-connections",
+        "version": CONN_BUNDLE_VERSION,
+        "generated_by": "dbxt",
+        "exported_at": now_iso8601(),
+        "connection_count": conns.len(),
+        "connections": conns
+            .iter()
+            .map(|c| connection_export_value(c, include_passwords))
+            .collect::<Vec<_>>(),
+    });
+    serde_json::to_string_pretty(&value).unwrap_or_else(|_| "{}".into())
+}
+
+fn parse_ssh_value(m: &serde_json::Map<String, serde_json::Value>) -> ImportSsh {
+    let mut ssh = ImportSsh::default();
+    ssh.host = cfg_str(m, &["host"]).unwrap_or_default();
+    ssh.port = m.get("port").and_then(value_to_port).unwrap_or(22);
+    ssh.user = cfg_str(m, &["user", "username"]).unwrap_or_default();
+    ssh.password = json_str(m.get("password"));
+    ssh.key_path = cfg_str(m, &["key_path", "keyPath"]);
+    ssh.passphrase = cfg_str(m, &["key_passphrase", "keyPassphrase"]);
+    ssh.use_agent = value_truthy(m.get("use_agent"));
+    ssh.agent_sock = cfg_str(m, &["agent_sock", "agentSock"]);
+    ssh.auth_method = cfg_str(m, &["auth_method", "authMethod"]).unwrap_or_else(|| {
+        if ssh.key_path.is_some() {
+            "key".into()
+        } else if ssh.use_agent {
+            "agent".into()
+        } else {
+            "password".into()
+        }
+    });
+    ssh
+}
+
+fn parse_dbxt_bundle(arr: &[serde_json::Value]) -> Result<Vec<ImportConn>, String> {
+    let mut out = Vec::new();
+    for item in arr {
+        let Some(obj) = item.as_object() else { continue };
+        let mut c = ImportConn::default();
+        c.name = cfg_str(obj, &["name"]).unwrap_or_default();
+        c.driver = cfg_str(obj, &["db_type", "dbType", "type"]).unwrap_or_default();
+        c.db_type = map_driver_to_db_type(&c.driver).map(str::to_string);
+        c.host = cfg_str(obj, &["host"]).unwrap_or_default();
+        c.port = obj.get("port").and_then(value_to_port);
+        c.user = cfg_str(obj, &["user", "username"]).unwrap_or_default();
+        c.password = json_str(obj.get("password"));
+        c.database = cfg_str(obj, &["database"]);
+        c.ssl = value_truthy(obj.get("ssl"));
+        c.color = cfg_str(obj, &["color"]);
+        if let Some(ssh) = obj.get("ssh").and_then(|v| v.as_object()) {
+            c.ssh = Some(parse_ssh_value(ssh));
+        }
+        if c.name.trim().is_empty() {
+            c.name = c.host.clone();
+        }
+        out.push(c);
+    }
+    Ok(out)
+}
+
+fn parse_dbeaver_ssh(m: &serde_json::Map<String, serde_json::Value>) -> ImportSsh {
+    let key_path = cfg_str(m, &["private-key-path", "privateKeyPath", "key-path", "keyPath"]);
+    let auth = cfg_str(m, &["auth-type", "authType"])
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+    let use_agent = auth.contains("agent");
+    let auth_method = if key_path.is_some() || auth.contains("key") {
+        "key".to_string()
+    } else if use_agent {
+        "agent".to_string()
+    } else {
+        "password".to_string()
+    };
+    ImportSsh {
+        host: cfg_str(m, &["host"]).unwrap_or_default(),
+        port: m.get("port").and_then(value_to_port).unwrap_or(22),
+        user: cfg_str(m, &["user", "username"]).unwrap_or_default(),
+        key_path,
+        use_agent,
+        auth_method,
+        ..ImportSsh::default()
+    }
+}
+
+fn parse_dbeaver_json(v: &serde_json::Value) -> Result<Vec<ImportConn>, String> {
+    let map = v
+        .get("connections")
+        .and_then(|c| c.as_object())
+        .ok_or_else(|| t("不是 DBeaver data-sources.json（缺少 connections 对象）").to_string())?;
+    let mut out = Vec::new();
+    for (id, item) in map {
+        let Some(obj) = item.as_object() else { continue };
+        let cfg = obj.get("configuration").and_then(|c| c.as_object());
+        let mut c = ImportConn::default();
+        c.name = cfg_str(obj, &["name"]).unwrap_or_else(|| id.clone());
+        c.driver = cfg_str(obj, &["provider", "driver"])
+            .or_else(|| cfg.and_then(|c| cfg_str(c, &["provider", "driver"])))
+            .unwrap_or_default();
+        c.db_type = map_driver_to_db_type(&c.driver).map(str::to_string);
+        if let Some(cfg) = cfg {
+            c.host = cfg_str(cfg, &["host", "serverName", "hostName", "server"]).unwrap_or_default();
+            c.port = cfg.get("port").and_then(value_to_port);
+            c.user = cfg_str(cfg, &["user", "username"]).unwrap_or_default();
+            c.database = cfg_str(cfg, &["database", "databaseName", "db"]);
+            if c.database.is_none() {
+                if let Some(url) = cfg_str(cfg, &["url", "jdbcUrl"]) {
+                    c.database = database_from_jdbc_url(&url);
+                }
+            }
+            let ssl_mode = cfg_str(cfg, &["sslMode", "ssl_mode"])
+                .map(|s| matches!(s.to_ascii_lowercase().as_str(), "require" | "required" | "verify-ca" | "verify-full"))
+                .unwrap_or(false);
+            c.ssl = value_truthy(cfg.get("ssl")) || ssl_mode;
+        }
+        if c.user.is_empty() {
+            c.user = cfg_str(obj, &["user", "username"]).unwrap_or_default();
+        }
+        // `ssh-tunnel` is a sibling of `configuration`; older files nest it.
+        let ssh = obj
+            .get("ssh-tunnel")
+            .or_else(|| obj.get("ssh_tunnel"))
+            .or_else(|| cfg.and_then(|c| c.get("ssh-tunnel")))
+            .or_else(|| cfg.and_then(|c| c.get("ssh_tunnel")));
+        if let Some(s) = ssh.and_then(|v| v.as_object()) {
+            let parsed = parse_dbeaver_ssh(s);
+            if !parsed.host.is_empty() {
+                c.ssh = Some(parsed);
+            }
+        }
+        // The password lives AES-encrypted in credentials-config.json; never read it.
+        c.needs_password = true;
+        if c.name.trim().is_empty() {
+            c.name = id.clone();
+        }
+        out.push(c);
+    }
+    Ok(out)
+}
+
+/// Navicat `.ncx` connections, parsed with a tolerant hand-written scanner
+/// (no extra dependency). Both child elements and attributes are accepted, and
+/// tag names are matched case-insensitively.
+fn parse_navicat_xml(text: &str) -> Vec<ImportConn> {
+    let lower = text.to_ascii_lowercase();
+    let mut out = Vec::new();
+    let mut pos = 0usize;
+    let needle = "<connection";
+    while let Some(rel) = lower[pos..].find(needle) {
+        let start = pos + rel;
+        let after = lower.as_bytes().get(start + needle.len()).copied();
+        // Skip `<connections>` (the root element).
+        if !matches!(after, Some(b'>') | Some(b'/') | Some(b' ') | Some(b'\t') | Some(b'\n') | Some(b'\r')) {
+            pos = start + needle.len();
+            continue;
+        }
+        let block_end; // exclusive end of this connection's text
+        if let Some(end_rel) = lower[start..].find("</connection>") {
+            block_end = start + end_rel + "</connection>".len();
+        } else if let Some(gt) = text[start..].find('>') {
+            block_end = start + gt + 1;
+        } else {
+            break;
+        }
+        let block = &text[start..block_end];
+        pos = block_end;
+        let conn = parse_navicat_conn(block);
+        if conn.name.trim().is_empty() && conn.host.trim().is_empty() {
+            continue;
+        }
+        out.push(conn);
+    }
+    out
+}
+
+fn parse_navicat_conn(block: &str) -> ImportConn {
+    let mut c = ImportConn::default();
+    c.name = xml_field(block, &["name", "connectionname", "connection_name", "connname"]).unwrap_or_default();
+    c.driver = xml_field(block, &["conntype", "conn_type", "type", "servertype", "dbtype"]).unwrap_or_default();
+    c.db_type = map_driver_to_db_type(&c.driver).map(str::to_string);
+    c.host = xml_field(block, &["host", "hostname", "server", "address"]).unwrap_or_default();
+    c.port = xml_field(block, &["port"]).and_then(|p| p.trim().parse::<u16>().ok());
+    c.user = xml_field(block, &["username", "user", "uid"]).unwrap_or_default();
+    c.database = xml_field(block, &["database", "databasename", "db", "initialcatalog"]);
+    c.ssl = xml_field(block, &["usessl", "ssl", "sslmode", "sslenabled"])
+        .map(|v| {
+            let v = v.trim().to_ascii_lowercase();
+            matches!(v.as_str(), "true" | "1" | "yes" | "on" | "require" | "required") || v.contains("verify")
+        })
+        .unwrap_or(false);
+    c.color = xml_field(block, &["color"]);
+    let ssh_on = xml_field(block, &["ssh_enabled", "sshenabled", "usessh", "sshtunnel"])
+        .map(|v| {
+            let v = v.trim().to_ascii_lowercase();
+            matches!(v.as_str(), "true" | "1" | "yes" | "on")
+        })
+        .unwrap_or(false);
+    let ssh_host = xml_field(block, &["ssh_host", "sshhost"]);
+    if ssh_on || ssh_host.is_some() {
+        let mut ssh = ImportSsh::default();
+        ssh.host = ssh_host.unwrap_or_default();
+        ssh.port = xml_field(block, &["ssh_port", "sshport"])
+            .and_then(|p| p.trim().parse::<u16>().ok())
+            .unwrap_or(22);
+        ssh.user = xml_field(block, &["ssh_user", "ssh_username", "sshuser"]).unwrap_or_default();
+        ssh.key_path = xml_field(block, &["ssh_keypath", "ssh_key_path", "ssh_privatekeypath", "sshprivatekeypath"]);
+        ssh.use_agent = xml_field(block, &["ssh_useagent", "sshagent", "ssh_use_agent"])
+            .map(|v| matches!(v.trim().to_ascii_lowercase().as_str(), "true" | "1" | "yes" | "on"))
+            .unwrap_or(false);
+        ssh.auth_method = if ssh.key_path.is_some() {
+            "key".into()
+        } else if ssh.use_agent {
+            "agent".into()
+        } else {
+            "password".into()
+        };
+        c.ssh = Some(ssh);
+    }
+    // The Navicat password (and SSH password) is encrypted; never read it.
+    c.needs_password = true;
+    c
+}
+
+/// Element text (`<name>value</name>`) or an attribute (`name="value"`), case-insensitive.
+fn xml_field(block: &str, names: &[&str]) -> Option<String> {
+    for name in names {
+        if let Some(v) = xml_element(block, name) {
+            return Some(v);
+        }
+        if let Some(v) = xml_attr(block, name) {
+            return Some(v);
+        }
+    }
+    None
+}
+
+fn xml_element(block: &str, name: &str) -> Option<String> {
+    let lower = block.to_ascii_lowercase();
+    let needle = format!("<{}", name.to_ascii_lowercase());
+    let mut from = 0usize;
+    while let Some(rel) = lower[from..].find(&needle) {
+        let start = from + rel;
+        let after = lower.as_bytes().get(start + needle.len()).copied();
+        if !matches!(after, Some(b'>') | Some(b'/') | Some(b' ') | Some(b'\t') | Some(b'\n') | Some(b'\r')) {
+            from = start + needle.len();
+            continue;
+        }
+        let gt = lower[start..].find('>').map(|g| start + g)?;
+        if lower.as_bytes().get(gt.wrapping_sub(1)) == Some(&b'/') {
+            return None;
+        }
+        let close = format!("</{}>", name.to_ascii_lowercase());
+        let end = lower[gt..].find(&close).map(|e| gt + e)?;
+        return Some(unescape_xml(block[gt + 1..end].trim()));
+    }
+    None
+}
+
+fn xml_attr(block: &str, name: &str) -> Option<String> {
+    let lower = block.to_ascii_lowercase();
+    let bytes = lower.as_bytes();
+    let needle = name.to_ascii_lowercase();
+    let mut from = 0usize;
+    while let Some(rel) = lower[from..].find(&needle) {
+        let start = from + rel;
+        let prev = if start == 0 { None } else { bytes.get(start - 1).copied() };
+        if !matches!(prev, None | Some(b' ') | Some(b'\t') | Some(b'\n') | Some(b'\r') | Some(b'>')) {
+            from = start + needle.len();
+            continue;
+        }
+        let mut j = start + needle.len();
+        while matches!(bytes.get(j), Some(b' ') | Some(b'\t')) {
+            j += 1;
+        }
+        if bytes.get(j) != Some(&b'=') {
+            from = start + needle.len();
+            continue;
+        }
+        j += 1;
+        while matches!(bytes.get(j), Some(b' ') | Some(b'\t')) {
+            j += 1;
+        }
+        let quote = match bytes.get(j) {
+            Some(q @ (b'"' | b'\'')) => *q,
+            _ => {
+                from = start + needle.len();
+                continue;
+            }
+        };
+        let vstart = j + 1;
+        let mut k = vstart;
+        while k < bytes.len() && bytes[k] != quote {
+            k += 1;
+        }
+        return Some(unescape_xml(block[vstart..k].trim()));
+    }
+    None
+}
+
+fn unescape_xml(s: &str) -> String {
+    s.replace("&lt;", "<")
+        .replace("&gt;", ">")
+        .replace("&quot;", "\"")
+        .replace("&apos;", "'")
+        .replace("&amp;", "&")
+}
+
+/// Auto-detect and parse a connection file: the dbxt bundle, a DBeaver
+/// `data-sources.json`, or a Navicat `.ncx` XML.
+fn sniff_connections(text: &str) -> Result<(ConnSource, Vec<ImportConn>), String> {
+    let trimmed = text.trim_start_matches('\u{feff}').trim();
+    if trimmed.is_empty() {
+        return Err(t("文件为空").into());
+    }
+    if trimmed.starts_with('<') {
+        let conns = parse_navicat_xml(trimmed);
+        if conns.is_empty() {
+            return Err(t("未找到 Navicat 连接节点（<Connection>）").into());
+        }
+        return Ok((ConnSource::Navicat, conns));
+    }
+    let v: serde_json::Value =
+        serde_json::from_str(trimmed).map_err(|e| tf("JSON 解析失败: {}", &[&e]))?;
+    if let Some(arr) = v.get("connections").and_then(|c| c.as_array()) {
+        return Ok((ConnSource::Dbxt, parse_dbxt_bundle(arr)?));
+    }
+    if v.get("connections").and_then(|c| c.as_object()).is_some() {
+        return Ok((ConnSource::DBeaver, parse_dbeaver_json(&v)?));
+    }
+    Err(t("无法识别的连接文件（dbxt / DBeaver / Navicat）").into())
+}
+
+fn build_conn_import_plan(
+    source: ConnSource,
+    origin: String,
+    conns: Vec<ImportConn>,
+    existing: &[ConnectionConfig],
+) -> ConnImportPlan {
+    let mut rows = Vec::new();
+    let mut skipped = Vec::new();
+    for c in conns {
+        if c.db_type.is_none() {
+            let driver = if c.driver.trim().is_empty() {
+                t("未知驱动").to_string()
+            } else {
+                c.driver.clone()
+            };
+            skipped.push(format!("{driver} · {}", c.name));
+            continue;
+        }
+        let dup = !c.name.trim().is_empty() && existing.iter().any(|e| e.name == c.name);
+        rows.push(ConnImportRow {
+            conn: c,
+            dup,
+            policy: DupPolicy::Skip,
+            selected: true,
+        });
+    }
+    ConnImportPlan {
+        source,
+        origin,
+        rows,
+        skipped,
+        cursor: 0,
+        confirm: None,
+    }
+}
+
+fn unique_import_name(base: &str, used: &[String]) -> String {
+    let base = if base.trim().is_empty() { "imported" } else { base.trim() };
+    let mut candidate = format!("{base}{CONN_IMPORT_SUFFIX}");
+    let mut n = 2usize;
+    while used.iter().any(|u| u == &candidate) {
+        candidate = format!("{base}{CONN_IMPORT_SUFFIX}{n}");
+        n += 1;
+    }
+    candidate
+}
+
+fn import_ssh_to_layer(conn_name: &str, s: &ImportSsh) -> SshTunnelConfig {
+    SshTunnelConfig {
+        id: Uuid::new_v4().to_string(),
+        name: format!("{conn_name} · SSH"),
+        enabled: true,
+        host: s.host.clone(),
+        port: if s.port == 0 { 22 } else { s.port },
+        user: s.user.clone(),
+        password: s.password.clone().unwrap_or_default(),
+        key_path: s.key_path.clone().unwrap_or_default(),
+        key_passphrase: s.passphrase.clone().unwrap_or_default(),
+        connect_timeout_secs: dbx_core::models::connection::default_ssh_connect_timeout_secs(),
+        expose_lan: false,
+        use_ssh_agent: s.use_agent,
+        ssh_agent_sock_path: s.agent_sock.clone().unwrap_or_default(),
+        auth_method: s.auth_method.clone(),
+        allow_exec_channel_proxy: false,
+        profile_id: String::new(),
+    }
+}
+
+fn import_conn_to_config(c: &ImportConn, name: String, id: String) -> Result<ConnectionConfig, String> {
+    let raw = c
+        .db_type
+        .clone()
+        .ok_or_else(|| tf("不支持的驱动: {}", &[&c.driver]))?;
+    let dt = parse_database_type(&raw)?;
+    let port = c
+        .port
+        .or_else(|| dbx_core::database_manifest::default_port(&dt))
+        .unwrap_or(0);
+    let mut cfg = new_connection_config(
+        id,
+        name.clone(),
+        dt,
+        c.host.clone(),
+        port,
+        c.user.clone(),
+        c.password.clone().unwrap_or_default(),
+        c.database.clone(),
+        c.ssl,
+        None,
+    )?;
+    if let Some(color) = &c.color {
+        if !color.is_empty() {
+            cfg.color = Some(color.clone());
+        }
+    }
+    if let Some(ssh) = &c.ssh {
+        cfg.transport_layers = vec![TransportLayerConfig::Ssh(import_ssh_to_layer(&name, ssh))];
+    }
+    Ok(cfg)
+}
+
+/// The configs (and duplicate skips) an import will produce. Split out so the
+/// duplicate policy is unit-testable without a backend.
+struct ImportTargets {
+    items: Vec<(Option<String>, ConnectionConfig)>,
+    skipped: usize,
+    needs_password: usize,
+    errors: Vec<String>,
+}
+
+fn resolve_import_targets(rows: &[ConnImportRow], existing: &[ConnectionConfig]) -> ImportTargets {
+    let mut items = Vec::new();
+    let mut skipped = 0usize;
+    let mut needs_password = 0usize;
+    let mut errors = Vec::new();
+    let mut used: Vec<String> = existing.iter().map(|c| c.name.clone()).collect();
+    for row in rows {
+        if !row.selected {
+            continue;
+        }
+        let existing_match = existing.iter().find(|c| c.name == row.conn.name);
+        let (name, replace_id) = match (row.dup, row.policy) {
+            (true, DupPolicy::Skip) => {
+                skipped += 1;
+                continue;
+            }
+            (true, DupPolicy::Overwrite) => match existing_match {
+                Some(e) => (e.name.clone(), Some(e.id.clone())),
+                None => (row.conn.name.clone(), None),
+            },
+            (true, DupPolicy::Both) => (unique_import_name(&row.conn.name, &used), None),
+            (false, _) => (row.conn.name.clone(), None),
+        };
+        if row.conn.needs_password {
+            needs_password += 1;
+        }
+        let id = replace_id.clone().unwrap_or_else(|| Uuid::new_v4().to_string());
+        match import_conn_to_config(&row.conn, name.clone(), id) {
+            Ok(cfg) => {
+                used.push(name);
+                items.push((replace_id, cfg));
+            }
+            Err(e) => errors.push(e),
+        }
+    }
+    ImportTargets { items, skipped, needs_password, errors }
+}
+
+fn conn_import_status(added: usize, skipped: usize, needs_password: usize, failed: &[String]) -> String {
+    if !failed.is_empty() {
+        return format!("✗ {}", tf("导入失败: {}", &[&failed.join("; ")]));
+    }
+    let mut parts = vec![tf("导入 {} 条", &[&added])];
+    if skipped > 0 {
+        parts.push(tf("跳过重复 {}", &[&skipped]));
+    }
+    if needs_password > 0 {
+        parts.push(tf("{} 条需补密码", &[&needs_password]));
+    }
+    format!("✓ {}", parts.join(" · "))
+}
+
+/// `Alt-E`: open the export overlay for the whole connection list.
+fn open_conn_export(app: &mut App) {
+    if app.connections.is_empty() {
+        app.status = t("没有可导出的连接").into();
+        return;
+    }
+    let mut path = TextArea::default();
+    path.insert_str(CONN_EXPORT_DEFAULT_PATH);
+    app.conn_export = Some(Box::new(ConnExport {
+        path,
+        field: 0,
+        editing: false,
+        include_passwords: false,
+        confirm_pw: false,
+    }));
+    app.status = tf(
+        "导出 {} 条连接 · Enter 导出 · y 复制 · p 含密码 · Esc 取消",
+        &[&app.connections.len()],
+    );
+}
+
+/// `Alt-I`: open the connection-file path prompt.
+fn open_conn_import(app: &mut App) {
+    let mut ta = TextArea::default();
+    ta.set_placeholder_text(t("连接文件路径（dbxt / DBeaver data-sources.json / Navicat .ncx，支持 ~）"));
+    app.conn_import_path = Some(ta);
+    app.status = t("导入连接 · 输入文件路径 · Enter 预览 · Esc 取消").into();
+}
+
+fn export_conns_clipboard(app: &mut App, include_passwords: bool) {
+    let json = conn_bundle_json(&app.connections, include_passwords);
+    let n = app.connections.len();
+    let bytes = json.len();
+    match clipboard_copy(&json) {
+        Some(p) => {
+            app.status = tf(
+                "✓ 已复制 {} 条连接 JSON（{} 字节）· 兜底 {}",
+                &[&n, &bytes, &(p.display())],
+            )
+        }
+        None => app.status = tf("✓ 已复制 {} 条连接 JSON（{} 字节）", &[&n, &bytes]),
+    }
+}
+
+fn export_conns_file(app: &mut App, path_input: &str, include_passwords: bool) {
+    let raw = path_input.trim();
+    let path = if raw.is_empty() {
+        expand_home(CONN_EXPORT_DEFAULT_PATH)
+    } else {
+        expand_home(raw)
+    };
+    let json = conn_bundle_json(&app.connections, include_passwords);
+    let n = app.connections.len();
+    match std::fs::write(&path, json.as_bytes()) {
+        Ok(()) => {
+            app.status = if include_passwords {
+                tf("✓ 已导出 {} 条连接（含明文密码）→ {}", &[&n, &(path.display())])
+            } else {
+                tf("✓ 已导出 {} 条连接 → {}", &[&n, &(path.display())])
+            };
+        }
+        Err(e) => app.status = tf("✗ 写入失败: {}", &[&e]),
+    }
+}
+
+fn conn_export_key(app: &mut App, k: KeyEvent) {
+    let Some(mut ex) = app.conn_export.take() else {
+        return;
+    };
+    if ex.confirm_pw {
+        match k.code {
+            KeyCode::Enter | KeyCode::Char('y') | KeyCode::Char('Y') => {
+                ex.include_passwords = true;
+                ex.confirm_pw = false;
+                app.status = t("⚠ 已开启含密码导出：明文密码将写入文件，请妥善保管").into();
+            }
+            KeyCode::Esc | KeyCode::Char('n') | KeyCode::Char('N') => {
+                ex.confirm_pw = false;
+                app.status = t("已取消含密码导出").into();
+            }
+            _ => {}
+        }
+        app.conn_export = Some(ex);
+        return;
+    }
+    if ex.editing {
+        match k.code {
+            KeyCode::Enter | KeyCode::Esc => ex.editing = false,
+            _ => {
+                ex.path.input(k);
+            }
+        }
+        app.conn_export = Some(ex);
+        return;
+    }
+    let n = 3usize;
+    let toggle_pw = |ex: &mut ConnExport, app: &mut App| {
+        if ex.include_passwords {
+            ex.include_passwords = false;
+            app.status = t("已关闭含密码导出").into();
+        } else {
+            ex.confirm_pw = true;
+            app.status = t("⚠ 含密码导出：明文密码将写入文件 · Enter 确认 / Esc 取消").into();
+        }
+    };
+    match k.code {
+        KeyCode::Esc => {
+            app.status = t("已取消导出").into();
+            return;
+        }
+        KeyCode::Up | KeyCode::Char('k') => ex.field = (ex.field + n - 1) % n,
+        KeyCode::Down | KeyCode::Char('j') => ex.field = (ex.field + 1) % n,
+        KeyCode::Char('e') | KeyCode::Char('E') => ex.editing = true,
+        KeyCode::Char('p') | KeyCode::Char('P') => toggle_pw(&mut ex, app),
+        KeyCode::Char('y') | KeyCode::Char('Y') => {
+            export_conns_clipboard(app, ex.include_passwords);
+            return;
+        }
+        KeyCode::Char('i') | KeyCode::Char('I') => {
+            open_conn_import(app);
+            return;
+        }
+        KeyCode::Enter => match ex.field {
+            0 => ex.editing = true,
+            1 => toggle_pw(&mut ex, app),
+            _ => {
+                let path_input = ex.path.lines().join("\n");
+                export_conns_file(app, &path_input, ex.include_passwords);
+                return;
+            }
+        },
+        _ => {}
+    }
+    app.conn_export = Some(ex);
+}
+
+fn conn_import_path_key(app: &mut App, k: KeyEvent) {
+    match k.code {
+        KeyCode::Esc => {
+            app.conn_import_path = None;
+            app.status = t("已取消导入连接").into();
+        }
+        KeyCode::Enter => {
+            let raw = app
+                .conn_import_path
+                .as_ref()
+                .map(|t| t.lines().join(" ").trim().to_string())
+                .unwrap_or_default();
+            if raw.is_empty() {
+                app.status = t("文件路径不能为空").into();
+                return;
+            }
+            let path = expand_home(&raw);
+            match std::fs::read(&path) {
+                Ok(bytes) => {
+                    let text = String::from_utf8_lossy(&bytes);
+                    match sniff_connections(&text) {
+                        Ok((source, conns)) => {
+                            let plan = build_conn_import_plan(
+                                source,
+                                path.display().to_string(),
+                                conns,
+                                &app.connections,
+                            );
+                            let rows = plan.rows.len();
+                            let dups = plan.rows.iter().filter(|r| r.dup).count();
+                            let skipped = plan.skipped.len();
+                            app.conn_import_path = None;
+                            app.conn_import_plan = Some(Box::new(plan));
+                            app.status = tf(
+                                "{} 格式 · {} 条待导入 · {} 条同名 · 跳过 {} 个未知驱动 · Enter 导入",
+                                &[&source.label(), &rows, &dups, &skipped],
+                            );
+                        }
+                        Err(e) => app.status = format!("✗ {e}"),
+                    }
+                }
+                Err(e) => app.status = tf("✗ 无法读取文件: {}", &[&e]),
+            }
+        }
+        _ => {
+            if let Some(ta) = app.conn_import_path.as_mut() {
+                ta.input(k);
+            }
+        }
+    }
+}
+
+fn conn_import_plan_key(app: &mut App, tx: &Tx, k: KeyEvent) {
+    let Some(mut plan) = app.conn_import_plan.take() else {
+        return;
+    };
+    // The red overwrite layer owns the keyboard while it is up.
+    if let Some(scope) = plan.confirm {
+        match k.code {
+            KeyCode::Enter | KeyCode::Char('y') | KeyCode::Char('Y') => {
+                match scope {
+                    ConnOverwriteScope::All => {
+                        for row in plan.rows.iter_mut() {
+                            if row.dup {
+                                row.policy = DupPolicy::Overwrite;
+                            }
+                        }
+                    }
+                    ConnOverwriteScope::Row(i) => {
+                        if let Some(row) = plan.rows.get_mut(i) {
+                            row.policy = DupPolicy::Overwrite;
+                        }
+                    }
+                }
+                plan.confirm = None;
+                app.status = t("⚠ 覆盖同名连接：导入时先删除原有配置").into();
+            }
+            KeyCode::Esc | KeyCode::Char('n') | KeyCode::Char('N') => {
+                plan.confirm = None;
+                app.status = t("已取消覆盖").into();
+            }
+            _ => {}
+        }
+        app.conn_import_plan = Some(plan);
+        return;
+    }
+    let rows = plan.rows.len();
+    match k.code {
+        KeyCode::Esc => {
+            app.status = t("已取消导入连接").into();
+            return;
+        }
+        KeyCode::Up | KeyCode::Char('k') => plan.cursor = plan.cursor.saturating_sub(1),
+        KeyCode::Down | KeyCode::Char('j') => {
+            if rows > 0 {
+                plan.cursor = (plan.cursor + 1).min(rows - 1);
+            }
+        }
+        KeyCode::Char(' ') => {
+            if let Some(row) = plan.rows.get_mut(plan.cursor) {
+                row.selected = !row.selected;
+            }
+        }
+        KeyCode::Char('s') => {
+            for row in plan.rows.iter_mut() {
+                if row.dup {
+                    row.policy = DupPolicy::Skip;
+                }
+            }
+            app.status = t("重复策略：跳过").into();
+        }
+        KeyCode::Char('b') => {
+            for row in plan.rows.iter_mut() {
+                if row.dup {
+                    row.policy = DupPolicy::Both;
+                }
+            }
+            app.status = tf("重复策略：都要（加后缀 {}）", &[&CONN_IMPORT_SUFFIX]);
+        }
+        KeyCode::Char('r') => {
+            if plan.rows.iter().any(|r| r.dup) {
+                plan.confirm = Some(ConnOverwriteScope::All);
+                app.status = t("⚠ 覆盖同名连接：将先删除原有配置 · Enter 确认 / Esc 取消").into();
+            } else {
+                app.status = t("没有同名连接").into();
+            }
+        }
+        KeyCode::Char('d') => {
+            if let Some(row) = plan.rows.get(plan.cursor).cloned() {
+                if row.dup {
+                    let next = row.policy.next();
+                    if next == DupPolicy::Overwrite {
+                        plan.confirm = Some(ConnOverwriteScope::Row(plan.cursor));
+                        app.status = tf("⚠ 覆盖同名连接 {} · Enter 确认 / Esc 取消", &[&row.conn.name]);
+                    } else if let Some(target) = plan.rows.get_mut(plan.cursor) {
+                        target.policy = next;
+                        app.status = tf("{} · {}", &[&row.conn.name, &next.label()]);
+                    }
+                }
+            }
+        }
+        KeyCode::Enter => {
+            run_conn_import(app, tx, &plan);
+            return;
+        }
+        _ => {}
+    }
+    app.conn_import_plan = Some(plan);
+}
+
+fn run_conn_import(app: &mut App, tx: &Tx, plan: &ConnImportPlan) {
+    let targets = resolve_import_targets(&plan.rows, &app.connections);
+    if !targets.errors.is_empty() {
+        app.status = format!("✗ {}", targets.errors.join("; "));
+        return;
+    }
+    if targets.items.is_empty() {
+        app.conn_import_plan = None;
+        app.status = if targets.skipped > 0 {
+            tf("没有可导入的连接（跳过重复 {}）", &[&targets.skipped])
+        } else {
+            t("没有可导入的连接").into()
+        };
+        return;
+    }
+    let count = targets.items.len();
+    let items: Vec<(Option<String>, Box<ConnectionConfig>)> = targets
+        .items
+        .into_iter()
+        .map(|(id, cfg)| (id, Box::new(cfg)))
+        .collect();
+    let skipped = targets.skipped;
+    let needs_password = targets.needs_password;
+    app.conn_import_plan = None;
+    app.loading = true;
+    app.status = tf("导入 {} 条连接…", &[&count]);
+    app.spawn(tx, Op::ImportConns { items, skipped, needs_password });
+}
+
 /// `Ctrl-O`: open the saved-SQL snippet overlay for the current connection.
 fn open_snippets(app: &mut App, tx: &Tx) {
     let Some(cfg) = app.selected.clone() else {
@@ -21360,6 +22548,15 @@ fn ui(f: &mut Frame, app: &mut App) {
     }
     if app.export_path.is_some() {
         render_export_path(f, f.area(), app);
+    }
+    if app.conn_export.is_some() {
+        render_conn_export(f, f.area(), app);
+    }
+    if app.conn_import_path.is_some() {
+        render_conn_import_prompt(f, f.area(), app);
+    }
+    if app.conn_import_plan.is_some() {
+        render_conn_import_plan(f, f.area(), app);
     }
     if app.import_prompt.is_some() {
         render_import_prompt(f, f.area(), app);
@@ -21702,6 +22899,9 @@ enum FooterView {
     FileLoadPlan,
     ExportPath,
     ExportPicker,
+    ConnExport,
+    ConnImportPrompt,
+    ConnImportPlan,
     FilterPrompt,
     Popup,
     ResultFilter,
@@ -21774,6 +22974,12 @@ fn footer_ctx(app: &App) -> FooterCtx {
         FooterView::ExportPath
     } else if app.export_open {
         FooterView::ExportPicker
+    } else if app.conn_export.is_some() {
+        FooterView::ConnExport
+    } else if app.conn_import_path.is_some() {
+        FooterView::ConnImportPrompt
+    } else if app.conn_import_plan.is_some() {
+        FooterView::ConnImportPlan
     } else if app.filter_prompt.is_some() {
         FooterView::FilterPrompt
     } else if app.row_popup.is_some() || app.cell_popup.is_some() {
@@ -21877,6 +23083,23 @@ fn footer_hints_ctx(ctx: FooterCtx) -> Vec<Hint> {
             ("Esc", t("取消")),
         ],
         FooterView::ExportPath => vec![("Enter", t("导出")), ("Esc", t("取消"))],
+        FooterView::ConnExport => vec![
+            ("Enter", t("导出")),
+            ("y", t("复制 JSON")),
+            ("p", t("含密码")),
+            ("i", t("导入")),
+            ("e", t("路径")),
+            ("Esc", t("取消")),
+        ],
+        FooterView::ConnImportPrompt => vec![("Enter", t("预览")), ("Esc", t("取消"))],
+        FooterView::ConnImportPlan => vec![
+            ("↑↓", t("选择")),
+            ("Space", t("勾选")),
+            ("s/r/b", t("跳过/覆盖/都存")),
+            ("d", t("逐条")),
+            ("Enter", t("导入")),
+            ("Esc", t("取消")),
+        ],
         FooterView::RedisPrompt => vec![("Enter", t("确认")), ("Esc", t("取消"))],
         FooterView::TablePrompt | FooterView::ResultFilter => {
             vec![("Enter", t("保留")), ("Esc", t("清除"))]
@@ -26360,6 +27583,13 @@ const HELP_ROWS: &[(&str, &str)] = &[
     ("远端目标", "隧道转发目标 = 连接的 host:port（改 host / port 即改目标）"),
     ("~/.ssh/config", "ssh_host 可填别名；ProxyJump 自动展开为多跳"),
     ("SSH 主机密钥", "首次连接弹出指纹确认（y 接受并记住 / s 仅本次 / n 拒绝）"),
+    ("— 连接导入 / 导出（Alt-E / Alt-I）—", ""),
+    ("Alt-E", "导出全部连接为 JSON 包（默认 ~/dbxt-connections.json）"),
+    ("Enter / y / p", "Enter 写文件 · y 复制 JSON 到剪贴板 · p 切换含密码导出（红色确认）"),
+    ("Alt-I / i", "导入连接：自动识别 dbxt JSON / DBeaver data-sources.json / Navicat .ncx"),
+    ("预览 s/r/b", "同名策略：s 跳过 · r 覆盖（红色确认，按 name 匹配） · b 都存（名加 -imported）"),
+    ("预览 Space / d", "Space 勾选/取消该条 · d 逐条循环 跳过/覆盖/都存 · Enter 导入"),
+    ("密码", "导出默认不含密码（p 显式开启）；DBeaver / Navicat 密码加密，不解析，导入后标「需补密码」"),
     ("— 侧栏 —", ""),
     ("↑ ↓", "移动表列表"),
     ("/", "过滤表名（输入即筛选，Enter 保留，Esc 清除）"),
@@ -27261,6 +28491,382 @@ fn render_export_path(f: &mut Frame, area: Rect, app: &mut App) {
     }
 }
 
+/// One preview row: `[x] name  type  host:port  SSH  colour  needs-password  dup`.
+fn conn_import_row_text(row: &ConnImportRow) -> String {
+    let mut s = String::new();
+    s.push_str(if row.selected { "[x] " } else { "[ ] " });
+    if row.conn.name.trim().is_empty() {
+        s.push_str(&row.conn.host);
+    } else {
+        s.push_str(&row.conn.name);
+    }
+    s.push_str("  ");
+    match &row.conn.db_type {
+        Some(dt) => s.push_str(dt),
+        None => s.push_str(&row.conn.driver),
+    }
+    if !row.conn.host.is_empty() {
+        match row.conn.port {
+            Some(p) => s.push_str(&format!("  {}:{}", row.conn.host, p)),
+            None => s.push_str(&format!("  {}", row.conn.host)),
+        }
+    }
+    if row.conn.ssh.is_some() {
+        s.push_str("  SSH");
+    }
+    if let Some(c) = &row.conn.color {
+        s.push_str(&format!("  {c}"));
+    }
+    if row.conn.needs_password {
+        s.push_str("  ");
+        s.push_str(t("需补密码"));
+    }
+    if row.dup {
+        s.push_str("  [");
+        s.push_str(row.policy.marker());
+        s.push(']');
+    }
+    s
+}
+
+fn render_conn_export(f: &mut Frame, area: Rect, app: &mut App) {
+    let count = app.connections.len();
+    let Some(ex) = app.conn_export.as_mut() else {
+        return;
+    };
+    if area.width < 12 || area.height < 4 {
+        return;
+    }
+    let w = {
+        let avail = area.width.saturating_sub(4);
+        if avail < 30 {
+            area.width
+        } else {
+            avail.min(82)
+        }
+    };
+    let h = 11.min(area.height).max(4);
+    let box_area = centered_overlay(area, w, h);
+    f.render_widget(Clear, box_area);
+    let border = if ex.confirm_pw { Color::Red } else { Color::Cyan };
+    let title = if ex.confirm_pw {
+        t(" ⚠ 含密码导出确认 · Enter 确认 · Esc 取消 ")
+    } else {
+        // The translated title is templated, so build it outside the widget chain.
+        ""
+    };
+    let block = if title.is_empty() {
+        Block::default()
+            .borders(Borders::ALL)
+            .title(tf(
+                " 导出连接 · {} 条 · Enter 导出 · y 复制 · p 密码 · Esc ",
+                &[&count],
+            ))
+            .border_set(border::ROUNDED)
+            .border_style(Style::default().fg(border))
+    } else {
+        Block::default()
+            .borders(Borders::ALL)
+            .title(title)
+            .border_set(border::ROUNDED)
+            .border_style(Style::default().fg(border))
+    };
+    let inner = block.inner(box_area);
+    f.render_widget(block, box_area);
+    if inner.width == 0 || inner.height == 0 {
+        return;
+    }
+    if ex.confirm_pw {
+        let lines = vec![
+            Line::from(Span::styled(
+                t("⚠ 开启后密码将以明文写入 JSON 文件。"),
+                Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
+            )),
+            Line::from(Span::styled(
+                t("请勿提交到版本库，导出后及时删除该文件。"),
+                Style::default().fg(Color::Red),
+            )),
+            Line::from(""),
+            Line::from(Span::styled(
+                t("Enter / y 确认开启 · Esc / n 取消"),
+                Style::default().fg(Color::Yellow),
+            )),
+        ];
+        f.render_widget(Paragraph::new(lines).wrap(Wrap { trim: true }), inner);
+        return;
+    }
+
+    let dim = Style::default().fg(Color::DarkGray);
+    let hl = |i: usize| {
+        if ex.field == i {
+            Style::default().fg(Color::Black).bg(Color::Cyan)
+        } else {
+            Style::default().fg(Color::White)
+        }
+    };
+    let marker = |i: usize| if ex.field == i { "▶ " } else { "  " };
+
+    // Path row: a fixed label plus either the live textarea or its value.
+    let label = t("文件 ");
+    let label_w = (disp_width(label) as u16).min(inner.width);
+    let label_rect = Rect {
+        x: inner.x,
+        y: inner.y,
+        width: label_w,
+        height: 1,
+    };
+    let value_rect = Rect {
+        x: inner.x + label_w,
+        y: inner.y,
+        width: inner.width.saturating_sub(label_w),
+        height: 1,
+    };
+    f.render_widget(
+        Paragraph::new(Line::from(Span::styled(label, dim))),
+        label_rect,
+    );
+    if ex.editing {
+        ex.path.set_block(Block::default());
+        f.render_widget(&ex.path, value_rect);
+    } else {
+        let value = ex.path.lines().join("");
+        let value = if value.trim().is_empty() {
+            CONN_EXPORT_DEFAULT_PATH.to_string()
+        } else {
+            value
+        };
+        let shown = truncate_disp(&value, value_rect.width as usize);
+        f.render_widget(
+            Paragraph::new(Line::from(Span::styled(shown, hl(0)))),
+            value_rect,
+        );
+    }
+
+    if inner.height >= 2 {
+        let rest = Rect {
+            x: inner.x,
+            y: inner.y + 1,
+            width: inner.width,
+            height: inner.height - 1,
+        };
+        let pw = if ex.include_passwords {
+            t("是")
+        } else {
+            t("否")
+        };
+        let mut lines = vec![
+            Line::from(Span::styled(
+                format!("{}{} {}", marker(1), t("含密码"), pw),
+                hl(1),
+            )),
+            Line::from(Span::styled(
+                format!("{}{}", marker(2), t("Enter 导出到文件")),
+                hl(2),
+            )),
+            Line::from(Span::styled(
+                t("y 复制 JSON 到剪贴板 · p 切换密码 · i 导入连接 · Esc 取消"),
+                dim,
+            )),
+        ];
+        lines.truncate(rest.height as usize);
+        f.render_widget(Paragraph::new(lines), rest);
+    }
+}
+
+fn render_conn_import_prompt(f: &mut Frame, area: Rect, app: &mut App) {
+    if area.width < 16 || area.height < 3 {
+        return;
+    }
+    let w = {
+        let avail = area.width.saturating_sub(4);
+        if avail < 30 {
+            area.width
+        } else {
+            avail.min(86)
+        }
+    };
+    let h = 4.min(area.height);
+    let box_area = centered_overlay(area, w, h);
+    f.render_widget(Clear, box_area);
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .title(t(" 导入连接 · 输入文件路径 · Enter 预览 · Esc 取消 "))
+        .border_set(border::ROUNDED)
+        .border_style(Style::default().fg(Color::Cyan));
+    let inner = block.inner(box_area);
+    f.render_widget(block, box_area);
+    if let Some(ta) = app.conn_import_path.as_mut() {
+        ta.set_block(Block::default());
+        f.render_widget(&*ta, inner);
+    }
+}
+
+fn render_conn_import_plan(f: &mut Frame, area: Rect, app: &mut App) {
+    let cursor_hint;
+    let confirm;
+    let source;
+    let origin;
+    let rows_n;
+    let skipped_n;
+    {
+        let Some(plan) = app.conn_import_plan.as_ref() else {
+            return;
+        };
+        confirm = plan.confirm;
+        source = plan.source.label();
+        origin = truncate_disp(&plan.origin, 40);
+        rows_n = plan.rows.len();
+        skipped_n = plan.skipped.len();
+        cursor_hint = plan.cursor;
+    }
+    if area.width < 16 || area.height < 5 {
+        return;
+    }
+    let w = {
+        let avail = area.width.saturating_sub(4);
+        if avail < 40 {
+            area.width
+        } else {
+            avail.min(96)
+        }
+    };
+    let body_h = (rows_n as u16 + 5).min(area.height.saturating_sub(2)).max(3);
+    let box_area = centered_overlay(area, w, body_h);
+    f.render_widget(Clear, box_area);
+    let border = if confirm.is_some() { Color::Red } else { Color::Cyan };
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .title(tf(" 导入连接 · {} · {} · {} 条 ", &[&source, &origin, &rows_n]))
+        .border_set(border::ROUNDED)
+        .border_style(Style::default().fg(border));
+    let inner = block.inner(box_area);
+    f.render_widget(block, box_area);
+    if inner.width == 0 || inner.height == 0 {
+        return;
+    }
+
+    if let Some(scope) = confirm {
+        let who = match scope {
+            ConnOverwriteScope::All => t("全部同名连接").to_string(),
+            ConnOverwriteScope::Row(_) => t("该同名连接").to_string(),
+        };
+        let lines = vec![
+            Line::from(Span::styled(
+                tf("⚠ 覆盖 {}：将先删除原有配置再写入。", &[&who]),
+                Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
+            )),
+            Line::from(Span::styled(
+                t("数据库数据不受影响，仅替换保存的连接配置。"),
+                Style::default().fg(Color::Red),
+            )),
+            Line::from(""),
+            Line::from(Span::styled(
+                t("Enter / y 确认覆盖 · Esc / n 取消"),
+                Style::default().fg(Color::Yellow),
+            )),
+        ];
+        f.render_widget(Paragraph::new(lines).wrap(Wrap { trim: true }), inner);
+        return;
+    }
+
+    // Reserve the last line for the footer hint; one more when drivers were skipped.
+    let hint_h = 1u16;
+    let skip_h = if skipped_n > 0 { 1u16 } else { 0 };
+    let list_h = inner.height.saturating_sub(hint_h + skip_h);
+    let list_area = Rect {
+        x: inner.x,
+        y: inner.y,
+        width: inner.width,
+        height: list_h.max(1),
+    };
+    let items: Vec<ListItem> = app
+        .conn_import_plan
+        .as_ref()
+        .map(|plan| {
+            plan.rows
+                .iter()
+                .map(|row| {
+                    let label = truncate_disp(&conn_import_row_text(row), list_area.width as usize);
+                    let style = if !row.selected {
+                        Style::default().fg(Color::DarkGray)
+                    } else if row.dup && row.policy == DupPolicy::Overwrite {
+                        Style::default().fg(Color::Red)
+                    } else if row.dup {
+                        Style::default().fg(Color::Yellow)
+                    } else {
+                        Style::default().fg(Color::White)
+                    };
+                    ListItem::new(Line::from(Span::styled(label, style)))
+                })
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+    let list = List::new(items)
+        .highlight_style(
+            Style::default()
+                .fg(Color::Black)
+                .bg(Color::Cyan)
+                .add_modifier(Modifier::BOLD),
+        )
+        .highlight_symbol("> ");
+    let mut st = ListState::default();
+    if rows_n > 0 {
+        st.select(Some(cursor_hint.min(rows_n - 1)));
+    }
+    f.render_stateful_widget(list, list_area, &mut st);
+
+    let mut foot_y = inner.y + list_h.max(1);
+    if skipped_n > 0 && foot_y < inner.y + inner.height {
+        let skipped: Vec<String> = app
+            .conn_import_plan
+            .as_ref()
+            .map(|p| {
+                p.skipped
+                    .iter()
+                    .take(6)
+                    .cloned()
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+        let mut joined = skipped.join(", ");
+        if skipped_n > 6 {
+            joined.push_str(&format!(" +{}", skipped_n - 6));
+        }
+        let rect = Rect {
+            x: inner.x,
+            y: foot_y,
+            width: inner.width,
+            height: 1,
+        };
+        f.render_widget(
+            Paragraph::new(Line::from(Span::styled(
+                truncate_disp(&tf("跳过未知驱动: {}", &[&joined]), inner.width as usize),
+                Style::default().fg(Color::DarkGray),
+            ))),
+            rect,
+        );
+        foot_y += 1;
+    }
+    if foot_y < inner.y + inner.height {
+        let rect = Rect {
+            x: inner.x,
+            y: foot_y,
+            width: inner.width,
+            height: 1,
+        };
+        f.render_widget(
+            Paragraph::new(Line::from(Span::styled(
+                truncate_disp(
+                    t("↑↓ 选择 · Space 勾选 · s/r/b 跳过/覆盖/都存 · d 逐条 · Enter 导入 · Esc 取消"),
+                    inner.width as usize,
+                ),
+                Style::default().fg(Color::Yellow),
+            ))),
+            rect,
+        );
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -27505,6 +29111,9 @@ mod tests {
             app.search_input = None;
             app.file_load_prompt = None;
             app.file_load_plan = None;
+            app.conn_export = None;
+            app.conn_import_path = None;
+            app.conn_import_plan = None;
         };
 
         let cases: Vec<OverlayCase> = vec![
@@ -27796,6 +29405,116 @@ mod tests {
                         responder: Some(tx),
                         input: "123456".into(),
                     });
+                }),
+            ),
+            (
+                "conn-export",
+                Box::new(|a| {
+                    let mut path = TextArea::default();
+                    path.insert_str(CONN_EXPORT_DEFAULT_PATH);
+                    a.conn_export = Some(Box::new(ConnExport {
+                        path,
+                        field: 0,
+                        editing: false,
+                        include_passwords: false,
+                        confirm_pw: false,
+                    }));
+                }),
+            ),
+            (
+                "conn-export-confirm",
+                Box::new(|a| {
+                    let mut path = TextArea::default();
+                    path.insert_str(CONN_EXPORT_DEFAULT_PATH);
+                    a.conn_export = Some(Box::new(ConnExport {
+                        path,
+                        field: 1,
+                        editing: false,
+                        include_passwords: false,
+                        confirm_pw: true,
+                    }));
+                }),
+            ),
+            (
+                "conn-import-path",
+                Box::new(|a| a.conn_import_path = Some(TextArea::from(["~/dbeaver.json"]))),
+            ),
+            (
+                "conn-import-plan",
+                Box::new(|a| {
+                    a.conn_import_plan = Some(Box::new(ConnImportPlan {
+                        source: ConnSource::DBeaver,
+                        origin: "~/.local/share/DBeaverData/…/data-sources.json".into(),
+                        rows: vec![
+                            ConnImportRow {
+                                conn: ImportConn {
+                                    name: "prod-mysql".into(),
+                                    driver: "mysql8".into(),
+                                    db_type: Some("mysql".into()),
+                                    host: "db.internal".into(),
+                                    port: Some(3306),
+                                    user: "root".into(),
+                                    ssl: true,
+                                    color: Some("#e06c75".into()),
+                                    needs_password: true,
+                                    ..ImportConn::default()
+                                },
+                                dup: true,
+                                policy: DupPolicy::Overwrite,
+                                selected: true,
+                            },
+                            ConnImportRow {
+                                conn: ImportConn {
+                                    name: "jump-pg".into(),
+                                    driver: "postgresql".into(),
+                                    db_type: Some("postgres".into()),
+                                    host: "10.0.0.5".into(),
+                                    port: Some(5432),
+                                    user: "pg".into(),
+                                    ssh: Some(ImportSsh {
+                                        host: "jump.example.com".into(),
+                                        port: 22,
+                                        user: "ops".into(),
+                                        auth_method: "key".into(),
+                                        ..ImportSsh::default()
+                                    }),
+                                    needs_password: true,
+                                    ..ImportConn::default()
+                                },
+                                dup: false,
+                                policy: DupPolicy::Skip,
+                                selected: true,
+                            },
+                        ],
+                        skipped: vec!["derby · legacy".into()],
+                        cursor: 1,
+                        confirm: None,
+                    }));
+                }),
+            ),
+            (
+                "conn-import-confirm",
+                Box::new(|a| {
+                    a.conn_import_plan = Some(Box::new(ConnImportPlan {
+                        source: ConnSource::Navicat,
+                        origin: "/tmp/conns.ncx".into(),
+                        rows: vec![ConnImportRow {
+                            conn: ImportConn {
+                                name: "hero".into(),
+                                driver: "MYSQL".into(),
+                                db_type: Some("mysql".into()),
+                                host: "127.0.0.1".into(),
+                                port: Some(3306),
+                                ..ImportConn::default()
+                            },
+                            dup: true,
+                            policy: DupPolicy::Overwrite,
+                            selected: true,
+                        }],
+                        skipped: Vec::new(),
+                        cursor: 0,
+                        confirm: Some(ConnOverwriteScope::All),
+                    }));
                 }),
             ),
         ];
@@ -34226,5 +35945,328 @@ mod tests {
         ] {
             assert_ne!(ui_text::t_lang(s, Lang::En), s, "{s}");
         }
+    }
+
+    // ── connection bundle import / export (Alt-E / Alt-I) ──
+
+    /// A MySQL connection with a colour and an SSH tunnel, for the export round trip.
+    fn export_fixture_conn(name: &str) -> ConnectionConfig {
+        let mut cfg = new_connection_config(
+            format!("id-{name}"),
+            name.into(),
+            DatabaseType::Mysql,
+            "db.internal".into(),
+            3306,
+            "root".into(),
+            "s3cret".into(),
+            Some("shop".into()),
+            true,
+            None,
+        )
+        .unwrap();
+        cfg.color = Some("#e06c75".into());
+        cfg.transport_layers = vec![TransportLayerConfig::Ssh(SshTunnelConfig {
+            id: "ssh-1".into(),
+            name: "ssh".into(),
+            enabled: true,
+            host: "jump".into(),
+            port: 22,
+            user: "ops".into(),
+            password: "sshpw".into(),
+            key_path: "/home/o/.ssh/id".into(),
+            key_passphrase: "kp".into(),
+            connect_timeout_secs: 5,
+            expose_lan: false,
+            use_ssh_agent: false,
+            ssh_agent_sock_path: String::new(),
+            auth_method: "password".into(),
+            allow_exec_channel_proxy: false,
+            profile_id: String::new(),
+        })];
+        cfg
+    }
+
+    #[test]
+    fn conn_bundle_excludes_passwords_by_default_and_roundtrips() {
+        let cfg = export_fixture_conn("prod-mysql");
+        let plain = conn_bundle_json(std::slice::from_ref(&cfg), false);
+        // The security default: no secret anywhere, and no `password` key at all.
+        assert!(!plain.contains("s3cret"), "password leaked: {plain}");
+        assert!(!plain.contains("sshpw"), "ssh password leaked: {plain}");
+        assert!(!plain.contains("kp"), "ssh passphrase leaked: {plain}");
+        assert!(!plain.contains("\"password\":"), "password key present: {plain}");
+
+        let v: serde_json::Value = serde_json::from_str(&plain).unwrap();
+        assert_eq!(v["format"], "dbxt-connections");
+        assert_eq!(v["version"], CONN_BUNDLE_VERSION);
+
+        let (source, conns) = sniff_connections(&plain).unwrap();
+        assert_eq!(source, ConnSource::Dbxt);
+        assert_eq!(conns.len(), 1);
+        let c = &conns[0];
+        assert_eq!(c.name, "prod-mysql");
+        assert_eq!(c.db_type.as_deref(), Some("mysql"));
+        assert_eq!(c.host, "db.internal");
+        assert_eq!(c.port, Some(3306));
+        assert_eq!(c.user, "root");
+        assert_eq!(c.database.as_deref(), Some("shop"));
+        assert!(c.ssl);
+        assert_eq!(c.color.as_deref(), Some("#e06c75"));
+        assert!(c.password.is_none());
+        let ssh = c.ssh.as_ref().expect("ssh tunnel survived");
+        assert_eq!(ssh.host, "jump");
+        assert_eq!(ssh.port, 22);
+        assert_eq!(ssh.user, "ops");
+        assert_eq!(ssh.key_path.as_deref(), Some("/home/o/.ssh/id"));
+        assert!(ssh.password.is_none());
+
+        // Explicit password export keeps them, and they re-parse.
+        let with_pw = conn_bundle_json(std::slice::from_ref(&cfg), true);
+        assert!(with_pw.contains("s3cret"));
+        let (_, conns2) = sniff_connections(&with_pw).unwrap();
+        assert_eq!(conns2[0].password.as_deref(), Some("s3cret"));
+        assert_eq!(conns2[0].ssh.as_ref().unwrap().password.as_deref(), Some("sshpw"));
+    }
+
+    #[test]
+    fn driver_alias_table_maps_both_ecosystems() {
+        assert_eq!(map_driver_to_db_type("mysql8"), Some("mysql"));
+        assert_eq!(map_driver_to_db_type("mariadb"), Some("mysql"));
+        assert_eq!(map_driver_to_db_type("PostgreSQL"), Some("postgres"));
+        assert_eq!(map_driver_to_db_type("MSSQL"), Some("sqlserver"));
+        assert_eq!(map_driver_to_db_type("duckdb"), Some("duckdb"));
+        assert_eq!(map_driver_to_db_type("mongodb"), Some("mongodb"));
+        assert_eq!(map_driver_to_db_type("Redis"), Some("redis"));
+        // A canonical dbxt name passes straight through.
+        assert_eq!(map_driver_to_db_type("cloudflare-d1"), Some("cloudflare-d1"));
+        // An unknown driver maps to nothing (and lands in the skipped list).
+        assert_eq!(map_driver_to_db_type("derby"), None);
+        assert_eq!(map_driver_to_db_type(""), None);
+    }
+
+    #[test]
+    fn dbeaver_data_sources_map_drivers_database_and_ssh() {
+        let json = r#"{
+          "connections": {
+            "mysql8-1": {"provider":"mysql8","name":"shop","configuration":{"host":"db","port":"3306","database":"shop","user":"root"}},
+            "pg-1": {"provider":"postgresql","name":"analytics","configuration":{"host":"10.0.0.5","port":5432,"database":"dw","user":"pg","sslMode":"require"},
+                     "ssh-tunnel":{"host":"jump","port":"22","user":"ops","auth-type":"public-key","private-key-path":"/k"}},
+            "duck-1": {"driver":"duckdb","name":"local","configuration":{"url":"jdbc:duckdb:/tmp/x.duckdb"}},
+            "ora-1": {"provider":"oracle","name":"ora","configuration":{"host":"ora","port":"1521","database":"svc","user":"scott"}},
+            "derby-1": {"provider":"derby","name":"legacy","configuration":{"host":"x","port":"1527"}}
+          }
+        }"#;
+        let (source, conns) = sniff_connections(json).unwrap();
+        assert_eq!(source, ConnSource::DBeaver);
+        let by = |n: &str| conns.iter().find(|c| c.name == n).unwrap();
+        assert_eq!(by("shop").db_type.as_deref(), Some("mysql"));
+        assert_eq!(by("shop").port, Some(3306));
+        assert_eq!(by("shop").user, "root");
+        assert!(by("shop").needs_password);
+        assert_eq!(by("analytics").db_type.as_deref(), Some("postgres"));
+        assert_eq!(by("analytics").port, Some(5432));
+        assert!(by("analytics").ssl, "sslMode=require maps to ssl");
+        let ssh = by("analytics").ssh.as_ref().expect("ssh tunnel");
+        assert_eq!(ssh.host, "jump");
+        assert_eq!(ssh.port, 22);
+        assert_eq!(ssh.user, "ops");
+        assert_eq!(ssh.key_path.as_deref(), Some("/k"));
+        assert_eq!(ssh.auth_method, "key");
+        assert_eq!(by("local").db_type.as_deref(), Some("duckdb"));
+        assert!(by("local").database.is_none());
+        assert_eq!(by("ora").db_type.as_deref(), Some("oracle"));
+        assert_eq!(by("ora").database.as_deref(), Some("svc"));
+        assert!(by("legacy").db_type.is_none());
+
+        let plan = build_conn_import_plan(source, "x".into(), conns, &[]);
+        assert_eq!(plan.rows.len(), 4);
+        assert_eq!(plan.skipped.len(), 1);
+        assert!(plan.skipped[0].contains("derby"), "{:?}", plan.skipped);
+    }
+
+    #[test]
+    fn navicat_ncx_xml_parses_elements_attributes_and_ssh() {
+        let xml = r#"<?xml version="1.0" encoding="UTF-8"?>
+<Connections>
+  <Connection>
+    <Name>hero</Name>
+    <ConnType>MYSQL</ConnType>
+    <Host>127.0.0.1</Host>
+    <Port>3306</Port>
+    <UserName>root</UserName>
+    <Password>ENC</Password>
+    <Database>hero_db</Database>
+    <UseSSL>true</UseSSL>
+  </Connection>
+  <Connection Name="pg-prod" ConnType="POSTGRESQL" Host="10.1.2.3" Port="5432" UserName="pg" Database="dw">
+    <SSH_Enabled>true</SSH_Enabled>
+    <SSH_Host>jump</SSH_Host>
+    <SSH_Port>22</SSH_Port>
+    <SSH_UserName>ops</SSH_UserName>
+  </Connection>
+</Connections>"#;
+        let (source, conns) = sniff_connections(xml).unwrap();
+        assert_eq!(source, ConnSource::Navicat);
+        assert_eq!(conns.len(), 2);
+        assert_eq!(conns[0].name, "hero");
+        assert_eq!(conns[0].db_type.as_deref(), Some("mysql"));
+        assert_eq!(conns[0].port, Some(3306));
+        assert_eq!(conns[0].user, "root");
+        assert_eq!(conns[0].database.as_deref(), Some("hero_db"));
+        assert!(conns[0].ssl);
+        assert!(conns[0].needs_password);
+        assert!(conns[0].password.is_none());
+        assert_eq!(conns[1].name, "pg-prod");
+        assert_eq!(conns[1].db_type.as_deref(), Some("postgres"));
+        assert_eq!(conns[1].host, "10.1.2.3");
+        assert_eq!(conns[1].port, Some(5432));
+        assert_eq!(conns[1].database.as_deref(), Some("dw"));
+        let ssh = conns[1].ssh.as_ref().expect("ssh tunnel");
+        assert_eq!(ssh.host, "jump");
+        assert_eq!(ssh.port, 22);
+        assert_eq!(ssh.user, "ops");
+    }
+
+    #[test]
+    fn sniff_rejects_empty_and_unknown_files() {
+        assert!(sniff_connections("   ").is_err());
+        assert!(sniff_connections("not json or xml").is_err());
+        assert!(sniff_connections(r#"{"foo": 1}"#).is_err());
+        assert!(sniff_connections("<html><body>nope</body></html>").is_err());
+    }
+
+    fn import_row(name: &str, policy: DupPolicy) -> ConnImportRow {
+        ConnImportRow {
+            conn: ImportConn {
+                name: name.into(),
+                driver: "mysql".into(),
+                db_type: Some("mysql".into()),
+                host: "h".into(),
+                port: Some(3306),
+                ..ImportConn::default()
+            },
+            dup: true,
+            policy,
+            selected: true,
+        }
+    }
+
+    #[test]
+    fn conn_import_duplicate_policy_resolves() {
+        let existing = vec![export_fixture_conn("dup")];
+        // Skip: nothing imported, one duplicate skipped.
+        let t = resolve_import_targets(&[import_row("dup", DupPolicy::Skip)], &existing);
+        assert!(t.items.is_empty());
+        assert_eq!(t.skipped, 1);
+        // Overwrite: the existing id is reused and routed through remove-then-add.
+        let t = resolve_import_targets(&[import_row("dup", DupPolicy::Overwrite)], &existing);
+        assert_eq!(t.items.len(), 1);
+        assert_eq!(t.items[0].0.as_deref(), Some(existing[0].id.as_str()));
+        assert_eq!(t.items[0].1.id, existing[0].id);
+        // Both: renamed with the suffix, inserted alongside.
+        let t = resolve_import_targets(&[import_row("dup", DupPolicy::Both)], &existing);
+        assert_eq!(t.items.len(), 1);
+        assert_eq!(t.items[0].1.name, "dup-imported");
+        assert!(t.items[0].0.is_none());
+        // A second “both” picks a distinct suffix.
+        let used = vec!["dup".to_string(), "dup-imported".to_string()];
+        assert_eq!(unique_import_name("dup", &used), "dup-imported2");
+        // An unselected row is ignored entirely.
+        let mut row = import_row("dup", DupPolicy::Skip);
+        row.selected = false;
+        let t = resolve_import_targets(&[row], &existing);
+        assert!(t.items.is_empty());
+        assert_eq!(t.skipped, 0);
+    }
+
+    #[test]
+    fn conn_import_fills_default_port_and_counts_missing_passwords() {
+        let row = ConnImportRow {
+            conn: ImportConn {
+                name: "pg".into(),
+                driver: "postgresql".into(),
+                db_type: Some("postgres".into()),
+                host: "h".into(),
+                port: None,
+                needs_password: true,
+                ..ImportConn::default()
+            },
+            dup: false,
+            policy: DupPolicy::Skip,
+            selected: true,
+        };
+        let t = resolve_import_targets(&[row], &[]);
+        assert_eq!(t.items.len(), 1);
+        assert_eq!(t.items[0].1.port, 5432);
+        assert_eq!(t.needs_password, 1);
+        assert!(t.errors.is_empty());
+    }
+
+    #[test]
+    fn conn_export_password_toggle_requires_red_confirmation() {
+        let mut app = test_app();
+        app.connections = vec![test_conn("mysql")];
+        open_conn_export(&mut app);
+        assert!(app.conn_export.is_some());
+        // `p` raises the red confirmation without enabling the export yet.
+        conn_export_key(&mut app, KeyEvent::from(KeyCode::Char('p')));
+        assert!(app.conn_export.as_ref().unwrap().confirm_pw);
+        assert!(!app.conn_export.as_ref().unwrap().include_passwords);
+        // Esc backs out of the confirmation, not the overlay.
+        conn_export_key(&mut app, KeyEvent::from(KeyCode::Esc));
+        assert!(app.conn_export.is_some());
+        assert!(!app.conn_export.as_ref().unwrap().confirm_pw);
+        assert!(!app.conn_export.as_ref().unwrap().include_passwords);
+        // p then Enter enables it.
+        conn_export_key(&mut app, KeyEvent::from(KeyCode::Char('p')));
+        conn_export_key(&mut app, KeyEvent::from(KeyCode::Enter));
+        assert!(app.conn_export.as_ref().unwrap().include_passwords);
+        // Esc then closes the overlay.
+        conn_export_key(&mut app, KeyEvent::from(KeyCode::Esc));
+        assert!(app.conn_export.is_none());
+        app.conn_export = None;
+    }
+
+    #[test]
+    fn conn_import_plan_key_cycles_duplicate_policy() {
+        let plan = build_conn_import_plan(
+            ConnSource::DBeaver,
+            "x".into(),
+            vec![ImportConn {
+                name: "dup".into(),
+                driver: "mysql".into(),
+                db_type: Some("mysql".into()),
+                host: "h".into(),
+                port: Some(3306),
+                ..ImportConn::default()
+            }],
+            &[export_fixture_conn("dup")],
+        );
+        let mut app = test_app();
+        app.connections = vec![export_fixture_conn("dup")];
+        app.conn_import_plan = Some(Box::new(plan));
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        // `b` sets keep-both on every duplicate, no confirmation needed.
+        conn_import_plan_key(&mut app, &tx, KeyEvent::from(KeyCode::Char('b')));
+        assert_eq!(
+            app.conn_import_plan.as_ref().unwrap().rows[0].policy,
+            DupPolicy::Both
+        );
+        // `r` is guarded by the red overwrite layer...
+        conn_import_plan_key(&mut app, &tx, KeyEvent::from(KeyCode::Char('r')));
+        assert!(app.conn_import_plan.as_ref().unwrap().confirm.is_some());
+        // ...and Enter applies it.
+        conn_import_plan_key(&mut app, &tx, KeyEvent::from(KeyCode::Enter));
+        assert!(app.conn_import_plan.as_ref().unwrap().confirm.is_none());
+        assert_eq!(
+            app.conn_import_plan.as_ref().unwrap().rows[0].policy,
+            DupPolicy::Overwrite
+        );
+        // Space toggles the row's inclusion.
+        conn_import_plan_key(&mut app, &tx, KeyEvent::from(KeyCode::Char(' ')));
+        assert!(!app.conn_import_plan.as_ref().unwrap().rows[0].selected);
+        // Esc drops the preview entirely.
+        conn_import_plan_key(&mut app, &tx, KeyEvent::from(KeyCode::Esc));
+        assert!(app.conn_import_plan.is_none());
     }
 }

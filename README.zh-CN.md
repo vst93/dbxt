@@ -14,6 +14,12 @@
 - `d` 弹出切换层 —— MySQL 库、PostgreSQL（及其他支持 schema 的引擎）先 schema 后库、MongoDB 库、Redis 逻辑 db 同一套手势。
 - `o` 返回连接选择，`r` 原地刷新列表。
 
+**连接导入 / 导出 / 迁移（`Alt-E` / `Alt-I`）**
+- `Alt-E` 把**全部**已保存连接导出为自描述 JSON 包（`format` / `version` / `connections[]`，默认 `~/dbxt-connections.json`）。**默认不含密码**；`p` 显式开启（红色明文警告确认），`y` 则复制 JSON 到剪贴板而不写文件。状态栏报告目标路径与条数。
+- `Alt-I` 从文件路径导入，自动识别格式 —— dbxt 自有 JSON 包、DBeaver `data-sources.json`（标准路径 `~/.local/share/DBeaverData/workspace6/General/.dbeaver/data-sources.json`）、Navicat `.ncx` XML 导出。预览清单逐条列出（名称 / 引擎 / 主机 / SSH / 颜色 / 需补密码），标出同名冲突，并列出无法映射的驱动（跳过）。
+- 同名策略可逐条或整批：`s` 跳过、`r` 覆盖（按 `name` 匹配，红色确认，先删原配置）、`b` 都存（名加 `-imported`）；`Space` 勾选该条、`d` 逐条循环策略、`Enter` 导入。所有写入都经 `LocalBackend`，导入后连接立即可用（照常用连接键验证）。
+- **DBeaver** 的 provider / driver 映射到 dbxt 引擎（`mysql8`→`mysql`、`postgresql`→`postgres`、`mariadb`、`duckdb`、`mongodb`、`sqlserver` 等），`ssh-tunnel` 段转为真实 SSH 层。**Navicat** `.ncx` XML 用容错的手写标签扫描解析（子元素或属性均可）。两家的密码均以 dbxt 没有的密钥加密，因此**不解析** —— 导入后标「需补密码」，完成状态汇总计数。
+
 **SSH 隧道（跳板机）**
 - 在 DBX 桌面端配好的带隧道连接在 dbxt 里直接可用：dbxt 把 `transport_layers` 原样透传给内核，无需重新录入。
 - 连接表单新增 `ssh_tunnel` 段：`ssh_host` / `ssh_port`（22）/ `ssh_user`，以及 `ssh_auth` 登录方式 —— `password`、`key`（密钥路径 + 口令）或 `agent`（SSH agent，可填 socket 路径）。
@@ -134,6 +140,7 @@ cargo install --git https://github.com/vst93/dbxt
 | --- | --- |
 | 全局 | `?` 帮助 · `Tab`/`Shift-Tab` 切栏 · `Alt-1/2/3` 聚焦 · `F5`/`Ctrl-J` 执行 · `Ctrl-C` 退出 |
 | 连接 | `↑` `↓` 移动 · `Enter` 连接 · `c` 新建 · `e` 编辑 · `p` 复制 · `s` 排序（名称/类型/颜色） · `x` 删除 · `d` 数据库/schema 切换 · `o` 返回选择 |
+| 导入 / 导出 | `Alt-E` 导出全部连接为 JSON（`p` 含密码需红色确认 · `y` 复制到剪贴板） · `Alt-I` 导入 dbxt / DBeaver / Navicat 文件（`s` 跳过 · `r` 覆盖需红色确认 · `b` 都存 · `Space` 勾选 · `d` 逐条） |
 | 连接表单 | `↑` `↓`/`Tab` 切换字段 · `Enter` 编辑/切换/保存 · `Space` 切换 `ssh_tunnel`/`ssl`/`ssh_auth`、循环 `color` 调色板 · `Esc` 返回 |
 | SSH 主机密钥 | `y`/`Enter` 接受并记住 · `s` 仅本次会话 · `n`/`Esc` 拒绝 |
 | 侧栏 | `↑` `↓` 表 · `/` 过滤 · `Enter` 浏览 · `r` 表结构 · `I` 导入 CSV · `t` 最近表 |
