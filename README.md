@@ -42,13 +42,14 @@ A keyboard-first terminal UI for databases, built on the [DBX](https://github.co
 
 **Table data & editing**
 - `Enter` on a table runs a paginated `SELECT *`; `↑`/`↓` walk rows continuously across page edges, `n`/`p` turn pages keeping the relative row.
+- The sidebar table list filters as you type — any printable key starts a case-insensitive substring filter at once (`/` opens an empty one), `Enter` opens the first hit, `Ctrl-U` / `Alt-Backspace` clears it, and a first-letter jump (`Alt`+letter, then `;`/`,` to cycle forward/back) skips through a long list without scanning; `s` cycles the order by name / type.
 - Continuous paging prefers **keyset** reads when the table has a primary key: the next page is `WHERE pk > last ORDER BY pk LIMIT n` and the previous page seeks backwards, so the cost no longer grows with the page number (an early page and page 20,000 of a ten-million-row table both run in milliseconds). A jump that is not exactly one page, a table with no primary key, or a sort on a non-key column keeps the classic `LIMIT … OFFSET` path. With no explicit sort the browser orders by the primary key, which makes page boundaries deterministic (a table without a primary key keeps the engine's natural order).
 - Row counts are cached per `db.schema.table` + filter for the session. On a large table the first load samples at most `DBXT_COUNT_SAMPLE_LIMIT` rows (default 500,000) and shows `>500000 行` instead of paying a full `COUNT(*)` scan on every page; set `DBXT_COUNT_SAMPLE_LIMIT=0` to always count exactly. A small table still shows its exact total.
 - `←`/`→` move a cell cursor, `z` pins the first data column, `Enter` opens the full cell; a bottom bar shows horizontal position.
 - `e` edits the focused cell in a diff layer showing old → new, the `WHERE` clause, the primary key and the full `UPDATE`.
 - `i` inserts from a column template and `Delete` / `Ctrl-D` deletes with a bound `WHERE` — every write is confirmed first.
 - `Ctrl-T` queues writes and `Ctrl-S` runs them as one `BEGIN … COMMIT`; `f` filters, `s` sorts, `Ctrl-K` adds a sort key, `Ctrl-R` clears.
-- `y` copies the focused row as `INSERT INTO … VALUES (…)`; `/` searches the visible rows.
+- `y` copies the focused row as `INSERT INTO … VALUES (…)`; `/` searches the visible rows (hiding non-matches), while `gv` locates a value in the sort / primary-key column without hiding anything (`n`/`N` cycle the hits); `|` jumps the cell cursor to a column by number or name prefix on a wide table.
 
 **Table structure**
 - `r` shows fields (type / key / nullable / default / comment); `t` toggles the dialect-aware `SHOW CREATE TABLE` DDL.
@@ -78,6 +79,7 @@ A keyboard-first terminal UI for databases, built on the [DBX](https://github.co
 
 **Efficiency & experience**
 - `?` opens a context mini cheat-sheet from anywhere (top keys for the surface under the cursor, single screen, no scrolling); a second `?` opens the full cheat-sheet, and the footer adapts its hint count to the terminal width. Every overlay closes with `Esc`.
+- Number and count-prefix jumps: `1-9` jumps to the Nth connection/table, `3j`/`5n` repeat a move / page in the sidebar, results and history; on the results pane `gd` shows the structure, `gt` returns to the data, `gv` locates a value and `|` jumps columns.
 - `Ctrl-A` auto-collapses unfocused panes and `Ctrl-W` pins one; below 50 columns the panes stack vertically.
 - `Alt-C` compacts column widths, `Alt-V` hides columns, `Alt-R` jumps to a recent table, `Alt-H` opens the query history — choices persist per `database.table`.
 - Mouse and touch work: click to select, click again to confirm; the wheel scrolls, `Shift`/`Alt`/`Ctrl`+wheel pans columns.
@@ -126,7 +128,7 @@ Releases are cut from GitHub Actions: `gh workflow run release.yml` (optionally 
 
 1. Run `dbxt` — it reads the same store as DBX Desktop.
 2. Pick a connection (`↑` `↓` + `Enter`), or press `c` to create one.
-3. `Enter` on a table to browse it; `/` filters the table list, `d` switches database.
+3. `Enter` on a table to browse it; type a letter in the sidebar to filter tables at once (`Enter` opens the first hit), `d` switches database.
 4. `e` edits a cell, `i` inserts, `Delete` deletes — each shows the full SQL before it runs.
 5. `F5` runs the editor's SQL; `?` opens a context mini cheat-sheet (again for the full help).
 
@@ -143,13 +145,13 @@ The TUI's `?` overlay and `dbxt --help` carry the complete list; this is the sho
 | Import / export | `Alt-E` export every connection as JSON (`p` include passwords w/ red confirm · `y` copy to clipboard) · `Alt-I` import a dbxt / DBeaver / Navicat file (`s` skip · `r` overwrite w/ red confirm · `b` keep both · `Space` toggle · `d` per row) |
 | Connection form | `↑` `↓`/`Tab` fields · `Enter` edit/toggle/save · `Space` toggle `ssh_tunnel`/`ssl`/`ssh_auth`, cycle the `color` palette · `Esc` back |
 | SSH host key | `y`/`Enter` accept & remember · `s` this session only · `n`/`Esc` reject |
-| Sidebar | `↑` `↓` tables · `1-9` jump to the Nth connection/table · `3j`/`3k` count prefix (move 3) · `/` filter · `Enter` browse · `r` structure · `I` import CSV · `t` recent |
+| Sidebar | `↑` `↓` tables · type any letter to filter at once (`/` too) · `Enter` opens the first hit · `Alt`+letter + `;`/`,` cycle by first letter · `s` sort (name/type) · `1-9` jump to the Nth connection/table · `3j`/`3k` count prefix (move 3) · `Ctrl-U` clears the filter · `r` structure · `I` import CSV · `t` recent |
 | Editor | `Alt-H` history panel · `Alt-G` global search · `Alt-L` run `.sql` file · `Alt-F` format/compress · `Ctrl-U` undo format · `Alt-/` complete · `F5`/`Ctrl-J` run · `↑` `↓` history |
 | Schema diff | `Alt-D` diff current table vs a chosen table (`c` picks another connection) · `Shift+Alt-D` diff two databases' tables · `Tab` columns/indexes/ALTER · `y` copy summary · `g` generate ALTER · `Esc` close |
 | Data compare | `Alt-K` compare two tables' rows by primary key (`c` picks another connection) · `m` switch schema/data · `w` WHERE · `Tab` summary/only-src/only-tgt/diff · `Enter` expand a diff row · `y` summary · `g` sync SQL · `Esc` close |
 | Data transfer | `Alt-T` copy structure/rows to another connection (`o` overwrite w/ red confirm · `m` mode · `w`/`l` WHERE/LIMIT · `i` indexes · `a` auto-increment · `s` stop/skip) · step ① connection · step ② db/schema/table · step ③ options · `g` summary · `b` browse target · `Esc` abort |
-| Results | `↑` `↓` rows · `←` `→` columns · `n`/`p` pages (`5n` = 5 pages) · `gd`/`gt` structure/data · `Enter`/`v` cell · `e` edit · `i` insert · `Delete` delete |
-| Results (more) | `f` filter · `s` sort · `Ctrl-K` extra sort · `Ctrl-R` clear · `y` copy row · `/` search · `Ctrl-Y` export · `[` `]` tabs |
+| Results | `↑` `↓` rows · `←` `→` columns · `n`/`p` pages (`5n` = 5 pages) · `gd`/`gt` structure/data · `gv` locate a value (n/N cycles hits) · `|` jump to a column by number/name · `Enter`/`v` cell · `e` edit · `i` insert · `Delete` delete |
+| Results (more) | `f` filter · `s` sort · `Ctrl-K` extra sort · `Ctrl-R` clear · `y` copy row · `/` search (hides non-matches) · `Ctrl-Y` export · `[` `]` tabs |
 | Redis | `Space` select · `a` all · `Del`/`x`/`m` batch delete/TTL/rename · `/` MATCH · `n` more · `e` edit · `Enter` value |
 | MongoDB | `e` edit · `i` insert · `Del` delete · `f` filter · `n`/`p` pages · `r` indexes |
 | Overlays | `Enter`/`y` confirm · `Esc`/`n` cancel · `↑` `↓` scroll |

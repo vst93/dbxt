@@ -8307,6 +8307,58 @@ fn sort_connection_list(list: &mut [ConnectionConfig], mode: ConnSort) {
     }
 }
 
+/// Order the sidebar table list `s` cycles through. Size is deliberately not a
+/// mode: the kernel exposes no table size, and counting every table would cost
+/// one query per table — the sidebar is zero-query by design.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum TableSort {
+    Name,
+    Type,
+}
+
+impl TableSort {
+    fn next(self) -> Self {
+        match self {
+            TableSort::Name => TableSort::Type,
+            TableSort::Type => TableSort::Name,
+        }
+    }
+    fn label(self) -> &'static str {
+        match self {
+            TableSort::Name => t("名称"),
+            TableSort::Type => t("类型"),
+        }
+    }
+}
+
+/// Views sort after tables so the type mode groups each kind together.
+fn table_kind_rank(table_type: &str) -> u8 {
+    if table_type.eq_ignore_ascii_case("VIEW") {
+        1
+    } else {
+        0
+    }
+}
+
+/// Sort the sidebar table list in place for the `s` modes. Case-insensitive and
+/// stable-shaped (name breaks type ties, type breaks name ties), so the order is
+/// identical in both languages and across runs.
+fn sort_table_list(list: &mut [TableInfo], mode: TableSort) {
+    match mode {
+        TableSort::Name => list.sort_by(|a, b| {
+            a.name
+                .to_lowercase()
+                .cmp(&b.name.to_lowercase())
+                .then_with(|| table_kind_rank(&a.table_type).cmp(&table_kind_rank(&b.table_type)))
+        }),
+        TableSort::Type => list.sort_by(|a, b| {
+            table_kind_rank(&a.table_type)
+                .cmp(&table_kind_rank(&b.table_type))
+                .then_with(|| a.name.to_lowercase().cmp(&b.name.to_lowercase()))
+        }),
+    }
+}
+
 /// The focusable rows for the current form state, in display order. Labels are
 /// technical keycaps kept identical in both languages (like the base fields).
 fn form_rows(f: &ConnForm) -> Vec<(FormRow, &'static str)> {
@@ -8643,6 +8695,10 @@ struct App {
     /// Active sidebar table-name filter (`/`, filter-as-you-type).
     table_filter: String,
     table_prompt: Option<TextArea<'static>>,
+    /// Sidebar table-list order (`s` cycles name / type).
+    table_sort: TableSort,
+    /// Last first-letter jump (R39): `;` / `,` repeat it forward / backward.
+    table_jump_letter: Option<char>,
 
     // table structure
     columns: Vec<ColumnInfo>,
@@ -8727,6 +8783,18 @@ struct App {
     result_needle: String,
     /// Displayed row index → row index in the unfiltered grid (row filter map).
     result_rows: Vec<usize>,
+    // ── grid value locate (`gv` in the results pane) ──
+    /// The modal input while `gv` is being typed.
+    locate_prompt: Option<TextArea<'static>>,
+    /// Active locate needle; unlike `result_needle` it never hides rows — the
+    /// cursor jumps to the match and `n`/`N` cycle the hits in place.
+    locate_needle: String,
+    /// The grid column the locate searched (sort / primary-key / first), kept
+    /// so `n`/`N` do not have to re-derive it after a page change.
+    locate_col: Option<usize>,
+    // ── grid column jump (`|` in the results pane) ──
+    /// The modal input for `|` (column number or name prefix).
+    col_jump: Option<TextArea<'static>>,
     /// Last SQL sent to the backend, used to guess a table for `y`.
     last_sql: Option<String>,
 
@@ -9285,6 +9353,8 @@ impl App {
             tables_all: Vec::new(),
             table_filter: String::new(),
             table_prompt: None,
+            table_sort: TableSort::Name,
+            table_jump_letter: None,
             columns: Vec::new(),
             ddl: None,
             struct_view: StructView::Fields,
@@ -9330,6 +9400,10 @@ impl App {
             result_filter: None,
             result_needle: String::new(),
             result_rows: Vec::new(),
+            locate_prompt: None,
+            locate_needle: String::new(),
+            locate_col: None,
+            col_jump: None,
             last_sql: None,
             search_input: None,
             search_query: String::new(),
@@ -11031,6 +11105,8 @@ fn reset_overlays_for_backend_switch(app: &mut App) {
     app.completion = None;
     app.table_prompt = None;
     app.result_filter = None;
+    app.locate_prompt = None;
+    app.col_jump = None;
     app.mongo_dialog = None;
     app.redis_prompt = None;
     app.help_open = false;
@@ -11299,6 +11375,16 @@ fn browse_key(app: &mut App, tx: &Tx, k: KeyEvent) {
         return;
     }
 
+    // Grid value locate (`gv`) and column jump (`|`) prompts are modal too.
+    if app.locate_prompt.is_some() {
+        locate_key(app, k);
+        return;
+    }
+    if app.col_jump.is_some() {
+        col_jump_key(app, k);
+        return;
+    }
+
     // SQL completion popup (editor): must be handled before the global Tab
     // handler, otherwise Tab would switch panes instead of accepting.
     if app.completion.is_some() {
@@ -11336,7 +11422,7 @@ fn browse_key(app: &mut App, tx: &Tx, k: KeyEvent) {
 
     // Sidebar table filter (`/`) is modal while it is being typed.
     if app.table_prompt.is_some() {
-        table_filter_key(app, k);
+        table_filter_key(app, tx, k);
         return;
     }
 
@@ -11431,12 +11517,12 @@ fn browse_key(app: &mut App, tx: &Tx, k: KeyEvent) {
         }
     }
 
-    // The `g` chord (`gd` / `gt`) is resolved before the global `?` / `d`
+    // The `g` chord (`gd` / `gt` / `gv`) is resolved before the global `?` / `d`
     // shortcuts: `gd` reaches the results pane instead of opening the database
     // picker, and any other key clears a stale pending `g`.
     if app.pending_g {
         match k.code {
-            KeyCode::Char('d') | KeyCode::Char('t') if k.modifiers.is_empty() => {
+            KeyCode::Char('d') | KeyCode::Char('t') | KeyCode::Char('v') if k.modifiers.is_empty() => {
                 preview_key(app, tx, k);
                 return;
             }
@@ -12185,6 +12271,29 @@ fn sidebar_key(app: &mut App, tx: &Tx, k: KeyEvent) {
     }
 
     // connection selected → table browser
+    // R39 first-letter jump: Alt+<letter> cycles to the next table whose name
+    // starts with that letter (vim `f`-style). Plain letters are reserved for
+    // the one-step type-to-filter below, so the jump takes the modifier; `;` /
+    // `,` then repeat it forward / backward like vim.
+    if k.modifiers.contains(KeyModifiers::ALT) {
+        if let KeyCode::Char(c) = k.code {
+            if c.is_alphabetic() {
+                match table_jump_by_letter(app, c, 1) {
+                    Some(i) => {
+                        let name = fix_double_encoding(&app.tables[i].name);
+                        app.status = tf(
+                            "首字母跳「{}」→ {} · Alt+字母 循环 · ; , 前后跳",
+                            &[&c, &name],
+                        );
+                    }
+                    None => {
+                        app.status = tf("没有以「{}」开头的表", &[&c]);
+                    }
+                }
+                return;
+            }
+        }
+    }
     match k.code {
         KeyCode::Tab => app.focus = Focus::Editor,
         KeyCode::Char('c') => {
@@ -12195,6 +12304,11 @@ fn sidebar_key(app: &mut App, tx: &Tx, k: KeyEvent) {
         KeyCode::Char('p') => duplicate_connection(app),
         KeyCode::Char('o') => back_to_picker(app),
         KeyCode::Char('r') => load_structure(app, tx),
+        // `s` — cycle the sidebar order: name → type (TABLE/VIEW).
+        KeyCode::Char('s') => app.cycle_table_sort(),
+        // `;` / `,` repeat the last Alt+letter jump forward / backward.
+        KeyCode::Char(';') => repeat_table_jump(app, 1),
+        KeyCode::Char(',') => repeat_table_jump(app, -1),
         // `/` — filter-as-you-type over the table list (vim-style), the fast way
         // to reach a table when the sidebar is long.
         KeyCode::Char('/') => open_table_filter(app),
@@ -12237,7 +12351,38 @@ fn sidebar_key(app: &mut App, tx: &Tx, k: KeyEvent) {
         // ←/→ (and h/l) stay as a fast shortcut; `d` is the discoverable list.
         KeyCode::Left | KeyCode::Char('h') => cycle_db(app, tx, false),
         KeyCode::Right | KeyCode::Char('l') => cycle_db(app, tx, true),
+        // One-step type-to-filter (R39): any printable character that is not a
+        // bound shortcut starts the filter with that character already typed,
+        // so a lookup is a single keystroke instead of `/` then type.
+        KeyCode::Char(c)
+            if !k.modifiers.contains(KeyModifiers::CONTROL)
+                && !k.modifiers.contains(KeyModifiers::ALT)
+                && !c.is_ascii_control() =>
+        {
+            if app.tables_all.is_empty() {
+                app.status = t("还没有表可过滤").into();
+            } else {
+                open_table_filter_with(app, Some(c));
+                app.status =
+                    tf("过滤「{}」· {} 个命中 · Enter 打开首位", &[&(app.table_filter), &(app.tables.len())]);
+            }
+        }
         _ => {}
+    }
+}
+
+/// `;` / `,` in the sidebar: repeat the last first-letter jump forward / backward.
+fn repeat_table_jump(app: &mut App, dir: i32) {
+    let Some(letter) = app.table_jump_letter else {
+        app.status = t("先用 Alt+字母 做首字母跳，再用 ; , 循环").into();
+        return;
+    };
+    match table_jump_by_letter(app, letter, dir) {
+        Some(i) => {
+            let name = fix_double_encoding(&app.tables[i].name);
+            app.status = tf("首字母跳「{}」→ {}", &[&letter, &name]);
+        }
+        None => app.status = tf("没有以「{}」开头的表", &[&letter]),
     }
 }
 
@@ -15096,6 +15241,11 @@ fn preview_key(app: &mut App, tx: &Tx, k: KeyEvent) {
                 }
                 return;
             }
+            KeyCode::Char('v') if k.modifiers.is_empty() => {
+                app.pending_g = false;
+                open_locate(app);
+                return;
+            }
             KeyCode::Esc => {
                 app.pending_g = false;
                 return;
@@ -15103,9 +15253,18 @@ fn preview_key(app: &mut App, tx: &Tx, k: KeyEvent) {
             _ => app.pending_g = false,
         }
     }
-    // Esc clears an active result search before it does anything else. This
-    // applies to the top-level grid and to a drilled script result; only the
-    // script *list* has no search to clear.
+    // Esc clears an active value locate, then an active result search, before it
+    // does anything else. This applies to the top-level grid and to a drilled
+    // script result; only the script *list* has no search to clear.
+    if k.code == KeyCode::Esc
+        && !app.locate_needle.is_empty()
+        && !ddl
+        && app.script.as_ref().is_none_or(|s| s.drilled.is_some())
+    {
+        clear_locate(app);
+        app.status = t("已清除定位").into();
+        return;
+    }
     if k.code == KeyCode::Esc
         && !app.result_needle.is_empty()
         && !ddl
@@ -15157,12 +15316,14 @@ fn preview_key(app: &mut App, tx: &Tx, k: KeyEvent) {
         // `g` starts the `gd` (goto structure) / `gt` (goto data) chord.
         KeyCode::Char('g') => {
             app.pending_g = true;
-            app.status = t("g… d=表结构 t=表数据").into();
+            app.status = t("g… d=表结构 t=表数据 v=定位值").into();
         }
         KeyCode::Char('s') => sort_column(app, tx, false),
         KeyCode::Char('f') => open_filter_prompt(app),
         // `/` searches the visible result rows (filter-as-you-type).
         KeyCode::Char('/') => open_result_filter(app),
+        // `|` jumps straight to a column by number or name prefix (wide tables).
+        KeyCode::Char('|') => open_col_jump(app),
         // `y` copies the focused row as an INSERT statement (OSC 52 + file).
         KeyCode::Char('y') => copy_row_sql(app),
         // Bare-key aliases for the two view commands (mobile reachability).
@@ -15246,20 +15407,26 @@ fn preview_key(app: &mut App, tx: &Tx, k: KeyEvent) {
         }
         KeyCode::Char('n') => {
             let times = take_count(app);
-            if app.result_needle.trim().is_empty() {
-                page_turn_by(app, tx, true, times);
-            } else {
+            if !app.result_needle.trim().is_empty() {
                 for _ in 0..times {
                     search_move(app, 1);
                 }
+            } else if !app.locate_needle.trim().is_empty() {
+                for _ in 0..times {
+                    locate_move(app, 1);
+                }
+            } else {
+                page_turn_by(app, tx, true, times);
             }
         }
         KeyCode::Char('N') => {
             take_count(app);
-            if app.result_needle.trim().is_empty() {
-                app.status = t("先按 / 搜索结果，再用 n/N 跳转命中").into();
-            } else {
+            if !app.result_needle.trim().is_empty() {
                 search_move(app, -1);
+            } else if !app.locate_needle.trim().is_empty() {
+                locate_move(app, -1);
+            } else {
+                app.status = t("先按 / 或 gv 搜索，再用 n/N 跳转命中").into();
             }
         }
         KeyCode::Char('p') => {
@@ -15431,6 +15598,9 @@ fn open_result_filter(app: &mut App) {
         app.status = t("没有可搜索的结果").into();
         return;
     }
+    // `/` and `gv` are mutually exclusive: a row filter would hide the rows a
+    // value locate wants to step through, so starting one drops the other.
+    clear_locate(app);
     let mut ta = TextArea::from([app.result_needle.clone()]);
     ta.set_placeholder_text(t("搜索本页结果行…"));
     ta.move_cursor(CursorMove::End);
@@ -15491,6 +15661,283 @@ fn search_move(app: &mut App, dir: i32) {
         app.sel = (app.sel + n - 1) % n;
     }
     app.status = tf("搜索「{}」· 命中 {}/{}", &[&(app.result_needle), &(app.sel + 1), &(n)]);
+}
+
+// ── grid value locate (`gv`) + column jump (`|`) ──
+
+/// The column a `gv` locate searches: an explicit sort column when one is set,
+/// otherwise the primary-key column, otherwise the first column. Derived from
+/// the *rendered* grid so a hidden column never becomes a phantom target.
+fn locate_target_col(app: &App) -> Option<usize> {
+    let grid = active_grid(app)?;
+    if grid.columns.is_empty() {
+        return None;
+    }
+    if let Some(ps) = &app.page_state {
+        if let Some((name, _)) = parse_order_by(ps.order_by.as_deref()).first() {
+            if let Some(i) = grid
+                .columns
+                .iter()
+                .position(|c| c.eq_ignore_ascii_case(name))
+            {
+                return Some(i);
+            }
+        }
+    }
+    if let Some(meta) = &app.table_meta {
+        for c in &meta.columns {
+            if c.is_primary_key {
+                if let Some(i) = grid
+                    .columns
+                    .iter()
+                    .position(|gc| gc.eq_ignore_ascii_case(&c.name))
+                {
+                    return Some(i);
+                }
+            }
+        }
+    }
+    Some(0)
+}
+
+/// Loaded rows whose `col` cell contains `needle` (case-insensitive substring).
+/// Pure so the locate state machine can be unit tested without a backend.
+fn locate_matches(grid: &Grid, col: usize, needle: &str) -> Vec<usize> {
+    let n = needle.trim().to_lowercase();
+    if n.is_empty() {
+        return Vec::new();
+    }
+    grid.rows
+        .iter()
+        .enumerate()
+        .filter(|(_, r)| {
+            r.get(col)
+                .is_some_and(|v| v.text().to_lowercase().contains(&n))
+        })
+        .map(|(i, _)| i)
+        .collect()
+}
+
+/// The locate hit rows for the current needle / target column.
+fn locate_hits(app: &App) -> Vec<usize> {
+    let Some(col) = app.locate_col else {
+        return Vec::new();
+    };
+    let Some(grid) = active_grid(app) else {
+        return Vec::new();
+    };
+    locate_matches(&grid, col, &app.locate_needle)
+}
+
+/// `gv` — locate a value in the sort / primary-key column. Unlike `/` (which
+/// hides non-matching rows) this only moves the cursor, so paging and the row
+/// positions stay intact while you hunt for one key. `n`/`N` cycle the hits.
+fn open_locate(app: &mut App) {
+    if app.grid_kind == GridKind::Columns {
+        app.status = t("表结构视图不支持定位").into();
+        return;
+    }
+    if app.script.as_ref().is_some_and(|s| s.drilled.is_none()) {
+        app.status = t("脚本列表不支持定位（先 Enter 进入某条语句的结果）").into();
+        return;
+    }
+    if active_grid(app).is_none() {
+        app.status = t("没有可定位的结果").into();
+        return;
+    }
+    let Some(col) = locate_target_col(app) else {
+        app.status = t("没有可定位的结果").into();
+        return;
+    };
+    // `/` and `gv` are mutually exclusive: a value locate wants every row on
+    // screen, an active row filter would hide the very rows it searches for.
+    if !app.result_needle.is_empty() {
+        app.result_needle.clear();
+        app.result_filter = None;
+        app.rebuild_view();
+        app.sel = 0;
+    }
+    app.locate_col = Some(col);
+    let mut ta = TextArea::from([app.locate_needle.clone()]);
+    ta.set_placeholder_text(t("定位值（排序列 / 主键列）…"));
+    ta.move_cursor(CursorMove::End);
+    app.locate_prompt = Some(ta);
+}
+
+/// Prompt handler for `gv`. Filters as you type so the hit count is live; Enter
+/// jumps to the first hit and keeps the needle for `n`/`N`, Esc clears it.
+fn locate_key(app: &mut App, k: KeyEvent) {
+    match k.code {
+        KeyCode::Enter => {
+            app.locate_needle = app
+                .locate_prompt
+                .as_ref()
+                .map(|t| t.lines().join(" ").trim().to_string())
+                .unwrap_or_default();
+            app.locate_prompt = None;
+            let hits = locate_hits(app);
+            if hits.is_empty() {
+                app.status = tf("未找到匹配值「{}」", &[&(app.locate_needle)]);
+                app.locate_needle.clear();
+                return;
+            }
+            app.sel = hits[0];
+            let label = locate_col_label(app);
+            app.status = tf(
+                "定位 {}「{}」· {} 命中 · n/N 跳转 · Esc 清除",
+                &[&(label), &(app.locate_needle), &(hits.len())],
+            );
+        }
+        KeyCode::Esc => {
+            clear_locate(app);
+            app.status = t("已清除定位").into();
+        }
+        _ => {
+            if let Some(t) = &mut app.locate_prompt {
+                t.input(k);
+            }
+            app.locate_needle = app
+                .locate_prompt
+                .as_ref()
+                .map(|t| t.lines().join(" ").trim().to_string())
+                .unwrap_or_default();
+            let n = locate_hits(app).len();
+            app.status = if app.locate_needle.trim().is_empty() {
+                t("输入以定位值…").into()
+            } else {
+                tf("定位「{}」· {} 命中", &[&(app.locate_needle), &(n)])
+            };
+        }
+    }
+}
+
+/// Drop the locate needle and prompt (but leave the cursor where it is).
+fn clear_locate(app: &mut App) {
+    app.locate_prompt = None;
+    app.locate_needle.clear();
+    app.locate_col = None;
+}
+
+/// The target column's display name, for the status line.
+fn locate_col_label(app: &App) -> String {
+    app.locate_col
+        .and_then(|c| active_grid(app).and_then(|g| g.columns.get(c).cloned()))
+        .unwrap_or_else(|| t("列").to_string())
+}
+
+/// `n` / `N` while a value locate is active: step to the next / previous hit,
+/// wrapping and anchoring on the cursor when it is not itself a hit.
+fn locate_move(app: &mut App, dir: i32) {
+    let hits = locate_hits(app);
+    if hits.is_empty() {
+        app.status = tf("定位「{}」· 0 命中", &[&(app.locate_needle)]);
+        return;
+    }
+    let pos = hits.iter().position(|&r| r == app.sel);
+    app.sel = if dir > 0 {
+        match pos {
+            Some(i) => hits[(i + 1) % hits.len()],
+            None => *hits.iter().find(|&&r| r > app.sel).unwrap_or(&hits[0]),
+        }
+    } else {
+        match pos {
+            Some(i) => hits[(i + hits.len() - 1) % hits.len()],
+            None => *hits
+                .iter()
+                .rev()
+                .find(|&&r| r < app.sel)
+                .unwrap_or(&hits[hits.len() - 1]),
+        }
+    };
+    let label = locate_col_label(app);
+    app.status = tf(
+        "定位 {}「{}」· 命中 {}/{}",
+        &[&(label), &(app.locate_needle), &(app.sel + 1), &(hits.len())],
+    );
+}
+
+/// `|` — jump the cell cursor to a column by 1-based number or name prefix.
+fn open_col_jump(app: &mut App) {
+    let Some(grid) = active_grid(app) else {
+        app.status = t("没有可跳转的列").into();
+        return;
+    };
+    if grid.columns.is_empty() {
+        app.status = t("没有可跳转的列").into();
+        return;
+    }
+    let mut ta = TextArea::default();
+    ta.set_placeholder_text(t("列号或列名前缀…"));
+    app.col_jump = Some(ta);
+}
+
+/// Parse a `|` column-jump input against the grid columns: a 1-based number, or
+/// a case-insensitive name prefix (then substring). Pure so it can be tested
+/// directly.
+fn parse_col_jump(columns: &[String], input: &str) -> Result<usize, String> {
+    let q = input.trim();
+    if q.is_empty() {
+        return Err(t("请输入列号或列名").to_string());
+    }
+    if let Ok(num) = q.parse::<usize>() {
+        if num >= 1 && num <= columns.len() {
+            return Ok(num - 1);
+        }
+        return Err(tf("列号超出范围（1-{}）", &[&(columns.len())]));
+    }
+    let lower = q.to_lowercase();
+    if let Some(i) = columns
+        .iter()
+        .position(|c| c.to_lowercase().starts_with(&lower))
+    {
+        return Ok(i);
+    }
+    if let Some(i) = columns
+        .iter()
+        .position(|c| c.to_lowercase().contains(&lower))
+    {
+        return Ok(i);
+    }
+    Err(tf("找不到列「{}」", &[&q]))
+}
+
+/// Prompt handler for `|`: Enter jumps, Esc cancels, anything else is text.
+fn col_jump_key(app: &mut App, k: KeyEvent) {
+    match k.code {
+        KeyCode::Enter => {
+            let input = app
+                .col_jump
+                .as_ref()
+                .map(|t| t.lines().join(" ").trim().to_string())
+                .unwrap_or_default();
+            app.col_jump = None;
+            let Some(grid) = active_grid(app) else {
+                app.status = t("没有可跳转的列").into();
+                return;
+            };
+            match parse_col_jump(&grid.columns, &input) {
+                Ok(i) => {
+                    let name = grid.columns.get(i).cloned().unwrap_or_default();
+                    app.col_cursor = i;
+                    app.sel = app.sel.min(grid.rows.len().saturating_sub(1));
+                    app.status = tf(
+                        "跳到第 {} 列 {}",
+                        &[&(i + 1), &(name)],
+                    );
+                }
+                Err(msg) => app.status = msg,
+            }
+        }
+        KeyCode::Esc => {
+            app.col_jump = None;
+            app.status = t("已取消跳列").into();
+        }
+        _ => {
+            if let Some(t) = &mut app.col_jump {
+                t.input(k);
+            }
+        }
+    }
 }
 
 // ── mobile efficiency: compact columns / column visibility / recents / filter ──
@@ -17750,17 +18197,17 @@ fn apply_table_filter(app: &mut App) {
     // Match the qualified `schema.table` the sidebar draws, so `/inv` finds
     // every table in the `inv` schema.
     let schema = app.schema.clone();
+    let mut list = app.tables_all.clone();
+    sort_table_list(&mut list, app.table_sort);
     app.tables = if needle.is_empty() {
-        app.tables_all.clone()
+        list
     } else {
-        app.tables_all
-            .iter()
+        list.into_iter()
             .filter(|t| {
                 qualified_display(&schema, &t.name)
                     .to_lowercase()
                     .contains(&needle)
             })
-            .cloned()
             .collect()
     };
     let n = app.tables.len();
@@ -17773,6 +18220,91 @@ fn apply_table_filter(app: &mut App) {
         .unwrap_or(0)
         .min(n - 1);
     app.table_list.select(Some(sel));
+}
+
+/// R39: cycle to the next table whose name starts with `letter` (case-
+/// insensitive), wrapping around. `dir` is +1 for the forward cycle (`g`-less
+/// first-letter press / `;`) and -1 for backward (`,`). The unqualified name is
+/// matched, so `inv.items` jumps on `i` not on the `inv` schema prefix. Returns
+/// the new index, or `None` when no table starts with that letter.
+fn table_jump_by_letter(app: &mut App, letter: char, dir: i32) -> Option<usize> {
+    if app.tables.is_empty() {
+        return None;
+    }
+    let n = app.tables.len();
+    let cur = app.table_list.selected().unwrap_or(0);
+    let lower = letter.to_ascii_lowercase();
+    let matches = |i: usize| {
+        app.tables[i]
+            .name
+            .chars()
+            .next()
+            .is_some_and(|c| c.to_ascii_lowercase() == lower)
+    };
+    let step = if dir >= 0 { 1 } else { n - 1 };
+    for k in 1..=n {
+        let i = (cur + k * step) % n;
+        if matches(i) {
+            app.table_list.select(Some(i));
+            app.table_jump_letter = Some(lower);
+            return Some(i);
+        }
+    }
+    None
+}
+
+/// Enter the sidebar table filter directly with `seed` pre-typed (R39 one-step
+/// type-to-filter). `/` still opens an empty filter for refinement.
+fn open_table_filter_with(app: &mut App, seed: Option<char>) {
+    if app.tables_all.is_empty() {
+        app.status = t("还没有表可过滤").into();
+        return;
+    }
+    let mut text = app.table_filter.clone();
+    if let Some(c) = seed {
+        text.push(c);
+    }
+    let mut ta = TextArea::from([text.clone()]);
+    ta.move_cursor(CursorMove::End);
+    app.table_prompt = Some(ta);
+    app.table_filter = text;
+    apply_table_filter(app);
+}
+
+/// Clear the sidebar table filter and the one-step prompt in one gesture.
+fn clear_table_filter(app: &mut App) {
+    app.table_prompt = None;
+    app.table_filter.clear();
+    apply_table_filter(app);
+}
+
+/// Split `text` into `(pre, match, post)` spans, underlining the first
+/// case-insensitive occurrence of `needle` (R39 filter-hit highlight). Uses
+/// ASCII-only case folding so byte offsets stay valid on UTF-8 table names; the
+/// needle is already lower-cased by the caller.
+fn highlight_match_spans(
+    text: &str,
+    needle_lower: &str,
+    base: Style,
+    hit: Style,
+) -> Vec<Span<'static>> {
+    if needle_lower.is_empty() {
+        return vec![Span::styled(text.to_string(), base)];
+    }
+    let hay = text.to_ascii_lowercase();
+    let Some(pos) = hay.find(needle_lower) else {
+        return vec![Span::styled(text.to_string(), base)];
+    };
+    let end = pos + needle_lower.len();
+    let mut out = Vec::with_capacity(3);
+    if pos > 0 {
+        out.push(Span::styled(text[..pos].to_string(), base));
+    }
+    out.push(Span::styled(text[pos..end].to_string(), hit));
+    if end < text.len() {
+        out.push(Span::styled(text[end..].to_string(), base));
+    }
+    out
 }
 
 /// Make `name` the selectable sidebar table and return its index in
@@ -17801,8 +18333,20 @@ fn open_table_filter(app: &mut App) {
     app.table_prompt = Some(ta);
 }
 
-fn table_filter_key(app: &mut App, k: KeyEvent) {
+fn table_filter_key(app: &mut App, tx: &Tx, k: KeyEvent) {
+    // Ctrl-U / Alt-Backspace clear the filter from inside the prompt (grep /
+    // less muscle memory); both are free while the sidebar filter owns the keys.
+    if (k.modifiers.contains(KeyModifiers::CONTROL) && k.code == KeyCode::Char('u'))
+        || (k.modifiers.contains(KeyModifiers::ALT) && k.code == KeyCode::Backspace)
+    {
+        clear_table_filter(app);
+        app.status = tf("已清除表过滤 · {} 个表/视图", &[&(app.tables.len())]);
+        return;
+    }
     match k.code {
+        // Enter goes straight to the first hit: type a few letters, Enter, and
+        // you are browsing. The filter stays active so Esc returns to the
+        // filtered sidebar rather than a 500-row list.
         KeyCode::Enter => {
             app.table_filter = app
                 .table_prompt
@@ -17812,16 +18356,20 @@ fn table_filter_key(app: &mut App, k: KeyEvent) {
             app.table_prompt = None;
             apply_table_filter(app);
             let (n, total) = (app.tables.len(), app.tables_all.len());
+            if n == 0 {
+                app.status = tf("过滤「{}」· 0 个表命中", &[&app.table_filter]);
+                return;
+            }
+            app.table_list.select(Some(0));
             app.status = if app.table_filter.is_empty() {
                 tf("{} 个表/视图", &[&(total)])
             } else {
-                tf("过滤「{}」· {}/{} 个表 · Esc 清除", &[&(app.table_filter), &(n), &(total)])
+                tf("过滤「{}」· 打开第 1 个命中 · Esc 清除", &[&(app.table_filter)])
             };
+            open_table_data(app, tx);
         }
         KeyCode::Esc => {
-            app.table_prompt = None;
-            app.table_filter.clear();
-            apply_table_filter(app);
+            clear_table_filter(app);
             app.status = tf("已清除表过滤 · {} 个表/视图", &[&(app.tables.len())]);
         }
         _ => {
@@ -19739,6 +20287,17 @@ impl App {
         }
     }
 
+    /// R39: `s` cycles the sidebar table order. The filter is re-applied so the
+    /// sort survives an active `/` filter, and the same table stays selected by
+    /// name.
+    fn cycle_table_sort(&mut self) {
+        self.table_sort = self.table_sort.next();
+        apply_table_filter(self);
+        let label = self.table_sort.label();
+        let n = self.tables.len();
+        self.status = tf("表排序：{} · s 切换（名称/类型）· {} 张", &[&label, &n]);
+    }
+
     /// Select `db` in the database list, appending it when it is not present
     /// (MongoDB `use <db>` on a database with no collections yet).
     fn select_database(&mut self, db: &str) {
@@ -20932,6 +21491,11 @@ impl App {
         self.grid = None;
         self.grid_full = None;
         self.result_rows.clear();
+        // A value locate belongs to the grid it was started on; a new result
+        // (another table, a query, a tab switch) starts clean.
+        self.locate_needle.clear();
+        self.locate_col = None;
+        self.locate_prompt = None;
         self.grid_epoch = self.grid_epoch.wrapping_add(1);
         self.width_cache = None;
     }
@@ -21076,6 +21640,9 @@ impl App {
             // A result search belongs to a data grid, not the script list.
             self.result_needle.clear();
             self.result_filter = None;
+            self.locate_needle.clear();
+            self.locate_col = None;
+            self.locate_prompt = None;
         }
         self.rebuild_view();
         self.sel = tab.sel.min(self.grid.as_ref().map(|g| g.rows.len()).unwrap_or(0).saturating_sub(1));
@@ -22876,6 +23443,25 @@ fn ui(f: &mut Frame, app: &mut App) {
     if app.result_filter.is_some() {
         render_result_filter(f, f.area(), app);
     }
+    if app.locate_prompt.is_some() {
+        let hits = locate_hits(app).len();
+        render_prompt_input(
+            f,
+            f.area(),
+            app.locate_prompt.as_mut(),
+            &tf(" 定位值 {} 命中 · Enter 跳转 · Esc 清除 ", &[&(hits)]),
+            t(" 定位值 · Enter/Esc "),
+        );
+    }
+    if app.col_jump.is_some() {
+        render_prompt_input(
+            f,
+            f.area(),
+            app.col_jump.as_mut(),
+            t(" 跳列：列号 1-9 或列名前缀 · Enter 跳转 · Esc 取消 "),
+            t(" 跳列 · Enter/Esc "),
+        );
+    }
     if let Some(popup) = app.cell_popup.clone() {
         render_text_popup(f, f.area(), &popup.title, &popup.lines, popup.scroll);
     }
@@ -23251,6 +23837,8 @@ enum FooterView {
     FilterPrompt,
     Popup,
     ResultFilter,
+    LocatePrompt,
+    ColJump,
     Completion,
     SnippetName,
     Snippets,
@@ -23341,6 +23929,10 @@ fn footer_ctx_inner(app: &App, include_help: bool) -> FooterCtx {
         FooterView::Popup
     } else if app.result_filter.is_some() {
         FooterView::ResultFilter
+    } else if app.locate_prompt.is_some() {
+        FooterView::LocatePrompt
+    } else if app.col_jump.is_some() {
+        FooterView::ColJump
     } else if app.completion.is_some() {
         FooterView::Completion
     } else if app.snippet_name.is_some() {
@@ -23463,6 +24055,11 @@ fn footer_hints_ctx(ctx: FooterCtx) -> Vec<Hint> {
         FooterView::TablePrompt | FooterView::ResultFilter => {
             vec![("Enter", t("保留")), ("Esc", t("清除"))]
         }
+        FooterView::LocatePrompt => vec![
+            ("Enter", t("跳到命中")),
+            ("Esc", t("清除")),
+        ],
+        FooterView::ColJump => vec![("Enter", t("跳列")), ("Esc", t("取消"))],
         FooterView::HistoryFilter => vec![("Enter", t("保留")), ("Esc", t("清除"))],
         FooterView::History => vec![
             ("↑↓", t("选择")),
@@ -23642,9 +24239,11 @@ fn footer_hints_ctx(ctx: FooterCtx) -> Vec<Hint> {
             ],
             Focus::Sidebar => vec![
                 ("↑↓", t("表")),
-                ("/", t("过滤")),
+                ("a-z", t("过滤")),
                 ("Enter", t("浏览")),
                 ("r", t("结构")),
+                ("s", t("排序")),
+                ("Alt+a-z", t("首字母跳")),
                 ("d", t("切库")),
                 ("Tab", t("SQL")),
                 ("1-9", t("直跳")),
@@ -23673,6 +24272,8 @@ fn footer_hints_ctx(ctx: FooterCtx) -> Vec<Hint> {
                 ("y", t("复制INSERT")),
                 ("f", t("过滤")),
                 ("/", t("搜索")),
+                ("gv", t("定位值")),
+                ("|", t("跳列")),
                 ("gd/gt", t("结构/数据")),
             ],
         },
@@ -24990,6 +25591,7 @@ fn render_sidebar(f: &mut Frame, area: Rect, app: &mut App) {
             .unwrap_or(0)
             .saturating_sub(cap / 2)
             .min(app.tables.len().saturating_sub(cap.min(app.tables.len())));
+        let needle = app.table_filter.trim().to_ascii_lowercase();
         for (i, t) in app.tables.iter().enumerate().skip(start).take(cap) {
             let marker = if sel == Some(i) { "▸ " } else { "  " };
             let view = if t.table_type.eq_ignore_ascii_case("VIEW") {
@@ -25006,13 +25608,14 @@ fn render_sidebar(f: &mut Frame, area: Rect, app: &mut App) {
             } else {
                 Style::default()
             };
-            lines.push(Line::from(Span::styled(
-                format!(
-                    "{marker}{}{view}",
-                    fix_double_encoding(&qualified_display(&app.schema, &t.name))
-                ),
-                style,
-            )));
+            let disp = fix_double_encoding(&qualified_display(&app.schema, &t.name));
+            let hit = style.add_modifier(Modifier::UNDERLINED);
+            let mut spans = vec![Span::styled(marker.to_string(), style)];
+            spans.extend(highlight_match_spans(&disp, &needle, style, hit));
+            if !view.is_empty() {
+                spans.push(Span::styled(view.to_string(), style));
+            }
+            lines.push(Line::from(spans));
         }
 
         let title = if app.table_filter.is_empty() {
@@ -25360,6 +25963,18 @@ fn centered_overlay(area: Rect, w: u16, h: u16) -> Rect {    let w = w.min(area.
     }
 }
 
+/// Pick a title that fits `box_width` (the overlay's outer width). ratatui clips
+/// an over-long title mid-word, so a short variant is substituted when the full
+/// one would not fit — the R39 "titles are never truncated" rule. Two columns
+/// are reserved for the border corners.
+fn fit_title(full: &str, short: &str, box_width: u16) -> String {
+    if disp_width(full) <= box_width.saturating_sub(2) as usize {
+        full.to_string()
+    } else {
+        short.to_string()
+    }
+}
+
 fn overlay_list_box(rows: usize, area: Rect) -> (u16, u16) {
     if area.height == 0 {
         return (area.y, 0);
@@ -25561,7 +26176,11 @@ fn render_snippets(f: &mut Frame, area: Rect, app: &mut App) {
         .block(
             Block::default()
                 .borders(Borders::ALL)
-                .title(tf(" SQL 片段 · {} 个 · Enter 插入 · r 刷新 · Esc 关 ", &[&(app.snippets.len())]))
+                .title(fit_title(
+                    &tf(" SQL 片段 · {} 个 · Enter 插入 · r 刷新 · Esc 关 ", &[&(app.snippets.len())]),
+                    t(" SQL 片段 · Enter 插入 · Esc "),
+                    box_area.width,
+                ))
                 .border_set(border::ROUNDED)
                 .border_style(Style::default().fg(Color::Cyan)),
         )
@@ -25630,7 +26249,11 @@ fn render_col_picker(f: &mut Frame, area: Rect, app: &mut App) {
         .block(
             Block::default()
                 .borders(Borders::ALL)
-                .title(tf(" 列显示 {}/{} · 空格勾选 · a 全选 · x 仅首列 · Esc 关 ", &[&(visible), &(grid.columns.len())]))
+                .title(fit_title(
+                    &tf(" 列显示 {}/{} · 空格勾选 · a 全选 · x 仅首列 · Esc 关 ", &[&(visible), &(grid.columns.len())]),
+                    t(" 列显示 · 空格/a/x · Esc "),
+                    box_area.width,
+                ))
                 .border_set(border::ROUNDED)
                 .border_style(Style::default().fg(Color::Cyan)),
         )
@@ -25715,14 +26338,22 @@ fn render_history_panel(f: &mut Frame, area: Rect, app: &mut App) {
     let total = app.history_rows.len();
     let shown = app.history_view.len();
     let title = if app.history_needle.trim().is_empty() {
-        tf(
-            " 查询历史 · {} 条 · Enter 回填 · f 收藏 · Del 删除 · y 复制 · / 搜索 · Esc 关 ",
-            &[&total],
+        fit_title(
+            &tf(
+                " 查询历史 · {} 条 · Enter 回填 · f 收藏 · Del 删除 · y 复制 · / 搜索 · Esc 关 ",
+                &[&total],
+            ),
+            t(" 查询历史 · Enter 回填 · Esc "),
+            box_area.width,
         )
     } else {
-        tf(
-            " 查询历史 · 过滤「{}」 {}/{} · Esc 关 ",
-            &[&(app.history_needle), &shown, &total],
+        fit_title(
+            &tf(
+                " 查询历史 · 过滤「{}」 {}/{} · Esc 关 ",
+                &[&(app.history_needle), &shown, &total],
+            ),
+            t(" 查询历史（已过滤）· Esc "),
+            box_area.width,
         )
     };
     let block = Block::default()
@@ -25953,6 +26584,11 @@ fn render_search_panel(f: &mut Frame, area: Rect, app: &mut App) {
         " 全库搜索「{}」· {} 命中{}{}{} · Enter 定位 · y 复制 · r 重搜 · Esc 关 ",
         &[&(app.search_query), &done, &cap, &skip, &progress],
     );
+    let title = fit_title(
+        &title,
+        &tf(" 全库搜索「{}」· {} 命中 ", &[&(app.search_query), &done]),
+        box_area.width,
+    );
     let block = Block::default()
         .borders(Borders::ALL)
         .border_set(border::ROUNDED)
@@ -26035,7 +26671,11 @@ fn render_search_input(f: &mut Frame, area: Rect, app: &mut App) {
     f.render_widget(Clear, box_area);
     let block = Block::default()
         .borders(Borders::ALL)
-        .title(tf(" 全库搜索 · {} · Enter 开始 · Esc 取消 ", &[&(app.selected_name())]))
+        .title(fit_title(
+            &tf(" 全库搜索 · {} · Enter 开始 · Esc 取消 ", &[&(app.selected_name())]),
+            t(" 全库搜索 · Enter 开始 "),
+            box_area.width,
+        ))
         .border_set(border::ROUNDED)
         .border_style(Style::default().fg(Color::Magenta));
     let inner = block.inner(box_area);
@@ -26239,6 +26879,9 @@ fn render_diff_picker(f: &mut Frame, area: Rect, app: &mut App) {
             ),
         }
     };
+    // A long diff title (source table + target + every key hint) clips on a
+    // narrow terminal; fall back to the essentials (R39 titles-never-truncated).
+    let title = fit_title(&title, t(" 结构/数据对比 · Enter 对比 · Esc "), box_area.width);
     let block = Block::default()
         .borders(Borders::ALL)
         .border_set(border::ROUNDED)
@@ -26749,7 +27392,11 @@ fn render_data_where(f: &mut Frame, area: Rect, app: &mut App) {
     f.render_widget(Clear, box_area);
     let block = Block::default()
         .borders(Borders::ALL)
-        .title(t(" 数据对比 WHERE（两边同时生效）· Enter 开始 · Esc 取消 "))
+        .title(fit_title(
+            t(" 数据对比 WHERE（两边同时生效）· Enter 开始 · Esc 取消 "),
+            t(" 数据对比 WHERE · Enter 开始 "),
+            box_area.width,
+        ))
         .border_set(border::ROUNDED)
         .border_style(Style::default().fg(Color::Yellow));
     let inner = block.inner(box_area);
@@ -26828,9 +27475,13 @@ fn render_transfer_wizard(f: &mut Frame, area: Rect, app: &mut App) {
                 .borders(Borders::ALL)
                 .border_set(border::ROUNDED)
                 .border_style(Style::default().fg(Color::Cyan))
-                .title(tf(
-                    " 数据搬运 ① 目标连接 · 源 {} · Enter 下一步 · Esc 取消 ",
-                    &[&src],
+                .title(fit_title(
+                    &tf(
+                        " 数据搬运 ① 目标连接 · 源 {} · Enter 下一步 · Esc 取消 ",
+                        &[&src],
+                    ),
+                    t(" 数据搬运 ① · Enter 下一步 "),
+                    box_area.width,
                 ));
             let inner = block.inner(box_area);
             f.render_widget(block, box_area);
@@ -26880,9 +27531,13 @@ fn render_transfer_wizard(f: &mut Frame, area: Rect, app: &mut App) {
                 .borders(Borders::ALL)
                 .border_set(border::ROUNDED)
                 .border_style(Style::default().fg(Color::Cyan))
-                .title(tf(
-                    " 数据搬运 ② 目标库/表 · {} · Tab 切换 · Enter 下一步 · Esc 返回 ",
-                    &[&tgt],
+                .title(fit_title(
+                    &tf(
+                        " 数据搬运 ② 目标库/表 · {} · Tab 切换 · Enter 下一步 · Esc 返回 ",
+                        &[&tgt],
+                    ),
+                    t(" 数据搬运 ② · Tab/Enter "),
+                    box_area.width,
                 ));
             let inner = block.inner(box_area);
             f.render_widget(block, box_area);
@@ -26948,7 +27603,11 @@ fn render_transfer_wizard(f: &mut Frame, area: Rect, app: &mut App) {
                 .borders(Borders::ALL)
                 .border_set(border::ROUNDED)
                 .border_style(Style::default().fg(Color::Cyan))
-                .title(t(" 数据搬运 ③ 模式与选项 · ↑↓ 选择 · Enter 切换 · Enter 开搬 · Esc 取消 "));
+                .title(fit_title(
+                    t(" 数据搬运 ③ 模式与选项 · ↑↓ 选择 · Enter 切换 · Enter 开搬 · Esc 取消 "),
+                    t(" 数据搬运 ③ · Enter 开搬 "),
+                    box_area.width,
+                ));
             let inner = block.inner(box_area);
             f.render_widget(block, box_area);
             let items: Vec<ListItem> = rows
@@ -27074,7 +27733,11 @@ fn render_transfer_running(f: &mut Frame, area: Rect, app: &mut App) {
         .borders(Borders::ALL)
         .border_set(border::ROUNDED)
         .border_style(Style::default().fg(Color::Cyan))
-        .title(t(" 数据搬运中… · Esc 中止（已提交批次保留） "));
+        .title(fit_title(
+            t(" 数据搬运中… · Esc 中止（已提交批次保留） "),
+            t(" 数据搬运中… · Esc 中止 "),
+            box_area.width,
+        ));
     let inner = block.inner(box_area);
     f.render_widget(block, box_area);
     let (rows, chunks, elapsed, total) = app.transfer_progress.unwrap_or((0, 0, 0, None));
@@ -27197,7 +27860,11 @@ fn render_transfer_report(f: &mut Frame, area: Rect, app: &mut App) {
         .borders(Borders::ALL)
         .border_set(border::ROUNDED)
         .border_style(Style::default().fg(color))
-        .title(t(" 数据搬运汇总 · g 复制摘要 · b 浏览目标表 · Esc 关闭 "));
+        .title(fit_title(
+            t(" 数据搬运汇总 · g 复制摘要 · b 浏览目标表 · Esc 关闭 "),
+            t(" 搬运汇总 · g 摘要 · b 浏览 "),
+            box_area.width,
+        ));
     let inner = block.inner(box_area);
     f.render_widget(block, box_area);
 
@@ -27297,7 +27964,11 @@ fn render_file_load_prompt(f: &mut Frame, area: Rect, app: &mut App) {
     f.render_widget(Clear, box_area);
     let block = Block::default()
         .borders(Borders::ALL)
-        .title(tf(" 加载 SQL 文件 · {} · Enter 预览 · Esc 取消 ", &[&(app.selected_name())]))
+        .title(fit_title(
+            &tf(" 加载 SQL 文件 · {} · Enter 预览 · Esc 取消 ", &[&(app.selected_name())]),
+            t(" 加载 SQL 文件 · Enter 预览 "),
+            box_area.width,
+        ))
         .border_set(border::ROUNDED)
         .border_style(Style::default().fg(Color::Cyan));
     let inner = block.inner(box_area);
@@ -27400,34 +28071,45 @@ fn render_file_load_plan(f: &mut Frame, area: Rect, app: &mut App) {
 }
 
 fn render_table_filter(f: &mut Frame, area: Rect, app: &mut App) {
-    let w = area.width.saturating_sub(4).max(20).min(area.width);
-    let h = 3.min(area.height);
-    let x = area.x + (area.width.saturating_sub(w)) / 2;
-    // Sit just above the footer line so the input is not clipped by it.
-    let y = area.y + area.height.saturating_sub(h + 1);
-    let box_area = Rect {
-        x,
-        y,
-        width: w,
-        height: h,
-    };
-    f.render_widget(Clear, box_area);
-    let block = Block::default()
-        .borders(Borders::ALL)
-        .title(tf(" 过滤表名 {}/{} · Enter 保留 · Esc 清除 ", &[&(app.tables.len()), &(app.tables_all.len())]))
-        .border_set(border::ROUNDED)
-        .border_style(Style::default().fg(Color::Yellow));
-    let inner = block.inner(box_area);
-    f.render_widget(block, box_area);
-    if let Some(ta) = app.table_prompt.as_mut() {
-        ta.set_block(Block::default());
-        f.render_widget(&*ta, inner);
-    }
+    render_prompt_input(
+        f,
+        area,
+        app.table_prompt.as_mut(),
+        &tf(
+            " 过滤表名 {}/{} · Enter 打开首位 · Esc 清除 ",
+            &[&(app.tables.len()), &(app.tables_all.len())],
+        ),
+        t(" 过滤表名 · Enter/Esc "),
+    );
 }
 
 /// Result-row search prompt (`/` in the results pane), styled like the table
 /// filter so both filter-as-you-type flows feel identical.
 fn render_result_filter(f: &mut Frame, area: Rect, app: &mut App) {
+    let hits = result_row_count(app);
+    render_prompt_input(
+        f,
+        area,
+        app.result_filter.as_mut(),
+        &tf(" 搜索结果 {} 行命中 · Enter 保留 · Esc 清除 ", &[&(hits)]),
+        t(" 搜索 · Enter 保留 "),
+    );
+}
+
+/// A bottom-anchored one-line input overlay shared by the result search, value
+/// locate and column jump. A long title would be clipped mid-word on a narrow
+/// terminal, so an unclipped short title is substituted instead (R39: titles are
+/// never truncated).
+fn render_prompt_input(
+    f: &mut Frame,
+    area: Rect,
+    ta: Option<&mut TextArea<'static>>,
+    title: &str,
+    short_title: &str,
+) {
+    if area.width == 0 || area.height == 0 {
+        return;
+    }
     let w = area.width.saturating_sub(4).max(20).min(area.width);
     let h = 3.min(area.height);
     let x = area.x + (area.width.saturating_sub(w)) / 2;
@@ -27439,15 +28121,19 @@ fn render_result_filter(f: &mut Frame, area: Rect, app: &mut App) {
         height: h,
     };
     f.render_widget(Clear, box_area);
-    let hits = result_row_count(app);
+    let label = if disp_width(title) > box_area.width.saturating_sub(2) as usize {
+        short_title
+    } else {
+        title
+    };
     let block = Block::default()
         .borders(Borders::ALL)
-        .title(tf(" 搜索结果 {} 行命中 · Enter 保留 · Esc 清除 ", &[&(hits)]))
+        .title(label.to_string())
         .border_set(border::ROUNDED)
         .border_style(Style::default().fg(Color::Yellow));
     let inner = block.inner(box_area);
     f.render_widget(block, box_area);
-    if let Some(ta) = app.result_filter.as_mut() {
+    if let Some(ta) = ta {
         ta.set_block(Block::default());
         f.render_widget(&*ta, inner);
     }
@@ -27503,7 +28189,11 @@ fn render_completion(f: &mut Frame, app: &App) {
         Paragraph::new(lines).block(
             Block::default()
                 .borders(Borders::ALL)
-                .title(t(" 补全 · T表 C列 K关键字 · Tab 上屏 · ↑↓ · Esc "))
+                .title(fit_title(
+                    t(" 补全 · T表 C列 K关键字 · Tab 上屏 · ↑↓ · Esc "),
+                    t(" 补全 · Tab 上屏 · Esc "),
+                    box_area.width,
+                ))
                 .border_set(border::ROUNDED)
                 .border_style(Style::default().fg(Color::Cyan)),
         ),
@@ -27526,7 +28216,11 @@ fn render_snippet_name(f: &mut Frame, area: Rect, app: &mut App) {
     f.render_widget(Clear, box_area);
     let block = Block::default()
         .borders(Borders::ALL)
-        .title(t(" 收藏为 SQL 片段（DBX saved_sql_files）· Enter 保存 · Esc 取消 "))
+        .title(fit_title(
+            t(" 收藏为 SQL 片段（DBX saved_sql_files）· Enter 保存 · Esc 取消 "),
+            t(" 收藏片段 · Enter 保存 "),
+            box_area.width,
+        ))
         .border_set(border::ROUNDED)
         .border_style(Style::default().fg(Color::Green));
     let inner = block.inner(box_area);
@@ -28026,7 +28720,10 @@ const HELP_ROWS: &[(&str, &str)] = &[
     ("↑ ↓", "移动表列表"),
     ("1-9", "直跳第 N 个连接 / 表"),
     ("3 j / 3 k", "计数前缀：下 / 上移动 3 项（侧栏 / 结果 / 历史通用）"),
-    ("/", "过滤表名（输入即筛选，Enter 保留，Esc 清除）"),
+    ("a-z / /", "过滤表名：任意字符一步直达过滤，Enter 打开第一个命中，Esc 清除"),
+    ("Ctrl-U / Alt-⌫", "清除表过滤（过滤提示框内）"),
+    ("s", "表排序：名称 / 类型（TABLE / VIEW）"),
+    ("Alt+a-z · ; ,", "首字母跳：跳到以该字母开头的下一张表；; , 前后循环（与过滤互斥）"),
     ("t", "最近表浮层（Enter 直达）"),
     ("Enter", "浏览表数据"),
     ("r", "表结构（字段 + DDL）"),
@@ -28057,8 +28754,10 @@ const HELP_ROWS: &[(&str, &str)] = &[
     ("[ ]", "切换本次会话的结果标签"),
     ("Ctrl-Y", "导出当前结果（CSV / JSON / NDJSON / Markdown / INSERT）"),
     ("y", "复制当前行为 INSERT 语句（OSC52 + 文件兜底）"),
-    ("/", "搜索结果行（输入即筛选，Enter 保留，Esc 清除）"),
-    ("n / Shift-N", "搜索命中时：下 / 上一个命中（否则 n 翻页）"),
+    ("/", "搜索结果行（隐藏不匹配行，输入即筛，Enter 保留，Esc 清除）"),
+    ("g v", "定位值：在排序列 / 主键列内搜值并跳转，不隐藏行（n/N 循环命中）"),
+    ("|", "跳列：输入列号或列名前缀直达该列（宽表横滚）"),
+    ("n / Shift-N", "搜索结果或定位命中时：下 / 上一个命中（否则 n 翻页）"),
     ("Ctrl-N", "结果被截断时加载更多行"),
     ("Enter", "整行详情（紧凑列模式）/ 完整单元格"),
     ("v", "完整单元格（任意模式）"),
@@ -28076,6 +28775,7 @@ const HELP_ROWS: &[(&str, &str)] = &[
     ("Alt-R", "最近表直达浮层"),
     ("t", "字段 ↔ DDL（表结构）"),
     ("g d / g t", "跳表结构视图 / 回表数据"),
+    ("g v", "定位值（排序列 / 主键列，不隐藏行）"),
     ("Esc", "收起结果 / 关闭浮层"),
     ("— 编辑确认层 —", ""),
     ("Enter", "执行（UPDATE / INSERT，SQL 全文可见）"),
@@ -29489,7 +30189,9 @@ mod tests {
     /// bounds rect, so this is the guard for the whole overlay family.
     #[test]
     fn overlays_render_at_extreme_sizes() {
-        let sizes = [(40u16, 12u16), (250, 70), (20, 6), (1, 1)];
+        // (42, 22) is the R39 acceptance size for the overlay small-screen
+        // sweep; the rest are the historical phone / huge / degenerate cases.
+        let sizes = [(40u16, 12u16), (42, 22), (250, 70), (20, 6), (1, 1)];
         let mut app = test_app();
         app.picker_open = false;
         app.selected = Some(test_conn("mysql"));
@@ -29527,6 +30229,8 @@ mod tests {
             app.snippet_name = None;
             app.table_prompt = None;
             app.result_filter = None;
+            app.locate_prompt = None;
+            app.col_jump = None;
             app.filter_prompt = None;
             app.search_open = false;
             app.search_input = None;
@@ -29540,6 +30244,11 @@ mod tests {
         let cases: Vec<OverlayCase> = vec![
             ("help", Box::new(|a| a.help_open = true)),
             ("help-mini", Box::new(|a| a.help_mini = true)),
+            (
+                "locate-prompt",
+                Box::new(|a| a.locate_prompt = Some(TextArea::default())),
+            ),
+            ("col-jump", Box::new(|a| a.col_jump = Some(TextArea::default()))),
             ("export-picker", Box::new(|a| a.export_open = true)),
             (
                 "export-path",
@@ -33298,6 +34007,305 @@ mod tests {
         assert_eq!(app.table_filter, "users");
     }
 
+    // ── R39 table quick-locate ──
+
+    fn table_info(name: &str, kind: &str) -> TableInfo {
+        TableInfo {
+            name: name.into(),
+            table_type: kind.into(),
+            comment: None,
+            parent_schema: None,
+            parent_name: None,
+        }
+    }
+
+    #[test]
+    fn table_sort_cycles_name_then_type() {
+        let mut list = vec![
+            table_info("beta", "VIEW"),
+            table_info("alpha", "TABLE"),
+            table_info("a_view", "VIEW"),
+            table_info("zeta", "TABLE"),
+        ];
+        sort_table_list(&mut list, TableSort::Name);
+        let names: Vec<&str> = list.iter().map(|t| t.name.as_str()).collect();
+        assert_eq!(names, vec!["a_view", "alpha", "beta", "zeta"]);
+        // Type mode groups tables before views, each alphabetical.
+        sort_table_list(&mut list, TableSort::Type);
+        let names: Vec<&str> = list.iter().map(|t| t.name.as_str()).collect();
+        assert_eq!(names, vec!["alpha", "zeta", "a_view", "beta"]);
+        // `s` cycles name → type → name.
+        assert_eq!(TableSort::Name.next(), TableSort::Type);
+        assert_eq!(TableSort::Type.next(), TableSort::Name);
+    }
+
+    #[test]
+    fn one_step_type_to_filter_then_enter_opens_the_first_hit() {
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel::<OpResult>();
+        // Enter routes through `open_table_data`, which defers its page load via
+        // `App::spawn`; that needs a Tokio context on the test thread.
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let _guard = rt.enter();
+        let mut app = test_app();
+        app.selected = Some(test_conn("mysql"));
+        app.tables_all = vec![
+            table_info("orders", "TABLE"),
+            table_info("users", "TABLE"),
+            table_info("user_logs", "TABLE"),
+        ];
+        apply_table_filter(&mut app);
+        // A single printable key enters the filter with that character typed.
+        open_table_filter_with(&mut app, Some('u'));
+        assert_eq!(app.table_filter, "u");
+        assert!(app.table_prompt.is_some());
+        assert_eq!(app.tables.len(), 2);
+        // Enter opens the first hit (open_table_data defers the page for the
+        // column metadata, which is what `pending_open_page` records).
+        table_filter_key(&mut app, &tx, KeyEvent::from(KeyCode::Enter));
+        assert!(app.table_prompt.is_none());
+        assert_eq!(app.table_filter, "u");
+        assert!(app.pending_open_page);
+        // Ctrl-U inside the prompt clears the filter (grep muscle memory).
+        open_table_filter(&mut app);
+        table_filter_key(
+            &mut app,
+            &tx,
+            KeyEvent::new(KeyCode::Char('u'), KeyModifiers::CONTROL),
+        );
+        assert!(app.table_filter.is_empty());
+        assert!(app.table_prompt.is_none());
+        assert_eq!(app.tables.len(), 3);
+    }
+
+    #[test]
+    fn first_letter_jump_cycles_forwards_backwards_and_wraps() {
+        let mut app = test_app();
+        app.tables = vec![
+            table_info("alpha", "TABLE"),
+            table_info("beta", "TABLE"),
+            table_info("atom", "TABLE"),
+            table_info("gamma", "TABLE"),
+        ];
+        app.table_list.select(Some(0));
+        // Forward from alpha finds the next `a` (atom), then wraps to alpha.
+        assert_eq!(table_jump_by_letter(&mut app, 'a', 1), Some(2));
+        assert_eq!(app.table_jump_letter, Some('a'));
+        assert_eq!(table_jump_by_letter(&mut app, 'a', 1), Some(0));
+        // Backward wraps the other way.
+        assert_eq!(table_jump_by_letter(&mut app, 'a', -1), Some(2));
+        // Uppercase matches case-insensitively and pins the repeat letter lower.
+        app.table_list.select(Some(0));
+        assert_eq!(table_jump_by_letter(&mut app, 'A', 1), Some(2));
+        assert_eq!(app.table_jump_letter, Some('a'));
+        // No match is a no-op.
+        assert_eq!(table_jump_by_letter(&mut app, 'z', 1), None);
+    }
+
+    #[test]
+    fn filter_highlight_underlines_the_matched_substring() {
+        let base = Style::default();
+        let hit = Style::default().add_modifier(Modifier::UNDERLINED);
+        let spans = highlight_match_spans("inv_orders", "ord", base, hit);
+        let text: String = spans.iter().map(|s| s.content.as_ref()).collect();
+        assert_eq!(text, "inv_orders");
+        let underlined: Vec<&str> = spans
+            .iter()
+            .filter(|s| s.style.add_modifier.contains(Modifier::UNDERLINED))
+            .map(|s| s.content.as_ref())
+            .collect();
+        assert_eq!(underlined, vec!["ord"]);
+        // No match (or an empty needle) leaves the text untouched in one span.
+        assert_eq!(highlight_match_spans("abc", "zzz", base, hit).len(), 1);
+        assert_eq!(highlight_match_spans("abc", "", base, hit).len(), 1);
+    }
+
+    // ── R39 grid value locate / column jump ──
+
+    fn locate_grid() -> Grid {
+        Grid {
+            columns: vec!["id".into(), "name".into()],
+            rows: vec![
+                vec![Val::Text("1".into()), Val::Text("alice".into())],
+                vec![Val::Text("42".into()), Val::Text("bob".into())],
+                vec![Val::Text("143".into()), Val::Text("carol".into())],
+                vec![Val::Null, Val::Text("dave".into())],
+            ],
+            note: String::new(),
+        }
+    }
+
+    #[test]
+    fn locate_matches_searches_only_the_target_column() {
+        let grid = locate_grid();
+        // Substring, not prefix: `4` hits 42 and 143 but not 1.
+        assert_eq!(locate_matches(&grid, 0, "4"), vec![1, 2]);
+        assert_eq!(locate_matches(&grid, 0, "1"), vec![0, 2]);
+        // Case-insensitive on a text column.
+        assert_eq!(locate_matches(&grid, 1, "BO"), vec![1]);
+        // A NULL cell never matches, and a blank needle is no search at all.
+        assert!(locate_matches(&grid, 0, "  ").is_empty());
+        assert!(!locate_matches(&grid, 1, "dave").is_empty());
+    }
+
+    #[test]
+    fn locate_target_prefers_sort_then_pk_then_first_column() {
+        let mut app = test_app();
+        app.grid_kind = GridKind::TableData;
+        app.set_grid(locate_grid());
+        app.page_state = Some(PageState {
+            table: "t".into(),
+            schema: String::new(),
+            table_type: Some("TABLE".into()),
+            page: 0,
+            page_size: PAGE_SIZE,
+            total: None,
+            total_lower_bound: false,
+            has_next: false,
+            filter: String::new(),
+            order_by: None,
+            keyset: None,
+        });
+        // No sort / no metadata → first column.
+        assert_eq!(locate_target_col(&app), Some(0));
+        // A primary key in the metadata wins over the first column when it is a
+        // different index.
+        let pk_col = ColumnInfo {
+            name: "name".into(),
+            data_type: "text".into(),
+            is_nullable: false,
+            is_primary_key: true,
+            ..Default::default()
+        };
+        app.table_meta = Some(TableMeta {
+            table: "t".into(),
+            schema: String::new(),
+            columns: vec![pk_col],
+        });
+        assert_eq!(locate_target_col(&app), Some(1));
+        // An explicit sort column wins over the primary key.
+        app.page_state.as_mut().unwrap().order_by = Some("id".into());
+        assert_eq!(locate_target_col(&app), Some(0));
+    }
+
+    #[test]
+    fn locate_move_cycles_hits_and_anchors_on_the_cursor() {
+        let mut app = test_app();
+        app.grid_kind = GridKind::TableData;
+        app.set_grid(locate_grid());
+        app.locate_col = Some(0);
+        app.locate_needle = "4".into();
+        // Hits are rows 1 and 2. From a non-hit cursor (0) forward lands on the
+        // next hit; a further step wraps.
+        app.sel = 0;
+        locate_move(&mut app, 1);
+        assert_eq!(app.sel, 1);
+        locate_move(&mut app, 1);
+        assert_eq!(app.sel, 2);
+        locate_move(&mut app, 1);
+        assert_eq!(app.sel, 1);
+        // Backward from a non-hit cursor lands on the previous hit.
+        app.sel = 3;
+        locate_move(&mut app, -1);
+        assert_eq!(app.sel, 2);
+    }
+
+    #[test]
+    fn parse_col_jump_accepts_number_and_name_prefix() {
+        let cols: Vec<String> = vec![
+            "id".into(),
+            "user_name".into(),
+            "email_address".into(),
+            "created_at".into(),
+        ];
+        assert_eq!(parse_col_jump(&cols, "2"), Ok(1));
+        assert_eq!(parse_col_jump(&cols, "user"), Ok(1));
+        assert_eq!(parse_col_jump(&cols, "EMAIL"), Ok(2));
+        // Substring fallback: "ate" only appears inside created_at.
+        assert_eq!(parse_col_jump(&cols, "ate"), Ok(3));
+        // A number out of range and a miss both fail with a message.
+        assert!(parse_col_jump(&cols, "9").is_err());
+        assert!(parse_col_jump(&cols, "0").is_err());
+        assert!(parse_col_jump(&cols, "nope").is_err());
+        assert!(parse_col_jump(&cols, "").is_err());
+    }
+
+    /// R39 overlay small-screen sweep: every bottom-anchored prompt owns a
+    /// short title that fits 42×22, and the frame still shows the pinned `?`
+    /// help hint (key hints survive on small screens).
+    #[test]
+    fn prompt_overlays_keep_titles_and_hints_at_42x22() {
+        let mut app = test_app();
+        app.picker_open = false;
+        app.selected = Some(test_conn("mysql"));
+        app.backend_kind = Backend::Sql;
+        app.grid_kind = GridKind::TableData;
+        app.set_grid(sample_grid());
+        app.focus = Focus::Preview;
+        app.tables_all = vec![table_info("orders", "TABLE"), table_info("users", "TABLE")];
+        apply_table_filter(&mut app);
+
+        // (fixture, expected short-title fragment)
+        type PromptCase = (&'static str, Box<dyn Fn(&mut App)>, &'static str);
+        let cases: Vec<PromptCase> = vec![
+            (
+                "table-filter",
+                Box::new(|a| a.table_prompt = Some(TextArea::default())),
+                "过滤表名",
+            ),
+            (
+                "result-filter",
+                Box::new(|a| a.result_filter = Some(TextArea::default())),
+                "搜索",
+            ),
+            (
+                "locate",
+                Box::new(|a| {
+                    a.locate_col = Some(0);
+                    a.locate_prompt = Some(TextArea::default());
+                }),
+                "定位值",
+            ),
+            (
+                "col-jump",
+                Box::new(|a| a.col_jump = Some(TextArea::default())),
+                "跳列",
+            ),
+        ];
+        for (name, open, fragment) in cases {
+            app.table_prompt = None;
+            app.result_filter = None;
+            app.locate_prompt = None;
+            app.col_jump = None;
+            open(&mut app);
+            let rows = draw(&mut app, 42, 22);
+            // The TestBackend pads each wide CJK glyph with a space cell, so
+            // strip whitespace before matching a multi-character title.
+            let text: String = rows.join("\n").chars().filter(|c| !c.is_whitespace()).collect();
+            assert!(
+                text.contains(fragment),
+                "{name}: short title {fragment:?} missing at 42×22\n{text}"
+            );
+            // The pinned help hint is present somewhere (footer tier Mini keeps
+            // the escape hatch even when it trims other hints).
+            assert!(text.contains('?'), "{name}: help hint dropped\n{text}");
+        }
+    }
+
+    #[test]
+    fn fit_title_swaps_in_the_short_variant_only_when_needed() {
+        let full = " a very very long overlay title with hints ";
+        let short = " short ";
+        assert_eq!(fit_title(full, short, 80), full);
+        assert_eq!(fit_title(full, short, 20), short);
+        // The two border corners are reserved, so exactly-fitting is OK.
+        let exact = "x".repeat(18);
+        assert_eq!(fit_title(&exact, short, 20), exact);
+        assert_eq!(fit_title(&"x".repeat(19), short, 20), short);
+    }
+
     /// R36 seam: Ctrl-L switches the backend line, so every modal opened on the
     /// old backend must be closed and its background task cancelled / invalidated
     /// — otherwise a SQL diff or transfer wizard kept owning the keyboard over
@@ -33683,6 +34691,17 @@ mod tests {
         assert!(!app.pending_g);
         assert!(app.status.contains("结构"), "status: {}", app.status);
 
+        // `gv` opens the value-locate prompt. It must survive the browse-level
+        // g-chord interceptor, which forwards only the known second keys.
+        key(&mut app, &tx, KeyEvent::new(KeyCode::Char('g'), KeyModifiers::NONE));
+        key(&mut app, &tx, KeyEvent::new(KeyCode::Char('v'), KeyModifiers::NONE));
+        assert!(app.locate_prompt.is_some(), "gv opens the locate prompt");
+        assert!(!app.pending_g);
+        // Close it without an Esc (Esc from the results pane also refocuses the
+        // sidebar, which would change how the next `g` is routed).
+        app.locate_prompt = None;
+        app.locate_needle.clear();
+
         key(&mut app, &tx, KeyEvent::new(KeyCode::Char('g'), KeyModifiers::NONE));
         key(&mut app, &tx, KeyEvent::new(KeyCode::Char('t'), KeyModifiers::NONE));
         assert!(app.page_state.is_some(), "gt loads the table data page");
@@ -33966,11 +34985,18 @@ mod tests {
         );
         // Each browse pane gets its own, most-relevant keys.
         let sidebar = keys(FooterView::Browse, Focus::Sidebar, true);
-        assert!(sidebar.contains(&"/") && sidebar.contains(&"r") && sidebar.contains(&"Tab"));
+        assert!(
+            sidebar.contains(&"a-z")
+                && sidebar.contains(&"s")
+                && sidebar.contains(&"Alt+a-z")
+                && sidebar.contains(&"r")
+                && sidebar.contains(&"Tab")
+        );
         let editor = keys(FooterView::Browse, Focus::Editor, true);
         assert!(editor.contains(&"Ctrl-J") && editor.contains(&"Alt-/"));
         let preview = keys(FooterView::Browse, Focus::Preview, true);
         assert!(preview.contains(&"↑↓") && preview.contains(&"e") && preview.contains(&"y"));
+        assert!(preview.contains(&"gv") && preview.contains(&"|"));
         // No connection yet → the picker group, never the table group.
         let no_conn = keys(FooterView::Browse, Focus::Sidebar, false);
         assert!(no_conn.contains(&"c") && !no_conn.contains(&"/"));

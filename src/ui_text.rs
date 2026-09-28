@@ -971,6 +971,115 @@ pub static ALL_KEYS: &[&str] = &[
 /// The Chinese → English table. Keys must match the source literals exactly.
 fn en_of(zh: &'static str) -> Option<&'static str> {
     match zh {
+        // ── R39 table quick-locate / grid locate / column jump ──
+        "首字母跳「{}」→ {} · Alt+字母 循环 · ; , 前后跳" => {
+            Some("first-letter jump `{}` → {} · Alt+letter cycles · ; , step")
+        }
+        "首字母跳「{}」→ {}" => Some("first-letter jump `{}` → {}"),
+        "没有以「{}」开头的表" => Some("no table starts with `{}`"),
+        "先用 Alt+字母 做首字母跳，再用 ; , 循环" => {
+            Some("do an Alt+letter jump first, then ; , to cycle")
+        }
+        "过滤「{}」· {} 个命中 · Enter 打开首位" => {
+            Some("filter \"{}\" · {} hits · Enter opens the first")
+        }
+        "过滤「{}」· 0 个表命中" => Some("filter \"{}\" · 0 tables match"),
+        "过滤「{}」· 打开第 1 个命中 · Esc 清除" => {
+            Some("filter \"{}\" · opening the first hit · Esc clears")
+        }
+        "表排序：{} · s 切换（名称/类型）· {} 张" => {
+            Some("table order: {} · s cycles (name/type) · {} tables")
+        }
+        "已清除定位" => Some("locate cleared"),
+        "先按 / 或 gv 搜索，再用 n/N 跳转命中" => {
+            Some("search with / or gv first, then n/N to jump between hits")
+        }
+        "表结构视图不支持定位" => Some("locate is not supported in the structure view"),
+        "脚本列表不支持定位（先 Enter 进入某条语句的结果）" => {
+            Some("locate is not supported in the statement list (Enter a statement's result first)")
+        }
+        "没有可定位的结果" => Some("nothing to locate in"),
+        "定位值（排序列 / 主键列）…" => Some("value to locate (sort / primary-key column)…"),
+        "未找到匹配值「{}」" => Some("no value matching `{}`"),
+        "定位 {}「{}」· {} 命中 · n/N 跳转 · Esc 清除" => {
+            Some("locate {} \"{}\" · {} hits · n/N jump · Esc clear")
+        }
+        "输入以定位值…" => Some("type to locate a value…"),
+        "定位「{}」· {} 命中" => Some("locate \"{}\" · {} hits"),
+        "定位「{}」· 0 命中" => Some("locate \"{}\" · 0 hits"),
+        "定位 {}「{}」· 命中 {}/{}" => Some("locate {} \"{}\" · hit {}/{}"),
+        "没有可跳转的列" => Some("no columns to jump to"),
+        "列号或列名前缀…" => Some("column number or name prefix…"),
+        "请输入列号或列名" => Some("enter a column number or name"),
+        "列号超出范围（1-{}）" => Some("column number out of range (1-{})"),
+        "找不到列「{}」" => Some("no column matching `{}`"),
+        "跳到第 {} 列 {}" => Some("jumped to column {} ({})"),
+        "已取消跳列" => Some("column jump cancelled"),
+        " 定位值 {} 命中 · Enter 跳转 · Esc 清除 " => {
+            Some(" locate · {} hits · Enter jump · Esc clear ")
+        }
+        " 定位值 · Enter/Esc " => Some(" locate · Enter/Esc "),
+        " 跳列：列号 1-9 或列名前缀 · Enter 跳转 · Esc 取消 " => {
+            Some(" column jump: number 1-9 or name prefix · Enter jump · Esc cancel ")
+        }
+        " 跳列 · Enter/Esc " => Some(" column jump · Enter/Esc "),
+        " 过滤表名 {}/{} · Enter 打开首位 · Esc 清除 " => {
+            Some(" filter tables {}/{} · Enter opens the first · Esc clears ")
+        }
+        " 过滤表名 · Enter/Esc " => Some(" filter tables · Enter/Esc "),
+        " 搜索 · Enter 保留 " => Some(" search · Enter keeps "),
+        "跳到命中" => Some("jump to hit"),
+        "跳列" => Some("column jump"),
+        "首字母跳" => Some("first-letter jump"),
+        "定位值" => Some("locate value"),
+        // ── R39 narrow overlay titles (short variants) ──
+        " SQL 片段 · Enter 插入 · Esc " => Some(" snippets · Enter insert · Esc "),
+        " 列显示 · 空格/a/x · Esc " => Some(" columns · Space/a/x · Esc "),
+        " 全库搜索 · Enter 开始 " => Some(" global search · Enter to start "),
+        " 数据对比 WHERE · Enter 开始 " => Some(" data compare WHERE · Enter to start "),
+        " 数据搬运 ① · Enter 下一步 " => Some(" transfer ① · Enter next "),
+        " 数据搬运 ② · Tab/Enter " => Some(" transfer ② · Tab/Enter "),
+        " 数据搬运 ③ · Enter 开搬 " => Some(" transfer ③ · Enter to run "),
+        " 数据搬运中… · Esc 中止 " => Some(" transferring… · Esc to abort "),
+        " 搬运汇总 · g 摘要 · b 浏览 " => Some(" transfer summary · g copy · b browse "),
+        " 加载 SQL 文件 · Enter 预览 " => Some(" load SQL file · Enter to preview "),
+        " 补全 · Tab 上屏 · Esc " => Some(" completion · Tab accepts · Esc "),
+        " 收藏片段 · Enter 保存 " => Some(" save snippet · Enter to save "),
+        " 查询历史 · Enter 回填 · Esc " => Some(" history · Enter recall · Esc "),
+        " 查询历史（已过滤）· Esc " => Some(" history (filtered) · Esc "),
+        " 全库搜索「{}」· {} 命中 " => Some(" global search \"{}\" · {} hits "),
+        " 结构/数据对比 · Enter 对比 · Esc " => Some(" schema/data compare · Enter · Esc "),
+        // ── R39 help sheet rows ──
+        "字母 / /" => Some("letter / /"),
+        "Ctrl-U / Alt-⌫" => Some("Ctrl-U / Alt-Backspace"),
+        "Alt+字母 · ; ," => Some("Alt+letter · ; ,"),
+        "过滤表名：任意字符一步直达过滤，Enter 打开第一个命中，Esc 清除" => {
+            Some("filter tables: any character filters at once, Enter opens the first hit, Esc clears")
+        }
+        "清除表过滤（过滤提示框内）" => {
+            Some("clear the table filter (inside the filter prompt)")
+        }
+        "表排序：名称 / 类型（TABLE / VIEW）" => {
+            Some("table order: name / type (TABLE / VIEW)")
+        }
+        "首字母跳：跳到以该字母开头的下一张表；; , 前后循环（与过滤互斥）" => {
+            Some("first-letter jump: next table starting with that letter; ; , cycle forward/back (mutually exclusive with filtering)")
+        }
+        "搜索结果行（隐藏不匹配行，输入即筛，Enter 保留，Esc 清除）" => {
+            Some("search result rows (hides non-matching rows, filters as you type, Enter keeps, Esc clears)")
+        }
+        "定位值：在排序列 / 主键列内搜值并跳转，不隐藏行（n/N 循环命中）" => {
+            Some("locate value: find a value in the sort / primary-key column and jump (n/N cycle hits; rows stay visible)")
+        }
+        "跳列：输入列号或列名前缀直达该列（宽表横滚）" => {
+            Some("jump column: type a number or name prefix to reach it (wide tables)")
+        }
+        "搜索结果或定位命中时：下 / 上一个命中（否则 n 翻页）" => {
+            Some("with a search or locate active: next / previous hit (otherwise n pages)")
+        }
+        "定位值（排序列 / 主键列，不隐藏行）" => {
+            Some("locate value (sort / primary-key column, rows stay visible)")
+        }
         // ── connection bundle import / export (Alt-E / Alt-I) ──
         "跳过" => Some("skip"),
         "都要" => Some("keep both"),
@@ -2283,7 +2392,7 @@ fn en_of(zh: &'static str) -> Option<&'static str> {
         "跳转 {}/{}" => Some("jump {}/{}"),
         "g d → 表结构" => Some("g d → structure"),
         "g t → 表数据" => Some("g t → data"),
-        "g… d=表结构 t=表数据" => Some("g… d=structure t=data"),
+        "g… d=表结构 t=表数据 v=定位值" => Some("g… d=structure t=data v=locate"),
         "跳表结构视图 / 回表数据" => Some("jump to structure view / back to data"),
         "计数前缀：翻 5 页 / 下移 3 行" => Some("count prefix: page 5 times / move down 3 rows"),
         "计数前缀：下 / 上移动 3 项（侧栏 / 结果 / 历史通用）" => Some("count prefix: move 3 items down / up (sidebar / results / history)"),
