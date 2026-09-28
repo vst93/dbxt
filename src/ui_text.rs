@@ -380,6 +380,12 @@ pub static ALL_KEYS: &[&str] = &[
     "循环切换区域（侧栏 → 编辑器 → 结果）",
     "快速插入 → diff 确认后执行",
     "总数未知",
+    "有主键时按主键续读（keyset），翻页耗时与页深无关",
+    "大表翻页",
+    "行数上限",
+    "50 万行以上的表显示 >50万，不再每页 COUNT",
+    ">{} 行",
+    "深翻页较慢（无主键或自定义排序）；加过滤可提速",
     "手动",
     "打开 DBX 存储文件失败 ({}): {}\n(可用 DBX_DATA_DIR 指定目录，或把 dbx.db 文件路径作为第一个位置参数传入)",
     "执行",
@@ -1211,6 +1217,18 @@ fn en_of(zh: &'static str) -> Option<&'static str> {
         "循环切换区域（侧栏 → 编辑器 → 结果）" => Some("Cycle panes (sidebar → editor → results)"),
         "快速插入 → diff 确认后执行" => Some("Quick insert → confirm the diff before running"),
         "总数未知" => Some("total unknown"),
+        "大表翻页" => Some("large-table paging"),
+        "行数上限" => Some("row-count cap"),
+        "有主键时按主键续读（keyset），翻页耗时与页深无关" => {
+            Some("with a primary key, pages are read by key seek (keyset); page cost is independent of depth")
+        }
+        "50 万行以上的表显示 >50万，不再每页 COUNT" => {
+            Some("a table over 500k rows shows >500k instead of a per-page COUNT")
+        }
+        ">{} 行" => Some(">{} rows"),
+        "深翻页较慢（无主键或自定义排序）；加过滤可提速" => {
+            Some("deep paging is slow without a primary key or with a custom sort; add a filter to speed it up")
+        }
         "手动" => Some("manual"),
         "打开 DBX 存储文件失败 ({}): {}\n(可用 DBX_DATA_DIR 指定目录，或把 dbx.db 文件路径作为第一个位置参数传入)" => Some("Failed to open the DBX storage file ({}): {}\n(set DBX_DATA_DIR, or pass the dbx.db file path as the first positional argument)"),
         "执行" => Some("execute"),

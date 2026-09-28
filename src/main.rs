@@ -32,7 +32,8 @@ use dbx_core::models::connection::{
 use dbx_core::query::QueryExecutionOptions;
 use dbx_core::sql_dialect::{
     build_count_table_sql, build_table_data_select_sql_with_database, is_schema_aware,
-    normalize_where_input, qualified_table_name, quote_table_identifier, TableDataSelectSqlOptions,
+    normalize_where_input, qualified_table_name, quote_table_identifier, table_pagination_strategy,
+    TableDataSelectSqlOptions, TablePaginationStrategy,
 };
 use dbx_core::types::{ColumnInfo, IndexInfo, TableInfo};
 use dbx_mcp::backend::{
@@ -56,6 +57,14 @@ type Tx = tokio::sync::mpsc::UnboundedSender<OpResult>;
 
 /// Rows fetched per table-data page (one extra row is fetched to detect a next page).
 const PAGE_SIZE: usize = 50;
+/// Above this row count the table browser stops running an exact `COUNT(*)` on
+/// the first load and reports a lower bound (`>500000 行`) instead, so a huge
+/// InnoDB table no longer pays a multi-second full scan just to show a total.
+/// `DBXT_COUNT_SAMPLE_LIMIT=0` disables the cap and always counts exactly.
+const COUNT_SAMPLE_LIMIT_DEFAULT: u64 = 500_000;
+/// A page this deep on the plain OFFSET path (no primary key to seek by) earns a
+/// one-off "deep paging is slow" hint.
+const DEEP_PAGE_HINT_AFTER: usize = 1000;
 /// Rows fetched for an arbitrary SQL statement on the first run.
 const QUERY_MAX_ROWS: usize = 500;
 /// How many extra rows each `Ctrl-N` "load more" step pulls.
@@ -2725,11 +2734,48 @@ struct PageState {
     page: usize,
     page_size: usize,
     total: Option<u64>,
+    /// True when `total` is only a lower bound: the row count hit the sample
+    /// cap, so the real table is larger. Rendered as `>N`.
+    total_lower_bound: bool,
     has_next: bool,
     /// Active WHERE predicate (without the `WHERE` keyword); empty = no filter.
     filter: String,
     /// Active ORDER BY expression (without the `ORDER BY` keyword).
     order_by: Option<String>,
+    /// Primary-key cursor enabling keyset pagination for `n`/`p` and edge
+    /// crossings. `None` while the view orders by something else (custom sort)
+    /// or the table has no usable primary key, in which case `n`/`p` fall back
+    /// to `LIMIT … OFFSET`.
+    keyset: Option<KeysetCursor>,
+}
+
+/// A primary-key cursor for keyset pagination: the key tuple of the first and
+/// last row of the current page. `n`/`p` then read `WHERE pk > last ORDER BY pk
+/// LIMIT n` instead of `LIMIT n OFFSET page*n`, whose cost grows with the page
+/// number.
+#[derive(Clone, Debug, PartialEq)]
+struct KeysetCursor {
+    /// Primary-key columns, in key order (single or composite).
+    pk: Vec<String>,
+    /// The display order on the key (true = ascending).
+    ascending: bool,
+    /// Key tuple of the first row on the current page.
+    first: Vec<serde_json::Value>,
+    /// Key tuple of the last row on the current page.
+    last: Vec<serde_json::Value>,
+}
+
+/// Where a table page read starts.
+#[derive(Clone, Debug, PartialEq, Default)]
+enum PageSeek {
+    /// Classic `LIMIT n OFFSET m` — used for the first page and for any jump
+    /// that is not one page forward or back.
+    #[default]
+    Offset,
+    /// Rows strictly after this key tuple, in the view's display order.
+    After(Vec<serde_json::Value>),
+    /// Rows strictly before this key tuple, in the view's display order.
+    Before(Vec<serde_json::Value>),
 }
 
 /// Column metadata for the table currently open in the data browser. Used to
@@ -2754,8 +2800,15 @@ struct TableDataReq {
     page_size: usize,
     filter: String,
     order_by: Option<String>,
-    /// Reuse a session-cached total instead of running COUNT(*) again.
-    known_total: Option<u64>,
+    /// Reuse a session-cached total instead of running COUNT(*) again; the bool
+    /// marks a lower bound (the sample cap was hit).
+    known_total: Option<(u64, bool)>,
+    /// Primary-key columns to browse by (empty = plain OFFSET).
+    keyset_pk: Vec<String>,
+    /// Whether the keyset browse order is ascending.
+    keyset_asc: bool,
+    /// Where the read starts (first page / keyset cursor / arbitrary OFFSET).
+    seek: PageSeek,
     /// Monotonic request id; a reply whose id is not the latest is discarded.
     gen: u64,
 }
@@ -4469,6 +4522,8 @@ enum OpResult {
     TableData {
         grid: Box<Grid>,
         total: Option<u64>,
+        /// True when `total` is only a lower bound (the sample cap was hit).
+        total_lower_bound: bool,
         has_next: bool,
         page: usize,
         table: String,
@@ -4476,6 +4531,8 @@ enum OpResult {
         table_type: Option<String>,
         filter: String,
         order_by: Option<String>,
+        /// Primary-key cursor carried on to the next/previous page.
+        keyset: Option<KeysetCursor>,
         gen: u64,
     },
     TableColumns {
@@ -4767,6 +4824,206 @@ async fn resolve_ddl_schema(
     }
 }
 
+/// Build the SQL for one table-browser page, plus whether the fetched rows must
+/// be reversed before display (a backwards keyset read fetches nearest-first).
+///
+/// With a keyset plan the page is always fetched in primary-key order, which is
+/// what makes the seek predicate sound; a `Before` read walks the key backwards
+/// and reverses afterwards so the page is still shown in display order.
+#[allow(clippy::too_many_arguments)]
+fn build_table_page_query(
+    cfg: &ConnectionConfig,
+    schema: Option<&str>,
+    table: &str,
+    table_type: Option<&str>,
+    page: usize,
+    page_size: usize,
+    filter: &str,
+    order_by: Option<&str>,
+    keyset_pk: &[String],
+    keyset_asc: bool,
+    seek: &PageSeek,
+) -> (String, bool) {
+    let (seek_op, fetch_asc, reverse) = match seek {
+        PageSeek::Before(_) => (if keyset_asc { "<" } else { ">" }, !keyset_asc, true),
+        _ => (if keyset_asc { ">" } else { "<" }, keyset_asc, false),
+    };
+    let keyset_where = match seek {
+        PageSeek::After(v) | PageSeek::Before(v) if !keyset_pk.is_empty() => {
+            table_data_keyset_predicate(Some(cfg.db_type), keyset_pk, v, seek_op)
+        }
+        _ => None,
+    };
+    let where_input = match (&keyset_where, filter.is_empty()) {
+        (Some(k), true) => Some(k.clone()),
+        (Some(k), false) => Some(format!("({filter}) AND ({k})")),
+        (None, true) => None,
+        (None, false) => Some(filter.to_string()),
+    };
+    let order_by_effective = if keyset_pk.is_empty() {
+        order_by.map(str::to_string)
+    } else {
+        Some(
+            keyset_pk
+                .iter()
+                .map(|c| {
+                    format!(
+                        "{} {}",
+                        quote_table_identifier(Some(cfg.db_type), c),
+                        if fetch_asc { "ASC" } else { "DESC" }
+                    )
+                })
+                .collect::<Vec<_>>()
+                .join(", "),
+        )
+    };
+    let keyset_active = !keyset_pk.is_empty() && keyset_where.is_some();
+    let offset = if keyset_active { 0 } else { page * page_size };
+    let options = TableDataSelectSqlOptions {
+        database_type: Some(cfg.db_type),
+        schema: schema.map(str::to_string),
+        table_name: table.to_string(),
+        table_type: table_type.map(str::to_string),
+        limit: Some(page_size + 1),
+        offset: Some(offset),
+        where_input,
+        order_by: order_by_effective,
+        ..Default::default()
+    };
+    (build_table_data_select_sql_with_database(options, false), reverse)
+}
+
+/// The derived-table `COUNT(*)` that stops once the sample cap is reached:
+/// `SELECT COUNT(*) FROM (SELECT 1 FROM t [WHERE …] LIMIT cap+1) dbxt_count`.
+///
+/// `SELECT 1` keeps the scan index-only, so a huge InnoDB table is sampled in
+/// milliseconds instead of materialising 500k full rows. Only dialects with the
+/// plain `LIMIT` pager are handled here; anything else returns `None` and the
+/// caller runs the exact `COUNT(*)` as it always did.
+fn bounded_count_sql(
+    cfg: &ConnectionConfig,
+    schema: Option<&str>,
+    table: &str,
+    filter: &str,
+    limit: u64,
+) -> Option<String> {
+    if table_pagination_strategy(Some(cfg.db_type)) != TablePaginationStrategy::LimitOffset {
+        return None;
+    }
+    let qualified = qualified_table_name(Some(cfg.db_type), schema, table);
+    let where_clause = if filter.is_empty() {
+        String::new()
+    } else {
+        format!(" WHERE ({filter})")
+    };
+    Some(format!(
+        "SELECT COUNT(*) AS row_count FROM (SELECT 1 FROM {qualified}{where_clause} LIMIT {}) dbxt_count",
+        limit.saturating_add(1)
+    ))
+}
+
+/// Row count for a table page whose total is not cached yet: a bounded sample
+/// when the dialect allows one, else the exact `COUNT(*)`. Returns
+/// `(value, is_lower_bound)`.
+async fn sample_row_count(
+    backend: &LocalBackend,
+    cfg: &ConnectionConfig,
+    db: &str,
+    schema: Option<&str>,
+    table: &str,
+    filter: &str,
+) -> Option<(u64, bool)> {
+    match count_sample_limit() {
+        // No cap: always run the exact count.
+        None => exact_row_count(backend, cfg, db, schema, table, filter)
+            .await
+            .map(|n| (n, false)),
+        Some(limit) => match bounded_count_sql(cfg, schema, table, filter, limit) {
+            None => exact_row_count(backend, cfg, db, schema, table, filter)
+                .await
+                .map(|n| (n, false)),
+            Some(sql) => match backend.execute_query(cfg, db, &sql, Some(1), Some(15)).await {
+                Ok(c) => match c.rows.first().and_then(|row| row.first()).and_then(count_value) {
+                    Some(n) => Some(classify_sample(n, limit)),
+                    // Should not happen, but never lose the total entirely.
+                    None => exact_row_count(backend, cfg, db, schema, table, filter)
+                        .await
+                        .map(|n| (n, false)),
+                },
+                // A dialect quirk in the sample query still gets its exact count.
+                Err(_) => exact_row_count(backend, cfg, db, schema, table, filter)
+                    .await
+                    .map(|n| (n, false)),
+            },
+        },
+    }
+}
+
+/// Exact `COUNT(*)` for a table, honouring the active `WHERE` (best effort).
+async fn exact_row_count(
+    backend: &LocalBackend,
+    cfg: &ConnectionConfig,
+    db: &str,
+    schema: Option<&str>,
+    table: &str,
+    filter: &str,
+) -> Option<u64> {
+    let base = build_count_table_sql(Some(cfg.db_type), schema, table);
+    let sql = if filter.is_empty() {
+        base
+    } else {
+        format!("{base} WHERE ({filter})")
+    };
+    let c = backend
+        .execute_query(cfg, db, &sql, Some(1), Some(15))
+        .await
+        .ok()?;
+    c.rows.first().and_then(|row| row.first()).and_then(count_value)
+}
+
+/// One `COUNT(*)` cell, as a number.
+fn count_value(v: &serde_json::Value) -> Option<u64> {
+    match v {
+        serde_json::Value::Number(n) => n.as_u64(),
+        serde_json::Value::String(s) => s.parse().ok(),
+        _ => None,
+    }
+}
+
+/// The primary-key tuples of a page's first and last rows, or `None` when the
+/// result does not carry every key column (or a key came back NULL).
+fn keyset_cursor(
+    pk: &[String],
+    ascending: bool,
+    columns: &[String],
+    rows: &[Vec<serde_json::Value>],
+) -> Option<KeysetCursor> {
+    if pk.is_empty() || rows.is_empty() {
+        return None;
+    }
+    let idx: Option<Vec<usize>> = pk
+        .iter()
+        .map(|c| columns.iter().position(|col| col.eq_ignore_ascii_case(c)))
+        .collect();
+    let idx = idx?;
+    let tuple = |row: &Vec<serde_json::Value>| {
+        idx.iter()
+            .map(|&i| row.get(i).cloned().unwrap_or(serde_json::Value::Null))
+            .collect::<Vec<_>>()
+    };
+    let first = tuple(rows.first()?);
+    let last = tuple(rows.last()?);
+    if first.iter().chain(last.iter()).any(serde_json::Value::is_null) {
+        return None;
+    }
+    Some(KeysetCursor {
+        pk: pk.to_vec(),
+        ascending,
+        first,
+        last,
+    })
+}
+
 async fn run_op(backend: &LocalBackend, op: Op, tx: &Tx) -> OpResult {
     match op {
         Op::ListConnections => match backend.load_connections().await {
@@ -4878,23 +5135,28 @@ async fn run_op(backend: &LocalBackend, op: Op, tx: &Tx) -> OpResult {
                 filter,
                 order_by,
                 known_total,
+                keyset_pk,
+                keyset_asc,
+                seek,
                 gen,
             } = *req;
             // A user filter may be typed with a leading WHERE; strip it so it can
             // be embedded as a predicate.
             let filter = normalize_where_input(Some(&filter));
-            let options = TableDataSelectSqlOptions {
-                database_type: Some(cfg.db_type),
-                schema: (!schema.trim().is_empty()).then(|| schema.clone()),
-                table_name: table.clone(),
-                table_type: table_type.clone(),
-                limit: Some(page_size + 1),
-                offset: Some(page * page_size),
-                where_input: (!filter.is_empty()).then(|| filter.clone()),
-                order_by: order_by.clone(),
-                ..Default::default()
-            };
-            let sql = build_table_data_select_sql_with_database(options, false);
+            let schema_opt = (!schema.trim().is_empty()).then(|| schema.clone());
+            let (sql, reverse) = build_table_page_query(
+                &cfg,
+                schema_opt.as_deref(),
+                &table,
+                table_type.as_deref(),
+                page,
+                page_size,
+                &filter,
+                order_by.as_deref(),
+                &keyset_pk,
+                keyset_asc,
+                &seek,
+            );
             match backend
                 .execute_query(&cfg, &db, &sql, Some(page_size + 1), Some(60))
                 .await
@@ -4903,44 +5165,45 @@ async fn run_op(backend: &LocalBackend, op: Op, tx: &Tx) -> OpResult {
                     let columns = r.columns;
                     let mut rows = r.rows;
                     let ms = r.execution_time_ms;
-                    let has_next = rows.len() > page_size;
+                    let has_next = if reverse {
+                        // Walking backwards: the row we came from is always
+                        // ahead of the page we just fetched.
+                        !rows.is_empty()
+                    } else {
+                        rows.len() > page_size
+                    };
                     rows.truncate(page_size);
+                    if reverse {
+                        rows.reverse();
+                    }
+                    // Primary-key tuples of this page's edges, carried back so
+                    // `n`/`p` can seek from here.
+                    let keyset = keyset_cursor(&keyset_pk, keyset_asc, &columns, &rows);
                     let grid = Grid::from_query(columns, &rows, format!("{ms}ms"));
-                    // COUNT(*) is a full scan on large tables; reuse the session
-                    // cache and only run it when the caller has no cached total.
-                    let total = match known_total {
-                        Some(t) => Some(t),
-                        None => {
-                            let base = build_count_table_sql(
-                                Some(cfg.db_type),
-                                (!schema.trim().is_empty()).then_some(schema.as_str()),
-                                &table,
-                            );
-                            let count_sql = if filter.is_empty() {
-                                base
-                            } else {
-                                format!("{base} WHERE ({filter})")
-                            };
-                            match backend
-                                .execute_query(&cfg, &db, &count_sql, Some(1), Some(15))
-                                .await
-                            {
-                                Ok(c) => c
-                                    .rows
-                                    .first()
-                                    .and_then(|row| row.first())
-                                    .and_then(|v| match v {
-                                        serde_json::Value::Number(n) => n.as_u64(),
-                                        serde_json::Value::String(s) => s.parse().ok(),
-                                        _ => None,
-                                    }),
-                                Err(_) => None,
-                            }
-                        }
+                    // Row count: cached if the session already knows it, else a
+                    // bounded sample. Counting only up to the cap keeps the first
+                    // page fast on a huge table — a full InnoDB `COUNT(*)` is a
+                    // multi-second scan — at the cost of a `>N` lower bound.
+                    let (total, total_lower_bound) = match known_total {
+                        Some((v, lb)) => (Some(v), lb),
+                        None => match sample_row_count(
+                            backend,
+                            &cfg,
+                            &db,
+                            schema_opt.as_deref(),
+                            &table,
+                            &filter,
+                        )
+                        .await
+                        {
+                            Some((v, lb)) => (Some(v), lb),
+                            None => (None, false),
+                        },
                     };
                     OpResult::TableData {
                         grid: Box::new(grid),
                         total,
+                        total_lower_bound,
                         has_next,
                         page,
                         table,
@@ -4948,6 +5211,7 @@ async fn run_op(backend: &LocalBackend, op: Op, tx: &Tx) -> OpResult {
                         table_type,
                         filter,
                         order_by,
+                        keyset,
                         gen,
                     }
                 }
@@ -7199,8 +7463,9 @@ struct App {
 
     // column metadata for the table currently open in the data browser
     table_meta: Option<TableMeta>,
-    // session cache of COUNT(*) totals, keyed by db/table/filter
-    count_cache: HashMap<String, u64>,
+    // session cache of row counts, keyed by db/table/filter; the bool marks a
+    // lower bound (the row-count sample cap was hit).
+    count_cache: HashMap<String, (u64, bool)>,
 
     // pagination hand-off between key handling and the async page load
     pending_sel: Option<usize>,
@@ -7209,6 +7474,13 @@ struct App {
     page_pending: bool,
     // monotonically increasing id of the latest table-data request
     page_gen: u64,
+    // The first page is deferred until the table's columns arrive, so the
+    // browser knows the primary key before it picks keyset-vs-OFFSET ordering.
+    pending_open_page: bool,
+    // Deep OFFSET paging (no primary key to seek by) is slow; show the hint once
+    // per table session.
+    deep_page_hint_shown: bool,
+    pending_deep_hint: bool,
 
     // database switcher overlay
     db_picker_open: bool,
@@ -7690,6 +7962,9 @@ impl App {
             pending_focus: None,
             page_pending: false,
             page_gen: 0,
+            pending_open_page: false,
+            deep_page_hint_shown: false,
+            pending_deep_hint: false,
             db_picker_open: false,
             db_list: ListState::default(),
             pending_table: None,
@@ -8066,6 +8341,7 @@ fn apply_op_result(app: &mut App, res: OpResult, tx: &Tx) {
         OpResult::TableData {
             grid,
             total,
+            total_lower_bound,
             has_next,
             page,
             table,
@@ -8073,6 +8349,7 @@ fn apply_op_result(app: &mut App, res: OpResult, tx: &Tx) {
             table_type,
             filter,
             order_by,
+            keyset,
             gen,
         } => {
             // Discard any reply that is not for the latest request: a slow page
@@ -8083,8 +8360,14 @@ fn apply_op_result(app: &mut App, res: OpResult, tx: &Tx) {
             app.page_pending = false;
             let rows = grid.rows.len();
             if let Some(t) = total {
-                app.count_cache
-                    .insert(count_cache_key(&app.current_db(), &schema, &table, &filter), t);
+                app.remember_count(
+                    &app.current_db(),
+                    &schema,
+                    &table,
+                    &filter,
+                    t,
+                    total_lower_bound,
+                );
             }
             app.grid_kind = GridKind::TableData;
             app.set_grid(*grid);
@@ -8098,9 +8381,11 @@ fn apply_op_result(app: &mut App, res: OpResult, tx: &Tx) {
                 page,
                 page_size: PAGE_SIZE,
                 total,
+                total_lower_bound,
                 has_next,
                 filter,
                 order_by,
+                keyset,
             });
             app.script = None;
             app.ddl = None;
@@ -8127,12 +8412,20 @@ fn apply_op_result(app: &mut App, res: OpResult, tx: &Tx) {
                     app.focus = f;
                 }
             }
-            let total_txt = total
-                .map(|t| tf("共 {} 行", &[&(t)]))
-                .unwrap_or_else(|| t("总数未知").into());
             let ps = app.page_state.as_ref().unwrap();
+            let total_txt = total_label(ps);
             let extra = page_state_extra(ps);
             app.status = tf("{}.{} · 第 {} 页 · {} 行 · {}{}", &[&(fix_double_encoding(&app.current_db())), &(fix_double_encoding(&schema_label)), &(page + 1), &(rows), &(total_txt), &(extra)]);
+            // A deep OFFSET page (no primary key to seek by) is slow; say so
+            // once instead of silently taking seconds.
+            if app.pending_deep_hint {
+                app.pending_deep_hint = false;
+                app.status = format!(
+                    "{} · {}",
+                    app.status,
+                    t("深翻页较慢（无主键或自定义排序）；加过滤可提速")
+                );
+            }
             if let Some(msg) = app.pending_write_msg.take() {
                 app.status = tf("{} · 已刷新（第 {} 页）", &[&(msg), &(page + 1)]);
             }
@@ -8148,10 +8441,16 @@ fn apply_op_result(app: &mut App, res: OpResult, tx: &Tx) {
                     && app.schema == schema);
             if active {
                 app.table_meta = Some(TableMeta {
-                    table,
-                    schema,
+                    table: table.clone(),
+                    schema: schema.clone(),
                     columns,
                 });
+            }
+            // The initial page load waits for this so keyset-vs-OFFSET is chosen
+            // once, with the primary key known, for every page including the first.
+            if active && app.pending_open_page {
+                app.pending_open_page = false;
+                spawn_table_page(app, tx, 0);
             }
         }
         OpResult::Query(r, sql, cap) => {
@@ -8421,9 +8720,11 @@ fn apply_op_result(app: &mut App, res: OpResult, tx: &Tx) {
                 page,
                 page_size: MONGO_PAGE,
                 total: Some(total),
+                total_lower_bound: false,
                 has_next,
                 filter,
                 order_by: None,
+                keyset: None,
             });
             app.sel = app
                 .pending_sel
@@ -8886,6 +9187,13 @@ fn apply_op_result(app: &mut App, res: OpResult, tx: &Tx) {
             // A failed scan must not leave the key list permanently unable to
             // load another page.
             app.redis_scan.pending = false;
+            // A failed column fetch must not strand a deferred first page: load
+            // it now without a primary-key plan (plain OFFSET ordering).
+            if app.pending_open_page {
+                app.pending_open_page = false;
+                app.pending_sel.get_or_insert(0);
+                spawn_table_page(app, tx, 0);
+            }
             app.status = format!("✗ {e}");
         }
     }
@@ -8903,6 +9211,161 @@ fn trim_output(v: &mut Vec<String>) {
 /// `public.orders` and `inv.orders` never share a total.
 fn count_cache_key(db: &str, schema: &str, table: &str, filter: &str) -> String {
     format!("{db}\u{1}{schema}\u{1}{table}\u{1}{filter}")
+}
+
+/// Row-count sample cap. `None` means "always run the exact `COUNT(*)`"; a value
+/// means "count at most this many rows and report a lower bound past it".
+/// `DBXT_COUNT_SAMPLE_LIMIT=0` (or `off`/`none`) disables the cap.
+fn count_sample_limit() -> Option<u64> {
+    match std::env::var("DBXT_COUNT_SAMPLE_LIMIT").ok().as_deref().map(str::trim) {
+        Some("0") | Some("off") | Some("none") | Some("") => None,
+        Some(v) => Some(v.parse().unwrap_or(COUNT_SAMPLE_LIMIT_DEFAULT)),
+        None => Some(COUNT_SAMPLE_LIMIT_DEFAULT),
+    }
+}
+
+/// Turn a sampled `COUNT(*)` (capped at `limit + 1` rows) into `(value, lower)`:
+/// within the cap the value is exact, past it we only know `value > limit`.
+fn classify_sample(n: u64, limit: u64) -> (u64, bool) {
+    if n > limit {
+        (limit, true)
+    } else {
+        (n, false)
+    }
+}
+
+/// Render the total for the status line / grid title, honouring the lower bound.
+fn total_label(ps: &PageState) -> String {
+    match ps.total {
+        Some(t) if ps.total_lower_bound => tf(">{} 行", &[&t]),
+        Some(t) => tf("共 {} 行", &[&t]),
+        None => t("总数未知").into(),
+    }
+}
+
+/// A SQL literal for one primary-key value. `None` (a NULL key) or a value that
+/// cannot be rendered safely aborts the keyset path in favour of OFFSET.
+fn pk_value_literal(v: &serde_json::Value) -> Option<String> {
+    match v {
+        serde_json::Value::Null => None,
+        serde_json::Value::Bool(b) => Some(if *b { "TRUE".into() } else { "FALSE".into() }),
+        serde_json::Value::Number(n) => Some(n.to_string()),
+        serde_json::Value::String(s) => Some(sql_literal(s)),
+        other => Some(sql_literal(&other.to_string())),
+    }
+}
+
+/// `pk > v` (single key) or `(a, b) > (va, vb)` (composite) — the keyset seek
+/// predicate for a table-browser page. Row-value comparison is understood by
+/// MySQL, PostgreSQL and SQLite. Returns `None` when the tuple is incomplete or
+/// holds a NULL. (The data-compare feature has its own `keyset_predicate` that
+/// expands to `(k1 > v1) OR (k1 = v1 AND k2 > v2) …`.)
+fn table_data_keyset_predicate(
+    db_type: Option<DatabaseType>,
+    pk: &[String],
+    values: &[serde_json::Value],
+    op: &str,
+) -> Option<String> {
+    if pk.is_empty() || pk.len() != values.len() {
+        return None;
+    }
+    let lits: Vec<String> = values.iter().map(pk_value_literal).collect::<Option<_>>()?;
+    if pk.len() == 1 {
+        Some(format!(
+            "{} {} {}",
+            quote_table_identifier(db_type, &pk[0]),
+            op,
+            lits[0]
+        ))
+    } else {
+        let cols = pk
+            .iter()
+            .map(|c| quote_table_identifier(db_type, c))
+            .collect::<Vec<_>>()
+            .join(", ");
+        Some(format!("({cols}) {op} ({})", lits.join(", ")))
+    }
+}
+
+/// Whether a primary-key column's type cannot round-trip through a text SQL
+/// literal (binary keys fall back to OFFSET).
+fn is_binary_pk_type(t: &str) -> bool {
+    let t = t.to_ascii_lowercase();
+    t.contains("blob") || t.contains("bytea") || t.contains("binary") || t.contains("image")
+}
+
+/// Can this view be browsed by primary-key seek? Returns the key columns and the
+/// display direction when the effective order is exactly the table's primary
+/// key — either the implicit default (no ORDER BY, so we impose `pk ASC`) or an
+/// explicit order over precisely those columns in that order, one direction for
+/// all of them. Anything else (a custom sort) keeps the classic OFFSET path.
+fn keyset_plan(meta: Option<&TableMeta>, ps: &PageState) -> Option<(Vec<String>, bool)> {
+    let meta = meta?;
+    if meta.table != ps.table || meta.schema != ps.schema {
+        return None;
+    }
+    let mut pk: Vec<String> = Vec::new();
+    for c in &meta.columns {
+        if c.is_primary_key {
+            if is_binary_pk_type(&c.data_type) {
+                return None;
+            }
+            pk.push(c.name.clone());
+        }
+    }
+    if pk.is_empty() || pk.len() > 6 {
+        return None;
+    }
+    let explicit = ps
+        .order_by
+        .as_deref()
+        .map(str::trim)
+        .filter(|o| !o.is_empty());
+    match explicit {
+        None => Some((pk, true)),
+        Some(o) => {
+            let keys = parse_order_by(Some(o));
+            if keys.len() != pk.len() {
+                return None;
+            }
+            let mut desc: Option<bool> = None;
+            for (i, (name, d)) in keys.iter().enumerate() {
+                if !name.eq_ignore_ascii_case(&pk[i]) {
+                    return None;
+                }
+                match desc {
+                    None => desc = Some(*d),
+                    Some(prev) if prev == *d => {}
+                    _ => return None,
+                }
+            }
+            Some((pk, !desc.unwrap_or(false)))
+        }
+    }
+}
+
+/// Pick the seek for `target`, given the page we are on and the cursor of the
+/// current page. Only the immediately adjacent pages can use keyset; a jump of
+/// any other size stays on OFFSET (there is nowhere to seek from).
+fn keyset_seek_for(
+    plan: Option<&(Vec<String>, bool)>,
+    cur: Option<&KeysetCursor>,
+    from_page: usize,
+    target: usize,
+) -> PageSeek {
+    let (Some((pk, asc)), Some(cur)) = (plan, cur) else {
+        return PageSeek::Offset;
+    };
+    if cur.pk != *pk || cur.ascending != *asc {
+        return PageSeek::Offset;
+    }
+    if target == from_page + 1 && !cur.last.is_empty() {
+        PageSeek::After(cur.last.clone())
+    } else if from_page == target + 1 && !cur.first.is_empty() {
+        PageSeek::Before(cur.first.clone())
+    } else {
+        PageSeek::Offset
+    }
 }
 
 /// Human-readable `· 过滤: … · 排序: …` suffix for the status line and grid title.
@@ -10010,6 +10473,8 @@ fn open_table_data(app: &mut App, tx: &Tx) {
     app.pending_focus = Some(Focus::Preview);
     app.page_pending = true;
     app.table_meta = None;
+    app.deep_page_hint_shown = false;
+    app.pending_deep_hint = false;
     app.result_needle.clear();
     app.result_filter = None;
     // A search-hit jump stashes a pre-filter here; consume it once.
@@ -10037,9 +10502,11 @@ fn open_table_data(app: &mut App, tx: &Tx) {
         page: 0,
         page_size: PAGE_SIZE,
         total: None,
+        total_lower_bound: false,
         has_next: false,
         filter: initial_filter.clone(),
         order_by: order_by.clone(),
+        keyset: None,
     });
     app.loading = true;
     app.status = if initial_filter.is_empty() {
@@ -10056,20 +10523,73 @@ fn open_table_data(app: &mut App, tx: &Tx) {
             ],
         )
     };
-    // Column metadata powers the `e`/`i` templates (primary-key detection).
+    // Column metadata powers the `e`/`i` templates (primary-key detection) and
+    // decides the page ordering, so the first page waits for it: the reply below
+    // spawns the actual data load via `spawn_table_page`.
+    app.pending_open_page = true;
     app.spawn(
         tx,
         Op::TableColumns(
-            Box::new(cfg.clone()),
+            Box::new(cfg),
             app.current_db(),
-            schema.clone(),
-            table.0.clone(),
+            schema,
+            table.0,
         ),
     );
+}
+
+impl App {
+    /// Cached row count for a table view: `(value, is_lower_bound)`.
+    fn cached_count(&self, db: &str, schema: &str, table: &str, filter: &str) -> Option<(u64, bool)> {
+        self.count_cache
+            .get(&count_cache_key(db, schema, table, filter))
+            .copied()
+    }
+
+    /// Remember a row count (exact, or a lower bound past the sample cap) for
+    /// the rest of the session, so pages after the first do not recount.
+    fn remember_count(
+        &mut self,
+        db: &str,
+        schema: &str,
+        table: &str,
+        filter: &str,
+        value: u64,
+        lower_bound: bool,
+    ) {
+        self.count_cache
+            .insert(count_cache_key(db, schema, table, filter), (value, lower_bound));
+    }
+}
+
+/// Spawn a table-data page for the current `page_state`, choosing keyset seek vs
+/// OFFSET and the primary-key ordering. Callers must have set `app.pending_sel`.
+fn spawn_table_page(app: &mut App, tx: &Tx, page: usize) {
+    let Some(ps) = app.page_state.clone() else {
+        return;
+    };
+    let Some(cfg) = app.selected.clone() else {
+        app.page_pending = false;
+        return;
+    };
+    let plan = keyset_plan(app.table_meta.as_ref(), &ps);
+    let (keyset_pk, keyset_asc) = match &plan {
+        Some((pk, asc)) => (pk.clone(), *asc),
+        None => (Vec::new(), true),
+    };
+    let seek = keyset_seek_for(plan.as_ref(), ps.keyset.as_ref(), ps.page, page);
+    // Deep OFFSET paging (no primary key to seek by) is slow; flag the hint so
+    // the reply can mention it once.
+    app.pending_deep_hint = false;
+    if plan.is_none() && page >= DEEP_PAGE_HINT_AFTER && !app.deep_page_hint_shown {
+        app.deep_page_hint_shown = true;
+        app.pending_deep_hint = true;
+    }
+    app.page_pending = true;
+    app.loading = true;
+    app.status = tf("加载 {} 第 {} 页…", &[&(fix_double_encoding(&ps.table)), &(page + 1)]);
     let known = app
-        .count_cache
-        .get(&count_cache_key(&app.current_db(), &schema, &table.0, &initial_filter))
-        .copied();
+        .cached_count(&app.current_db(), &ps.schema, &ps.table, &ps.filter);
     app.page_gen += 1;
     let gen = app.page_gen;
     app.spawn(
@@ -10077,14 +10597,17 @@ fn open_table_data(app: &mut App, tx: &Tx) {
         Op::TableData(Box::new(TableDataReq {
             cfg: Box::new(cfg),
             db: app.current_db(),
-            schema,
-            table: table.0,
-            table_type: Some(table.1),
-            page: 0,
-            page_size: PAGE_SIZE,
-            filter: initial_filter,
-            order_by,
+            schema: ps.schema.clone(),
+            table: ps.table.clone(),
+            table_type: ps.table_type.clone(),
+            page,
+            page_size: ps.page_size,
+            filter: ps.filter.clone(),
+            order_by: ps.order_by.clone(),
             known_total: known,
+            keyset_pk,
+            keyset_asc,
+            seek,
             gen,
         })),
     );
@@ -10104,38 +10627,11 @@ fn goto_page(app: &mut App, tx: &Tx, page: usize, pending_sel: Option<usize>) ->
         reload_mongo_docs(app, tx, page);
         return true;
     }
-    let Some(ps) = app.page_state.clone() else {
+    if app.page_state.is_none() || app.selected.is_none() {
         return false;
-    };
-    let Some(cfg) = app.selected.clone() else {
-        return false;
-    };
-    app.page_pending = true;
+    }
     app.pending_sel = pending_sel;
-    app.loading = true;
-    app.status = tf("加载 {} 第 {} 页…", &[&(fix_double_encoding(&ps.table)), &(page + 1)]);
-    let known = app
-        .count_cache
-        .get(&count_cache_key(&app.current_db(), &ps.schema, &ps.table, &ps.filter))
-        .copied();
-    app.page_gen += 1;
-    let gen = app.page_gen;
-    app.spawn(
-        tx,
-        Op::TableData(Box::new(TableDataReq {
-            cfg: Box::new(cfg),
-            db: app.current_db(),
-            schema: ps.schema.clone(),
-            table: ps.table.clone(),
-            table_type: ps.table_type.clone(),
-            page,
-            page_size: ps.page_size,
-            filter: ps.filter.clone(),
-            order_by: ps.order_by.clone(),
-            known_total: known,
-            gen,
-        })),
-    );
+    spawn_table_page(app, tx, page);
     true
 }
 
@@ -10145,43 +10641,21 @@ fn reload_table_view(app: &mut App, tx: &Tx, filter: String, order_by: Option<St
     let Some(ps) = app.page_state.clone() else {
         return;
     };
-    let Some(cfg) = app.selected.clone() else {
+    if app.selected.is_none() {
         return;
-    };
+    }
     app.page_state = Some(PageState {
         page,
         total: None,
+        total_lower_bound: false,
         has_next: false,
         filter: filter.clone(),
         order_by: order_by.clone(),
+        keyset: None,
         ..ps.clone()
     });
-    app.page_pending = true;
     app.pending_sel = Some(0);
-    app.loading = true;
-    app.status = tf("加载 {} 第 {} 页…", &[&(fix_double_encoding(&ps.table)), &(page + 1)]);
-    let known = app
-        .count_cache
-        .get(&count_cache_key(&app.current_db(), &ps.schema, &ps.table, &filter))
-        .copied();
-    app.page_gen += 1;
-    let gen = app.page_gen;
-    app.spawn(
-        tx,
-        Op::TableData(Box::new(TableDataReq {
-            cfg: Box::new(cfg),
-            db: app.current_db(),
-            schema: ps.schema,
-            table: ps.table,
-            table_type: ps.table_type,
-            page,
-            page_size: ps.page_size,
-            filter,
-            order_by,
-            known_total: known,
-            gen,
-        })),
-    );
+    spawn_table_page(app, tx, page);
 }
 
 /// Rows the results pane can show at once (header + borders excluded).
@@ -19039,10 +19513,11 @@ fn context_info(app: &App) -> String {
         None
     };
     if let Some(ps) = &app.page_state {
-        let pages = ps
-            .total
-            .map(|t| page_count(t, ps.page_size).to_string())
-            .unwrap_or_else(|| "?".into());
+        // A lower-bound total cannot give an exact page count.
+        let pages = match ps.total {
+            Some(t) if !ps.total_lower_bound => page_count(t, ps.page_size).to_string(),
+            _ => "?".into(),
+        };
         parts.push(tf("第 {}/{} 页", &[&(ps.page + 1), &(pages)]));
     }
     let n = result_row_count(app);
@@ -19051,6 +19526,7 @@ fn context_info(app: &App) -> String {
         let total_abs = app
             .page_state
             .as_ref()
+            .filter(|ps| !ps.total_lower_bound)
             .and_then(|ps| ps.total)
             .map(|t| t as usize)
             .unwrap_or(n);
@@ -19880,10 +20356,7 @@ fn grid_title(app: &App) -> String {
             };
             let rows = app.grid.as_ref().map(|g| g.rows.len()).unwrap_or(0);
             let offset = ps.page * ps.page_size;
-            let total = ps
-                .total
-                .map(|t| tf("共 {} 行", &[&(t)]))
-                .unwrap_or_else(|| t("总数未知").into());
+            let total = total_label(ps);
             let more = if ps.has_next { t(" · n 下一页") } else { "" };
             let table_label = fix_double_encoding(&qualified_display(&ps.schema, &ps.table));
             tf(" {}{}.{} · 第 {} 页 · {}–{} / {} · {}{}{} ", &[&(search_marker(app)), &(fix_double_encoding(&app.current_db())), &(table_label), &(ps.page + 1), &(if rows == 0 { 0 } else { offset + 1 }), &(offset + rows), &(total), &(app.grid.as_ref().map(|g| g.note.clone()).unwrap_or_default()), &(more), &(page_state_extra(ps))])
@@ -20245,7 +20718,9 @@ fn render_grid(
         let win = h.min(nrows.saturating_sub(start)).max(1);
         let (v_total, v_start) = match (&app.page_state, kind) {
             (Some(ps), GridKind::TableData) => match ps.total {
-                Some(t) if (t as usize) > win => (t as usize, ps.page * ps.page_size + start),
+                Some(t) if !ps.total_lower_bound && (t as usize) > win => {
+                    (t as usize, ps.page * ps.page_size + start)
+                }
                 _ => (nrows, start),
             },
             _ => (nrows, start),
@@ -23300,6 +23775,8 @@ const HELP_ROWS: &[(&str, &str)] = &[
     ("PgUp / PgDn", "整屏滚动，跨页衔接"),
     ("n / p", "下一页 / 上一页"),
     ("Ctrl-F / Ctrl-B", "下一页 / 上一页"),
+    ("大表翻页", "有主键时按主键续读（keyset），翻页耗时与页深无关"),
+    ("行数上限", "50 万行以上的表显示 >50万，不再每页 COUNT"),
     ("← → / h l", "单元格光标（列窗口跟随）"),
     ("Home / End", "首行 / 末行"),
     ("Ctrl-E", "聚焦 SQL 编辑器"),
@@ -24353,9 +24830,11 @@ mod tests {
             page: 0,
             page_size: MONGO_PAGE,
             total: Some(30),
+            total_lower_bound: false,
             has_next: false,
             filter: String::new(),
             order_by: None,
+            keyset: None,
         });
         for (w, h) in sizes {
             draw(&mut app, w, h);
@@ -25102,7 +25581,7 @@ mod tests {
     fn import_done_invalidates_the_count_cache() {
         let (tx, _rx) = tokio::sync::mpsc::unbounded_channel::<OpResult>();
         let mut app = test_app();
-        app.count_cache.insert("d\u{1}\u{1}t\u{1}".into(), 5);
+        app.count_cache.insert("d\u{1}\u{1}t\u{1}".into(), (5, false));
         app.import_progress = Some((1, 1));
         let rep = ImportReport {
             table: "t".into(),
@@ -25768,6 +26247,296 @@ mod tests {
         );
     }
 
+    // ── R34: keyset pagination + bounded row count ──
+
+    fn pk_col(name: &str, ty: &str) -> ColumnInfo {
+        ColumnInfo {
+            is_primary_key: true,
+            ..col_info(name, ty)
+        }
+    }
+
+    fn orders_meta(pks: &[(&str, &str)], others: &[(&str, &str)]) -> TableMeta {
+        let mut columns: Vec<ColumnInfo> = pks.iter().map(|(n, t)| pk_col(n, t)).collect();
+        columns.extend(others.iter().map(|(n, t)| col_info(n, t)));
+        TableMeta {
+            table: "orders".into(),
+            schema: String::new(),
+            columns,
+        }
+    }
+
+    fn orders_page(order_by: Option<&str>) -> PageState {
+        PageState {
+            table: "orders".into(),
+            schema: String::new(),
+            table_type: Some("BASE TABLE".into()),
+            page: 0,
+            page_size: 50,
+            total: None,
+            total_lower_bound: false,
+            has_next: false,
+            filter: String::new(),
+            order_by: order_by.map(str::to_string),
+            keyset: None,
+        }
+    }
+
+    #[test]
+    fn keyset_predicate_builds_single_and_composite_seeks() {
+        let n = |i: i64| serde_json::json!(i);
+        let s = |v: &str| serde_json::json!(v);
+        // Single key, both dialects and both directions.
+        let pk = vec!["id".to_string()];
+        assert_eq!(
+            table_data_keyset_predicate(Some(DatabaseType::Mysql), &pk, &[n(10)], ">").unwrap(),
+            "`id` > 10"
+        );
+        assert_eq!(
+            table_data_keyset_predicate(Some(DatabaseType::Postgres), &pk, &[n(10)], "<").unwrap(),
+            "\"id\" < 10"
+        );
+        // String keys are quoted and escaped.
+        assert_eq!(
+            table_data_keyset_predicate(Some(DatabaseType::Mysql), &pk, &[s("O'Brien")], ">").unwrap(),
+            "`id` > 'O''Brien'"
+        );
+        // Composite keys use a row-value comparison.
+        let cpk = vec!["a".to_string(), "b".to_string()];
+        assert_eq!(
+            table_data_keyset_predicate(Some(DatabaseType::Postgres), &cpk, &[n(1), s("x")], ">")
+                .unwrap(),
+            "(\"a\", \"b\") > (1, 'x')"
+        );
+        // Booleans render as SQL literals.
+        assert_eq!(
+            table_data_keyset_predicate(
+                Some(DatabaseType::Mysql),
+                &pk,
+                &[serde_json::Value::Bool(true)],
+                ">"
+            )
+            .unwrap(),
+            "`id` > TRUE"
+        );
+        // An incomplete tuple or a NULL key aborts the seek.
+        assert!(table_data_keyset_predicate(Some(DatabaseType::Mysql), &cpk, &[n(1)], ">").is_none());
+        assert!(table_data_keyset_predicate(
+            Some(DatabaseType::Mysql),
+            &pk,
+            &[serde_json::Value::Null],
+            ">"
+        )
+        .is_none());
+        assert!(table_data_keyset_predicate(Some(DatabaseType::Mysql), &[], &[], ">").is_none());
+    }
+
+    #[test]
+    fn table_page_query_uses_keyset_and_reverses_a_backward_read() {
+        let cfg = mysql_cfg();
+        let pk = vec!["id".to_string()];
+        let after = PageSeek::After(vec![serde_json::json!(50)]);
+        let before = PageSeek::Before(vec![serde_json::json!(51)]);
+
+        // First page under a keyset plan: primary-key order, no OFFSET at all.
+        let (sql, rev) = build_table_page_query(&cfg, None, "orders", None, 0, 50, "", None, &pk, true, &PageSeek::Offset);
+        assert!(!rev);
+        assert!(sql.contains("ORDER BY `id` ASC"), "{sql}");
+        assert!(sql.contains("LIMIT 51"), "{sql}");
+        assert!(!sql.contains("OFFSET"), "{sql}");
+
+        // Next page: seek past the last key, still no OFFSET.
+        let (sql, rev) = build_table_page_query(&cfg, None, "orders", None, 1, 50, "", None, &pk, true, &after);
+        assert!(!rev);
+        assert!(sql.contains("`id` > 50"), "{sql}");
+        assert!(!sql.contains("OFFSET"), "{sql}");
+
+        // Previous page: seek before the first key, order and rows reversed.
+        let (sql, rev) = build_table_page_query(&cfg, None, "orders", None, 0, 50, "", None, &pk, true, &before);
+        assert!(rev);
+        assert!(sql.contains("`id` < 51"), "{sql}");
+        assert!(sql.contains("ORDER BY `id` DESC"), "{sql}");
+
+        // A descending view flips the comparison.
+        let (sql, rev) = build_table_page_query(&cfg, None, "orders", None, 1, 50, "", None, &pk, false, &after);
+        assert!(!rev);
+        assert!(sql.contains("`id` < 50"), "{sql}");
+        assert!(sql.contains("ORDER BY `id` DESC"), "{sql}");
+
+        // A user filter is ANDed with the seek predicate.
+        let (sql, _) = build_table_page_query(&cfg, None, "orders", None, 1, 50, "grp = 1", None, &pk, true, &after);
+        assert!(sql.contains("(grp = 1) AND (`id` > 50)"), "{sql}");
+
+        // Without a keyset plan a custom sort keeps the classic OFFSET page.
+        let (sql, rev) = build_table_page_query(&cfg, None, "orders", None, 3, 50, "", Some("`name` ASC"), &[], true, &PageSeek::Offset);
+        assert!(!rev);
+        assert!(sql.contains("ORDER BY `name` ASC"), "{sql}");
+        assert!(sql.contains("OFFSET 150"), "{sql}");
+    }
+
+    #[test]
+    fn keyset_plan_only_accepts_the_primary_key_order() {
+        let single = orders_meta(&[("id", "int")], &[("name", "varchar(64)")]);
+        // No explicit sort → the implicit primary-key order (ascending).
+        assert_eq!(
+            keyset_plan(Some(&single), &orders_page(None)),
+            Some((vec!["id".to_string()], true))
+        );
+        // Explicit sort on the key, either direction.
+        assert_eq!(
+            keyset_plan(Some(&single), &orders_page(Some("`id` ASC"))),
+            Some((vec!["id".to_string()], true))
+        );
+        assert_eq!(
+            keyset_plan(Some(&single), &orders_page(Some("`id` DESC"))),
+            Some((vec!["id".to_string()], false))
+        );
+        // A custom sort falls back to OFFSET.
+        assert_eq!(keyset_plan(Some(&single), &orders_page(Some("`name` ASC"))), None);
+
+        // Composite key: column order must match and the direction must agree.
+        let composite = orders_meta(&[("a", "int"), ("b", "int")], &[]);
+        assert_eq!(
+            keyset_plan(Some(&composite), &orders_page(None)),
+            Some((vec!["a".to_string(), "b".to_string()], true))
+        );
+        assert_eq!(
+            keyset_plan(Some(&composite), &orders_page(Some("`a` ASC, `b` ASC"))),
+            Some((vec!["a".to_string(), "b".to_string()], true))
+        );
+        assert_eq!(
+            keyset_plan(Some(&composite), &orders_page(Some("`a` DESC, `b` DESC"))),
+            Some((vec!["a".to_string(), "b".to_string()], false))
+        );
+        // Mixed directions, swapped order, or a partial key cannot seek.
+        assert_eq!(keyset_plan(Some(&composite), &orders_page(Some("`a` ASC, `b` DESC"))), None);
+        assert_eq!(keyset_plan(Some(&composite), &orders_page(Some("`b` ASC, `a` ASC"))), None);
+        assert_eq!(keyset_plan(Some(&composite), &orders_page(Some("`a` ASC"))), None);
+
+        // No primary key, a binary key, or metadata for another table → OFFSET.
+        let keyless = orders_meta(&[], &[("x", "int")]);
+        assert_eq!(keyset_plan(Some(&keyless), &orders_page(None)), None);
+        let binary = orders_meta(&[("k", "blob")], &[]);
+        assert_eq!(keyset_plan(Some(&binary), &orders_page(None)), None);
+        assert_eq!(keyset_plan(None, &orders_page(None)), None);
+        let mut other = orders_page(None);
+        other.table = "other".into();
+        assert_eq!(keyset_plan(Some(&single), &other), None);
+    }
+
+    #[test]
+    fn keyset_seek_only_follows_adjacent_pages() {
+        let plan = (vec!["id".to_string()], true);
+        let cur = KeysetCursor {
+            pk: vec!["id".to_string()],
+            ascending: true,
+            first: vec![serde_json::json!(10)],
+            last: vec![serde_json::json!(60)],
+        };
+        assert_eq!(
+            keyset_seek_for(Some(&plan), Some(&cur), 0, 1),
+            PageSeek::After(vec![serde_json::json!(60)])
+        );
+        assert_eq!(
+            keyset_seek_for(Some(&plan), Some(&cur), 1, 0),
+            PageSeek::Before(vec![serde_json::json!(10)])
+        );
+        // A jump that is not exactly one page keeps OFFSET.
+        assert_eq!(keyset_seek_for(Some(&plan), Some(&cur), 0, 5), PageSeek::Offset);
+        assert_eq!(keyset_seek_for(Some(&plan), Some(&cur), 5, 0), PageSeek::Offset);
+        // A direction or key mismatch keeps OFFSET.
+        let desc = (vec!["id".to_string()], false);
+        assert_eq!(keyset_seek_for(Some(&desc), Some(&cur), 0, 1), PageSeek::Offset);
+        assert_eq!(keyset_seek_for(None, Some(&cur), 0, 1), PageSeek::Offset);
+        assert_eq!(keyset_seek_for(Some(&plan), None, 0, 1), PageSeek::Offset);
+    }
+
+    #[test]
+    fn keyset_cursor_maps_result_columns_to_the_key() {
+        let pk = vec!["id".to_string()];
+        let columns = vec!["name".to_string(), "id".to_string()];
+        let rows = vec![
+            vec![serde_json::json!("a"), serde_json::json!(1)],
+            vec![serde_json::json!("b"), serde_json::json!(7)],
+        ];
+        let c = keyset_cursor(&pk, true, &columns, &rows).unwrap();
+        assert_eq!(c.pk, vec!["id".to_string()]);
+        assert!(c.ascending);
+        assert_eq!(c.first, vec![serde_json::json!(1)]);
+        assert_eq!(c.last, vec![serde_json::json!(7)]);
+        // Missing key column / NULL key / empty page → no cursor.
+        assert!(keyset_cursor(&pk, true, &["name".to_string()], &rows).is_none());
+        let with_null = vec![vec![serde_json::json!("a"), serde_json::Value::Null]];
+        assert!(keyset_cursor(&pk, true, &columns, &with_null).is_none());
+        assert!(keyset_cursor(&pk, true, &columns, &[]).is_none());
+    }
+
+    #[test]
+    fn bounded_count_sql_uses_an_index_only_scan_capped_at_the_sample() {
+        let cfg = mysql_cfg();
+        let sql = bounded_count_sql(&cfg, None, "big", "", 500_000).unwrap();
+        assert_eq!(
+            sql,
+            "SELECT COUNT(*) AS row_count FROM (SELECT 1 FROM `big` LIMIT 500001) dbxt_count"
+        );
+        assert!(!sql.contains(';'), "{sql}");
+        // `SELECT 1` keeps the capped scan index-only rather than materialising
+        // half a million full rows.
+        assert!(sql.contains("SELECT 1 FROM"), "{sql}");
+        // A filter is carried into the sampled scan.
+        let sql = bounded_count_sql(&cfg, None, "big", "grp = 1", 1_000).unwrap();
+        assert!(sql.contains("WHERE (grp = 1)"), "{sql}");
+        assert!(sql.contains("LIMIT 1001"), "{sql}");
+        // A dialect without a plain LIMIT pager declines the sample so the caller
+        // falls back to the exact count.
+        let mut oracle = cfg.clone();
+        oracle.db_type = DatabaseType::Oracle;
+        assert!(bounded_count_sql(&oracle, None, "big", "", 500_000).is_none());
+    }
+
+    #[test]
+    fn sampled_count_reports_a_lower_bound_past_the_cap() {
+        assert_eq!(classify_sample(0, 500_000), (0, false));
+        assert_eq!(classify_sample(10, 500_000), (10, false));
+        assert_eq!(classify_sample(500_000, 500_000), (500_000, false));
+        assert_eq!(classify_sample(500_001, 500_000), (500_000, true));
+    }
+
+    #[test]
+    fn count_cache_remembers_value_and_lower_bound_per_filter() {
+        let mut app = test_app();
+        assert!(app.cached_count("db", "public", "big", "").is_none());
+        app.remember_count("db", "public", "big", "", 500_000, true);
+        assert_eq!(
+            app.cached_count("db", "public", "big", ""),
+            Some((500_000, true))
+        );
+        // The filter is part of the key, so a filtered view has its own total.
+        assert!(app.cached_count("db", "public", "big", "grp = 1").is_none());
+        app.remember_count("db", "public", "big", "grp = 1", 42, false);
+        assert_eq!(
+            app.cached_count("db", "public", "big", "grp = 1"),
+            Some((42, false))
+        );
+        // ...and the exact value is untouched by the filtered one.
+        assert_eq!(
+            app.cached_count("db", "public", "big", ""),
+            Some((500_000, true))
+        );
+    }
+
+    #[test]
+    fn total_label_marks_a_lower_bound_with_a_greater_than() {
+        let mut ps = orders_page(None);
+        ps.total = Some(500_000);
+        ps.total_lower_bound = true;
+        assert!(total_label(&ps).contains(">500000"), "{}", total_label(&ps));
+        ps.total_lower_bound = false;
+        assert!(total_label(&ps).contains("共 500000 行"), "{}", total_label(&ps));
+        ps.total = None;
+        assert_eq!(total_label(&ps), "总数未知");
+    }
+
     #[test]
     fn page_state_extra_reports_filter_and_sort() {
         let ps = PageState {
@@ -25777,9 +26546,11 @@ mod tests {
             page: 0,
             page_size: 50,
             total: None,
+            total_lower_bound: false,
             has_next: false,
             filter: "city = 'Beijing'".into(),
             order_by: Some("`id` DESC".into()),
+            keyset: None,
         };
         let extra = page_state_extra(&ps);
         assert!(extra.contains("过滤: city = 'Beijing'"));
@@ -25795,9 +26566,11 @@ mod tests {
             page: 0,
             page_size: 50,
             total: None,
+            total_lower_bound: false,
             has_next: false,
             filter: String::new(),
             order_by: None,
+            keyset: None,
         };
         assert!(page_state_extra(&ps).is_empty());
     }

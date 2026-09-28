@@ -36,6 +36,8 @@ A keyboard-first terminal UI for databases, built on the [DBX](https://github.co
 
 **Table data & editing**
 - `Enter` on a table runs a paginated `SELECT *`; `↑`/`↓` walk rows continuously across page edges, `n`/`p` turn pages keeping the relative row.
+- Continuous paging prefers **keyset** reads when the table has a primary key: the next page is `WHERE pk > last ORDER BY pk LIMIT n` and the previous page seeks backwards, so the cost no longer grows with the page number (an early page and page 20,000 of a ten-million-row table both run in milliseconds). A jump that is not exactly one page, a table with no primary key, or a sort on a non-key column keeps the classic `LIMIT … OFFSET` path. With no explicit sort the browser orders by the primary key, which makes page boundaries deterministic (a table without a primary key keeps the engine's natural order).
+- Row counts are cached per `db.schema.table` + filter for the session. On a large table the first load samples at most `DBXT_COUNT_SAMPLE_LIMIT` rows (default 500,000) and shows `>500000 行` instead of paying a full `COUNT(*)` scan on every page; set `DBXT_COUNT_SAMPLE_LIMIT=0` to always count exactly. A small table still shows its exact total.
 - `←`/`→` move a cell cursor, `z` pins the first data column, `Enter` opens the full cell; a bottom bar shows horizontal position.
 - `e` edits the focused cell in a diff layer showing old → new, the `WHERE` clause, the primary key and the full `UPDATE`.
 - `i` inserts from a column template and `Delete` / `Ctrl-D` deletes with a bound `WHERE` — every write is confirmed first.
