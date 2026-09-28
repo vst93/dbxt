@@ -4721,6 +4721,12 @@ struct App {
     /// True when the hit list was capped at [`SEARCH_MAX_HITS`].
     search_truncated: bool,
 
+    // ── SQL file execution (Alt-L) ──
+    /// The modal file-path input.
+    file_load_prompt: Option<TextArea<'static>>,
+    /// The preview / confirmation layer for a read `.sql` file.
+    file_load_plan: Option<Box<FileLoadPlan>>,
+
     // WHERE filter prompt (modal text input)
     filter_prompt: Option<TextArea<'static>>,
 
@@ -5228,6 +5234,8 @@ impl App {
             search_gen: 0,
             search_cancel: Arc::new(AtomicBool::new(false)),
             search_truncated: false,
+            file_load_prompt: None,
+            file_load_plan: None,
             filter_prompt: None,
             edit_dialog: None,
             pending_write: false,
@@ -6436,6 +6444,8 @@ fn key(app: &mut App, tx: &Tx, k: KeyEvent) {
         app.search_open = false;
         app.search_input = None;
         app.search_cancel.store(true, Ordering::Relaxed);
+        app.file_load_prompt = None;
+        app.file_load_plan = None;
         app.set_placeholder();
         return;
     }
@@ -6570,6 +6580,15 @@ fn browse_key(app: &mut App, tx: &Tx, k: KeyEvent) {
     }
     if app.import_prompt.is_some() {
         import_prompt_key(app, tx, k);
+        return;
+    }
+    // SQL file execution (Alt-L): path prompt then preview are modal.
+    if app.file_load_prompt.is_some() {
+        file_load_prompt_key(app, k);
+        return;
+    }
+    if app.file_load_plan.is_some() {
+        file_load_plan_key(app, tx, k);
         return;
     }
     if app.export_path.is_some() {
@@ -9145,6 +9164,10 @@ fn editor_key(app: &mut App, tx: &Tx, k: KeyEvent) {
         (KeyModifiers::ALT, KeyCode::Char('f')) | (KeyModifiers::ALT, KeyCode::Char('F')) => {
             toggle_format_editor(app)
         }
+        // Alt-L: read a .sql file, preview it, then run it as a script.
+        (KeyModifiers::ALT, KeyCode::Char('l')) | (KeyModifiers::ALT, KeyCode::Char('L')) => {
+            open_file_load(app)
+        }
         // Ctrl-U: undo the last Alt-F reformat in one step; with no reformat to
         // undo it falls back to the editor's own undo history (tui-textarea),
         // which has no default key binding of its own.
@@ -11034,6 +11057,198 @@ fn search_key(app: &mut App, tx: &Tx, k: KeyEvent) {
                 return;
             };
             open_search_hit(app, tx, &hit);
+        }
+        _ => {}
+    }
+}
+
+// ── SQL file execution (Alt-L) ──
+
+/// A read `.sql` file waiting for the user's confirmation before it runs.
+#[derive(Clone)]
+struct FileLoadPlan {
+    path: PathBuf,
+    sql: String,
+    bytes: u64,
+    statements: usize,
+    /// Target connection name (shown so the file is never run on the wrong one).
+    connection: String,
+    db: String,
+    /// Per-statement danger reasons (deduped): routes execution through the red
+    /// confirmation layer.
+    danger: Vec<String>,
+    /// Set for a large file, as a slow-run heads-up.
+    warning: Option<String>,
+}
+
+/// `~` / `~/…` → $HOME. A bare path is returned unchanged.
+fn expand_tilde(raw: &str) -> PathBuf {
+    let raw = raw.trim();
+    let home = || {
+        std::env::var_os("HOME")
+            .filter(|v| !v.is_empty())
+            .map(PathBuf::from)
+    };
+    if raw == "~" {
+        if let Some(h) = home() {
+            return h;
+        }
+    } else if let Some(rest) = raw.strip_prefix("~/") {
+        if let Some(h) = home() {
+            return h.join(rest);
+        }
+    }
+    PathBuf::from(raw)
+}
+
+/// Read a `.sql` file as text, tolerating non-UTF-8 bytes (lossy) and a UTF-8
+/// BOM. Returns the raw IO error string on failure.
+fn read_sql_file(path: &std::path::Path) -> Result<String, String> {
+    let bytes = std::fs::read(path).map_err(|e| e.to_string())?;
+    let text = String::from_utf8_lossy(&bytes).into_owned();
+    Ok(text.strip_prefix('\u{feff}').map(str::to_string).unwrap_or(text))
+}
+
+/// Count the executable statements in a script using the dialect-aware splitter
+/// (semicolons in strings / comments / routines do not count). A whitespace-only
+/// file is zero statements.
+fn count_sql_statements(sql: &str, db_type: DatabaseType) -> usize {
+    if sql.trim().is_empty() {
+        return 0;
+    }
+    dbx_core::sql::split_sql_statements_for_database(sql, db_type).len()
+}
+
+/// Open the `.sql` file-path prompt (editor `Alt-L`).
+fn open_file_load(app: &mut App) {
+    if app.backend_kind != Backend::Sql {
+        app.status = t("SQL 文件执行仅支持 SQL 后端").into();
+        return;
+    }
+    if app.selected.is_none() {
+        app.status = t("✗ 未选择连接").into();
+        return;
+    }
+    let mut ta = TextArea::default();
+    ta.set_placeholder_text(t("SQL 文件路径（~ 展开）"));
+    app.file_load_prompt = Some(ta);
+    app.status = t("加载 SQL 文件 · 输入路径 · Enter 预览 · Esc 取消").into();
+}
+
+/// Read the typed path and build the confirmation plan.
+fn file_load_prompt_key(app: &mut App, k: KeyEvent) {
+    match k.code {
+        KeyCode::Enter => {
+            let raw = app
+                .file_load_prompt
+                .as_ref()
+                .map(|t| t.lines().join(" ").trim().to_string())
+                .unwrap_or_default();
+            if raw.is_empty() {
+                app.status = t("文件路径不能为空").into();
+                return;
+            }
+            let Some(cfg) = app.selected.clone() else {
+                app.status = t("✗ 未选择连接").into();
+                return;
+            };
+            let path = expand_tilde(&raw);
+            match read_sql_file(&path) {
+                Ok(sql) if sql.trim().is_empty() => {
+                    app.status = tf("文件为空：{}", &[&(path.display())]);
+                }
+                Ok(sql) => {
+                    app.file_load_prompt = None;
+                    let bytes = std::fs::metadata(&path)
+                        .map(|m| m.len())
+                        .unwrap_or(sql.len() as u64);
+                    let statements = count_sql_statements(&sql, cfg.db_type).max(1);
+                    let mut danger: Vec<String> = Vec::new();
+                    for st in dbx_core::sql::split_sql_statements_for_database(&sql, cfg.db_type) {
+                        if let Some(r) = detect_danger(&st) {
+                            if !danger.contains(&r) {
+                                danger.push(r);
+                            }
+                        }
+                    }
+                    let warning = (bytes > FILE_LOAD_WARN_BYTES)
+                        .then(|| tf("文件较大（{}），执行可能较慢", &[&(human_size(bytes))]));
+                    app.file_load_plan = Some(Box::new(FileLoadPlan {
+                        path,
+                        sql,
+                        bytes,
+                        statements,
+                        connection: cfg.name.clone(),
+                        db: app.current_db(),
+                        danger,
+                        warning,
+                    }));
+                    app.status = tf(
+                        "已读取 · {} 条语句 · Enter 执行 · e 转编辑器 · Esc 取消",
+                        &[&statements],
+                    );
+                }
+                Err(e) => {
+                    app.status = tf("✗ 无法读取文件: {}", &[&e]);
+                }
+            }
+        }
+        KeyCode::Esc => {
+            app.file_load_prompt = None;
+            app.status = t("已取消加载 SQL 文件").into();
+        }
+        _ => {
+            if let Some(ta) = app.file_load_prompt.as_mut() {
+                ta.input(k);
+            }
+        }
+    }
+}
+
+/// Confirm the file: run it through the multi-statement script pipeline, or open
+/// the red layer first when it contains a destructive statement.
+fn file_load_plan_key(app: &mut App, tx: &Tx, k: KeyEvent) {
+    match k.code {
+        KeyCode::Enter => {
+            let Some(plan) = app.file_load_plan.take() else {
+                return;
+            };
+            if !plan.danger.is_empty() {
+                app.confirm = Some(Confirm {
+                    sql: plan.sql,
+                    reasons: plan.danger,
+                    refresh: false,
+                    clear_batch: false,
+                    conn: None,
+                    redis: None,
+                    mongo: None,
+                });
+                app.status = t("危险语句确认 · Enter 执行 · Esc 取消").into();
+                return;
+            }
+            let n = plan.statements;
+            app.push_history(&plan.sql);
+            app.status = tf(
+                "执行 {} · {} 条语句…",
+                &[&(plan.path.display()), &n],
+            );
+            execute_sql(app, tx, plan.sql);
+        }
+        KeyCode::Esc => {
+            app.file_load_plan = None;
+            app.status = t("已取消加载 SQL 文件").into();
+        }
+        // Load the whole file into the editor for review / tweaking.
+        KeyCode::Char('e') | KeyCode::Char('v') if k.modifiers.is_empty() => {
+            let Some(plan) = app.file_load_plan.take() else {
+                return;
+            };
+            app.set_editor_text(&plan.sql);
+            app.focus = Focus::Editor;
+            app.status = tf(
+                "已载入 {} 到编辑器（{} 条语句）",
+                &[&(plan.path.display()), &(plan.statements)],
+            );
         }
         _ => {}
     }
@@ -15000,6 +15215,12 @@ fn ui(f: &mut Frame, app: &mut App) {
     if app.search_input.is_some() {
         render_search_input(f, f.area(), app);
     }
+    if app.file_load_plan.is_some() {
+        render_file_load_plan(f, f.area(), app);
+    }
+    if app.file_load_prompt.is_some() {
+        render_file_load_prompt(f, f.area(), app);
+    }
     if app.table_prompt.is_some() {
         render_table_filter(f, f.area(), app);
     }
@@ -15375,6 +15596,8 @@ enum FooterView {
     ImportReport,
     ImportPlan,
     ImportPrompt,
+    FileLoadPrompt,
+    FileLoadPlan,
     ExportPath,
     ExportPicker,
     FilterPrompt,
@@ -15431,6 +15654,10 @@ fn footer_ctx(app: &App) -> FooterCtx {
         FooterView::ImportPlan
     } else if app.import_prompt.is_some() {
         FooterView::ImportPrompt
+    } else if app.file_load_prompt.is_some() {
+        FooterView::FileLoadPrompt
+    } else if app.file_load_plan.is_some() {
+        FooterView::FileLoadPlan
     } else if app.export_path.is_some() {
         FooterView::ExportPath
     } else if app.export_open {
@@ -15497,6 +15724,12 @@ fn footer_hints_ctx(ctx: FooterCtx) -> Vec<Hint> {
         // these arms the footer fell through to the page's group while an
         // overlay owned the keyboard.
         FooterView::ImportPrompt => vec![("Enter", t("预览")), ("Esc", t("取消"))],
+        FooterView::FileLoadPrompt => vec![("Enter", t("预览")), ("Esc", t("取消"))],
+        FooterView::FileLoadPlan => vec![
+            ("Enter", t("执行")),
+            ("e", t("转编辑器")),
+            ("Esc", t("取消")),
+        ],
         FooterView::ImportPlan => vec![
             ("Enter", t("导入")),
             ("m", t("追加/覆盖")),
@@ -17936,6 +18169,126 @@ fn render_search_input(f: &mut Frame, area: Rect, app: &mut App) {
     }
 }
 
+/// The `Alt-L` file-path input, drawn as a one-line box at the bottom.
+fn render_file_load_prompt(f: &mut Frame, area: Rect, app: &mut App) {
+    if area.height < 3 || area.width < 12 {
+        return;
+    }
+    let w = area.width.saturating_sub(4).max(20).min(area.width);
+    let h = 3.min(area.height);
+    let x = area.x + (area.width.saturating_sub(w)) / 2;
+    let y = area.y + area.height.saturating_sub(h + 1);
+    let box_area = Rect {
+        x,
+        y,
+        width: w,
+        height: h,
+    };
+    f.render_widget(Clear, box_area);
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .title(tf(" 加载 SQL 文件 · {} · Enter 预览 · Esc 取消 ", &[&(app.selected_name())]))
+        .border_set(border::ROUNDED)
+        .border_style(Style::default().fg(Color::Cyan));
+    let inner = block.inner(box_area);
+    f.render_widget(block, box_area);
+    if let Some(ta) = app.file_load_prompt.as_mut() {
+        ta.set_block(Block::default());
+        f.render_widget(&*ta, inner);
+    }
+}
+
+/// The `Alt-L` confirmation layer: file size, statement count, target connection
+/// and a wrapped preview of the script, with any destructive statements called
+/// out in red before Enter runs it.
+fn render_file_load_plan(f: &mut Frame, area: Rect, app: &mut App) {
+    let Some(plan) = app.file_load_plan.as_ref() else {
+        return;
+    };
+    if area.width < 14 || area.height < 5 {
+        return;
+    }
+    let w = if area.width < 32 {
+        area.width
+    } else {
+        area.width.saturating_sub(4).min(84)
+    };
+    let inner_w = w.saturating_sub(4).max(1) as usize;
+    let sql_lines = wrap_sql_lines(&plan.sql, inner_w);
+    let max_h = area.height.saturating_sub(2) as usize;
+    let h = (sql_lines.len() + 8).min(max_h).max(5) as u16;
+    let box_area = centered_overlay(area, w, h);
+    f.render_widget(Clear, box_area);
+
+    let target = if plan.db.trim().is_empty() {
+        plan.connection.clone()
+    } else {
+        format!("{}.{}", plan.connection, fix_double_encoding(&plan.db))
+    };
+    let label = Style::default().fg(Color::DarkGray);
+    let value = Style::default().fg(Color::White);
+    let mut lines: Vec<Line> = Vec::new();
+    lines.push(Line::from(vec![
+        Span::styled(t("文件 "), label),
+        Span::styled(
+            plan.path.display().to_string(),
+            value.add_modifier(Modifier::BOLD),
+        ),
+    ]));
+    lines.push(Line::from(vec![
+        Span::styled(t("大小 "), label),
+        Span::styled(human_size(plan.bytes), value),
+        Span::styled(t(" · 语句 "), label),
+        Span::styled(plan.statements.to_string(), value),
+        Span::styled(t(" · 目标 "), label),
+        Span::styled(target, value),
+    ]));
+    if let Some(w) = &plan.warning {
+        lines.push(Line::from(Span::styled(
+            format!("⚠ {w}"),
+            Style::default().fg(Color::Yellow),
+        )));
+    }
+    for d in &plan.danger {
+        lines.push(Line::from(Span::styled(
+            format!("⚠ {d}"),
+            Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
+        )));
+    }
+    lines.push(Line::from(""));
+    let room = (box_area.height as usize).saturating_sub(lines.len() + 2);
+    for l in sql_lines.iter().take(room) {
+        lines.push(Line::from(Span::styled(
+            l.clone(),
+            Style::default().fg(Color::White),
+        )));
+    }
+    if sql_lines.len() > room {
+        lines.push(Line::from(Span::styled(
+            tf("…（预览截断，共 {} 行）", &[&(sql_lines.len())]),
+            Style::default().fg(Color::DarkGray),
+        )));
+    }
+    lines.push(Line::from(Span::styled(
+        t("Enter 执行 · e 转编辑器 · Esc 取消"),
+        Style::default().fg(Color::Yellow),
+    )));
+    let border = if plan.danger.is_empty() {
+        Color::Cyan
+    } else {
+        Color::Red
+    };
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_set(border::ROUNDED)
+        .border_style(Style::default().fg(border))
+        .title(Span::styled(
+            t(" 执行 SQL 文件 "),
+            Style::default().fg(border).add_modifier(Modifier::BOLD),
+        ));
+    f.render_widget(Paragraph::new(lines).block(block), box_area);
+}
+
 fn render_table_filter(f: &mut Frame, area: Rect, app: &mut App) {
     let w = area.width.saturating_sub(4).max(20).min(area.width);
     let h = 3.min(area.height);
@@ -18654,6 +19007,7 @@ const HELP_ROWS: &[(&str, &str)] = &[
     ("↑ ↓ / Enter", "选择命中 / 跳到该表并定位到命中行"),
     ("y / r", "复制命中值 / 以同一关键词重搜"),
     ("Esc", "关闭；扫描中按一下中止（保留已扫描结果）"),
+    ("Alt-L", "加载并执行 .sql 文件（预览语句数/大小/目标库，危险语句先确认）"),
     ("补全上下文", "表名. 后只补该表列名；FROM/JOIN 后优先表名；WHERE/ON 后优先列名"),
     ("↑ ↓", "历史（首行 / 末行）"),
     ("Esc", "回到侧栏"),
@@ -19666,6 +20020,8 @@ mod tests {
             app.filter_prompt = None;
             app.search_open = false;
             app.search_input = None;
+            app.file_load_prompt = None;
+            app.file_load_plan = None;
         };
 
         let cases: Vec<OverlayCase> = vec![
@@ -19858,6 +20214,25 @@ mod tests {
             (
                 "search-input",
                 Box::new(|a| a.search_input = Some(TextArea::from(["ali"]))),
+            ),
+            (
+                "file-load-prompt",
+                Box::new(|a| a.file_load_prompt = Some(TextArea::from(["seed.sql"]))),
+            ),
+            (
+                "file-load-plan",
+                Box::new(|a| {
+                    a.file_load_plan = Some(Box::new(FileLoadPlan {
+                        path: PathBuf::from("/tmp/seed.sql"),
+                        sql: "DELETE FROM t;\nSELECT 1;".into(),
+                        bytes: 123,
+                        statements: 2,
+                        connection: "prod-mysql".into(),
+                        db: "shop".into(),
+                        danger: vec!["DELETE 没有 WHERE 子句，会作用于整张表".into()],
+                        warning: None,
+                    }))
+                }),
             ),
             (
                 "history",
@@ -21450,6 +21825,8 @@ mod tests {
             "Ctrl-V",
             "Ctrl-T",
             "Alt-/",
+            "Alt-G",
+            "Alt-L",
         ] {
             assert!(
                 keys.iter().any(|k| k.contains(needle)),
@@ -22306,6 +22683,45 @@ mod tests {
         app.search_running = false;
         search_key(&mut app, &tx, KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
         assert!(!app.search_open);
+    }
+
+    #[test]
+    fn count_sql_statements_uses_the_dialect_splitter() {
+        let my = parse_database_type("mysql").unwrap();
+        assert_eq!(count_sql_statements("", my), 0);
+        assert_eq!(count_sql_statements("   \n\t ", my), 0);
+        assert_eq!(count_sql_statements("SELECT 1", my), 1);
+        assert_eq!(count_sql_statements("SELECT 1; SELECT 2;", my), 2);
+        // Semicolons inside a string literal or a comment do not split.
+        assert_eq!(count_sql_statements("SELECT ';'; SELECT 2", my), 2);
+        assert_eq!(count_sql_statements("-- a; b\nSELECT 1; -- tail;", my), 1);
+    }
+
+    #[test]
+    fn expand_tilde_only_touches_a_leading_tilde() {
+        assert_eq!(expand_tilde("seed.sql"), PathBuf::from("seed.sql"));
+        assert_eq!(expand_tilde("/tmp/a.sql"), PathBuf::from("/tmp/a.sql"));
+        if let Some(home) = std::env::var_os("HOME").filter(|v| !v.is_empty()) {
+            let home = PathBuf::from(home);
+            assert_eq!(expand_tilde("~"), home);
+            assert_eq!(expand_tilde("~/x.sql"), home.join("x.sql"));
+        }
+    }
+
+    #[test]
+    fn read_sql_file_strips_bom_and_tolerates_non_utf8() {
+        let path = std::env::temp_dir().join(format!("dbxt-sql-{}.sql", std::process::id()));
+        // A UTF-8 BOM is stripped; a stray non-UTF-8 byte decodes lossily rather
+        // than failing the read.
+        let mut bytes = vec![0xEF, 0xBB, 0xBF];
+        bytes.extend_from_slice(b"SELECT 1;\xFF");
+        std::fs::write(&path, &bytes).unwrap();
+        let text = read_sql_file(&path).unwrap();
+        assert!(text.starts_with("SELECT 1;"), "{text:?}");
+        assert!(!text.starts_with('\u{feff}'), "BOM must be stripped");
+        let _ = std::fs::remove_file(&path);
+        // A missing file is an error, not a panic.
+        assert!(read_sql_file(&path).is_err());
     }
 
     fn column(name: &str, ty: &str, nullable: bool, default: Option<&str>, extra: Option<&str>) -> ColumnInfo {
