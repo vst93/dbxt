@@ -7,7 +7,7 @@ mod ui_text;
 use ui_text::{t, tf};
 
 use std::collections::{HashMap, HashSet, VecDeque};
-use std::io::{IsTerminal, Write};
+use std::io::{BufWriter, IsTerminal, Write};
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -86,6 +86,13 @@ const OP_WATCHDOG_FALLBACK: Duration = Duration::from_secs(60);
 /// SQL may be a multi-statement script, so it gets a wider ceiling (each
 /// statement is still bounded by the driver's own 60 s timeout).
 const OP_WATCHDOG_SQL: Duration = Duration::from_secs(180);
+/// Streaming export writes a (possibly large) file to local disk. Local IO is
+/// fast, but a very wide 20k-row result on a slow filesystem still deserves a
+/// generous ceiling rather than the generic 60 s fallback.
+const OP_WATCHDOG_EXPORT: Duration = Duration::from_secs(600);
+/// Buffered writer size for a streaming export (1 MiB keeps syscalls rare while
+/// bounding the memory held above the OS page cache).
+const EXPORT_BUF_BYTES: usize = 1 << 20;
 
 // ─── pages & focus ───────────────────────────────────────────────────────────
 
@@ -1102,6 +1109,21 @@ struct ExportPending {
     /// `(schema, table)` guessed for INSERT exports (`None` for the other
     /// formats).
     table: Option<(String, String)>,
+}
+
+/// A file export handed to the background worker: everything the streaming
+/// writer needs, captured up front so the render/UI thread never touches the
+/// grid again (and never builds the whole document as one String).
+struct ExportJob {
+    format: ExportFormat,
+    path: PathBuf,
+    grid: Grid,
+    /// Connection used to quote identifiers / literals (INSERT formats).
+    cfg: Option<ConnectionConfig>,
+    schema: String,
+    table: String,
+    /// Declared type per column, for the INSERT formats (empty when unknown).
+    types: Vec<Option<String>>,
 }
 
 #[derive(Clone)]
@@ -2256,6 +2278,9 @@ enum Op {
     },
     /// Execute a prepared CSV import, reporting progress per chunk.
     Import(Box<ImportJob>),
+    /// Stream a result set to a file on a background thread, so a large export
+    /// never freezes the UI and never holds the whole document in memory.
+    Export(Box<ExportJob>),
 }
 
 impl Op {
@@ -2267,6 +2292,7 @@ impl Op {
         match self {
             Op::Query(..) => OP_WATCHDOG_SQL,
             Op::Import(_) => OP_WATCHDOG_IMPORT,
+            Op::Export(_) => OP_WATCHDOG_EXPORT,
             _ => OP_WATCHDOG_FALLBACK,
         }
     }
@@ -2399,6 +2425,16 @@ enum OpResult {
     /// Chunk progress; does not count as the op finishing.
     ImportProgress { done: usize, total: usize },
     ImportDone(Box<ImportReport>),
+    /// A background file export finished (or failed). Carries the timing and
+    /// byte count for the status line.
+    ExportDone {
+        format: ExportFormat,
+        path: PathBuf,
+        rows: usize,
+        bytes: u64,
+        elapsed_ms: u128,
+        error: Option<String>,
+    },
     /// A blocking SSH prompt (host-key TOFU / keyboard-interactive) the kernel
     /// handshake is waiting on. Not an op completion — handled before the
     /// spinner accounting, like [`OpResult::ImportProgress`].
@@ -3482,6 +3518,63 @@ async fn run_op(backend: &LocalBackend, op: Op, tx: &Tx) -> OpResult {
                 elapsed_ms: start.elapsed().as_millis(),
             }))
         }
+        Op::Export(job) => {
+            let ExportJob {
+                format,
+                path,
+                grid,
+                cfg,
+                schema,
+                table,
+                types,
+            } = *job;
+            let rows = grid.rows.len();
+            // The writer is blocking (file IO + CPU); keep it off the async
+            // worker pool so the render loop keeps its thread.
+            let write_path = path.clone();
+            let result = tokio::task::spawn_blocking(move || {
+                let start = Instant::now();
+                let file = std::fs::File::create(&write_path)?;
+                let mut w = BufWriter::with_capacity(EXPORT_BUF_BYTES, file);
+                write_export(
+                    &mut w,
+                    cfg.as_ref(),
+                    &schema,
+                    &table,
+                    &types,
+                    &grid,
+                    format,
+                )?;
+                w.flush()?;
+                let bytes = w
+                    .into_inner()
+                    .ok()
+                    .and_then(|f| f.metadata().ok())
+                    .map(|m| m.len())
+                    .unwrap_or(0);
+                Ok::<(u64, u128), std::io::Error>((bytes, start.elapsed().as_millis()))
+            })
+            .await;
+            match result {
+                Ok(Ok((bytes, elapsed_ms))) => OpResult::ExportDone {
+                    format,
+                    path,
+                    rows,
+                    bytes,
+                    elapsed_ms,
+                    error: None,
+                },
+                Ok(Err(e)) => OpResult::ExportDone {
+                    format,
+                    path,
+                    rows,
+                    bytes: 0,
+                    elapsed_ms: 0,
+                    error: Some(e.to_string()),
+                },
+                Err(e) => OpResult::Error(format!("export: {e}")),
+            }
+        }
     }
 }
 
@@ -4263,6 +4356,14 @@ struct App {
     /// cursor lands inside the window the renderer will actually draw (a stale
     /// count would let `window_for_cursor` undo the pan).
     grid_avail: usize,
+    /// Version counter for the displayed grid, bumped whenever `grid` is
+    /// replaced. The column-width cache below is keyed on it so a scroll never
+    /// rescans the whole result set.
+    grid_epoch: u64,
+    /// Cached natural column widths for `(grid_epoch, max_cell)`. Building a
+    /// 20k-row grid's widths is O(cells); caching turns the per-frame cost into
+    /// a lookup.
+    width_cache: Option<(u64, usize, Vec<usize>)>,
 
     confirm: Option<Confirm>,
 
@@ -4705,6 +4806,8 @@ impl App {
             grid_frozen: 0,
             grid_widths: Vec::new(),
             grid_avail: 0,
+            grid_epoch: 0,
+            width_cache: None,
             confirm: None,
             loading: true,
             // The initial `ListConnections` below is the one call not spawned through
@@ -5620,6 +5723,31 @@ fn apply_op_result(app: &mut App, res: OpResult, tx: &Tx) {
             app.import_report = Some(rep);
         }
         OpResult::ImportProgress { .. } => {}
+        OpResult::ExportDone {
+            format,
+            path,
+            rows,
+            bytes,
+            elapsed_ms,
+            error,
+        } => {
+            let label = format.label();
+            let ok = error.is_none();
+            app.status = match error {
+                Some(e) => tf("✗ {} 导出失败: {}", &[&label, &e]),
+                None => tf(
+                    "✓ 已导出 {} · {} 行 · {} → {}",
+                    &[&label, &rows, &human_size(bytes), &(path.display())],
+                ),
+            };
+            // A slow export reports its own timing so the win is visible.
+            if ok && elapsed_ms >= 250 {
+                app.status = tf(
+                    "✓ 已导出 {} · {} 行 · {} · {}ms → {}",
+                    &[&label, &rows, &human_size(bytes), &elapsed_ms, &(path.display())],
+                );
+            }
+        }
         // Handled before the spinner accounting above; unreachable here.
         OpResult::SshPrompt(_) | OpResult::SshNotice(_) => {}
         OpResult::Error(e) => {
@@ -5915,7 +6043,7 @@ fn browse_key(app: &mut App, tx: &Tx, k: KeyEvent) {
         return;
     }
     if app.export_path.is_some() {
-        export_path_key(app, k);
+        export_path_key(app, tx, k);
         return;
     }
     if app.export_open {
@@ -7196,6 +7324,7 @@ fn apply_row_search(grid: Grid, needle: &str) -> Grid {
 
 /// Natural width of one grid column: the widest of its header and cells,
 /// clamped to `[MIN_CELL_WIDTH, max_cell]`.
+#[cfg(test)]
 fn natural_width(grid: &Grid, ci: usize, max_cell: usize) -> usize {
     let mut w = disp_width(grid.columns.get(ci).map(String::as_str).unwrap_or(""));
     for row in &grid.rows {
@@ -7209,18 +7338,45 @@ fn natural_width(grid: &Grid, ci: usize, max_cell: usize) -> usize {
     w.clamp(MIN_CELL_WIDTH, max_cell)
 }
 
+/// Natural width of every column in one row-major pass. One scan of the grid
+/// beats one full scan per column (cache locality), and the result feeds the
+/// per-grid width cache so scrolling a 20k-row result never rescans it.
+fn natural_widths(grid: &Grid, max_cell: usize) -> Vec<usize> {
+    let mut widths: Vec<usize> = grid.columns.iter().map(|c| disp_width(c)).collect();
+    for row in &grid.rows {
+        for (ci, w) in widths.iter_mut().enumerate() {
+            if let Some(v) = row.get(ci) {
+                let cw = disp_width(v.text());
+                if cw > *w {
+                    *w = cw;
+                }
+            }
+        }
+    }
+    for w in &mut widths {
+        *w = (*w).clamp(MIN_CELL_WIDTH, max_cell);
+    }
+    widths
+}
+
 /// How many columns starting at `off` fit in `avail` display columns using their
 /// natural widths. Content-sized columns keep a narrow `id` narrow instead of
 /// stretching it to fill the pane.
 fn visible_cols(grid: &Grid, off: usize, avail: usize, max_cell: usize) -> usize {
-    let n = grid.columns.len();
+    let widths = natural_widths(grid, max_cell);
+    visible_cols_from_widths(&widths, off, avail)
+}
+
+/// [`visible_cols`] against precomputed widths (the render path uses the
+/// cached vector so it never rebuilds it).
+fn visible_cols_from_widths(widths: &[usize], off: usize, avail: usize) -> usize {
+    let n = widths.len();
     if n == 0 || off >= n {
         return 0;
     }
     let mut used = 0usize;
     let mut count = 0usize;
-    for ci in off..n {
-        let w = natural_width(grid, ci, max_cell);
+    for w in widths.iter().skip(off) {
         let add = w + if count > 0 { 1 } else { 0 };
         if count > 0 && used + add > avail {
             break;
@@ -7307,6 +7463,7 @@ fn page_count(total: u64, page_size: usize) -> usize {
 /// How many leading data columns to pin. The row-number gutter is always pinned;
 /// the first data column is pinned only when the toggle is on, the grid is wide
 /// enough to still scroll, and there is room for at least one more column.
+#[cfg(test)]
 fn effective_frozen(
     freeze_first: bool,
     grid: &Grid,
@@ -7314,14 +7471,25 @@ fn effective_frozen(
     inner_w: usize,
     max_cell: usize,
 ) -> usize {
+    let widths = natural_widths(grid, max_cell);
+    effective_frozen_widths(freeze_first, widths.len(), &widths, gutter, inner_w)
+}
+
+/// [`effective_frozen`] against precomputed widths.
+fn effective_frozen_widths(
+    freeze_first: bool,
+    ncols: usize,
+    widths: &[usize],
+    gutter: usize,
+    inner_w: usize,
+) -> usize {
     if !freeze_first {
         return 0;
     }
-    let n = grid.columns.len();
-    if n < 3 {
+    if ncols < 3 {
         return 0;
     }
-    let w0 = natural_width(grid, 0, max_cell);
+    let w0 = widths.first().copied().unwrap_or(MIN_CELL_WIDTH);
     if gutter + 1 + w0 + 1 + MIN_CELL_WIDTH <= inner_w {
         1
     } else {
@@ -7332,6 +7500,7 @@ fn effective_frozen(
 /// The scrollable window `(off, visible)` that keeps `cursor` on screen, starting
 /// from the previous window origin `start` and never scrolling into the frozen
 /// prefix.
+#[cfg(test)]
 fn window_for_cursor(
     grid: &Grid,
     cursor: usize,
@@ -7340,24 +7509,36 @@ fn window_for_cursor(
     max_cell: usize,
     frozen: usize,
 ) -> (usize, usize) {
-    let n = grid.columns.len();
+    let widths = natural_widths(grid, max_cell);
+    window_for_cursor_widths(&widths, cursor, start, avail, frozen)
+}
+
+/// [`window_for_cursor`] against precomputed widths.
+fn window_for_cursor_widths(
+    widths: &[usize],
+    cursor: usize,
+    start: usize,
+    avail: usize,
+    frozen: usize,
+) -> (usize, usize) {
+    let n = widths.len();
     if n == 0 {
         return (0, 0);
     }
     let mut off = start.max(frozen).min(n - 1);
-    let mut visible = visible_cols(grid, off, avail, max_cell).max(1);
+    let mut visible = visible_cols_from_widths(widths, off, avail).max(1);
     if cursor < frozen {
         return (off, visible);
     }
     let mut guard = 0usize;
     while cursor >= off + visible && off + visible < n && guard <= n {
         off += 1;
-        visible = visible_cols(grid, off, avail, max_cell).max(1);
+        visible = visible_cols_from_widths(widths, off, avail).max(1);
         guard += 1;
     }
     if cursor < off {
         off = cursor;
-        visible = visible_cols(grid, off, avail, max_cell).max(1);
+        visible = visible_cols_from_widths(widths, off, avail).max(1);
     }
     (off, visible)
 }
@@ -10868,6 +11049,30 @@ fn build_insert_sql(
     row: &[Val],
     app: &App,
 ) -> String {
+    let types = grid_column_types(app, schema, table, grid);
+    build_insert_sql_types(cfg, schema, table, grid, row, &types)
+}
+
+/// Declared type per grid column, resolved from the browsed table's metadata
+/// (one lookup per column instead of one per cell). The streaming export and
+/// `build_insert_sql` both use this.
+fn grid_column_types(app: &App, schema: &str, table: &str, grid: &Grid) -> Vec<Option<String>> {
+    grid.columns
+        .iter()
+        .map(|c| column_type(app, schema, table, c))
+        .collect()
+}
+
+/// `build_insert_sql` with precomputed column types, so a background export can
+/// build a row without an `App`.
+fn build_insert_sql_types(
+    cfg: &ConnectionConfig,
+    schema: &str,
+    table: &str,
+    grid: &Grid,
+    row: &[Val],
+    types: &[Option<String>],
+) -> String {
     let q = |name: &str| quote_table_identifier(Some(cfg.db_type), name);
     let cols = grid
         .columns
@@ -10879,11 +11084,11 @@ fn build_insert_sql(
         .columns
         .iter()
         .enumerate()
-        .map(|(ci, c)| {
+        .map(|(ci, _)| {
             let v = row.get(ci).cloned().unwrap_or(Val::Null);
             insert_literal(
                 &v,
-                column_type(app, schema, table, c).as_deref(),
+                types.get(ci).and_then(|t| t.as_deref()),
                 Some(cfg.db_type.as_str()),
             )
         })
@@ -12779,11 +12984,222 @@ fn render_export_content(
     }
 }
 
+// ── streaming export (background file path) ───────────────────────────────────
+//
+// The clipboard path above still builds one String (clipboard payloads are
+// bounded and the copy must happen on the UI thread). A file export, by
+// contrast, streams straight into a `BufWriter`: peak memory stays at one row
+// (or one INSERT batch) instead of the whole document, and the work runs on a
+// blocking worker so the UI never freezes. Every writer below is byte-for-byte
+// identical to its `grid_to_*` counterpart — the `export_stream_matches_*`
+// tests pin that down.
+
+/// Stream `format` into `w`. Identical bytes to [`render_export_content`], but
+/// no intermediate document.
+fn write_export<W: Write>(
+    w: &mut W,
+    cfg: Option<&ConnectionConfig>,
+    schema: &str,
+    table: &str,
+    types: &[Option<String>],
+    grid: &Grid,
+    format: ExportFormat,
+) -> std::io::Result<()> {
+    match format {
+        ExportFormat::Csv => write_csv(w, grid),
+        ExportFormat::JsonArray => write_json_array(w, grid),
+        ExportFormat::JsonNdjson => write_json_ndjson(w, grid),
+        ExportFormat::Markdown => write_markdown(w, grid),
+        ExportFormat::Insert => match cfg {
+            Some(cfg) => write_inserts(w, cfg, schema, table, types, grid),
+            None => Ok(()),
+        },
+        ExportFormat::InsertBatch => match cfg {
+            Some(cfg) => {
+                write_batch_inserts(w, cfg, schema, table, types, grid, EXPORT_INSERT_BATCH)
+            }
+            None => Ok(()),
+        },
+    }
+}
+
+fn write_csv<W: Write>(w: &mut W, grid: &Grid) -> std::io::Result<()> {
+    for (ci, c) in grid.columns.iter().enumerate() {
+        if ci > 0 {
+            w.write_all(b",")?;
+        }
+        w.write_all(csv_field(c).as_bytes())?;
+    }
+    w.write_all(b"\n")?;
+    // One row per buffer: memory stays bounded while a whole row still goes out
+    // in a single `write_all`.
+    let mut line = String::new();
+    for row in &grid.rows {
+        line.clear();
+        for ci in 0..grid.columns.len() {
+            if ci > 0 {
+                line.push(',');
+            }
+            line.push_str(&csv_field(row.get(ci).map(Val::text).unwrap_or("")));
+        }
+        line.push('\n');
+        w.write_all(line.as_bytes())?;
+    }
+    Ok(())
+}
+
+/// Pretty-printed JSON array, one object at a time. `to_string_pretty` of a
+/// single object is context-free, so prefixing each of its lines with two
+/// spaces reproduces the object's place inside the pretty array exactly.
+fn write_json_array<W: Write>(w: &mut W, grid: &Grid) -> std::io::Result<()> {
+    if grid.rows.is_empty() {
+        return w.write_all(b"[]");
+    }
+    w.write_all(b"[\n")?;
+    for (i, row) in grid.rows.iter().enumerate() {
+        if i > 0 {
+            w.write_all(b",\n")?;
+        }
+        let obj = serde_json::Value::Object(grid_row_object(grid, row));
+        let s = serde_json::to_string_pretty(&obj).map_err(std::io::Error::other)?;
+        for (j, line) in s.split('\n').enumerate() {
+            if j > 0 {
+                w.write_all(b"\n")?;
+            }
+            w.write_all(b"  ")?;
+            w.write_all(line.as_bytes())?;
+        }
+    }
+    w.write_all(b"\n]")
+}
+
+fn write_json_ndjson<W: Write>(w: &mut W, grid: &Grid) -> std::io::Result<()> {
+    for row in &grid.rows {
+        let obj = serde_json::Value::Object(grid_row_object(grid, row));
+        if let Ok(s) = serde_json::to_string(&obj) {
+            w.write_all(s.as_bytes())?;
+            w.write_all(b"\n")?;
+        }
+    }
+    Ok(())
+}
+
+fn write_markdown<W: Write>(w: &mut W, grid: &Grid) -> std::io::Result<()> {
+    w.write_all(b"|")?;
+    for c in &grid.columns {
+        w.write_all(b" ")?;
+        w.write_all(markdown_cell(c).as_bytes())?;
+        w.write_all(b" |")?;
+    }
+    w.write_all(b"\n|")?;
+    for _ in &grid.columns {
+        w.write_all(b" --- |")?;
+    }
+    w.write_all(b"\n")?;
+    let mut line = String::new();
+    for row in &grid.rows {
+        line.clear();
+        line.push('|');
+        for ci in 0..grid.columns.len() {
+            line.push(' ');
+            match row.get(ci) {
+                None | Some(Val::Null) => line.push_str("NULL"),
+                Some(Val::Text(s)) => line.push_str(&markdown_cell(s)),
+            }
+            line.push_str(" |");
+        }
+        line.push('\n');
+        w.write_all(line.as_bytes())?;
+    }
+    Ok(())
+}
+
+/// One `INSERT` per row, separated by `\n` (no trailing newline), matching
+/// [`grid_to_inserts`].
+fn write_inserts<W: Write>(
+    w: &mut W,
+    cfg: &ConnectionConfig,
+    schema: &str,
+    table: &str,
+    types: &[Option<String>],
+    grid: &Grid,
+) -> std::io::Result<()> {
+    for (i, row) in grid.rows.iter().enumerate() {
+        if i > 0 {
+            w.write_all(b"\n")?;
+        }
+        w.write_all(build_insert_sql_types(cfg, schema, table, grid, row, types).as_bytes())?;
+    }
+    Ok(())
+}
+
+/// Grouped multi-row `INSERT … VALUES (…),(…);` — one statement per `batch`
+/// rows, streamed batch by batch, matching [`batch_insert_sql`].
+fn write_batch_inserts<W: Write>(
+    w: &mut W,
+    cfg: &ConnectionConfig,
+    schema: &str,
+    table: &str,
+    types: &[Option<String>],
+    grid: &Grid,
+    batch: usize,
+) -> std::io::Result<()> {
+    let batch = batch.max(1);
+    let q = |name: &str| quote_table_identifier(Some(cfg.db_type), name);
+    let cols = grid
+        .columns
+        .iter()
+        .map(|c| q(c))
+        .collect::<Vec<_>>()
+        .join(", ");
+    for chunk in grid.rows.chunks(batch) {
+        // One statement per chunk: bounded by `batch` rows, and written in one
+        // pass so the buffered writer sees a few large writes instead of
+        // thousands of tiny ones.
+        let mut out = String::new();
+        out.push_str(&format!(
+            "INSERT INTO {} ({}) VALUES\n",
+            table_ref(cfg.db_type, schema, table),
+            cols
+        ));
+        for (i, row) in chunk.iter().enumerate() {
+            if i > 0 {
+                out.push_str(",\n");
+            }
+            out.push('(');
+            for (ci, _) in grid.columns.iter().enumerate() {
+                if ci > 0 {
+                    out.push_str(", ");
+                }
+                let v = row.get(ci).cloned().unwrap_or(Val::Null);
+                out.push_str(&insert_literal(
+                    &v,
+                    types.get(ci).and_then(|t| t.as_deref()),
+                    Some(cfg.db_type.as_str()),
+                ));
+            }
+            out.push(')');
+        }
+        out.push_str(";\n");
+        w.write_all(out.as_bytes())?;
+    }
+    Ok(())
+}
+
 /// True when the active grid has columns hidden to the right, i.e. horizontal
 /// panning would actually change what is on screen.
 fn has_h_scroll(app: &App) -> bool {
     if app.grid_kind == GridKind::Columns {
         return false;
+    }
+    // The common case (table data / query results) borrows the grid instead of
+    // cloning it: this runs on every wheel event.
+    if let Some(grid) = app.grid.as_ref() {
+        let n = grid.columns.len();
+        if n == 0 {
+            return false;
+        }
+        return n > app.grid_frozen + visible_now(app, grid, app.col_offset);
     }
     let Some(grid) = active_grid(app) else {
         return false;
@@ -12795,17 +13211,51 @@ fn has_h_scroll(app: &App) -> bool {
     n > app.grid_frozen + visible_now(app, &grid, app.col_offset)
 }
 
+/// Column count of the active grid, without cloning its rows.
+fn active_col_count(app: &App) -> Option<usize> {
+    if let Some(s) = &app.script {
+        if let Some(i) = s.drilled {
+            let full = &s.outcomes.get(i)?.grid;
+            return Some(if app.col_hidden.is_empty() {
+                full.columns.len()
+            } else {
+                filter_grid(full, &app.col_hidden).columns.len()
+            });
+        }
+    }
+    app.grid.as_ref().map(|g| g.columns.len())
+}
+
 /// How many columns fit starting at `off`, using the geometry the last render
 /// captured. Exact rather than remembered, so a pan can place the cell cursor
-/// where the renderer will actually keep the window.
+/// where the renderer will actually keep the window. Uses the cached widths
+/// when they belong to the on-screen grid, so a wheel event never rescans the
+/// result set.
 fn visible_now(app: &App, grid: &Grid, off: usize) -> usize {
-    visible_cols(
-        grid,
-        off,
-        app.grid_avail.max(MIN_CELL_WIDTH),
-        app.grid_max_cell.max(MIN_CELL_WIDTH),
-    )
-    .max(1)
+    let avail = app.grid_avail.max(MIN_CELL_WIDTH);
+    let max_cell = app.grid_max_cell.max(MIN_CELL_WIDTH);
+    if let Some((epoch, cell, widths)) = &app.width_cache {
+        if *epoch == app.grid_epoch
+            && *cell == max_cell
+            && widths.len() == grid.columns.len()
+            && app.grid.as_ref().is_some_and(|g| std::ptr::eq(g, grid))
+        {
+            return visible_cols_from_widths(widths, off, avail).max(1);
+        }
+    }
+    visible_cols(grid, off, avail, max_cell).max(1)
+}
+
+/// [`visible_now`] for the active grid, preferring the cache and avoiding a grid
+/// clone on the hot pan path.
+fn active_visible_cols(app: &App, off: usize) -> usize {
+    if let Some(grid) = app.grid.as_ref() {
+        return visible_now(app, grid, off);
+    }
+    match active_grid(app) {
+        Some(g) => visible_now(app, &g, off),
+        None => 1,
+    }
 }
 
 /// Pure core of `pan_columns`: move the window by `delta` columns and place the
@@ -12845,13 +13295,12 @@ fn pan_columns(app: &mut App, delta: i32) -> bool {
     if !has_h_scroll(app) {
         return false;
     }
-    let Some(grid) = active_grid(app) else {
+    let Some(n) = active_col_count(app) else {
         return false;
     };
-    let n = grid.columns.len();
     let min_off = app.grid_frozen.min(n - 1);
     let target = (app.col_offset as i32 + delta).clamp(min_off as i32, n as i32 - 1) as usize;
-    let vis = visible_now(app, &grid, target);
+    let vis = active_visible_cols(app, target);
     let (off, cursor) = pan_window(
         n,
         app.grid_frozen,
@@ -13020,6 +13469,8 @@ impl App {
         self.grid = None;
         self.grid_full = None;
         self.result_rows.clear();
+        self.grid_epoch = self.grid_epoch.wrapping_add(1);
+        self.width_cache = None;
     }
 
     /// Re-apply the session column selection to the grid on screen.
@@ -13031,6 +13482,9 @@ impl App {
     /// set and the result-row search, and rebuild the display→source row map that
     /// the popups and `y` (copy as INSERT) rely on.
     fn rebuild_view(&mut self) {
+        // The displayed grid is about to change: invalidate the width cache.
+        self.grid_epoch = self.grid_epoch.wrapping_add(1);
+        self.width_cache = None;
         let Some(full) = self.grid_full.clone() else {
             self.grid = None;
             self.result_rows.clear();
@@ -13061,6 +13515,23 @@ impl App {
             note: cols.note,
         });
         self.result_rows = map;
+    }
+
+    /// Natural column widths for `grid` at `max_cell`, served from the cache
+    /// unless the displayed grid or the width cap changed. This is the single
+    /// hot-path cost the render loop used to pay on every frame.
+    fn column_widths(&mut self, grid: &Grid, max_cell: usize) -> Vec<usize> {
+        if let Some((epoch, cell, widths)) = &self.width_cache {
+            if *epoch == self.grid_epoch
+                && *cell == max_cell
+                && widths.len() == grid.columns.len()
+            {
+                return widths.clone();
+            }
+        }
+        let widths = natural_widths(grid, max_cell);
+        self.width_cache = Some((self.grid_epoch, max_cell, widths.clone()));
+        widths
     }
 
     /// Index of the focused display row in the *unfiltered* grid. The result-row
@@ -13354,7 +13825,7 @@ fn choose_export_format(app: &mut App, format: ExportFormat) {
 }
 
 /// Destination prompt: blank copies via OSC 52, otherwise writes a file.
-fn export_path_key(app: &mut App, k: KeyEvent) {
+fn export_path_key(app: &mut App, tx: &Tx, k: KeyEvent) {
     let Some(mut ta) = app.export_path.take() else {
         return;
     };
@@ -13375,11 +13846,13 @@ fn export_path_key(app: &mut App, k: KeyEvent) {
         app.status = t("没有可导出的结果").into();
         return;
     };
-    let content = render_export_content(app, &grid, pending.format, pending.table.as_ref());
     let input = ta.lines().join("\n");
     let path = input.trim();
     let label = pending.format.label();
     if path.is_empty() {
+        // Clipboard export stays synchronous: the payload is bounded by what a
+        // terminal can carry and the OSC 52 write must run on the UI thread.
+        let content = render_export_content(app, &grid, pending.format, pending.table.as_ref());
         let n = content.chars().count();
         match clipboard_copy(&content) {
             Some(p) => {
@@ -13392,15 +13865,32 @@ fn export_path_key(app: &mut App, k: KeyEvent) {
                 app.status = tf("✓ 已导出 {} 到剪贴板（{} 字符）", &[&label, &n])
             }
         }
-    } else {
-        let expanded = expand_home(path);
-        match std::fs::write(&expanded, content.as_bytes()) {
-            Ok(_) => {
-                app.status = tf("✓ 已导出 {} → {}", &[&label, &(expanded.display())])
-            }
-            Err(e) => app.status = tf("✗ 写入失败: {}", &[&(e)]),
-        }
+        return;
     }
+    // File export runs on a background worker and streams to disk: the UI keeps
+    // painting (spinner) and peak memory stays at one row, not the whole file.
+    let expanded = expand_home(path);
+    let cfg = app.selected.clone();
+    let (schema, table) = pending.table.clone().unwrap_or_default();
+    let types = grid_column_types(app, &schema, &table, &grid);
+    let rows = grid.rows.len();
+    app.loading = true;
+    app.status = tf(
+        "导出中… {} · {} 行 → {}",
+        &[&label, &rows, &(expanded.display())],
+    );
+    app.spawn(
+        tx,
+        Op::Export(Box::new(ExportJob {
+            format: pending.format,
+            path: expanded,
+            grid,
+            cfg,
+            schema,
+            table,
+            types,
+        })),
+    );
 }
 
 // ── CSV import: entry points and modal keys ──────────────────────────────────
@@ -14715,7 +15205,7 @@ fn render_results_pane(f: &mut Frame, area: Rect, app: &mut App) {
                     o.grid.note.clone()
                 })]);
             if let Some(grid) = active_grid(app) {
-                render_grid(f, area, app, &grid, GridKind::Query, &title);
+                render_grid(f, area, app, &grid, GridKind::Query, &title, false);
             }
         } else {
             render_script_list(f, area, app, &s);
@@ -14730,9 +15220,13 @@ fn render_results_pane(f: &mut Frame, area: Rect, app: &mut App) {
     }
     if app.grid.is_some() {
         let title = grid_title(app);
-        let grid = app.grid.clone().unwrap();
+        // Move the grid out instead of deep-cloning it every frame: a 20k-row
+        // result is ~12 ms of allocation per frame otherwise. `render_grid` only
+        // borrows it, so it is put back right after.
+        let grid = app.grid.take().expect("grid present");
         let kind = app.grid_kind;
-        render_grid(f, area, app, &grid, kind, &title);
+        render_grid(f, area, app, &grid, kind, &title, true);
+        app.grid = Some(grid);
         return;
     }
     if app.backend_kind != Backend::Sql && !app.cmd_output.is_empty() {
@@ -14847,7 +15341,15 @@ fn grid_title(app: &App) -> String {
     }
 }
 
-fn render_grid(f: &mut Frame, area: Rect, app: &mut App, grid: &Grid, kind: GridKind, title: &str) {
+fn render_grid(
+    f: &mut Frame,
+    area: Rect,
+    app: &mut App,
+    grid: &Grid,
+    kind: GridKind,
+    title: &str,
+    cache: bool,
+) {
     let focused = app.focus == Focus::Preview;
     let block = Block::default()
         .borders(Borders::ALL)
@@ -14893,10 +15395,16 @@ fn render_grid(f: &mut Frame, area: Rect, app: &mut App, grid: &Grid, kind: Grid
     // content width, capped per layout.
     let max_cell = grid_max_cell(app, ncols, inner_w, gutter);
     app.grid_max_cell = max_cell;
-    let widths: Vec<usize> = (0..ncols)
-        .map(|ci| natural_width(grid, ci, max_cell))
-        .collect();
-    let frozen = effective_frozen(app.freeze_first, grid, gutter as usize, inner_w, max_cell);
+    // Column widths are content-sized, so building them scans every cell. Cache
+    // them per displayed grid (and width cap) so scrolling 20k rows is a lookup,
+    // not a rescan. The drilled-script grid is rebuilt per frame, so it skips
+    // the cache.
+    let widths: Vec<usize> = if cache {
+        app.column_widths(grid, max_cell)
+    } else {
+        natural_widths(grid, max_cell)
+    };
+    let frozen = effective_frozen_widths(app.freeze_first, ncols, &widths, gutter as usize, inner_w);
     let left_w: usize = gutter as usize
         + if frozen > 0 {
             frozen + widths[..frozen].iter().sum::<usize>()
@@ -14906,12 +15414,11 @@ fn render_grid(f: &mut Frame, area: Rect, app: &mut App, grid: &Grid, kind: Grid
     const GAP: usize = 1;
     let avail = inner_w.saturating_sub(left_w + GAP).max(MIN_CELL_WIDTH);
     app.grid_avail = avail;
-    let (off, visible) = window_for_cursor(
-        grid,
+    let (off, visible) = window_for_cursor_widths(
+        &widths,
         app.col_cursor,
         app.col_offset,
         avail,
-        max_cell,
         frozen,
     );
     app.col_offset = off;
@@ -18650,6 +19157,221 @@ mod tests {
         assert!(md.contains(&huge));
     }
 
+    /// Build an `App` whose table metadata matches `(schema, table)` so the
+    /// INSERT generators resolve column types exactly as they would in the TUI.
+    fn export_meta_app(cfg: ConnectionConfig, schema: &str, table: &str, cols: &[(&str, &str)]) -> App {
+        let mut app = test_app();
+        app.selected = Some(cfg);
+        app.table_meta = Some(TableMeta {
+            table: table.to_string(),
+            schema: schema.to_string(),
+            columns: cols
+                .iter()
+                .map(|(n, t)| ColumnInfo {
+                    name: (*n).to_string(),
+                    data_type: (*t).to_string(),
+                    ..Default::default()
+                })
+                .collect(),
+        });
+        app
+    }
+
+    /// The hard requirement for the streaming export: every format must produce
+    /// exactly the bytes the legacy in-memory string builder produces. Compared
+    /// over a grid that exercises NULLs, empty strings, quotes, commas, embedded
+    /// newlines/tabs, unicode, canonical numbers, booleans and binary/array
+    /// columns (MySQL + PostgreSQL dialect paths).
+    fn assert_stream_matches(app: &App, grid: &Grid, schema: &str, table: &str) {
+        let cfg = app.selected.as_ref().expect("a selected connection");
+        let types = grid_column_types(app, schema, table, grid);
+        let table_ref = Some((schema.to_string(), table.to_string()));
+        for fmt in EXPORT_FORMATS {
+            let reference = render_export_content(app, grid, *fmt, table_ref.as_ref());
+            let mut buf: Vec<u8> = Vec::new();
+            write_export(&mut buf, Some(cfg), schema, table, &types, grid, *fmt).unwrap();
+            assert_eq!(
+                String::from_utf8(buf).unwrap(),
+                reference,
+                "streaming {:?} diverged from the string builder",
+                fmt
+            );
+        }
+    }
+
+    #[test]
+    fn export_stream_matches_string_builders() {
+        let cols = [
+            ("id", "int"),
+            ("name", "varchar(64)"),
+            ("note", "text"),
+            ("amount", "numeric(10,2)"),
+            ("flag", "boolean"),
+            ("empty", "text"),
+            ("blob", "longblob"),
+            ("tags", "text[]"),
+        ];
+        let app = export_meta_app(
+            test_conn("mysql"),
+            "shop",
+            "orders",
+            &cols,
+        );
+        let grid = Grid {
+            columns: cols.iter().map(|(n, _)| (*n).to_string()).collect(),
+            rows: vec![
+                vec![
+                    Val::Text("1".into()),
+                    Val::Text("a,b".into()),
+                    Val::Text("he said \"hi\"".into()),
+                    Val::Text("1.50".into()),
+                    Val::Text("true".into()),
+                    Val::Text(String::new()),
+                    Val::Text("0x00FF10".into()),
+                    Val::Text("[1, 2, 3]".into()),
+                ],
+                vec![
+                    Val::Null,
+                    Val::Text("行\n新".into()),
+                    Val::Text("back\\slash|pipe".into()),
+                    Val::Text("007".into()),
+                    Val::Text("false".into()),
+                    Val::Null,
+                    Val::Null,
+                    Val::Null,
+                ],
+                vec![
+                    Val::Text("3".into()),
+                    Val::Text("用户\t名".into()),
+                    Val::Text("cr\rlf".into()),
+                    Val::Text("1e5".into()),
+                    Val::Text("0.5".into()),
+                    Val::Text("  ".into()),
+                    Val::Text("raw".into()),
+                    Val::Text("[]".into()),
+                ],
+            ],
+            note: String::new(),
+        };
+        assert_stream_matches(&app, &grid, "shop", "orders");
+
+        // The PostgreSQL dialect exercises `"schema"."table"` quoting, bytea
+        // and array literals through the same comparison.
+        let pg = export_meta_app(
+            test_conn("postgres"),
+            "public",
+            "items",
+            &cols,
+        );
+        assert_stream_matches(&pg, &grid, "public", "items");
+    }
+
+    /// Edge shapes: no rows, no columns, and a row count that straddles the
+    /// batch-INSERT chunk boundary (the streaming writer emits one statement per
+    /// chunk, so an off-by-one there would corrupt the output).
+    #[test]
+    fn export_stream_matches_on_edge_grids() {
+        let app = export_meta_app(
+            test_conn("mysql"),
+            "shop",
+            "t",
+            &[("id", "int"), ("name", "varchar(16)")],
+        );
+        let empty = Grid {
+            columns: vec!["id".into(), "name".into()],
+            rows: Vec::new(),
+            note: String::new(),
+        };
+        assert_stream_matches(&app, &empty, "shop", "t");
+
+        let no_cols = Grid {
+            columns: Vec::new(),
+            rows: vec![Vec::new()],
+            note: String::new(),
+        };
+        assert_stream_matches(&app, &no_cols, "shop", "t");
+
+        for rows in [EXPORT_INSERT_BATCH - 1, EXPORT_INSERT_BATCH, EXPORT_INSERT_BATCH + 1] {
+            let grid = Grid {
+                columns: vec!["id".into(), "name".into()],
+                rows: (0..rows)
+                    .map(|i| {
+                        vec![
+                            Val::Text(i.to_string()),
+                            Val::Text(format!("n{i}")),
+                        ]
+                    })
+                    .collect(),
+                note: String::new(),
+            };
+            assert_stream_matches(&app, &grid, "shop", "t");
+        }
+    }
+
+    /// The background export result lands on the status line, and a failure is
+    /// surfaced instead of silently swallowing the write error.
+    #[test]
+    fn export_done_updates_the_status() {
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel::<OpResult>();
+        let mut app = test_app();
+        apply_op_result(
+            &mut app,
+            OpResult::ExportDone {
+                format: ExportFormat::Csv,
+                path: PathBuf::from("/tmp/out.csv"),
+                rows: 20_000,
+                bytes: 4_178_962,
+                elapsed_ms: 0,
+                error: None,
+            },
+            &tx,
+        );
+        assert!(app.status.contains("CSV"), "{}", app.status);
+        assert!(app.status.contains("20000"), "{}", app.status);
+        assert!(app.status.contains("/tmp/out.csv"), "{}", app.status);
+        apply_op_result(
+            &mut app,
+            OpResult::ExportDone {
+                format: ExportFormat::JsonArray,
+                path: PathBuf::from("/nope/out.json"),
+                rows: 3,
+                bytes: 0,
+                elapsed_ms: 0,
+                error: Some("permission denied".into()),
+            },
+            &tx,
+        );
+        assert!(app.status.contains("permission denied"), "{}", app.status);
+    }
+
+    /// The cached widths must equal the per-column reference for every column,
+    /// including the clamp at both ends of `[MIN_CELL_WIDTH, max_cell]`.
+    #[test]
+    fn natural_widths_matches_the_per_column_reference() {
+        let grid = Grid {
+            columns: vec!["id".into(), "description".into(), "n".into()],
+            rows: vec![
+                vec![
+                    Val::Text("1".into()),
+                    Val::Text("a very wide cell indeed".into()),
+                    Val::Null,
+                ],
+                vec![
+                    Val::Text("22".into()),
+                    Val::Text("短".into()),
+                    Val::Text("1234567890".into()),
+                ],
+            ],
+            note: String::new(),
+        };
+        for max_cell in [MIN_CELL_WIDTH, 12, 44] {
+            let all = natural_widths(&grid, max_cell);
+            for (ci, w) in all.iter().enumerate() {
+                assert_eq!(*w, natural_width(&grid, ci, max_cell), "col {ci}");
+            }
+        }
+    }
+
     /// An import writes rows, so the session COUNT(*) cache must be dropped —
     /// otherwise a table browsed before the import (imported into from the
     /// sidebar) would show a stale total on its next open.
@@ -18692,7 +19414,7 @@ mod tests {
                 width: 40,
                 height: 0,
             };
-            render_grid(f, area, &mut app, &grid, GridKind::TableData, " t ");
+            render_grid(f, area, &mut app, &grid, GridKind::TableData, " t ", false);
         })
         .unwrap();
     }
@@ -22205,4 +22927,210 @@ mod tests {
 
         let _ = std::fs::remove_dir_all(&dir);
     }
+    // ── R30 temporary baseline benchmark ────────────────────────────────────
+    fn r30_big_grid(rows: usize) -> Grid {
+        let cols: Vec<String> = (0..12).map(|i| format!("col_{i}")).collect();
+        let data: Vec<Vec<Val>> = (0..rows)
+            .map(|r| {
+                (0..12)
+                    .map(|c| match (r + c) % 9 {
+                        0 => Val::Null,
+                        1 => Val::Text(format!("用户_{r}_{c}")),
+                        2 => Val::Text(format!("note {} 中文备注内容示例文本，用于撑宽列宽。", r)),
+                        3 => Val::Text(format!("{}", r * 137 + c)),
+                        _ => Val::Text(format!("value-{r}-{c}")),
+                    })
+                    .collect()
+            })
+            .collect();
+        Grid { columns: cols, rows: data, note: String::new() }
+    }
+
+    fn r30_hwm() -> String {
+        std::fs::read_to_string("/proc/self/status")
+            .ok()
+            .and_then(|s| s.lines().find(|l| l.starts_with("VmHWM:")).map(str::to_string))
+            .unwrap_or_default()
+    }
+
+    /// Scratch dir for the perf probes, under `target/` (never the system temp
+    /// dir, which may be a small tmpfs).
+    fn r30_bench_dir(name: &str) -> PathBuf {
+        let dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("target")
+            .join("r30-bench")
+            .join(name);
+        let _ = std::fs::create_dir_all(&dir);
+        dir
+    }
+
+    /// Legacy-only memory probe, the counterpart to `r30_stream_bench`: builds
+    /// the whole document in memory per format so the peak is comparable.
+    #[test]
+    #[ignore]
+    fn r30_legacy_bench() {
+        let rows = 20_000usize;
+        let grid = r30_big_grid(rows);
+        let app = {
+            let mut a = test_app();
+            a.selected = Some(test_conn("mysql"));
+            a
+        };
+        let table = Some(("shop".to_string(), "r30_big".to_string()));
+        let dir = r30_bench_dir("legacy");
+        let _ = std::fs::create_dir_all(&dir);
+        eprintln!("BENCH legacy-only baseline peak={}", r30_hwm());
+        for (name, fmt) in [
+            ("csv", ExportFormat::Csv),
+            ("json", ExportFormat::JsonArray),
+            ("ndjson", ExportFormat::JsonNdjson),
+            ("markdown", ExportFormat::Markdown),
+            ("insert", ExportFormat::Insert),
+            ("insertbatch", ExportFormat::InsertBatch),
+        ] {
+            let content = render_export_content(&app, &grid, fmt, table.as_ref());
+            let path = dir.join(format!("l.{name}"));
+            std::fs::write(&path, content.as_bytes()).unwrap();
+            eprintln!(
+                "BENCH legacy-only {name}: bytes={} peak={}",
+                content.len(),
+                r30_hwm()
+            );
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Streaming-only memory probe: no legacy export runs first, so VmHWM
+    /// reflects the streaming path alone.
+    #[test]
+    #[ignore]
+    fn r30_stream_bench() {
+        let rows = 20_000usize;
+        let grid = r30_big_grid(rows);
+        let app = {
+            let mut a = test_app();
+            a.selected = Some(test_conn("mysql"));
+            a
+        };
+        let types = grid_column_types(&app, "shop", "r30_big", &grid);
+        let cfg = app.selected.clone().unwrap();
+        let dir = r30_bench_dir("stream");
+        let _ = std::fs::create_dir_all(&dir);
+        eprintln!("BENCH stream-only baseline peak={}", r30_hwm());
+        for (name, fmt) in [
+            ("csv", ExportFormat::Csv),
+            ("json", ExportFormat::JsonArray),
+            ("ndjson", ExportFormat::JsonNdjson),
+            ("markdown", ExportFormat::Markdown),
+            ("insert", ExportFormat::Insert),
+            ("insertbatch", ExportFormat::InsertBatch),
+        ] {
+            let path = dir.join(format!("s.{name}"));
+            let f = std::fs::File::create(&path).unwrap();
+            let mut w = BufWriter::with_capacity(EXPORT_BUF_BYTES, f);
+            write_export(&mut w, Some(&cfg), "shop", "r30_big", &types, &grid, fmt).unwrap();
+            w.flush().unwrap();
+            let bytes = std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
+            eprintln!("BENCH stream-only {name}: bytes={} peak={}", bytes, r30_hwm());
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    #[ignore]
+    fn r30_baseline_bench() {
+        let rows = 20_000usize;
+        let grid = r30_big_grid(rows);
+        let t = Instant::now();
+        let g2 = grid.clone();
+        eprintln!("BENCH clone grid ({}x12): {:?}", rows, t.elapsed());
+        std::hint::black_box(&g2);
+
+        let t = Instant::now();
+        let widths: Vec<usize> = (0..12).map(|ci| natural_width(&grid, ci, 44)).collect();
+        eprintln!("BENCH natural_width x12: {:?} -> {:?}", t.elapsed(), widths);
+        let t = Instant::now();
+        let _ = visible_cols(&grid, 0, 120, 44);
+        eprintln!("BENCH visible_cols: {:?}", t.elapsed());
+
+        {
+            let mut app2 = test_app();
+            app2.set_grid(r30_big_grid(rows));
+            app2.grid_kind = GridKind::Query;
+            let n = 20u32;
+            let t = Instant::now();
+            for i in 0..n {
+                app2.sel = (i as usize) * 7;
+                std::hint::black_box(draw(&mut app2, 120, 40));
+            }
+            eprintln!("BENCH draw query grid 120x40: {:?}/frame", t.elapsed() / n);
+            let t = Instant::now();
+            for i in 0..n {
+                app2.sel = (i as usize) * 7;
+                app2.col_cursor = (i as usize) % 12;
+                std::hint::black_box(draw(&mut app2, 80, 24));
+            }
+            eprintln!("BENCH draw query grid 80x24: {:?}/frame", t.elapsed() / n);
+        }
+
+        eprintln!("BENCH peak before exports: {}", r30_hwm());
+        let mut app = test_app();
+        app.selected = Some(test_conn("mysql"));
+        let table = Some(("shop".to_string(), "r30_big".to_string()));
+        let dir = r30_bench_dir("all");
+        let _ = std::fs::create_dir_all(&dir);
+        for (name, fmt) in [
+            ("csv", ExportFormat::Csv),
+            ("json", ExportFormat::JsonArray),
+            ("ndjson", ExportFormat::JsonNdjson),
+            ("markdown", ExportFormat::Markdown),
+            ("insert", ExportFormat::Insert),
+            ("insertbatch", ExportFormat::InsertBatch),
+        ] {
+            let t = Instant::now();
+            let content = render_export_content(&app, &grid, fmt, table.as_ref());
+            let gen = t.elapsed();
+            let path = dir.join(format!("bench.{name}"));
+            let t2 = Instant::now();
+            std::fs::write(&path, content.as_bytes()).unwrap();
+            let wr = t2.elapsed();
+            eprintln!(
+                "BENCH export {name}: gen={:?} write={:?} bytes={} peak={}",
+                gen,
+                wr,
+                content.len(),
+                r30_hwm()
+            );
+        }
+        // Streaming path (after): bytes go straight to a BufWriter, one row at
+        // a time, so peak memory stays flat regardless of format.
+        let types = grid_column_types(&app, "shop", "r30_big", &grid);
+        let cfg = app.selected.clone().unwrap();
+        for (name, fmt) in [
+            ("csv", ExportFormat::Csv),
+            ("json", ExportFormat::JsonArray),
+            ("ndjson", ExportFormat::JsonNdjson),
+            ("markdown", ExportFormat::Markdown),
+            ("insert", ExportFormat::Insert),
+            ("insertbatch", ExportFormat::InsertBatch),
+        ] {
+            let path = dir.join(format!("stream.{name}"));
+            let t = Instant::now();
+            {
+                let f = std::fs::File::create(&path).unwrap();
+                let mut w = BufWriter::with_capacity(EXPORT_BUF_BYTES, f);
+                write_export(&mut w, Some(&cfg), "shop", "r30_big", &types, &grid, fmt).unwrap();
+                w.flush().unwrap();
+            }
+            let bytes = std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
+            eprintln!(
+                "BENCH stream {name}: total={:?} bytes={} peak={}",
+                t.elapsed(),
+                bytes,
+                r30_hwm()
+            );
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
 }

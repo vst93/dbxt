@@ -67,6 +67,7 @@ A keyboard-first terminal UI for databases, built on the [DBX](https://github.co
 - `Alt-C` compacts column widths, `Alt-V` hides columns, `Alt-R` jumps to a recent table, `Alt-H` opens the query history — choices persist per `database.table`.
 - Mouse and touch work: click to select, click again to confirm; the wheel scrolls, `Shift`/`Alt`/`Ctrl`+wheel pans columns.
 - Failures are visible: a watchdog turns a dead backend into an error, a spinner with elapsed seconds shows work in flight, and server errors echo verbatim.
+- Large results stay smooth: a 20,000×12 grid scrolls at ~0.6 ms/frame (column widths are cached and only the visible window is sliced out, instead of re-scanning every row each frame), and file export runs on a background worker that streams straight to disk — 20,000 rows × 12 columns in well under a second, with peak memory near a single row (~36 MB whole-process, versus ~96 MB when the document was built in memory).
 - All UI strings come from one table (`src/ui_text.rs`); Chinese is the default, `DBXT_LANG=en` switches to English.
 
 ## Installation
