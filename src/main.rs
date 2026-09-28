@@ -109,6 +109,17 @@ const DEFAULT_SEARCH_MAX_ROWS: u64 = 1_000_000;
 const SEARCH_MAX_HITS: usize = 500;
 /// A `.sql` file larger than this warns before its script is executed.
 const FILE_LOAD_WARN_BYTES: u64 = 2 * 1024 * 1024;
+/// Rows fetched per chunk from each side of a data compare. Small enough to
+/// keep only a few thousand values resident, large enough that a whole-table
+/// compare is not dominated by round trips.
+const DATA_CHUNK: usize = 1000;
+/// Cap on the difference rows a data compare retains. Past it the compare keeps
+/// counting (so the summary stays accurate) but stops storing rows; a bigger
+/// result should be exported and diffed, not shown in a terminal list.
+const DATA_MAX_DIFF_ROWS: usize = 5000;
+/// A data compare is many sequential bounded queries, so the last-resort
+/// watchdog is generous (every statement still has its own driver timeout).
+const OP_WATCHDOG_DATA_DIFF: Duration = Duration::from_secs(900);
 
 // ─── pages & focus ───────────────────────────────────────────────────────────
 
@@ -463,6 +474,14 @@ enum DiffPickMode {
     Database,
 }
 
+/// What the picker compares: table *structure* (R32 `Alt-D`) or table *data*
+/// (`Alt-K`). `m` toggles it inside the picker.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum DiffKind {
+    Schema,
+    Data,
+}
+
 /// Which step of the picker is active.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum DiffPickStage {
@@ -472,10 +491,13 @@ enum DiffPickStage {
     Connections,
 }
 
-/// The `Alt-D` target picker (source is the focused table / current database).
+/// The `Alt-D` / `Alt-K` target picker (source is the focused table / current
+/// database).
 #[derive(Clone, Debug)]
 struct DiffPicker {
     mode: DiffPickMode,
+    /// Structure or data compare; `m` toggles it.
+    kind: DiffKind,
     stage: DiffPickStage,
     list: ListState,
     entries: Vec<String>,
@@ -487,11 +509,211 @@ struct DiffPicker {
     target_schema: String,
     /// A cross-connection table-list fetch is in flight.
     loading: bool,
+    /// A data compare is running in the background; Esc aborts it.
+    comparing: bool,
+    /// The optional `WHERE` predicate applied to both sides of a data compare.
+    where_input: String,
     /// Monotonic id of the latest target table fetch; a stale reply is dropped.
     gen: u64,
     /// The same-connection table list, restored when backing out of the
     /// connection step.
     src_entries: Vec<String>,
+}
+
+// ─── data compare (Alt-K) ────────────────────────────────────────────────────
+//
+// Compares the *rows* of two tables aligned by primary key. Everything below
+// the async op is pure data, so key alignment, chunk classification, cell
+// comparison and sync-SQL generation are unit-testable without a backend.
+
+/// Which tab of the data-diff overlay is shown.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum DataTab {
+    Summary,
+    OnlySrc,
+    OnlyTgt,
+    Diff,
+    /// Generated `INSERT` / `UPDATE` / `DELETE`, reached by `g` (Tab skips it).
+    Sync,
+}
+
+impl DataTab {
+    /// The Tab cycle: the four data views; `Sync` is reached with `g`.
+    fn next(self) -> Self {
+        match self {
+            DataTab::Summary => DataTab::OnlySrc,
+            DataTab::OnlySrc => DataTab::OnlyTgt,
+            DataTab::OnlyTgt => DataTab::Diff,
+            DataTab::Diff | DataTab::Sync => DataTab::Summary,
+        }
+    }
+    fn label(self) -> &'static str {
+        match self {
+            DataTab::Summary => "汇总",
+            DataTab::OnlySrc => "仅源",
+            DataTab::OnlyTgt => "仅目标",
+            DataTab::Diff => "差异",
+            DataTab::Sync => "同步 SQL",
+        }
+    }
+}
+
+/// Which side a difference row sits on.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum RowMark {
+    /// `<` — the key exists only in the source.
+    OnlySrc,
+    /// `>` — the key exists only in the target.
+    OnlyTgt,
+    /// `≠` — the key exists on both sides but the rows differ.
+    Diff,
+}
+
+impl RowMark {
+    fn sign(self) -> &'static str {
+        match self {
+            RowMark::OnlySrc => "<",
+            RowMark::OnlyTgt => ">",
+            RowMark::Diff => "≠",
+        }
+    }
+    fn color(self) -> Color {
+        match self {
+            RowMark::OnlySrc => Color::Green,
+            RowMark::OnlyTgt => Color::Red,
+            RowMark::Diff => Color::Yellow,
+        }
+    }
+}
+
+/// How a primary-key cell is compared during the ordered merge join.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum PkCmp {
+    Numeric,
+    Text,
+}
+
+/// One aligned column pair (source name/type ↔ target name/type).
+#[derive(Clone, Debug)]
+struct DataCol {
+    /// Display name (the source spelling).
+    name: String,
+    src_name: String,
+    tgt_name: String,
+    src_type: String,
+    tgt_type: String,
+    /// Canonical signature when the two sides' types map to the same family and
+    /// the comparison is cross-dialect; value normalisation keys off it.
+    canon: Option<String>,
+    /// At least one side's type is outside the mapping table (shown with `?`).
+    unknown_type: bool,
+}
+
+/// The aligned-column plan for a data compare: primary-key columns first, then
+/// the remaining name-intersection columns in source order.
+#[derive(Clone, Debug)]
+struct DataAlign {
+    cols: Vec<DataCol>,
+    pk_len: usize,
+    cross: bool,
+}
+
+impl DataAlign {
+    fn pk(&self) -> &[DataCol] {
+        &self.cols[..self.pk_len]
+    }
+    fn src_select(&self) -> Vec<String> {
+        self.cols.iter().map(|c| c.src_name.clone()).collect()
+    }
+    fn tgt_select(&self) -> Vec<String> {
+        self.cols.iter().map(|c| c.tgt_name.clone()).collect()
+    }
+    fn src_types(&self) -> Vec<String> {
+        self.cols.iter().map(|c| c.src_type.clone()).collect()
+    }
+    fn tgt_types(&self) -> Vec<String> {
+        self.cols.iter().map(|c| c.tgt_type.clone()).collect()
+    }
+    fn src_pk_names(&self) -> Vec<String> {
+        self.pk().iter().map(|c| c.src_name.clone()).collect()
+    }
+    fn tgt_pk_names(&self) -> Vec<String> {
+        self.pk().iter().map(|c| c.tgt_name.clone()).collect()
+    }
+}
+
+/// A cell-level difference inside a `≠` row.
+#[derive(Clone, Debug)]
+struct DataCellDiff {
+    col: String,
+    /// Index into [`DataAlign::cols`], so the sync generator can find the
+    /// target name / type without a second lookup.
+    idx: usize,
+    src_val: Val,
+    tgt_val: Val,
+    unknown_type: bool,
+}
+
+/// One retained difference row.
+#[derive(Clone, Debug)]
+struct DataDiffRow {
+    mark: RowMark,
+    /// Primary-key display (`1, 42`).
+    key: String,
+    /// Raw primary-key values, for the generated `WHERE`.
+    pk_vals: Vec<Val>,
+    /// `≠` only: the columns whose values differ.
+    cells: Vec<DataCellDiff>,
+    /// `<` / `>` only: the whole row in aligned column order.
+    vals: Vec<Val>,
+}
+
+/// The result of a two-table data compare.
+#[derive(Clone, Debug)]
+struct DataCompare {
+    src_label: String,
+    tgt_label: String,
+    src_db_type: DatabaseType,
+    tgt_schema: String,
+    tgt_table: String,
+    tgt_db_type: DatabaseType,
+    /// `COUNT(*)` forecasts (a hint for scale, not part of the compare).
+    src_count: Option<u64>,
+    tgt_count: Option<u64>,
+    filter: String,
+    align: DataAlign,
+    rows: Vec<DataDiffRow>,
+    only_src: usize,
+    only_tgt: usize,
+    differing: usize,
+    /// The row cap was hit; `rows` holds only the first `DATA_MAX_DIFF_ROWS`.
+    truncated: bool,
+    /// The user aborted the compare; the rows found so far are kept.
+    cancelled: bool,
+}
+
+impl DataCompare {
+    fn cross(&self) -> bool {
+        self.align.cross
+    }
+    fn equal(&self) -> bool {
+        self.rows.is_empty()
+    }
+    fn changed(&self) -> usize {
+        self.only_src + self.only_tgt + self.differing
+    }
+}
+
+/// The open data-diff overlay.
+#[derive(Clone, Debug)]
+struct DataDiffState {
+    result: DataCompare,
+    tab: DataTab,
+    list: ListState,
+    /// Scroll offset for the wrapped sync-SQL preview.
+    scroll: u16,
+    /// Generated sync SQL, filled lazily by `g`.
+    sync_sql: String,
 }
 
 // ─── type normalisation (cross-dialect) ──────────────────────────────────────
@@ -1290,11 +1512,569 @@ fn diff_summary_text(diff: &TableDiff) -> String {
     out
 }
 
+// ─── data compare pure logic ─────────────────────────────────────────────────
+
+/// Case-insensitive key for matching a column by name across two tables.
+fn col_key(name: &str) -> String {
+    name.trim().to_ascii_lowercase()
+}
+
+/// Primary-key columns in index order: prefer the primary index (its column
+/// order is the one `ORDER BY` must follow), falling back to the
+/// `is_primary_key` flags in table-column order.
+fn pk_from_metadata(columns: &[ColumnInfo], indexes: &[IndexInfo]) -> Vec<String> {
+    if let Some(ix) = indexes
+        .iter()
+        .find(|i| i.is_primary && !i.columns.is_empty())
+    {
+        return ix.columns.clone();
+    }
+    columns
+        .iter()
+        .filter(|c| c.is_primary_key)
+        .map(|c| c.name.clone())
+        .collect()
+}
+
+fn make_data_col(sc: &ColumnInfo, tc: &ColumnInfo, cross: bool) -> DataCol {
+    let canon = if cross && canonical_type(&sc.data_type) == canonical_type(&tc.data_type) {
+        canonical_type(&sc.data_type)
+    } else {
+        None
+    };
+    let unknown_type = cross
+        && (canonical_type(&sc.data_type).is_none() || canonical_type(&tc.data_type).is_none());
+    DataCol {
+        name: sc.name.clone(),
+        src_name: sc.name.clone(),
+        tgt_name: tc.name.clone(),
+        src_type: sc.data_type.clone(),
+        tgt_type: tc.data_type.clone(),
+        canon,
+        unknown_type,
+    }
+}
+
+/// Find a column by (trimmed, case-insensitive) name.
+fn find_col<'a>(cols: &'a [ColumnInfo], name: &str) -> Option<&'a ColumnInfo> {
+    cols.iter().find(|c| col_key(&c.name) == col_key(name))
+}
+
+/// Build the aligned-column plan. Rejects a pair that cannot be aligned by
+/// primary key (the reason is surfaced to the user verbatim).
+fn build_data_align(
+    src_cols: &[ColumnInfo],
+    tgt_cols: &[ColumnInfo],
+    src_pk: &[String],
+    tgt_pk: &[String],
+    cross: bool,
+) -> Result<DataAlign, String> {
+    if src_pk.is_empty() && tgt_pk.is_empty() {
+        return Err(t("数据对比需要主键：两表都没有主键，无法按行对齐").into());
+    }
+    if src_pk.is_empty() {
+        return Err(t("数据对比需要主键：源表没有主键，无法按行对齐").into());
+    }
+    if tgt_pk.is_empty() {
+        return Err(t("数据对比需要主键：目标表没有主键，无法按行对齐").into());
+    }
+    if src_pk.len() != tgt_pk.len() {
+        return Err(tf(
+            "主键列数不一致（源 {} / 目标 {}），无法对齐",
+            &[&src_pk.len(), &tgt_pk.len()],
+        ));
+    }
+    let mut used: HashSet<String> = HashSet::new();
+    let mut cols: Vec<DataCol> = Vec::new();
+    for sk in src_pk {
+        let sc = find_col(src_cols, sk).ok_or_else(|| tf("源表主键列 {} 不在表结构中", &[sk]))?;
+        let tc = find_col(tgt_cols, sk).ok_or_else(|| tf("目标表缺少主键列 {}，无法对齐", &[sk]))?;
+        used.insert(col_key(&tc.name));
+        cols.push(make_data_col(sc, tc, cross));
+    }
+    for sc in src_cols {
+        if src_pk.iter().any(|k| col_key(k) == col_key(&sc.name)) {
+            continue;
+        }
+        let Some(tc) = find_col(tgt_cols, &sc.name) else {
+            continue;
+        };
+        if used.contains(&col_key(&tc.name)) {
+            continue;
+        }
+        used.insert(col_key(&tc.name));
+        cols.push(make_data_col(sc, tc, cross));
+    }
+    if cols.is_empty() {
+        return Err(t("两表没有可对齐的列（列名交集为空）").into());
+    }
+    Ok(DataAlign {
+        cols,
+        pk_len: src_pk.len(),
+        cross,
+    })
+}
+
+/// Canonical boolean for a value spelling, or `None` when it is not boolean-ish.
+fn norm_bool(s: &str) -> Option<bool> {
+    match s.trim().to_ascii_lowercase().as_str() {
+        "true" | "t" | "1" | "yes" | "y" | "on" => Some(true),
+        "false" | "f" | "0" | "no" | "n" | "off" => Some(false),
+        _ => None,
+    }
+}
+
+/// Compare two text values under a shared canonical type, so `1` == `1.0` in a
+/// numeric family and `true` == `1` for a boolean. Falls back to an exact
+/// comparison when a value does not parse for the family.
+fn canon_cell_equal(a: &str, b: &str, canon: &str) -> bool {
+    if a == b {
+        return true;
+    }
+    let family = canon.split(['(', ' ']).next().unwrap_or(canon);
+    match family {
+        "boolean" => match (norm_bool(a), norm_bool(b)) {
+            (Some(x), Some(y)) => x == y,
+            _ => a == b,
+        },
+        "int" | "bigint" | "smallint" | "tinyint" | "decimal" | "float" | "double" => {
+            match (a.trim().parse::<f64>(), b.trim().parse::<f64>()) {
+                (Ok(x), Ok(y)) => x == y,
+                _ => a == b,
+            }
+        }
+        "timestamp" => a.replace('T', " ") == b.replace('T', " "),
+        _ => a == b,
+    }
+}
+
+/// Whether two cells are equal. NULL is distinct from the empty string; a
+/// cross-dialect pair only normalises when both sides share a canonical type.
+fn values_equal(a: &Val, b: &Val, canon: Option<&str>) -> bool {
+    match (a, b) {
+        (Val::Null, Val::Null) => true,
+        (Val::Null, _) | (_, Val::Null) => false,
+        (Val::Text(x), Val::Text(y)) => match canon {
+            Some(c) => canon_cell_equal(x, y, c),
+            None => x == y,
+        },
+    }
+}
+
+/// The comparison mode for a primary-key column, from its canonical family.
+fn pk_cmp_mode(col: &DataCol) -> PkCmp {
+    let ty = col.canon.clone().unwrap_or_else(|| col.src_type.clone());
+    let family = canonical_type(&ty).unwrap_or_else(|| norm_type_text(&ty));
+    let base = family.split(['(', ' ']).next().unwrap_or("");
+    if matches!(
+        base,
+        "int" | "bigint" | "smallint" | "tinyint" | "decimal" | "float" | "double"
+    ) {
+        PkCmp::Numeric
+    } else {
+        PkCmp::Text
+    }
+}
+
+/// Order two primary-key rows the way `ORDER BY pk` does, so the chunked merge
+/// join advances the correct side.
+fn cmp_pk_row(a: &[Val], b: &[Val], modes: &[PkCmp]) -> std::cmp::Ordering {
+    use std::cmp::Ordering;
+    let n = modes.len().min(a.len()).min(b.len());
+    for i in 0..n {
+        let ord = match (&a[i], &b[i]) {
+            (Val::Null, Val::Null) => Ordering::Equal,
+            (Val::Null, _) => Ordering::Less,
+            (_, Val::Null) => Ordering::Greater,
+            (Val::Text(x), Val::Text(y)) => match modes[i] {
+                PkCmp::Numeric => match (x.trim().parse::<f64>(), y.trim().parse::<f64>()) {
+                    (Ok(nx), Ok(ny)) => nx.partial_cmp(&ny).unwrap_or(Ordering::Equal),
+                    _ => x.cmp(y),
+                },
+                PkCmp::Text => x.cmp(y),
+            },
+        };
+        if ord != Ordering::Equal {
+            return ord;
+        }
+    }
+    a.len().cmp(&b.len())
+}
+
+/// Primary key as `a, b` for the row list.
+fn pk_display(align: &DataAlign, row: &[Val]) -> String {
+    (0..align.pk_len)
+        .map(|i| {
+            let v = row.get(i).cloned().unwrap_or(Val::Null);
+            value_display(&v).0
+        })
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+/// Classify a pair of matched rows; `None` when they are identical.
+fn compare_data_row(align: &DataAlign, src_row: &[Val], tgt_row: &[Val]) -> Option<DataDiffRow> {
+    let mut cells = Vec::new();
+    for (i, col) in align.cols.iter().enumerate() {
+        let sv = src_row.get(i).cloned().unwrap_or(Val::Null);
+        let tv = tgt_row.get(i).cloned().unwrap_or(Val::Null);
+        if !values_equal(&sv, &tv, col.canon.as_deref()) {
+            cells.push(DataCellDiff {
+                col: col.name.clone(),
+                idx: i,
+                src_val: sv,
+                tgt_val: tv,
+                unknown_type: col.unknown_type,
+            });
+        }
+    }
+    if cells.is_empty() {
+        return None;
+    }
+    Some(DataDiffRow {
+        mark: RowMark::Diff,
+        key: pk_display(align, src_row),
+        pk_vals: src_row[..align.pk_len.min(src_row.len())].to_vec(),
+        cells,
+        vals: Vec::new(),
+    })
+}
+
+fn only_data_row(align: &DataAlign, row: &[Val], mark: RowMark) -> DataDiffRow {
+    DataDiffRow {
+        mark,
+        key: pk_display(align, row),
+        pk_vals: row[..align.pk_len.min(row.len())].to_vec(),
+        cells: Vec::new(),
+        vals: row.to_vec(),
+    }
+}
+
+/// The decision for the current merge frontier of the chunked compare.
+#[derive(Debug)]
+enum MergeStep {
+    /// The source row has no target match; advance the source.
+    SrcOnly,
+    /// The target row has no source match; advance the target.
+    TgtOnly,
+    /// Both sides present the same key; advance both. `Some` carries the row's
+    /// column-level difference (`None` when the rows are identical).
+    Both(Option<DataDiffRow>),
+    /// Both sides are exhausted.
+    Done,
+}
+
+/// Decide the next merge step from the two streams' front rows. Pure, so the
+/// chunked state machine can be unit-tested without a backend.
+fn merge_next(
+    align: &DataAlign,
+    modes: &[PkCmp],
+    src: Option<&[Val]>,
+    tgt: Option<&[Val]>,
+) -> MergeStep {
+    match (src, tgt) {
+        (None, None) => MergeStep::Done,
+        (Some(_), None) => MergeStep::SrcOnly,
+        (None, Some(_)) => MergeStep::TgtOnly,
+        (Some(s), Some(t)) => match cmp_pk_row(s, t, modes) {
+            std::cmp::Ordering::Less => MergeStep::SrcOnly,
+            std::cmp::Ordering::Greater => MergeStep::TgtOnly,
+            std::cmp::Ordering::Equal => MergeStep::Both(compare_data_row(align, s, t)),
+        },
+    }
+}
+
+/// A SQL literal for one cell, dialect-aware (a binary cell → hex literal).
+fn data_val_literal(v: &Val, data_type: Option<&str>, db_type: DatabaseType) -> String {
+    if let Val::Text(s) = v {
+        if data_type.map(is_binary_type).unwrap_or(false) {
+            if let Some(hex) = binary_hex_digits(s) {
+                return binary_literal(hex, Some(db_type.as_str()));
+            }
+        }
+    }
+    val_literal(v, data_type)
+}
+
+/// `(k1 > v1) OR (k1 = v1 AND k2 > v2) OR …` — portable keyset pagination that
+/// avoids `OFFSET` (which is O(offset) on a large table).
+fn keyset_predicate(
+    names: &[String],
+    types: &[String],
+    last: &[Val],
+    db_type: DatabaseType,
+) -> String {
+    let mut clauses = Vec::new();
+    for i in 0..names.len().min(last.len()) {
+        let mut parts: Vec<String> = Vec::new();
+        for j in 0..i {
+            parts.push(format!(
+                "{} = {}",
+                quote_table_identifier(Some(db_type), &names[j]),
+                data_val_literal(&last[j], types.get(j).map(String::as_str), db_type)
+            ));
+        }
+        parts.push(format!(
+            "{} > {}",
+            quote_table_identifier(Some(db_type), &names[i]),
+            data_val_literal(&last[i], types.get(i).map(String::as_str), db_type)
+        ));
+        clauses.push(format!("({})", parts.join(" AND ")));
+    }
+    format!("({})", clauses.join(" OR "))
+}
+
+/// A chunked, primary-key-ordered `SELECT`. `select_cols` / `pk_names` are in
+/// aligned order (primary key first), so the two sides' rows line up positionally.
+#[allow(clippy::too_many_arguments)]
+fn build_data_select(
+    db_type: DatabaseType,
+    schema: &str,
+    table: &str,
+    select_cols: &[String],
+    pk_names: &[String],
+    pk_types: &[String],
+    filter: &str,
+    last: Option<&[Val]>,
+    limit: usize,
+) -> String {
+    let cols = select_cols
+        .iter()
+        .map(|c| quote_table_identifier(Some(db_type), c))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let mut sql = format!("SELECT {cols} FROM {}", table_ref(db_type, schema, table));
+    let mut conds: Vec<String> = Vec::new();
+    let filter = filter.trim();
+    if !filter.is_empty() {
+        conds.push(format!("({filter})"));
+    }
+    if let Some(last) = last {
+        conds.push(keyset_predicate(pk_names, pk_types, last, db_type));
+    }
+    if !conds.is_empty() {
+        sql.push_str(" WHERE ");
+        sql.push_str(&conds.join(" AND "));
+    }
+    let order = pk_names
+        .iter()
+        .map(|c| quote_table_identifier(Some(db_type), c))
+        .collect::<Vec<_>>()
+        .join(", ");
+    sql.push_str(&format!(" ORDER BY {order} LIMIT {limit}"));
+    sql
+}
+
+/// Chunks a `COUNT(*)` forecast, rounded up (0 rows → 0 chunks).
+fn chunk_ceil(rows: Option<u64>) -> usize {
+    match rows {
+        Some(0) => 0,
+        Some(n) => (n as usize).div_ceil(DATA_CHUNK),
+        None => 0,
+    }
+}
+
+/// Estimated total chunk count across both sides (0 when a count is unknown).
+fn chunk_total(src: Option<u64>, tgt: Option<u64>) -> usize {
+    chunk_ceil(src) + chunk_ceil(tgt)
+}
+
+/// The `WHERE` that pins one difference row on the target, from its key values.
+fn sync_pk_where(align: &DataAlign, row: &[Val], dt: DatabaseType) -> String {
+    align
+        .pk()
+        .iter()
+        .enumerate()
+        .map(|(i, col)| {
+            let v = row.get(i).cloned().unwrap_or(Val::Null);
+            format!(
+                "{} = {}",
+                quote_table_identifier(Some(dt), &col.tgt_name),
+                data_val_literal(&v, Some(&col.tgt_type), dt)
+            )
+        })
+        .collect::<Vec<_>>()
+        .join(" AND ")
+}
+
+/// Generate the sync script that rewrites the **target** to match the source.
+/// Never executed by dbxt: values are escaped for the target dialect and column
+/// names use the target spelling.
+fn generate_data_sync(cmp: &DataCompare) -> String {
+    let dt = cmp.tgt_db_type;
+    let table = table_ref(dt, &cmp.tgt_schema, &cmp.tgt_table);
+    let align = &cmp.align;
+    let mut out = String::new();
+    out.push_str(&format!("{}\n", t("-- dbxt 数据对比（源 → 目标，对目标执行）")));
+    out.push_str(&format!(
+        "-- {}: {} ({})\n",
+        t("源"),
+        cmp.src_label,
+        cmp.src_db_type.as_str()
+    ));
+    out.push_str(&format!(
+        "-- {}: {} ({})\n",
+        t("目标"),
+        cmp.tgt_label,
+        cmp.tgt_db_type.as_str()
+    ));
+    out.push_str(&format!("-- {}\n", t("方向：源 → 目标（只生成不执行）")));
+    if cmp.cross() {
+        out.push_str(&format!(
+            "-- {}\n",
+            t("⚠ 跨方言：值按目标方言转义，请先核对再执行")
+        ));
+    }
+    if cmp.truncated {
+        out.push_str(&format!(
+            "-- {}\n",
+            tf(
+                "⚠ 差异行已截断（仅前 {} 行）；请缩小范围，或导出两侧后离线比对",
+                &[&DATA_MAX_DIFF_ROWS]
+            )
+        ));
+    }
+    out.push('\n');
+    if cmp.equal() {
+        out.push_str(&format!("-- {}\n", t("数据一致，无需同步")));
+        return out;
+    }
+    for row in &cmp.rows {
+        match row.mark {
+            RowMark::OnlySrc => {
+                let names = align
+                    .cols
+                    .iter()
+                    .map(|c| quote_table_identifier(Some(dt), &c.tgt_name))
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                let vals = align
+                    .cols
+                    .iter()
+                    .enumerate()
+                    .map(|(i, c)| {
+                        let v = row.vals.get(i).cloned().unwrap_or(Val::Null);
+                        data_val_literal(&v, Some(&c.tgt_type), dt)
+                    })
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                out.push_str(&format!("INSERT INTO {table} ({names}) VALUES ({vals});\n"));
+            }
+            RowMark::OnlyTgt => {
+                out.push_str(&format!(
+                    "DELETE FROM {table} WHERE {};\n",
+                    sync_pk_where(align, &row.pk_vals, dt)
+                ));
+            }
+            RowMark::Diff => {
+                let sets = row
+                    .cells
+                    .iter()
+                    .map(|c| {
+                        let col = &align.cols[c.idx];
+                        format!(
+                            "{} = {}",
+                            quote_table_identifier(Some(dt), &col.tgt_name),
+                            data_val_literal(&c.src_val, Some(&col.tgt_type), dt)
+                        )
+                    })
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                out.push_str(&format!(
+                    "UPDATE {table} SET {sets} WHERE {};\n",
+                    sync_pk_where(align, &row.pk_vals, dt)
+                ));
+            }
+        }
+    }
+    out
+}
+
+/// Plain-text summary for `y` (ticket-friendly).
+fn data_diff_summary_text(cmp: &DataCompare) -> String {
+    let mut out = String::new();
+    out.push_str(&format!("{}\n", t("-- dbxt 数据对比")));
+    out.push_str(&format!(
+        "-- {}: {} ({})\n",
+        t("源"),
+        cmp.src_label,
+        cmp.src_db_type.as_str()
+    ));
+    out.push_str(&format!(
+        "-- {}: {} ({})\n",
+        t("目标"),
+        cmp.tgt_label,
+        cmp.tgt_db_type.as_str()
+    ));
+    if !cmp.filter.trim().is_empty() {
+        out.push_str(&format!("-- {}: {}\n", t("过滤"), cmp.filter));
+    }
+    out.push_str(&format!("-- {}\n", t("方向：源 → 目标")));
+    let count = |v: Option<u64>| v.map(|n| n.to_string()).unwrap_or_else(|| "?".into());
+    out.push_str(&format!(
+        "-- {}: {} {} / {} {}\n",
+        t("行数"),
+        t("源"),
+        count(cmp.src_count),
+        t("目标"),
+        count(cmp.tgt_count)
+    ));
+    out.push_str(&format!(
+        "-- {} {} / {} {} / {} {}\n",
+        t("仅源"),
+        cmp.only_src,
+        t("仅目标"),
+        cmp.only_tgt,
+        t("差异"),
+        cmp.differing
+    ));
+    if cmp.truncated {
+        out.push_str(&format!(
+            "-- {}\n",
+            tf("差异行已截断（仅前 {} 行）", &[&DATA_MAX_DIFF_ROWS])
+        ));
+    }
+    if cmp.cancelled {
+        out.push_str(&format!("-- {}\n", t("已中止（仅比了部分）")));
+    }
+    if cmp.equal() {
+        out.push_str(&format!("-- {}\n", t("数据一致，无差异")));
+        return out;
+    }
+    out.push('\n');
+    for row in &cmp.rows {
+        match row.mark {
+            RowMark::OnlySrc => {
+                out.push_str(&format!("{:<2} {}  {}\n", "<", t("仅源"), row.key));
+            }
+            RowMark::OnlyTgt => {
+                out.push_str(&format!("{:<2} {}  {}\n", ">", t("仅目标"), row.key));
+            }
+            RowMark::Diff => {
+                let cols = row
+                    .cells
+                    .iter()
+                    .map(|c| c.col.clone())
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                out.push_str(&format!(
+                    "{:<2} {}  {}  [{}]\n",
+                    "≠",
+                    t("差异"),
+                    row.key,
+                    cols
+                ));
+            }
+        }
+    }
+    out
+}
+
 // ─── cell values ─────────────────────────────────────────────────────────────
 
 /// A result cell. NULL is kept distinct from the empty string so the grid can
 /// render them differently.
-#[derive(Clone, PartialEq)]
+#[derive(Clone, PartialEq, Debug)]
 enum Val {
     Null,
     Text(String),
@@ -3617,6 +4397,22 @@ enum Op {
         schema: String,
         gen: u64,
     },
+    /// Compare the rows of two tables by primary key, in chunks. Streams
+    /// [`OpResult::DataDiffProgress`] between chunks and aborts when `cancel`
+    /// is set (keeping the rows found so far).
+    DataDiff {
+        src_cfg: Box<ConnectionConfig>,
+        src_db: String,
+        src_schema: String,
+        src_table: String,
+        tgt_cfg: Box<ConnectionConfig>,
+        tgt_db: String,
+        tgt_schema: String,
+        tgt_table: String,
+        where_input: String,
+        gen: u64,
+        cancel: Arc<AtomicBool>,
+    },
 }
 
 impl Op {
@@ -3630,6 +4426,7 @@ impl Op {
             Op::Import(_) => OP_WATCHDOG_IMPORT,
             Op::Export(_) => OP_WATCHDOG_EXPORT,
             Op::GlobalSearch { .. } => OP_WATCHDOG_SEARCH,
+            Op::DataDiff { .. } => OP_WATCHDOG_DATA_DIFF,
             _ => OP_WATCHDOG_FALLBACK,
         }
     }
@@ -3813,6 +4610,18 @@ enum OpResult {
         db: String,
         schema: String,
         tables: Vec<String>,
+    },
+    /// Intermediate data-compare progress; like [`OpResult::ImportProgress`] it
+    /// does not count as the op finishing.
+    DataDiffProgress {
+        gen: u64,
+        done: usize,
+        total: usize,
+    },
+    /// A two-table data compare finished (or was aborted; see `result.cancelled`).
+    DataDiffDone {
+        gen: u64,
+        result: Box<DataCompare>,
     },
     Error(String),
 }
@@ -5074,6 +5883,36 @@ async fn run_op(backend: &LocalBackend, op: Op, tx: &Tx) -> OpResult {
             }
             Err(e) => OpResult::Error(format!("diff target tables: {e}")),
         },
+        Op::DataDiff {
+            src_cfg,
+            src_db,
+            src_schema,
+            src_table,
+            tgt_cfg,
+            tgt_db,
+            tgt_schema,
+            tgt_table,
+            where_input,
+            gen,
+            cancel,
+        } => {
+            run_data_diff(
+                backend,
+                &src_cfg,
+                &src_db,
+                &src_schema,
+                &src_table,
+                &tgt_cfg,
+                &tgt_db,
+                &tgt_schema,
+                &tgt_table,
+                &where_input,
+                gen,
+                &cancel,
+                tx,
+            )
+            .await
+        }
     }
 }
 
@@ -5104,6 +5943,325 @@ async fn fetch_diff_side(
         columns,
         indexes,
     })
+}
+
+/// One side's chunked row stream for the data compare.
+#[derive(Default)]
+struct DataSideStream {
+    buf: VecDeque<Vec<Val>>,
+    exhausted: bool,
+    /// The last row consumed; its primary key drives the next keyset query.
+    last: Option<Vec<Val>>,
+}
+
+/// Primary-key columns for one side, from its primary index (best effort).
+async fn resolve_data_pk(
+    backend: &LocalBackend,
+    cfg: &ConnectionConfig,
+    db: &str,
+    schema: &str,
+    table: &str,
+    columns: &[ColumnInfo],
+) -> Vec<String> {
+    let indexes = dbx_core::schema::list_indexes_core(
+        backend.state().as_ref(),
+        &cfg.id,
+        db,
+        schema,
+        table,
+    )
+    .await
+    .unwrap_or_default();
+    pk_from_metadata(columns, &indexes)
+}
+
+/// `COUNT(*)` for one side, honouring the compare's `WHERE` (best effort — a
+/// failure just means “size unknown”).
+async fn data_count(
+    backend: &LocalBackend,
+    cfg: &ConnectionConfig,
+    db: &str,
+    schema: &str,
+    table: &str,
+    filter: &str,
+) -> Option<u64> {
+    let base = build_count_table_sql(
+        Some(cfg.db_type),
+        (!schema.trim().is_empty()).then_some(schema),
+        table,
+    );
+    let sql = if filter.trim().is_empty() {
+        base
+    } else {
+        format!("{base} WHERE ({})", filter.trim())
+    };
+    let r = backend
+        .execute_query(cfg, db, &sql, Some(1), Some(15))
+        .await
+        .ok()?;
+    r.rows.first().and_then(|row| row.first()).and_then(|v| match v {
+        serde_json::Value::Number(n) => n.as_u64(),
+        serde_json::Value::String(s) => s.parse().ok(),
+        _ => None,
+    })
+}
+
+/// Feed one fetched chunk into a side stream: append the rows, mark the side
+/// exhausted on a short/empty chunk, and advance the keyset cursor to the
+/// chunk's last primary key (so the next refill reads the following rows).
+/// Returns `true` when rows were appended.
+fn feed_chunk(stream: &mut DataSideStream, rows: Vec<Vec<Val>>, pk_len: usize) -> bool {
+    if rows.is_empty() {
+        stream.exhausted = true;
+        return false;
+    }
+    if let Some(last) = rows.last() {
+        stream.last = Some(last[..pk_len.min(last.len())].to_vec());
+    }
+    let n = rows.len();
+    for row in rows {
+        stream.buf.push_back(row);
+    }
+    // A short chunk means the table ended.
+    if n < DATA_CHUNK {
+        stream.exhausted = true;
+    }
+    true
+}
+
+/// Fill one side's buffer with the next `DATA_CHUNK` rows (keyset-paginated).
+/// Returns `Ok(true)` when a query ran and returned rows.
+#[allow(clippy::too_many_arguments)]
+async fn data_refill(
+    backend: &LocalBackend,
+    cfg: &ConnectionConfig,
+    db: &str,
+    schema: &str,
+    table: &str,
+    select: &[String],
+    pk_names: &[String],
+    pk_types: &[String],
+    filter: &str,
+    stream: &mut DataSideStream,
+) -> Result<bool, String> {
+    if stream.exhausted || !stream.buf.is_empty() {
+        return Ok(false);
+    }
+    let sql = build_data_select(
+        cfg.db_type,
+        schema,
+        table,
+        select,
+        pk_names,
+        pk_types,
+        filter,
+        stream.last.as_deref(),
+        DATA_CHUNK,
+    );
+    let r = backend
+        .execute_query(cfg, db, &sql, Some(DATA_CHUNK), Some(60))
+        .await?;
+    let rows: Vec<Vec<Val>> = r
+        .rows
+        .iter()
+        .map(|row| row.iter().map(value_to_val).collect())
+        .collect();
+    Ok(feed_chunk(stream, rows, pk_names.len()))
+}
+
+/// `db.schema.table` for the overlay title / copied summary (mirrors
+/// [`DiffSide::label`]).
+fn data_table_label(db: &str, schema: &str, table: &str) -> String {
+    let rel = qualified_display(schema, table);
+    let prefix = if db.trim().is_empty() {
+        String::new()
+    } else {
+        format!("{}.", fix_double_encoding(db))
+    };
+    format!("{}{}", prefix, fix_double_encoding(&rel))
+}
+
+/// The data-compare worker: resolve both sides' primary keys, forecast counts,
+/// then merge-join chunk by chunk. Progress is streamed between chunks and the
+/// shared `cancel` flag aborts, keeping the rows found so far.
+#[allow(clippy::too_many_arguments)]
+async fn run_data_diff(
+    backend: &LocalBackend,
+    src_cfg: &ConnectionConfig,
+    src_db: &str,
+    src_schema: &str,
+    src_table: &str,
+    tgt_cfg: &ConnectionConfig,
+    tgt_db: &str,
+    tgt_schema: &str,
+    tgt_table: &str,
+    where_input: &str,
+    gen: u64,
+    cancel: &AtomicBool,
+    tx: &Tx,
+) -> OpResult {
+    let src_cols = match backend.get_columns(src_cfg, src_db, src_schema, src_table).await {
+        Ok(c) => c,
+        Err(e) => return OpResult::Error(format!("data diff source columns: {e}")),
+    };
+    let tgt_cols = match backend.get_columns(tgt_cfg, tgt_db, tgt_schema, tgt_table).await {
+        Ok(c) => c,
+        Err(e) => return OpResult::Error(format!("data diff target columns: {e}")),
+    };
+    let src_pk = resolve_data_pk(backend, src_cfg, src_db, src_schema, src_table, &src_cols).await;
+    let tgt_pk = resolve_data_pk(backend, tgt_cfg, tgt_db, tgt_schema, tgt_table, &tgt_cols).await;
+    let cross = src_cfg.db_type != tgt_cfg.db_type;
+    let align = match build_data_align(&src_cols, &tgt_cols, &src_pk, &tgt_pk, cross) {
+        Ok(a) => a,
+        Err(reason) => return OpResult::Error(reason),
+    };
+    let filter = normalize_where_input(Some(where_input));
+    // Forecast both sizes so the user can judge scale before the compare ends.
+    let src_count = data_count(backend, src_cfg, src_db, src_schema, src_table, &filter).await;
+    let tgt_count = data_count(backend, tgt_cfg, tgt_db, tgt_schema, tgt_table, &filter).await;
+
+    let src_select = align.src_select();
+    let tgt_select = align.tgt_select();
+    let src_types = align.src_types();
+    let tgt_types = align.tgt_types();
+    let src_pk_names = align.src_pk_names();
+    let tgt_pk_names = align.tgt_pk_names();
+    let modes: Vec<PkCmp> = align.pk().iter().map(pk_cmp_mode).collect();
+    let total_chunks = chunk_total(src_count, tgt_count);
+
+    let mut src_stream = DataSideStream::default();
+    let mut tgt_stream = DataSideStream::default();
+    let mut rows: Vec<DataDiffRow> = Vec::new();
+    let mut only_src = 0usize;
+    let mut only_tgt = 0usize;
+    let mut differing = 0usize;
+    let mut truncated = false;
+    let mut cancelled = false;
+    let mut done = 0usize;
+
+    // Store a row unless the cap is hit; the counters keep running either way.
+    macro_rules! keep {
+        ($row:expr) => {
+            if rows.len() < DATA_MAX_DIFF_ROWS {
+                rows.push($row);
+            } else {
+                truncated = true;
+            }
+        };
+    }
+
+    loop {
+        if cancel.load(Ordering::Relaxed) {
+            cancelled = true;
+            break;
+        }
+        let mut refreshed = false;
+        if src_stream.buf.is_empty() {
+            match data_refill(
+                backend,
+                src_cfg,
+                src_db,
+                src_schema,
+                src_table,
+                &src_select,
+                &src_pk_names,
+                &src_types,
+                &filter,
+                &mut src_stream,
+            )
+            .await
+            {
+                Ok(true) => {
+                    done += 1;
+                    refreshed = true;
+                }
+                Ok(false) => {}
+                Err(e) => return OpResult::Error(format!("data diff source: {e}")),
+            }
+        }
+        if tgt_stream.buf.is_empty() {
+            match data_refill(
+                backend,
+                tgt_cfg,
+                tgt_db,
+                tgt_schema,
+                tgt_table,
+                &tgt_select,
+                &tgt_pk_names,
+                &tgt_types,
+                &filter,
+                &mut tgt_stream,
+            )
+            .await
+            {
+                Ok(true) => {
+                    done += 1;
+                    refreshed = true;
+                }
+                Ok(false) => {}
+                Err(e) => return OpResult::Error(format!("data diff target: {e}")),
+            }
+        }
+        if refreshed {
+            let _ = tx.send(OpResult::DataDiffProgress {
+                gen,
+                done,
+                total: total_chunks,
+            });
+        }
+        match merge_next(
+            &align,
+            &modes,
+            src_stream.buf.front().map(Vec::as_slice),
+            tgt_stream.buf.front().map(Vec::as_slice),
+        ) {
+            MergeStep::Done => break,
+            MergeStep::SrcOnly => {
+                let row = src_stream.buf.pop_front().unwrap();
+                only_src += 1;
+                keep!(only_data_row(&align, &row, RowMark::OnlySrc));
+            }
+            MergeStep::TgtOnly => {
+                let row = tgt_stream.buf.pop_front().unwrap();
+                only_tgt += 1;
+                keep!(only_data_row(&align, &row, RowMark::OnlyTgt));
+            }
+            MergeStep::Both(diff) => {
+                src_stream.buf.pop_front();
+                tgt_stream.buf.pop_front();
+                if let Some(row) = diff {
+                    differing += 1;
+                    keep!(row);
+                }
+            }
+        }
+    }
+    // A cancel that lands while the last chunk is in flight still counts.
+    if cancel.load(Ordering::Relaxed) {
+        cancelled = true;
+    }
+
+    OpResult::DataDiffDone {
+        gen,
+        result: Box::new(DataCompare {
+            src_label: data_table_label(src_db, src_schema, src_table),
+            tgt_label: data_table_label(tgt_db, tgt_schema, tgt_table),
+            src_db_type: src_cfg.db_type,
+            tgt_schema: tgt_schema.to_string(),
+            tgt_table: tgt_table.to_string(),
+            tgt_db_type: tgt_cfg.db_type,
+            src_count,
+            tgt_count,
+            filter,
+            align,
+            rows,
+            only_src,
+            only_tgt,
+            differing,
+            truncated,
+            cancelled,
+        }),
+    }
 }
 
 /// The global-search worker: enumerate tables, skip the big ones, then scan each
@@ -5965,6 +7123,19 @@ struct App {
     /// Monotonic id of the latest diff request; a stale reply is discarded.
     diff_gen: u64,
 
+    // ── data compare (Alt-K / picker `m`) ──
+    /// The open two-table data-diff overlay.
+    data_diff: Option<Box<DataDiffState>>,
+    /// The optional `WHERE` input for a data compare (modal, on top of the
+    /// picker).
+    data_where: Option<TextArea<'static>>,
+    /// Monotonic id of the latest data-compare request.
+    data_diff_gen: u64,
+    /// `(done, total)` chunks while a data compare runs.
+    data_progress: Option<(usize, usize)>,
+    /// Cancellation flag shared with the running compare (Esc aborts).
+    data_cancel: Arc<AtomicBool>,
+
     // ── SQL file execution (Alt-L) ──
     /// The modal file-path input.
     file_load_prompt: Option<TextArea<'static>>,
@@ -6482,6 +7653,11 @@ impl App {
             diff: None,
             db_diff: None,
             diff_gen: 0,
+            data_diff: None,
+            data_where: None,
+            data_diff_gen: 0,
+            data_progress: None,
+            data_cancel: Arc::new(AtomicBool::new(false)),
             file_load_prompt: None,
             file_load_plan: None,
             filter_prompt: None,
@@ -6667,6 +7843,7 @@ fn apply_op_result(app: &mut App, res: OpResult, tx: &Tx) {
             | OpResult::SshPrompt(_)
             | OpResult::SshNotice(_)
             | OpResult::SearchProgress { .. }
+            | OpResult::DataDiffProgress { .. }
     ) {
         match res {
             OpResult::SearchProgress { gen, done, total } => {
@@ -6676,6 +7853,16 @@ fn apply_op_result(app: &mut App, res: OpResult, tx: &Tx) {
                         "全库搜索「{}」· {}/{} 表…",
                         &[&(app.search_query), &(done), &(total)],
                     );
+                }
+            }
+            OpResult::DataDiffProgress { gen, done, total } => {
+                if gen == app.data_diff_gen {
+                    app.data_progress = Some((done, total));
+                    app.status = if total > 0 {
+                        tf("数据对比中… · {}/{} 块", &[&done, &total])
+                    } else {
+                        tf("数据对比中… · {} 块", &[&done])
+                    };
                 }
             }
             OpResult::ImportProgress { done, total } => {
@@ -7570,6 +8757,60 @@ fn apply_op_result(app: &mut App, res: OpResult, tx: &Tx) {
                 )
             };
         }
+        OpResult::DataDiffDone { gen, result } => {
+            if gen != app.data_diff_gen {
+                return;
+            }
+            app.data_progress = None;
+            if let Some(p) = app.diff_picker.as_mut() {
+                p.comparing = false;
+                p.loading = false;
+            }
+            app.diff_picker = None;
+            let only_src = result.only_src;
+            let only_tgt = result.only_tgt;
+            let differing = result.differing;
+            let cancelled = result.cancelled;
+            let truncated = result.truncated;
+            let equal = result.equal();
+            let src = result.src_label.clone();
+            let tgt = result.tgt_label.clone();
+            let mut state = DataDiffState {
+                result: *result,
+                tab: DataTab::Summary,
+                list: ListState::default(),
+                scroll: 0,
+                sync_sql: String::new(),
+            };
+            if data_tab_rows(&state) > 0 {
+                state.list.select(Some(0));
+            }
+            app.data_diff = Some(Box::new(state));
+            let tail = if truncated {
+                tf(
+                    " · ⚠ 已截断（仅前 {} 行）",
+                    &[&DATA_MAX_DIFF_ROWS],
+                )
+            } else {
+                String::new()
+            };
+            let stop = if cancelled {
+                tf(" · {}", &[&t("已中止（保留已比结果）")])
+            } else {
+                String::new()
+            };
+            app.status = if equal {
+                tf(
+                    "数据对比 {} → {} · {} · Tab 切换 · Esc 关{}{}",
+                    &[&src, &tgt, &t("数据一致"), &tail, &stop],
+                )
+            } else {
+                tf(
+                    "数据对比 {} → {} · 仅源 {} · 仅目标 {} · 差异 {}{}{} · Enter 详情 · y 摘要 · g 同步 SQL",
+                    &[&src, &tgt, &only_src, &only_tgt, &differing, &tail, &stop],
+                )
+            };
+        }
         OpResult::DbDiffReady { gen, diff } => {
             if gen != app.diff_gen {
                 return;
@@ -7622,7 +8863,10 @@ fn apply_op_result(app: &mut App, res: OpResult, tx: &Tx) {
             };
         }
         // Handled before the spinner accounting above; unreachable here.
-        OpResult::SshPrompt(_) | OpResult::SshNotice(_) | OpResult::SearchProgress { .. } => {}
+        OpResult::SshPrompt(_)
+        | OpResult::SshNotice(_)
+        | OpResult::SearchProgress { .. }
+        | OpResult::DataDiffProgress { .. } => {}
         OpResult::Error(e) => {
             app.import_progress = None;
             app.page_pending = false;
@@ -7632,10 +8876,12 @@ fn apply_op_result(app: &mut App, res: OpResult, tx: &Tx) {
             app.pending_write_msg = None;
             app.search_running = false;
             app.search_progress = None;
-            // A failed cross-connection table fetch must not leave the picker
-            // stuck on its spinner.
+            app.data_progress = None;
+            // A failed cross-connection table fetch — or a rejected data compare
+            // (no primary key) — must not leave the picker stuck on its spinner.
             if let Some(p) = app.diff_picker.as_mut() {
                 p.loading = false;
+                p.comparing = false;
             }
             // A failed scan must not leave the key list permanently unable to
             // load another page.
@@ -8026,9 +9272,18 @@ fn browse_key(app: &mut App, tx: &Tx, k: KeyEvent) {
     }
 
     // Schema diff overlays (Alt-D / Shift+Alt-D) are modal: the target picker,
-    // the two-table diff and the two-database diff.
+    // the two-table diff and the two-database diff. The data-compare overlays
+    // (Alt-K) share the same picker.
+    if app.data_where.is_some() {
+        data_where_key(app, tx, k);
+        return;
+    }
     if app.diff_picker.is_some() {
         diff_picker_key(app, tx, k);
+        return;
+    }
+    if app.data_diff.is_some() {
+        data_diff_key(app, tx, k);
         return;
     }
     if app.diff.is_some() {
@@ -8197,11 +9452,16 @@ fn browse_key(app: &mut App, tx: &Tx, k: KeyEvent) {
             }
             // Alt-D: two-table structure diff; Shift+Alt-D: two-database diff.
             KeyCode::Char('d') => {
-                open_diff_picker(app, DiffPickMode::Table);
+                open_diff_picker(app, DiffPickMode::Table, DiffKind::Schema);
                 return;
             }
             KeyCode::Char('D') => {
-                open_diff_picker(app, DiffPickMode::Database);
+                open_diff_picker(app, DiffPickMode::Database, DiffKind::Schema);
+                return;
+            }
+            // Alt-K: two-table data compare (primary-key aligned).
+            KeyCode::Char('k') | KeyCode::Char('K') => {
+                open_diff_picker(app, DiffPickMode::Table, DiffKind::Data);
                 return;
             }
             _ => {}
@@ -12472,15 +13732,25 @@ fn diff_target_schema(cfg: &ConnectionConfig, src_schema: &str) -> String {
     "public".to_string()
 }
 
-fn open_diff_picker(app: &mut App, mode: DiffPickMode) {
+fn open_diff_picker(app: &mut App, mode: DiffPickMode, kind: DiffKind) {
     if app.backend_kind != Backend::Sql || app.selected.is_none() {
-        app.status = t("结构对比仅支持 SQL 连接").into();
+        app.status = t("对比仅支持 SQL 连接").into();
         return;
     }
+    // Data compare is inherently table-to-table; the database list is a
+    // structure-only view.
+    let mode = if kind == DiffKind::Data {
+        DiffPickMode::Table
+    } else {
+        mode
+    };
     let entries: Vec<String> = match mode {
         DiffPickMode::Table => {
             let Some((_, _, src)) = diff_source(app) else {
-                app.status = t("先选中一张表再按 Alt-D").into();
+                app.status = match kind {
+                    DiffKind::Schema => t("先选中一张表再按 Alt-D").into(),
+                    DiffKind::Data => t("先选中一张表再按 Alt-K").into(),
+                };
                 return;
             };
             app.tables
@@ -12511,6 +13781,7 @@ fn open_diff_picker(app: &mut App, mode: DiffPickMode) {
     list.select(Some(0));
     app.diff_picker = Some(DiffPicker {
         mode,
+        kind,
         stage: DiffPickStage::Lists,
         list,
         src_entries: entries.clone(),
@@ -12519,21 +13790,33 @@ fn open_diff_picker(app: &mut App, mode: DiffPickMode) {
         target_db: String::new(),
         target_schema: String::new(),
         loading: false,
+        comparing: false,
+        where_input: String::new(),
         gen,
     });
-    app.status = match mode {
-        DiffPickMode::Table => {
+    app.status = match (kind, mode) {
+        (DiffKind::Schema, DiffPickMode::Table) => {
             t("选择目标表（源 = 当前表；c 换连接做跨库/跨方言对比）").into()
         }
-        DiffPickMode::Database => t("选择目标库（源 = 当前库）").into(),
+        (DiffKind::Schema, DiffPickMode::Database) => t("选择目标库（源 = 当前库）").into(),
+        (DiffKind::Data, _) => t("选择目标表做数据对比（按主键对齐；c 换连接；w 加 WHERE）").into(),
     };
 }
 
 fn diff_picker_key(app: &mut App, tx: &Tx, k: KeyEvent) {
-    let Some((mode, stage)) = app.diff_picker.as_ref().map(|p| (p.mode, p.stage)) else {
+    let Some((mode, stage, kind)) = app
+        .diff_picker
+        .as_ref()
+        .map(|p| (p.mode, p.stage, p.kind))
+    else {
         return;
     };
     let n = app.diff_picker.as_ref().map(|p| p.entries.len()).unwrap_or(0);
+    let comparing = app
+        .diff_picker
+        .as_ref()
+        .map(|p| p.comparing)
+        .unwrap_or(false);
     let step = |app: &mut App, delta: i32| {
         if n == 0 {
             return;
@@ -12559,28 +13842,72 @@ fn diff_picker_key(app: &mut App, tx: &Tx, k: KeyEvent) {
             p.gen = gen;
             p.list.select(if p.entries.is_empty() { None } else { Some(0) });
         }
-        app.status = t("选择目标表（源 = 当前表；c 换连接做跨库/跨方言对比）").into();
+        app.status = match kind {
+            DiffKind::Schema => {
+                t("选择目标表（源 = 当前表；c 换连接做跨库/跨方言对比）").into()
+            }
+            DiffKind::Data => {
+                t("选择目标表做数据对比（按主键对齐；c 换连接；w 加 WHERE）").into()
+            }
+        };
     };
     match k.code {
         KeyCode::Esc | KeyCode::Char('q') => {
+            // A running data compare aborts on Esc, keeping the rows found so far.
+            if app
+                .diff_picker
+                .as_ref()
+                .map(|p| p.comparing)
+                .unwrap_or(false)
+            {
+                app.data_cancel.store(true, Ordering::Relaxed);
+                app.status = t("正在中止数据对比…（保留已比结果）").into();
+                return;
+            }
             if stage == DiffPickStage::Connections {
                 back_to_lists(app);
                 return;
             }
             app.diff_picker = None;
-            app.status = t("已取消结构对比").into();
+            app.status = t("已取消对比").into();
         }
-        // Toggle target kind: table (Alt-D) ↔ database (Shift+Alt-D).
-        KeyCode::Char('d') | KeyCode::Char('D') if stage == DiffPickStage::Lists => {
+        // Toggle target kind: table (Alt-D) ↔ database (Shift+Alt-D). Structure only.
+        KeyCode::Char('d') | KeyCode::Char('D')
+            if kind == DiffKind::Schema
+                && stage == DiffPickStage::Lists
+                && !comparing =>
+        {
             let next = if mode == DiffPickMode::Table {
                 DiffPickMode::Database
             } else {
                 DiffPickMode::Table
             };
-            open_diff_picker(app, next);
+            open_diff_picker(app, next, DiffKind::Schema);
+        }
+        // `m`: switch the picker between structure and data compare.
+        KeyCode::Char('m') | KeyCode::Char('M')
+            if stage == DiffPickStage::Lists && !comparing =>
+        {
+            let next = match kind {
+                DiffKind::Schema => DiffKind::Data,
+                DiffKind::Data => DiffKind::Schema,
+            };
+            open_diff_picker(app, mode, next);
+        }
+        // `w`: type an optional WHERE applied to both sides of a data compare.
+        KeyCode::Char('w') | KeyCode::Char('W')
+            if kind == DiffKind::Data
+                && stage == DiffPickStage::Lists
+                && !comparing =>
+        {
+            open_data_where(app);
         }
         // `c`: pick another connection as the diff target (cross-dialect).
-        KeyCode::Char('c') if mode == DiffPickMode::Table && stage == DiffPickStage::Lists => {
+        KeyCode::Char('c')
+            if mode == DiffPickMode::Table
+                && stage == DiffPickStage::Lists
+                && !comparing =>
+        {
             let conns = diff_other_connections(app);
             if conns.is_empty() {
                 app.status = t("没有别的 SQL 连接可做跨连接对比").into();
@@ -12616,6 +13943,15 @@ fn diff_picker_key(app: &mut App, tx: &Tx, k: KeyEvent) {
             }
         }
         KeyCode::Enter => {
+            // A running compare ignores Enter (Esc aborts it).
+            if app
+                .diff_picker
+                .as_ref()
+                .map(|p| p.comparing)
+                .unwrap_or(false)
+            {
+                return;
+            }
             let Some(p) = app.diff_picker.as_ref() else {
                 return;
             };
@@ -12654,8 +13990,8 @@ fn diff_picker_key(app: &mut App, tx: &Tx, k: KeyEvent) {
             let Some(choice) = p.entries.get(idx).cloned() else {
                 return;
             };
-            match mode {
-                DiffPickMode::Table => {
+            match (kind, mode) {
+                (DiffKind::Schema, DiffPickMode::Table) => {
                     let Some((db, schema, src)) = diff_source(app) else {
                         return;
                     };
@@ -12675,11 +14011,14 @@ fn diff_picker_key(app: &mut App, tx: &Tx, k: KeyEvent) {
                         app, tx, src_cfg, db, schema, src, tgt_cfg, tgt_db, tgt_schema, choice,
                     );
                 }
-                DiffPickMode::Database => {
+                (DiffKind::Schema, DiffPickMode::Database) => {
                     let src_db = app.current_db();
                     let schema = app.schema.clone();
                     let tgt_schema = schema.clone();
                     start_db_diff(app, tx, src_db, schema, choice, tgt_schema);
+                }
+                (DiffKind::Data, _) => {
+                    start_selected_data_diff(app, tx);
                 }
             }
         }
@@ -12933,6 +14272,326 @@ fn db_diff_key(app: &mut App, tx: &Tx, k: KeyEvent) {
                 }
                 DbTableMark::OnlyTgt => {
                     app.status = tf("{} 只在目标库", &[&fix_double_encoding(&entry.table)])
+                }
+            }
+        }
+        _ => {}
+    }
+}
+
+// ── data compare (Alt-K) ──
+
+/// Start a two-table data compare. The picker stays open (with `comparing` set)
+/// so Esc can abort; the result overlay opens when the op finishes.
+#[allow(clippy::too_many_arguments)]
+fn start_data_diff(
+    app: &mut App,
+    tx: &Tx,
+    src_cfg: ConnectionConfig,
+    src_db: String,
+    src_schema: String,
+    src_table: String,
+    tgt_cfg: ConnectionConfig,
+    tgt_db: String,
+    tgt_schema: String,
+    tgt_table: String,
+    where_input: String,
+) {
+    app.data_diff = None;
+    app.data_where = None;
+    app.data_diff_gen += 1;
+    let gen = app.data_diff_gen;
+    app.data_cancel = Arc::new(AtomicBool::new(false));
+    let cancel = app.data_cancel.clone();
+    app.data_progress = Some((0, 0));
+    if let Some(p) = app.diff_picker.as_mut() {
+        p.comparing = true;
+        p.loading = true;
+    }
+    app.loading = true;
+    app.status = tf(
+        "数据对比 {} → {}…（按主键对齐；Esc 中止）",
+        &[
+            &fix_double_encoding(&qualified_display(&src_schema, &src_table)),
+            &fix_double_encoding(&qualified_display(&tgt_schema, &tgt_table)),
+        ],
+    );
+    app.spawn(
+        tx,
+        Op::DataDiff {
+            src_cfg: Box::new(src_cfg),
+            src_db,
+            src_schema,
+            src_table,
+            tgt_cfg: Box::new(tgt_cfg),
+            tgt_db,
+            tgt_schema,
+            tgt_table,
+            where_input,
+            gen,
+            cancel,
+        },
+    );
+}
+
+/// Open the optional `WHERE` input for a data compare (prefilled with any
+/// existing value). Enter starts the compare; Esc returns to the picker.
+fn open_data_where(app: &mut App) {
+    let initial = app
+        .diff_picker
+        .as_ref()
+        .map(|p| p.where_input.clone())
+        .unwrap_or_default();
+    let mut ta = TextArea::from(initial.split('\n').collect::<Vec<_>>());
+    ta.set_placeholder_text(t("例: status = 'active'（留空回车 = 无过滤）"));
+    ta.move_cursor(CursorMove::End);
+    app.data_where = Some(ta);
+    app.status = t("数据对比 WHERE 过滤（两边同时生效）· Enter 开始 · Esc 返回").into();
+}
+
+fn data_where_key(app: &mut App, tx: &Tx, k: KeyEvent) {
+    match k.code {
+        KeyCode::Enter => {
+            let text = app
+                .data_where
+                .as_ref()
+                .map(|t| t.lines().join(" ").trim().to_string())
+                .unwrap_or_default();
+            app.data_where = None;
+            if let Some(p) = app.diff_picker.as_mut() {
+                p.where_input = text;
+            }
+            start_selected_data_diff(app, tx);
+        }
+        KeyCode::Esc => {
+            app.data_where = None;
+            app.status = t("已取消 WHERE 输入").into();
+        }
+        _ => {
+            if let Some(t) = app.data_where.as_mut() {
+                t.input(k);
+            }
+        }
+    }
+}
+
+/// The `Enter` action shared by the picker and the WHERE prompt: start the
+/// compare for the picker's current selection.
+fn start_selected_data_diff(app: &mut App, tx: &Tx) {
+    let Some(p) = app.diff_picker.as_ref() else {
+        return;
+    };
+    let Some(idx) = p.list.selected() else {
+        return;
+    };
+    let Some(choice) = p.entries.get(idx).cloned() else {
+        return;
+    };
+    let where_input = p.where_input.clone();
+    let Some((db, schema, src)) = diff_source(app) else {
+        return;
+    };
+    let Some(src_cfg) = app.selected.clone() else {
+        return;
+    };
+    let (tgt_cfg, tgt_db, tgt_schema) = match &p.target_conn {
+        Some(c) => ((**c).clone(), p.target_db.clone(), p.target_schema.clone()),
+        None => (src_cfg.clone(), db.clone(), schema.clone()),
+    };
+    start_data_diff(
+        app, tx, src_cfg, db, schema, src, tgt_cfg, tgt_db, tgt_schema, choice, where_input,
+    );
+}
+
+/// The Nth row of the active data tab, in list order.
+fn data_tab_row(state: &DataDiffState, idx: usize) -> Option<&DataDiffRow> {
+    let mark = match state.tab {
+        DataTab::OnlySrc => RowMark::OnlySrc,
+        DataTab::OnlyTgt => RowMark::OnlyTgt,
+        DataTab::Diff => RowMark::Diff,
+        DataTab::Summary | DataTab::Sync => return None,
+    };
+    state
+        .result
+        .rows
+        .iter()
+        .filter(|r| r.mark == mark)
+        .nth(idx)
+}
+
+/// Selectable row count in the active data tab (`Summary` / `Sync` are not
+/// lists).
+fn data_tab_rows(state: &DataDiffState) -> usize {
+    match state.tab {
+        DataTab::OnlySrc => state
+            .result
+            .rows
+            .iter()
+            .filter(|r| r.mark == RowMark::OnlySrc)
+            .count(),
+        DataTab::OnlyTgt => state
+            .result
+            .rows
+            .iter()
+            .filter(|r| r.mark == RowMark::OnlyTgt)
+            .count(),
+        DataTab::Diff => state
+            .result
+            .rows
+            .iter()
+            .filter(|r| r.mark == RowMark::Diff)
+            .count(),
+        DataTab::Summary | DataTab::Sync => 0,
+    }
+}
+
+fn data_move(app: &mut App, delta: i32) {
+    let Some(state) = app.data_diff.as_mut() else {
+        return;
+    };
+    if state.tab == DataTab::Sync {
+        state.scroll = (state.scroll as i32 + delta).max(0) as u16;
+        return;
+    }
+    let n = data_tab_rows(state);
+    if n == 0 {
+        return;
+    }
+    let cur = state.list.selected().unwrap_or(0) as i32;
+    let next = (cur + delta).clamp(0, n as i32 - 1) as usize;
+    state.list.select(Some(next));
+}
+
+/// `Enter` on a data row: show its column-level detail (or the whole row for an
+/// only-source / only-target row) in the shared popup.
+fn open_data_row_popup(app: &mut App) {
+    let Some(state) = app.data_diff.as_ref() else {
+        return;
+    };
+    let Some(idx) = state.list.selected() else {
+        return;
+    };
+    let Some(row) = data_tab_row(state, idx) else {
+        return;
+    };
+    let align = &state.result.align;
+    let title = format!("{} {} {}", row.mark.sign(), t("行"), row.key);
+    let mut lines: Vec<PopupLine> = Vec::new();
+    match row.mark {
+        RowMark::Diff => {
+            for cell in &row.cells {
+                let (sv, s_style) = value_display(&cell.src_val);
+                let (tv, t_style) = value_display(&cell.tgt_val);
+                let tag = if cell.unknown_type { " ?" } else { "" };
+                lines.push(PopupLine {
+                    text: format!("{} {}", cell.col, tag),
+                    style: Style::default()
+                        .fg(Color::Cyan)
+                        .add_modifier(Modifier::BOLD),
+                });
+                lines.push(PopupLine {
+                    text: format!("  {}  {}", t("源"), sv),
+                    style: s_style,
+                });
+                lines.push(PopupLine {
+                    text: format!("  {}  {}", t("目标"), tv),
+                    style: t_style,
+                });
+            }
+        }
+        _ => {
+            for (i, val) in row.vals.iter().enumerate() {
+                let name = align
+                    .cols
+                    .get(i)
+                    .map(|c| c.name.clone())
+                    .unwrap_or_default();
+                let (v, style) = value_display(val);
+                lines.push(PopupLine {
+                    text: format!("{name} = {v}"),
+                    style,
+                });
+            }
+        }
+    }
+    if lines.is_empty() {
+        lines.push(PopupLine {
+            text: t("（无列差异）").into(),
+            style: Style::default().fg(Color::DarkGray),
+        });
+    }
+    app.cell_popup = Some(CellPopup {
+        title,
+        lines,
+        scroll: 0,
+    });
+}
+
+/// `y` in the data-diff overlay: copy the plain-text summary.
+fn copy_data_summary(app: &mut App) {
+    let Some(state) = app.data_diff.as_ref() else {
+        return;
+    };
+    let text = data_diff_summary_text(&state.result);
+    let lines = text.lines().count();
+    match clipboard_copy(&text) {
+        Some(p) => {
+            app.status = tf(
+                "✓ 已复制差异摘要（{} 行）· 兜底 {}",
+                &[&lines, &(p.display())],
+            )
+        }
+        None => app.status = tf("✓ 已复制差异摘要（{} 行）· OSC52 剪贴板", &[&lines]),
+    }
+}
+
+fn data_diff_key(app: &mut App, _tx: &Tx, k: KeyEvent) {
+    match k.code {
+        KeyCode::Esc | KeyCode::Char('q') => {
+            app.data_diff = None;
+            app.status = t("已关闭数据对比").into();
+        }
+        KeyCode::Char('y') => copy_data_summary(app),
+        KeyCode::Char('g') => {
+            if let Some(state) = app.data_diff.as_mut() {
+                if state.sync_sql.is_empty() {
+                    state.sync_sql = generate_data_sync(&state.result);
+                }
+                state.tab = DataTab::Sync;
+                state.scroll = 0;
+            }
+            app.status = t("已生成同步语句（源 → 目标，只生成不执行）· Tab 回差异 · Esc 关").into();
+        }
+        KeyCode::Tab | KeyCode::Char('t') => {
+            if let Some(state) = app.data_diff.as_mut() {
+                state.tab = state.tab.next();
+                state.scroll = 0;
+                state.list.select(if data_tab_rows(state) == 0 {
+                    None
+                } else {
+                    Some(0)
+                });
+            }
+        }
+        KeyCode::Enter => open_data_row_popup(app),
+        KeyCode::Up | KeyCode::Char('k') => data_move(app, -1),
+        KeyCode::Down | KeyCode::Char('j') => data_move(app, 1),
+        KeyCode::PageUp => data_move(app, -10),
+        KeyCode::PageDown => data_move(app, 10),
+        KeyCode::Home => {
+            if let Some(state) = app.data_diff.as_mut() {
+                if state.tab == DataTab::Sync {
+                    state.scroll = 0;
+                } else if data_tab_rows(state) > 0 {
+                    state.list.select(Some(0));
+                }
+            }
+        }
+        KeyCode::End => {
+            if let Some(state) = app.data_diff.as_mut() {
+                let n = data_tab_rows(state);
+                if state.tab != DataTab::Sync && n > 0 {
+                    state.list.select(Some(n - 1));
                 }
             }
         }
@@ -17096,6 +18755,12 @@ fn ui(f: &mut Frame, app: &mut App) {
     if app.diff_picker.is_some() {
         render_diff_picker(f, f.area(), app);
     }
+    if app.data_where.is_some() {
+        render_data_where(f, f.area(), app);
+    }
+    if app.data_diff.is_some() {
+        render_data_diff(f, chunks[1], app);
+    }
     if app.diff.is_some() {
         render_diff_panel(f, chunks[1], app);
     }
@@ -17504,6 +19169,8 @@ enum FooterView {
     DiffPicker,
     SchemaDiff,
     DbDiff,
+    DataDiff,
+    DataWhere,
     Recent,
     ColPicker,
     ConnPicker,
@@ -17580,8 +19247,12 @@ fn footer_ctx(app: &App) -> FooterCtx {
         FooterView::SearchInput
     } else if app.search_open {
         FooterView::Search
+    } else if app.data_where.is_some() {
+        FooterView::DataWhere
     } else if app.diff_picker.is_some() {
         FooterView::DiffPicker
+    } else if app.data_diff.is_some() {
+        FooterView::DataDiff
     } else if app.diff.is_some() {
         FooterView::SchemaDiff
     } else if app.db_diff.is_some() {
@@ -17666,6 +19337,7 @@ fn footer_hints_ctx(ctx: FooterCtx) -> Vec<Hint> {
         FooterView::DiffPicker => vec![
             ("↑↓", t("选择")),
             ("Enter", t("对比")),
+            ("m", t("结构/数据")),
             ("d", t("表/库")),
             ("Esc", t("取消")),
         ],
@@ -17680,6 +19352,18 @@ fn footer_hints_ctx(ctx: FooterCtx) -> Vec<Hint> {
             ("↑↓", t("选择")),
             ("Enter", t("对比两库同有表")),
             ("Esc", t("关闭")),
+        ],
+        FooterView::DataDiff => vec![
+            ("Tab", t("切换")),
+            ("Enter", t("展开")),
+            ("y", t("摘要")),
+            ("g", t("同步 SQL")),
+            ("↑↓", t("滚动")),
+            ("Esc", t("关闭")),
+        ],
+        FooterView::DataWhere => vec![
+            ("Enter", t("开始对比")),
+            ("Esc", t("取消")),
         ],
         FooterView::Recent => vec![
             ("↑↓", t("选择")),
@@ -20164,7 +21848,11 @@ fn diff_index_line(row: &IndexDiffRow, width: usize) -> Line<'static> {
 
 /// The `Alt-D` target picker overlay.
 fn render_diff_picker(f: &mut Frame, area: Rect, app: &mut App) {
-    let Some((mode, stage)) = app.diff_picker.as_ref().map(|p| (p.mode, p.stage)) else {
+    let Some((mode, stage, kind)) = app
+        .diff_picker
+        .as_ref()
+        .map(|p| (p.mode, p.stage, p.kind))
+    else {
         return;
     };
     if area.width < 12 || area.height < 5 {
@@ -20182,6 +21870,16 @@ fn render_diff_picker(f: &mut Frame, area: Rect, app: &mut App) {
         .and_then(|p| p.target_conn.as_ref())
         .map(|c| c.name.clone());
     let loading = app.diff_picker.as_ref().map(|p| p.loading).unwrap_or(false);
+    let comparing = app
+        .diff_picker
+        .as_ref()
+        .map(|p| p.comparing)
+        .unwrap_or(false);
+    let where_input = app
+        .diff_picker
+        .as_ref()
+        .map(|p| p.where_input.clone())
+        .unwrap_or_default();
     let entries = app
         .diff_picker
         .as_ref()
@@ -20199,22 +21897,63 @@ fn render_diff_picker(f: &mut Frame, area: Rect, app: &mut App) {
     };
     let box_area = centered_overlay(area, w, h);
     f.render_widget(Clear, box_area);
-    let title = if stage == DiffPickStage::Connections {
-        t(" 结构对比 · 选择目标连接 · Enter 进入 · Esc 返回 ").to_string()
-    } else if let Some(tn) = target_conn {
+    let data = kind == DiffKind::Data;
+    let mode_key = if data {
+        t("m 切结构")
+    } else {
+        t("d 表/库 · m 切数据")
+    };
+    let title = if comparing {
+        let progress = app
+            .data_progress
+            .map(|(d, tt)| {
+                if tt > 0 {
+                    tf("{}/{}", &[&d, &tt])
+                } else {
+                    format!("{d}")
+                }
+            })
+            .unwrap_or_else(|| "0".into());
         tf(
-            " 结构对比 · 源 {} → 连接 {} · Enter 对比 · c 换连接 · Esc 关 ",
-            &[&src, &tn],
+            " 数据对比中… · {} 块 · Esc 中止（保留已比结果） ",
+            &[&progress],
         )
+    } else if stage == DiffPickStage::Connections {
+        if data {
+            t(" 数据对比 · 选择目标连接 · Enter 进入 · Esc 返回 ").to_string()
+        } else {
+            t(" 结构对比 · 选择目标连接 · Enter 进入 · Esc 返回 ").to_string()
+        }
+    } else if let Some(tn) = target_conn {
+        if data {
+            tf(
+                " 数据对比 · 源 {} → 连接 {} · Enter 对比 · c 换连接 · w WHERE · Esc 关 ",
+                &[&src, &tn],
+            )
+        } else {
+            tf(
+                " 结构对比 · 源 {} → 连接 {} · Enter 对比 · c 换连接 · Esc 关 ",
+                &[&src, &tn],
+            )
+        }
+    } else if data {
+        let mut s = tf(
+            " 数据对比 · 源表 {} · 选择目标 · {} · c 换连接 · w WHERE · Enter 对比 · Esc 关 ",
+            &[&src, &mode_key],
+        );
+        if !where_input.trim().is_empty() {
+            s.push_str(&tf(" · WHERE: {} ", &[&truncate_disp(&where_input, 40)]));
+        }
+        s
     } else {
         match mode {
             DiffPickMode::Table => tf(
-                " 结构对比 · 源表 {} · 选择目标 · d 表/库 · c 换连接 · Enter 对比 · Esc 关 ",
-                &[&src],
+                " 结构对比 · 源表 {} · 选择目标 · {} · c 换连接 · Enter 对比 · Esc 关 ",
+                &[&src, &mode_key],
             ),
             DiffPickMode::Database => tf(
-                " 结构对比 · 源库 {} · 选择目标 · d 表/库 · c 换连接 · Enter 对比 · Esc 关 ",
-                &[&src],
+                " 结构对比 · 源库 {} · 选择目标 · {} · c 换连接 · Enter 对比 · Esc 关 ",
+                &[&src, &mode_key],
             ),
         }
     };
@@ -20453,6 +22192,324 @@ fn render_db_diff(f: &mut Frame, area: Rect, app: &mut App) {
             .add_modifier(Modifier::BOLD),
     );
     f.render_stateful_widget(list, inner, &mut state.list);
+}
+
+/// One list line for an only-source / only-target data row: the marker, the
+/// primary key, then as many other column values as fit.
+fn data_only_line(row: &DataDiffRow, align: &DataAlign, width: usize) -> Line<'static> {
+    let color = row.mark.color();
+    let mut spans = vec![
+        Span::styled(
+            format!(" {} ", row.mark.sign()),
+            Style::default().fg(color).add_modifier(Modifier::BOLD),
+        ),
+        Span::styled(
+            row.key.clone(),
+            Style::default()
+                .fg(Color::White)
+                .add_modifier(Modifier::BOLD),
+        ),
+    ];
+    let mut used = row.key.chars().count() + 3;
+    for (i, col) in align.cols.iter().enumerate().skip(align.pk_len) {
+        let Some(v) = row.vals.get(i) else {
+            continue;
+        };
+        let (text, _) = value_display(v);
+        let piece = format!(" · {}={}", col.name, text);
+        if used + piece.chars().count() > width.saturating_sub(2) {
+            break;
+        }
+        used += piece.chars().count();
+        spans.push(Span::styled(piece, Style::default().fg(Color::Gray)));
+    }
+    Line::from(spans)
+}
+
+/// One list line for a `≠` row: the key and the names of the differing columns.
+fn data_diff_row_line(row: &DataDiffRow, width: usize) -> Line<'static> {
+    let head = format!(" ≠ {} ", row.key);
+    let mut rest = row
+        .cells
+        .iter()
+        .map(|c| c.col.clone())
+        .collect::<Vec<_>>()
+        .join(", ");
+    if row.cells.iter().any(|c| c.unknown_type) {
+        rest.push_str(" ?");
+    }
+    let avail = width.saturating_sub(head.chars().count() + 2).max(4);
+    Line::from(vec![
+        Span::styled(
+            head,
+            Style::default()
+                .fg(Color::Yellow)
+                .add_modifier(Modifier::BOLD),
+        ),
+        Span::styled(truncate_disp(&rest, avail), Style::default().fg(Color::Gray)),
+    ])
+}
+
+/// The two-table data-diff overlay (summary / only-src / only-tgt / diff / sync).
+fn render_data_diff(f: &mut Frame, area: Rect, app: &mut App) {
+    let Some(state) = app.data_diff.as_mut() else {
+        return;
+    };
+    if area.width < 10 || area.height < 5 {
+        return;
+    }
+    let narrow = area.width < 64;
+    let cmp = &state.result;
+    let badge = if cmp.equal() {
+        t("数据一致").to_string()
+    } else {
+        tf("{} 处差异", &[&cmp.changed()])
+    };
+    let tab_label = t(state.tab.label());
+    let mut title = tf(
+        " 数据对比 {} → {} · {} · {} · Tab 切换 · y 摘要 · g 同步 SQL · Esc 关 ",
+        &[&cmp.src_label, &cmp.tgt_label, &badge, &tab_label],
+    );
+    if cmp.cross() {
+        title.push_str(&format!(" · {} ", t("⚠ 跨方言")));
+    }
+    if cmp.truncated {
+        title.push_str(&format!(" · {} ", t("⚠ 已截断")));
+    }
+    if cmp.cancelled {
+        title.push_str(&format!(" · {} ", t("已中止")));
+    }
+    f.render_widget(Clear, area);
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_set(border::ROUNDED)
+        .border_style(Style::default().fg(Color::Magenta))
+        .title(Span::styled(title, Style::default().fg(Color::Magenta)));
+    let inner = block.inner(area);
+    f.render_widget(block, area);
+    if inner.width < 4 || inner.height < 2 {
+        return;
+    }
+    let count = |v: Option<u64>| v.map(|n| n.to_string()).unwrap_or_else(|| "?".into());
+    let summary = format!(
+        "{} {} · {} {} · {} {} · {} {} · {} {}",
+        t("源"),
+        count(cmp.src_count),
+        t("目标"),
+        count(cmp.tgt_count),
+        t("仅源"),
+        cmp.only_src,
+        t("仅目标"),
+        cmp.only_tgt,
+        t("差异"),
+        cmp.differing,
+    );
+    // Header line: counts + filter.
+    let header = if cmp.filter.trim().is_empty() {
+        summary
+    } else {
+        format!(
+            "{} · {}: {}",
+            summary,
+            t("过滤"),
+            truncate_disp(&one_line(&cmp.filter), 40)
+        )
+    };
+    let header_area = Rect {
+        x: inner.x,
+        y: inner.y,
+        width: inner.width,
+        height: 1,
+    };
+    f.render_widget(
+        Paragraph::new(Line::from(Span::styled(
+            truncate_disp(&header, inner.width as usize),
+            Style::default().fg(Color::Gray),
+        ))),
+        header_area,
+    );
+    let body = Rect {
+        x: inner.x,
+        y: inner.y + 1,
+        width: inner.width,
+        height: inner.height.saturating_sub(1),
+    };
+    if body.height == 0 {
+        return;
+    }
+    let width = body.width as usize;
+    match state.tab {
+        DataTab::Summary => {
+            let pk = cmp
+                .align
+                .pk()
+                .iter()
+                .map(|c| c.name.clone())
+                .collect::<Vec<_>>()
+                .join(", ");
+            let cols = cmp
+                .align
+                .cols
+                .iter()
+                .map(|c| c.name.clone())
+                .collect::<Vec<_>>()
+                .join(", ");
+            let mut lines = vec![
+                Line::from(Span::styled(
+                    t("按主键归一对齐，分块流式拉取（每块 1000 行）。"),
+                    Style::default().fg(Color::DarkGray),
+                )),
+                Line::from(Span::raw(format!("{}: {}", t("主键"), pk))),
+                Line::from(Span::raw(format!("{}: {}", t("对比列"), truncate_disp(&cols, width.saturating_sub(8))))),
+            ];
+            if cmp.equal() {
+                lines.push(Line::from(Span::styled(
+                    t("数据一致，无差异。"),
+                    Style::default().fg(Color::Green),
+                )));
+            } else {
+                lines.push(Line::from(Span::styled(
+                    t("Tab 切换到 仅源 / 仅目标 / 差异 查看明细；差异行按 Enter 展开列级对照。"),
+                    Style::default().fg(Color::DarkGray),
+                )));
+            }
+            f.render_widget(Paragraph::new(lines).wrap(Wrap { trim: true }), body);
+        }
+        DataTab::OnlySrc | DataTab::OnlyTgt | DataTab::Diff => {
+            let legend = if narrow {
+                t("< 仅源  > 仅目标  ≠ 差异").to_string()
+            } else {
+                t("< 仅源有   > 仅目标有   ≠ 两边都有但内容不同（Enter 展开列级对照）")
+                    .to_string()
+            };
+            let legend_area = Rect {
+                x: body.x,
+                y: body.y,
+                width: body.width,
+                height: 1,
+            };
+            f.render_widget(
+                Paragraph::new(Line::from(Span::styled(
+                    truncate_disp(&legend, width),
+                    Style::default().fg(Color::DarkGray),
+                ))),
+                legend_area,
+            );
+            let list_area = Rect {
+                x: body.x,
+                y: body.y + 1,
+                width: body.width,
+                height: body.height.saturating_sub(1),
+            };
+            if list_area.height == 0 {
+                return;
+            }
+            let items: Vec<ListItem> = match state.tab {
+                DataTab::Diff => cmp
+                    .rows
+                    .iter()
+                    .filter(|r| r.mark == RowMark::Diff)
+                    .map(|r| ListItem::new(data_diff_row_line(r, width)))
+                    .collect(),
+                _ => {
+                    let mark = if state.tab == DataTab::OnlySrc {
+                        RowMark::OnlySrc
+                    } else {
+                        RowMark::OnlyTgt
+                    };
+                    cmp.rows
+                        .iter()
+                        .filter(|r| r.mark == mark)
+                        .map(|r| ListItem::new(data_only_line(r, &cmp.align, width)))
+                        .collect()
+                }
+            };
+            if items.is_empty() {
+                f.render_widget(
+                    Paragraph::new(Line::from(Span::styled(
+                        t("（本类没有行）"),
+                        Style::default().fg(Color::DarkGray),
+                    ))),
+                    list_area,
+                );
+                return;
+            }
+            let list = List::new(items).highlight_style(
+                Style::default()
+                    .bg(Color::DarkGray)
+                    .add_modifier(Modifier::BOLD),
+            );
+            f.render_stateful_widget(list, list_area, &mut state.list);
+        }
+        DataTab::Sync => {
+            let sql = state.sync_sql.clone();
+            let lines: Vec<Line> = sql
+                .lines()
+                .map(|l| {
+                    let color = if l.trim_start().starts_with("--") {
+                        Color::DarkGray
+                    } else {
+                        Color::White
+                    };
+                    Line::from(Span::styled(l.to_string(), Style::default().fg(color)))
+                })
+                .collect();
+            f.render_widget(Paragraph::new(lines).scroll((state.scroll, 0)), body);
+        }
+    }
+}
+
+/// The optional data-compare `WHERE` input.
+fn render_data_where(f: &mut Frame, area: Rect, app: &mut App) {
+    let w = {
+        let avail = area.width.saturating_sub(4);
+        if avail < 24 {
+            area.width
+        } else {
+            avail.min(74)
+        }
+    };
+    let h = 7.min(area.height);
+    let box_area = centered_overlay(area, w, h);
+    f.render_widget(Clear, box_area);
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .title(t(" 数据对比 WHERE（两边同时生效）· Enter 开始 · Esc 取消 "))
+        .border_set(border::ROUNDED)
+        .border_style(Style::default().fg(Color::Yellow));
+    let inner = block.inner(box_area);
+    f.render_widget(block, box_area);
+    let hint_h = 2u16.min(inner.height.saturating_sub(1));
+    let ta_h = inner.height.saturating_sub(hint_h).max(1);
+    let ta_area = Rect {
+        x: inner.x,
+        y: inner.y,
+        width: inner.width,
+        height: ta_h,
+    };
+    let hint_area = Rect {
+        x: inner.x,
+        y: inner.y + ta_h,
+        width: inner.width,
+        height: hint_h,
+    };
+    if let Some(ta) = app.data_where.as_mut() {
+        ta.set_block(Block::default());
+        f.render_widget(&*ta, ta_area);
+    }
+    if hint_h > 0 {
+        let hints = vec![
+            Line::from(Span::styled(
+                t("例: created_at > '2026-01-01' AND status = 'active'"),
+                Style::default().fg(Color::DarkGray),
+            )),
+            Line::from(Span::styled(
+                t("两边使用相同条件；列名按各自方言书写 · 留空 = 无过滤"),
+                Style::default().fg(Color::DarkGray),
+            )),
+        ];
+        f.render_widget(Paragraph::new(hints), hint_area);
+    }
 }
 
 /// The `Alt-L` file-path input, drawn as a one-line box at the bottom.
@@ -21303,6 +23360,15 @@ const HELP_ROWS: &[(&str, &str)] = &[
     ("y", "复制差异摘要（纯文本，可贴进工单）"),
     ("g", "生成 ALTER 同步语句（方向：源 → 目标，只生成不执行）"),
     ("Enter", "对比：库清单里两库都有的表进入单表对比"),
+    ("— 数据对比（Alt-K）—", ""),
+    ("Alt-K", "数据对比：按主键对齐两张表的数据（源 = 当前表；选择目标，可跨连接）"),
+    ("m（对比浮层内）", "切换 结构对比 / 数据对比"),
+    ("w（数据对比内）", "输入 WHERE 过滤（两边同时生效，可留空）"),
+    ("Tab", "切换 汇总 / 仅源 / 仅目标 / 差异 四个视图"),
+    ("Enter", "展开差异行的列级对照（两侧值对照）"),
+    ("y", "复制差异摘要（纯文本）"),
+    ("g", "生成同步 INSERT/UPDATE/DELETE（方向：源 → 目标，只生成不执行）"),
+    ("Esc", "关闭；对比进行中按一下中止（保留已比结果）"),
     ("补全上下文", "表名. 后只补该表列名；FROM/JOIN 后优先表名；WHERE/ON 后优先列名"),
     ("↑ ↓", "历史（首行 / 末行）"),
     ("Esc", "回到侧栏"),
@@ -24123,6 +26189,7 @@ mod tests {
             "Alt-G",
             "Alt-L",
             "Alt-D",
+            "Alt-K",
         ] {
             assert!(
                 keys.iter().any(|k| k.contains(needle)),
@@ -27431,6 +29498,7 @@ mod tests {
         list.select(Some(0));
         app.diff_picker = Some(DiffPicker {
             mode: DiffPickMode::Database,
+            kind: DiffKind::Schema,
             stage: DiffPickStage::Lists,
             list,
             src_entries: vec!["shop2".into(), "shop3".into()],
@@ -27439,6 +29507,8 @@ mod tests {
             target_db: String::new(),
             target_schema: String::new(),
             loading: false,
+            comparing: false,
+            where_input: String::new(),
             gen: 0,
         });
         for (w, h) in sizes {
@@ -27507,5 +29577,456 @@ mod tests {
             ui_text::t_lang("+ 新增  - 多余  ~ 差异", Lang::En),
             "+ 新增  - 多余  ~ 差异"
         );
+    }
+
+    // ── data compare (R33) ──────────────────────────────────────────────────
+
+    fn data_align(
+        src: Vec<ColumnInfo>,
+        tgt: Vec<ColumnInfo>,
+        src_pk: &[&str],
+        tgt_pk: &[&str],
+        cross: bool,
+    ) -> Result<DataAlign, String> {
+        let src_pk: Vec<String> = src_pk.iter().map(|s| s.to_string()).collect();
+        let tgt_pk: Vec<String> = tgt_pk.iter().map(|s| s.to_string()).collect();
+        build_data_align(&src, &tgt, &src_pk, &tgt_pk, cross)
+    }
+
+    /// A small `mysql` result with one `<`, one `>`, one `≠` and one identical
+    /// row, plus a changed-column popup target.
+    fn data_cmp_fixture() -> DataCompare {
+        let src = vec![
+            col_full("id", "int", false, None, None, true),
+            col_full("name", "varchar(20)", true, None, None, false),
+        ];
+        let tgt = src.clone();
+        let align = data_align(src, tgt, &["id"], &["id"], false).unwrap();
+        let rows = vec![
+            only_data_row(
+                &align,
+                &[Val::Text("1".into()), Val::Text("a".into())],
+                RowMark::OnlySrc,
+            ),
+            only_data_row(
+                &align,
+                &[Val::Text("2".into()), Val::Text("b".into())],
+                RowMark::OnlyTgt,
+            ),
+            compare_data_row(
+                &align,
+                &[Val::Text("3".into()), Val::Text("new".into())],
+                &[Val::Text("3".into()), Val::Text("old".into())],
+            )
+            .unwrap(),
+        ];
+        let dt = parse_database_type("mysql").unwrap();
+        DataCompare {
+            src_label: "shop.a".into(),
+            tgt_label: "shop.b".into(),
+            src_db_type: dt,
+            tgt_schema: String::new(),
+            tgt_table: "b".into(),
+            tgt_db_type: dt,
+            src_count: Some(3),
+            tgt_count: Some(3),
+            filter: String::new(),
+            align,
+            rows,
+            only_src: 1,
+            only_tgt: 1,
+            differing: 1,
+            truncated: false,
+            cancelled: false,
+        }
+    }
+
+    #[test]
+    fn data_align_uses_column_name_intersection() {
+        let src = vec![
+            col_full("id", "int", false, None, None, true),
+            col_full("name", "varchar(50)", true, None, None, false),
+            col_full("only_src", "text", true, None, None, false),
+        ];
+        // Target columns are reordered and use a different case for `name`.
+        let tgt = vec![
+            col_full("NAME", "varchar(50)", true, None, None, false),
+            col_full("id", "int", false, None, None, true),
+            col_full("only_tgt", "text", true, None, None, false),
+        ];
+        let align = data_align(src, tgt, &["id"], &["id"], false).unwrap();
+        assert_eq!(align.pk_len, 1);
+        assert_eq!(align.src_pk_names(), vec!["id".to_string()]);
+        assert_eq!(align.tgt_pk_names(), vec!["id".to_string()]);
+        // PK first, then the source-ordered intersection; nothing extra.
+        let names: Vec<String> = align.cols.iter().map(|c| c.name.clone()).collect();
+        assert_eq!(names, vec!["id", "name"]);
+        assert_eq!(align.cols[1].tgt_name, "NAME");
+        assert_eq!(align.src_select(), vec!["id".to_string(), "name".to_string()]);
+        assert_eq!(align.tgt_select(), vec!["id".to_string(), "NAME".to_string()]);
+    }
+
+    #[test]
+    fn data_align_rejects_tables_without_pk() {
+        let no_pk = vec![col_full("a", "int", false, None, None, false)];
+        let with_pk = vec![col_full("id", "int", false, None, None, true)];
+        let err = data_align(no_pk.clone(), no_pk.clone(), &[], &[], false).unwrap_err();
+        assert!(err.contains("主键"), "{err}");
+        let err = data_align(no_pk.clone(), with_pk.clone(), &[], &["id"], false).unwrap_err();
+        assert!(err.contains("源表没有主键"), "{err}");
+        let err = data_align(with_pk.clone(), no_pk.clone(), &["id"], &[], false).unwrap_err();
+        assert!(err.contains("目标表没有主键"), "{err}");
+        // Source has a PK the target lacks entirely.
+        let err = data_align(with_pk.clone(), no_pk, &["id"], &["id"], false).unwrap_err();
+        assert!(err.contains("目标表缺少主键列"), "{err}");
+        // Different PK arity cannot be aligned.
+        let two = vec![
+            col_full("id", "int", false, None, None, true),
+            col_full("seq", "int", false, None, None, true),
+        ];
+        let err = data_align(two, with_pk, &["id", "seq"], &["id"], false).unwrap_err();
+        assert!(err.contains("主键列数不一致"), "{err}");
+        // A PK present on both sides still needs an intersection to compare.
+        let src = vec![col_full("id", "int", false, None, None, true)];
+        let tgt = vec![col_full("ID", "int", false, None, None, true)];
+        let align = data_align(src, tgt, &["id"], &["ID"], false).unwrap();
+        assert_eq!(align.tgt_pk_names(), vec!["ID".to_string()]);
+    }
+
+    #[test]
+    fn data_row_classification_marks_only_and_diff() {
+        let src = vec![
+            col_full("id", "int", false, None, None, true),
+            col_full("name", "varchar(20)", true, None, None, false),
+            col_full("qty", "int", true, None, None, false),
+        ];
+        let tgt = vec![
+            col_full("id", "integer", false, None, None, true),
+            col_full("name", "character varying(20)", true, None, None, false),
+            col_full("qty", "int", true, None, None, false),
+        ];
+        let align = data_align(src, tgt, &["id"], &["id"], true).unwrap();
+        let row = |id: &str, name: &str, qty: &str| {
+            vec![
+                Val::Text(id.into()),
+                Val::Text(name.into()),
+                Val::Text(qty.into()),
+            ]
+        };
+        // Identical rows produce no diff.
+        assert!(compare_data_row(&align, &row("1", "a", "10"), &row("1", "a", "10")).is_none());
+        // Cross-dialect numeric normalisation: 10 == 10.0.
+        assert!(compare_data_row(&align, &row("1", "a", "10"), &row("1", "a", "10.0")).is_none());
+        // One changed column is recorded by name, keyed by the primary key.
+        let d = compare_data_row(&align, &row("2", "b", "5"), &row("2", "c", "5")).unwrap();
+        assert_eq!(d.mark, RowMark::Diff);
+        assert_eq!(d.key, "2");
+        assert_eq!(d.cells.len(), 1);
+        assert_eq!(d.cells[0].col, "name");
+        // NULL is distinct from the empty string.
+        let d = compare_data_row(
+            &align,
+            &[Val::Text("3".into()), Val::Null, Val::Text("1".into())],
+            &[
+                Val::Text("3".into()),
+                Val::Text(String::new()),
+                Val::Text("1".into()),
+            ],
+        )
+        .unwrap();
+        assert_eq!(d.cells[0].col, "name");
+        // Only-source / only-target rows carry the whole row.
+        let o = only_data_row(&align, &row("9", "z", "7"), RowMark::OnlySrc);
+        assert_eq!(o.mark, RowMark::OnlySrc);
+        assert_eq!(o.key, "9");
+        assert_eq!(o.vals.len(), 3);
+    }
+
+    #[test]
+    fn data_merge_state_machine_classifies_chunks() {
+        let src = vec![
+            col_full("id", "int", false, None, None, true),
+            col_full("v", "varchar(10)", true, None, None, false),
+        ];
+        let tgt = src.clone();
+        let align = data_align(src, tgt, &["id"], &["id"], false).unwrap();
+        let modes: Vec<PkCmp> = align.pk().iter().map(pk_cmp_mode).collect();
+        let row = |id: i64, v: &str| vec![Val::Text(id.to_string()), Val::Text(v.into())];
+        // Source: 1, 3, 5, 7 · Target: 2, 3, 5(changed), 7, 8 (a mixed merge).
+        let src_rows = [row(1, "a"), row(3, "b"), row(5, "c"), row(7, "d")];
+        let tgt_rows = [
+            row(2, "x"),
+            row(3, "b"),
+            row(5, "z"),
+            row(7, "d"),
+            row(8, "e"),
+        ];
+        let mut si = 0usize;
+        let mut ti = 0usize;
+        let (mut only_src, mut only_tgt, mut diff) = (0usize, 0usize, 0usize);
+        let mut steps = Vec::new();
+        loop {
+            let s = src_rows.get(si).map(Vec::as_slice);
+            let t = tgt_rows.get(ti).map(Vec::as_slice);
+            match merge_next(&align, &modes, s, t) {
+                MergeStep::Done => break,
+                MergeStep::SrcOnly => {
+                    only_src += 1;
+                    steps.push(format!("<{}", pk_display(&align, &src_rows[si])));
+                    si += 1;
+                }
+                MergeStep::TgtOnly => {
+                    only_tgt += 1;
+                    steps.push(format!(">{}", pk_display(&align, &tgt_rows[ti])));
+                    ti += 1;
+                }
+                MergeStep::Both(d) => {
+                    si += 1;
+                    ti += 1;
+                    if let Some(r) = d {
+                        diff += 1;
+                        steps.push(format!("≠{}", r.key));
+                    } else {
+                        steps.push("=".to_string());
+                    }
+                }
+            }
+        }
+        assert_eq!((only_src, only_tgt, diff), (1, 2, 1));
+        assert_eq!(steps, vec!["<1", ">2", "=", "≠5", "=", ">8"]);
+        assert_eq!(si, src_rows.len());
+        assert_eq!(ti, tgt_rows.len());
+    }
+
+    #[test]
+    fn data_sync_sql_generates_insert_update_delete() {
+        let cmp = data_cmp_fixture();
+        let sql = generate_data_sync(&cmp);
+        assert!(
+            sql.contains("INSERT INTO `b` (`id`, `name`) VALUES (1, 'a');"),
+            "{sql}"
+        );
+        assert!(sql.contains("DELETE FROM `b` WHERE `id` = 2;"), "{sql}");
+        assert!(
+            sql.contains("UPDATE `b` SET `name` = 'new' WHERE `id` = 3;"),
+            "{sql}"
+        );
+        // The header names the direction and the target dialect.
+        assert!(sql.contains("源 → 目标"), "{sql}");
+        // The summary is ticket-friendly and marks each row.
+        let text = data_diff_summary_text(&cmp);
+        assert!(text.contains("仅源"), "{text}");
+        assert!(text.contains("仅目标"), "{text}");
+        assert!(text.contains('≠'), "{text}");
+        assert!(text.contains("[name]"), "{text}");
+    }
+
+    #[test]
+    fn data_cross_dialect_value_comparison() {
+        // Boolean family: true == 1, false == 0.
+        assert!(canon_cell_equal("true", "1", "boolean"));
+        assert!(canon_cell_equal("FALSE", "0", "boolean"));
+        assert!(!canon_cell_equal("true", "0", "boolean"));
+        // Numeric families normalise the text form.
+        assert!(canon_cell_equal("1.50", "1.5", "decimal(10,2)"));
+        assert!(canon_cell_equal("1", "1.0", "int"));
+        assert!(!canon_cell_equal("1", "2", "int"));
+        // Temporal: the ISO `T` separator does not matter.
+        assert!(canon_cell_equal(
+            "2026-01-01T00:00:00",
+            "2026-01-01 00:00:00",
+            "timestamp"
+        ));
+        // Unmapped types compare verbatim (and stay case-sensitive).
+        assert!(canon_cell_equal("abc", "abc", "geometry"));
+        assert!(!canon_cell_equal("abc", "ABC", "geometry"));
+        // NULL is never equal to the empty string.
+        assert!(!values_equal(&Val::Null, &Val::Text(String::new()), None));
+        assert!(values_equal(&Val::Null, &Val::Null, None));
+        // An unmapped cross-dialect column is flagged `?`.
+        let src = vec![col_full("g", "geometry", true, None, None, true)];
+        let tgt = vec![col_full("g", "point", true, None, None, true)];
+        let align = data_align(src, tgt, &["g"], &["g"], true).unwrap();
+        assert!(align.cols[0].unknown_type);
+        assert!(align.cols[0].canon.is_none());
+    }
+
+    #[test]
+    fn data_select_and_keyset_are_dialect_aware() {
+        let mysql = parse_database_type("mysql").unwrap();
+        let pg = parse_database_type("postgres").unwrap();
+        let cols = vec!["id".to_string(), "name".to_string()];
+        let pk = vec!["id".to_string()];
+        let types = vec!["int".to_string(), "varchar(20)".to_string()];
+        let sql = build_data_select(mysql, "", "t", &cols, &pk, &types, "", None, DATA_CHUNK);
+        assert_eq!(sql, "SELECT `id`, `name` FROM `t` ORDER BY `id` LIMIT 1000");
+        let sql = build_data_select(
+            mysql,
+            "",
+            "t",
+            &cols,
+            &pk,
+            &types,
+            "status = 'a'",
+            Some(&[Val::Text("5".into())]),
+            DATA_CHUNK,
+        );
+        assert!(
+            sql.contains("WHERE (status = 'a') AND ((`id` > 5))"),
+            "{sql}"
+        );
+        // Composite keyset: (a > 1) OR (a = 1 AND b > 2).
+        let pk2 = vec!["a".to_string(), "b".to_string()];
+        let types2 = vec!["int".to_string(), "int".to_string()];
+        let pred = keyset_predicate(
+            &pk2,
+            &types2,
+            &[Val::Text("1".into()), Val::Text("2".into())],
+            mysql,
+        );
+        assert_eq!(pred, "((`a` > 1) OR (`a` = 1 AND `b` > 2))");
+        // PostgreSQL quotes the schema separately.
+        let sql = build_data_select(pg, "public", "t", &cols, &pk, &types, "", None, DATA_CHUNK);
+        assert!(sql.contains("\"public\".\"t\""), "{sql}");
+        assert!(sql.contains("ORDER BY \"id\""), "{sql}");
+        // Chunk forecast.
+        assert_eq!(chunk_total(Some(1000), Some(1)), 2);
+        assert_eq!(chunk_total(None, Some(2500)), 3);
+        assert_eq!(chunk_total(None, None), 0);
+        assert_eq!(chunk_ceil(Some(0)), 0);
+    }
+
+    #[test]
+    fn data_feed_chunk_advances_the_keyset_cursor() {
+        // A full chunk keeps the side open and advances the cursor to its last
+        // row (the bug this guards: a missing cursor update re-reads page one).
+        let full: Vec<Vec<Val>> = (1..=DATA_CHUNK)
+            .map(|i| vec![Val::Text(i.to_string())])
+            .collect();
+        let mut s = DataSideStream::default();
+        assert!(feed_chunk(&mut s, full, 1));
+        assert!(!s.exhausted);
+        assert_eq!(s.buf.len(), DATA_CHUNK);
+        assert_eq!(s.last, Some(vec![Val::Text(DATA_CHUNK.to_string())]));
+        // A short chunk advances further and marks the side exhausted.
+        let short: Vec<Vec<Val>> = (1..=3)
+            .map(|i| vec![Val::Text((DATA_CHUNK + i).to_string())])
+            .collect();
+        assert!(feed_chunk(&mut s, short, 1));
+        assert!(s.exhausted);
+        assert_eq!(s.buf.len(), DATA_CHUNK + 3);
+        assert_eq!(
+            s.last,
+            Some(vec![Val::Text((DATA_CHUNK + 3).to_string())])
+        );
+        // An empty chunk yields nothing and leaves the side exhausted.
+        assert!(!feed_chunk(&mut s, Vec::new(), 1));
+        assert!(s.exhausted);
+    }
+
+    #[test]
+    fn data_diff_key_tabs_and_generates_sync() {
+        let mut app = test_app();
+        let mut list = ListState::default();
+        list.select(Some(0));
+        app.data_diff = Some(Box::new(DataDiffState {
+            result: data_cmp_fixture(),
+            tab: DataTab::Summary,
+            list,
+            scroll: 0,
+            sync_sql: String::new(),
+        }));
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        data_diff_key(&mut app, &tx, KeyEvent::from(KeyCode::Tab));
+        assert_eq!(app.data_diff.as_ref().unwrap().tab, DataTab::OnlySrc);
+        data_diff_key(&mut app, &tx, KeyEvent::from(KeyCode::Tab));
+        assert_eq!(app.data_diff.as_ref().unwrap().tab, DataTab::OnlyTgt);
+        data_diff_key(&mut app, &tx, KeyEvent::from(KeyCode::Char('g')));
+        assert_eq!(app.data_diff.as_ref().unwrap().tab, DataTab::Sync);
+        assert!(!app.data_diff.as_ref().unwrap().sync_sql.is_empty());
+        // Tab from Sync returns to the summary.
+        data_diff_key(&mut app, &tx, KeyEvent::from(KeyCode::Tab));
+        assert_eq!(app.data_diff.as_ref().unwrap().tab, DataTab::Summary);
+        data_diff_key(&mut app, &tx, KeyEvent::from(KeyCode::Esc));
+        assert!(app.data_diff.is_none());
+    }
+
+    #[test]
+    fn data_diff_overlays_render_at_extreme_sizes() {
+        let mut app = test_app();
+        app.selected = Some(test_conn("mysql"));
+        let mut list = ListState::default();
+        list.select(Some(0));
+        app.data_diff = Some(Box::new(DataDiffState {
+            result: data_cmp_fixture(),
+            tab: DataTab::Summary,
+            list,
+            scroll: 0,
+            sync_sql: String::new(),
+        }));
+        let sizes = [(42u16, 22u16), (120, 40), (20, 6), (1, 1)];
+        for tab in [
+            DataTab::Summary,
+            DataTab::OnlySrc,
+            DataTab::OnlyTgt,
+            DataTab::Diff,
+            DataTab::Sync,
+        ] {
+            if let Some(s) = app.data_diff.as_mut() {
+                s.tab = tab;
+                if tab == DataTab::Sync {
+                    s.sync_sql = generate_data_sync(&s.result);
+                }
+            }
+            for (w, h) in sizes {
+                draw(&mut app, w, h);
+            }
+        }
+        // Picker in data mode, then mid-run progress.
+        app.data_diff = None;
+        let mut list = ListState::default();
+        list.select(Some(0));
+        app.diff_picker = Some(DiffPicker {
+            mode: DiffPickMode::Table,
+            kind: DiffKind::Data,
+            stage: DiffPickStage::Lists,
+            list,
+            src_entries: vec!["b".into()],
+            entries: vec!["b".into()],
+            target_conn: None,
+            target_db: String::new(),
+            target_schema: String::new(),
+            loading: false,
+            comparing: false,
+            where_input: "id > 0".into(),
+            gen: 0,
+        });
+        for (w, h) in sizes {
+            draw(&mut app, w, h);
+        }
+        if let Some(p) = app.diff_picker.as_mut() {
+            p.comparing = true;
+        }
+        app.data_progress = Some((2, 5));
+        for (w, h) in sizes {
+            draw(&mut app, w, h);
+        }
+        // WHERE prompt on its own.
+        app.diff_picker = None;
+        app.data_progress = None;
+        app.data_where = Some(TextArea::default());
+        for (w, h) in sizes {
+            draw(&mut app, w, h);
+        }
+    }
+
+    #[test]
+    fn data_diff_strings_have_english_translations() {
+        use ui_text::Lang;
+        assert_ne!(ui_text::t_lang("仅源", Lang::En), "仅源");
+        assert_ne!(ui_text::t_lang("仅目标", Lang::En), "仅目标");
+        assert_ne!(ui_text::t_lang("差异", Lang::En), "差异");
+        assert_ne!(ui_text::t_lang("数据一致", Lang::En), "数据一致");
+        assert_ne!(ui_text::t_lang("同步 SQL", Lang::En), "同步 SQL");
     }
 }
