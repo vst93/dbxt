@@ -44,6 +44,9 @@ A keyboard-first terminal UI for databases, built on the [DBX](https://github.co
 
 **Table structure**
 - `r` shows fields (type / key / nullable / default / comment); `t` toggles the dialect-aware `SHOW CREATE TABLE` DDL.
+- `Alt-D` **diffs two table structures**: the focused table is the source, then pick a target table (or `c` to pick *another connection* and diff across databases / dialects). The overlay shows, for every column, `+` (missing in the target — add), `-` (extra in the target — drop) and `~` (attributes differ: type / nullable / default / comment / charset / collation / extra / PK / unique), plus a second tab for indexes (name, columns, unique, filter) and a `⚠ cross-dialect` badge when the two sides use different engines. Type comparison is dialect-aware: within one engine it ignores cosmetic display width (`int(11)` = `int`), and across engines it maps the common types (`varchar(255)` ≈ `character varying(255)`, `int` ≈ `integer`, `tinyint(1)` ≈ `smallint`, `jsonb` ≈ `json`, …); a type outside the map is shown with `?` and both raw spellings.
+- `y` copies a plain-text diff summary (paste it into a ticket), `g` generates the `ALTER` script that would rewrite the **target** to match the source (`ADD` / `DROP` / `MODIFY`, indexes included, plus `COMMENT ON COLUMN` for PostgreSQL) — dbxt **never executes it**: it is shown only in a preview tab so you can copy it into another client or the editor.
+- `Shift+Alt-D` compares two **databases' table lists** (only-source / only-target / shared); `Enter` on a shared table opens its table diff. The generated `ALTER` is dialect-quoted (MySQL backticks, PostgreSQL `"double quotes"`).
 
 **Import & export**
 - `I` imports a CSV into the focused table (the browsed table, else the sidebar selection). Enter a path (a leading `~` expands to `$HOME`) and confirm the preview: encoding, delimiter, row count and file size, the first five parsed rows, and the column mapping with per-column type inference (`int` / `float` / `bool` / `date` / `datetime` / `text`).
@@ -131,6 +134,7 @@ The TUI's `?` overlay and `dbxt --help` carry the complete list; this is the sho
 | SSH host key | `y`/`Enter` accept & remember · `s` this session only · `n`/`Esc` reject |
 | Sidebar | `↑` `↓` tables · `/` filter · `Enter` browse · `r` structure · `I` import CSV · `t` recent |
 | Editor | `Alt-H` history panel · `Alt-G` global search · `Alt-L` run `.sql` file · `Alt-F` format/compress · `Ctrl-U` undo format · `Alt-/` complete · `F5`/`Ctrl-J` run · `↑` `↓` history |
+| Schema diff | `Alt-D` diff current table vs a chosen table (`c` picks another connection) · `Shift+Alt-D` diff two databases' tables · `Tab` columns/indexes/ALTER · `y` copy summary · `g` generate ALTER · `Esc` close |
 | Results | `↑` `↓` rows · `←` `→` columns · `n`/`p` pages · `Enter`/`v` cell · `e` edit · `i` insert · `Delete` delete |
 | Results (more) | `f` filter · `s` sort · `Ctrl-K` extra sort · `Ctrl-R` clear · `y` copy row · `/` search · `Ctrl-Y` export · `[` `]` tabs |
 | Redis | `Space` select · `a` all · `Del`/`x`/`m` batch delete/TTL/rename · `/` MATCH · `n` more · `e` edit · `Enter` value |

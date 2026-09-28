@@ -34,7 +34,7 @@ use dbx_core::sql_dialect::{
     build_count_table_sql, build_table_data_select_sql_with_database, is_schema_aware,
     normalize_where_input, qualified_table_name, quote_table_identifier, TableDataSelectSqlOptions,
 };
-use dbx_core::types::{ColumnInfo, TableInfo};
+use dbx_core::types::{ColumnInfo, IndexInfo, TableInfo};
 use dbx_mcp::backend::{
     new_connection_config, parse_database_type, BatchStatementResult, DbxBackend, LocalBackend,
 };
@@ -242,6 +242,1052 @@ enum GridKind {
 enum StructView {
     Fields,
     Ddl,
+}
+
+// ─── schema diff (Alt-D) ─────────────────────────────────────────────────────
+//
+// Compares the structure of two tables (or the table lists of two databases)
+// using the same `get_columns` / `list_indexes` / `list_tables` metadata the
+// sidebar already fetches. The diff itself is pure data: the async op only
+// fills the two sides and everything below is unit-testable without a backend.
+
+/// How a diff row differs, always relative to the **target** side — the side the
+/// generated `ALTER` rewrites to match the source.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum DiffMark {
+    /// The source has it, the target does not → `ALTER … ADD`.
+    Add,
+    /// The target has it, the source does not → `ALTER … DROP`.
+    Drop,
+    /// Present on both sides but with different attributes → `ALTER … MODIFY`.
+    Modify,
+    /// Identical on both sides (rendered dimmed for context).
+    Same,
+}
+
+impl DiffMark {
+    fn sign(self) -> &'static str {
+        match self {
+            DiffMark::Add => "+",
+            DiffMark::Drop => "-",
+            DiffMark::Modify => "~",
+            DiffMark::Same => " ",
+        }
+    }
+    fn color(self) -> Color {
+        match self {
+            DiffMark::Add => Color::Green,
+            DiffMark::Drop => Color::Red,
+            DiffMark::Modify => Color::Yellow,
+            DiffMark::Same => Color::DarkGray,
+        }
+    }
+}
+
+/// One side of a schema comparison, reduced to what the diff needs.
+#[derive(Clone, Debug)]
+struct DiffSide {
+    db: String,
+    schema: String,
+    table: String,
+    db_type: DatabaseType,
+    columns: Vec<ColumnInfo>,
+    indexes: Vec<IndexInfo>,
+}
+
+impl DiffSide {
+    /// `db.schema.table` for the overlay title and the copied summary.
+    fn label(&self) -> String {
+        let rel = qualified_display(&self.schema, &self.table);
+        let db = if self.db.trim().is_empty() {
+            String::new()
+        } else {
+            format!("{}.", fix_double_encoding(&self.db))
+        };
+        format!("{}{}", db, fix_double_encoding(&rel))
+    }
+}
+
+/// One column's place in the diff.
+#[derive(Clone, Debug)]
+struct ColDiffRow {
+    name: String,
+    mark: DiffMark,
+    /// Source-side rendering (`type NOT NULL DEFAULT …`).
+    src: String,
+    /// Target-side rendering.
+    tgt: String,
+    /// Attribute summary for a `~` row (and the whole row in the narrow layout).
+    detail: String,
+}
+
+/// Minimal index shape kept alongside a diff row so the `ALTER` generator can
+/// emit `CREATE` / `DROP INDEX` without re-fetching metadata.
+#[derive(Clone, Debug, Default)]
+struct IndexShape {
+    name: String,
+    columns: Vec<String>,
+    is_unique: bool,
+    is_primary: bool,
+}
+
+/// One index's place in the diff.
+#[derive(Clone, Debug)]
+struct IndexDiffRow {
+    mark: DiffMark,
+    /// Target rendering.
+    tgt: String,
+    detail: String,
+    src_shape: Option<IndexShape>,
+    tgt_shape: Option<IndexShape>,
+}
+
+/// A full two-table comparison. `cols` / `idx` include `Same` rows so the view
+/// shows the whole structure with the differences highlighted.
+#[derive(Clone, Debug)]
+struct TableDiff {
+    src: DiffSide,
+    tgt: DiffSide,
+    cols: Vec<ColDiffRow>,
+    idx: Vec<IndexDiffRow>,
+    /// The two sides use different dialects (type mapping applies).
+    cross: bool,
+}
+
+impl TableDiff {
+    /// True when no column or index differs.
+    fn equal(&self) -> bool {
+        self.cols.iter().all(|c| c.mark == DiffMark::Same)
+            && self.idx.iter().all(|i| i.mark == DiffMark::Same)
+    }
+    /// Number of changed rows (columns + indexes), for the title badge.
+    fn changed(&self) -> usize {
+        self.cols.iter().filter(|c| c.mark != DiffMark::Same).count()
+            + self.idx.iter().filter(|i| i.mark != DiffMark::Same).count()
+    }
+}
+
+/// Verdict of comparing two declared types.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum TypeVerdict {
+    Same,
+    /// Both sides map to canonical types and they differ.
+    Diff,
+    /// At least one side is not in the mapping table (shown with `?`).
+    Unknown,
+}
+
+/// What a database-level diff found for one table name.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum DbTableMark {
+    /// Only in the source database.
+    OnlySrc,
+    /// Only in the target database.
+    OnlyTgt,
+    /// Present in both (and openable as a table diff).
+    Both,
+}
+
+#[derive(Clone, Debug)]
+struct DbDiffEntry {
+    table: String,
+    mark: DbTableMark,
+}
+
+/// A database-to-database table-list comparison.
+#[derive(Clone, Debug)]
+struct DbDiff {
+    src_label: String,
+    tgt_label: String,
+    entries: Vec<DbDiffEntry>,
+    src_db: String,
+    tgt_db: String,
+    src_schema: String,
+    tgt_schema: String,
+}
+
+impl DbDiff {
+    fn count(&self, mark: DbTableMark) -> usize {
+        self.entries.iter().filter(|e| e.mark == mark).count()
+    }
+}
+
+/// Which tab of the diff overlay is shown.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum DiffTab {
+    Columns,
+    Indexes,
+    Alter,
+}
+
+impl DiffTab {
+    fn next(self) -> Self {
+        match self {
+            DiffTab::Columns => DiffTab::Indexes,
+            DiffTab::Indexes => DiffTab::Alter,
+            DiffTab::Alter => DiffTab::Columns,
+        }
+    }
+    fn label(self) -> &'static str {
+        match self {
+            DiffTab::Columns => "列",
+            DiffTab::Indexes => "索引",
+            DiffTab::Alter => "ALTER",
+        }
+    }
+}
+
+/// The open table-diff overlay.
+#[derive(Clone, Debug)]
+struct SchemaDiffState {
+    diff: TableDiff,
+    tab: DiffTab,
+    list: ListState,
+    /// Scroll offset for the wrapped `ALTER` preview.
+    scroll: u16,
+    /// Generated sync SQL, filled lazily by `g`.
+    alter: String,
+}
+
+/// The database-level diff overlay (table lists of two databases).
+#[derive(Clone, Debug)]
+struct DbDiffState {
+    diff: DbDiff,
+    list: ListState,
+}
+
+/// Which list the `Alt-D` target picker is browsing.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum DiffPickMode {
+    Table,
+    Database,
+}
+
+/// Which step of the picker is active.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum DiffPickStage {
+    /// Browsing the target's tables / databases.
+    Lists,
+    /// Browsing other connections, to diff across connections (cross-dialect).
+    Connections,
+}
+
+/// The `Alt-D` target picker (source is the focused table / current database).
+#[derive(Clone, Debug)]
+struct DiffPicker {
+    mode: DiffPickMode,
+    stage: DiffPickStage,
+    list: ListState,
+    entries: Vec<String>,
+    /// The target connection when diffing across connections (`None` = the
+    /// source connection itself).
+    target_conn: Option<Box<ConnectionConfig>>,
+    /// The target database / schema on `target_conn`.
+    target_db: String,
+    target_schema: String,
+    /// A cross-connection table-list fetch is in flight.
+    loading: bool,
+    /// Monotonic id of the latest target table fetch; a stale reply is dropped.
+    gen: u64,
+    /// The same-connection table list, restored when backing out of the
+    /// connection step.
+    src_entries: Vec<String>,
+}
+
+// ─── type normalisation (cross-dialect) ──────────────────────────────────────
+
+/// Collapse runs of whitespace to single spaces.
+fn collapse_ws(s: &str) -> String {
+    s.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+/// Split `varchar(255)` into (`varchar`, `(255)`); `int` into (`int`, ``).
+fn split_type_params(s: &str) -> (String, String) {
+    match s.find('(') {
+        Some(i) => (s[..i].trim().to_string(), s[i..].trim().to_string()),
+        None => (s.trim().to_string(), String::new()),
+    }
+}
+
+/// Normalise a declared type for a **same-dialect** comparison: lowercase,
+/// collapse whitespace and drop the cosmetic MySQL integer display width
+/// (`int(11)` == `int`).
+fn norm_type_text(raw: &str) -> String {
+    let s = collapse_ws(&raw.trim().to_ascii_lowercase());
+    let (base, params) = split_type_params(&s);
+    if matches!(
+        base.as_str(),
+        "int" | "integer" | "bigint" | "smallint" | "tinyint" | "mediumint" | "int4" | "int8" | "int2"
+    ) {
+        return base;
+    }
+    let params = params.replace(' ', "");
+    if params.is_empty() {
+        base
+    } else {
+        format!("{base}{params}")
+    }
+}
+
+/// Canonical, dialect-neutral signature of a SQL type, used only for
+/// **cross-dialect** comparison: `varchar(255)`, `character varying(255)` →
+/// `varchar(255)`; `int`, `integer`, `int4` → `int`. `None` for a base type
+/// outside the common table (the diff then shows `?` and both raw spellings).
+fn canonical_type(raw: &str) -> Option<String> {
+    let s = collapse_ws(&raw.trim().to_ascii_lowercase());
+    let (head, params) = split_type_params(&s);
+    let params = params.replace(' ', "");
+    let mut words = head.split_whitespace();
+    let first = words.next().unwrap_or("");
+    let rest: Vec<&str> = words.collect();
+    let (family, extra): (&str, &str) = match first {
+        "varchar" | "nvarchar" | "varchar2" => ("varchar", ""),
+        "char" | "nchar" => ("char", ""),
+        "character" => {
+            if rest.first() == Some(&"varying") {
+                ("varchar", "")
+            } else {
+                ("char", "")
+            }
+        }
+        "int" | "integer" | "int4" | "mediumint" | "int32" => ("int", ""),
+        "bigint" | "int8" | "int64" => ("bigint", ""),
+        "smallint" | "int2" | "int16" => ("smallint", ""),
+        "tinyint" => ("tinyint", ""),
+        "text" | "clob" | "longtext" | "mediumtext" | "tinytext" | "string" => ("text", ""),
+        "bool" | "boolean" => ("boolean", ""),
+        "decimal" | "numeric" | "number" => ("decimal", ""),
+        "float" | "real" | "float4" => ("float", ""),
+        "double" => ("double", ""),
+        "timestamp" | "datetime" => (
+            "timestamp",
+            if rest.first() == Some(&"with") { " tz" } else { "" },
+        ),
+        "timestamptz" => ("timestamp", " tz"),
+        "date" => ("date", ""),
+        "time" => ("time", ""),
+        "json" | "jsonb" => ("json", ""),
+        "blob" | "bytea" | "varbinary" | "binary" | "longblob" | "mediumblob" | "tinyblob" => {
+            ("blob", "")
+        }
+        _ => return None,
+    };
+    // `unsigned` / `zerofill` is a real difference, so it must stay in the
+    // signature rather than being flattened away.
+    let mut sig = String::from(family);
+    sig.push_str(extra);
+    if rest.contains(&"unsigned") {
+        sig.push_str(" unsigned");
+    }
+    if rest.contains(&"zerofill") {
+        sig.push_str(" zerofill");
+    }
+    if !params.is_empty() {
+        sig.push_str(&params);
+    }
+    Some(sig)
+}
+
+/// Compare two declared types. Same-dialect comparisons only normalise
+/// whitespace/display width; cross-dialect comparisons go through
+/// [`canonical_type`] so `varchar(255)` and `character varying(255)` match.
+fn compare_types(src: &str, tgt: &str, cross: bool) -> TypeVerdict {
+    if !cross {
+        return if norm_type_text(src) == norm_type_text(tgt) {
+            TypeVerdict::Same
+        } else {
+            TypeVerdict::Diff
+        };
+    }
+    match (canonical_type(src), canonical_type(tgt)) {
+        (Some(a), Some(b)) => {
+            if a == b {
+                TypeVerdict::Same
+            } else {
+                TypeVerdict::Diff
+            }
+        }
+        // An unmapped base type on both sides is only "unknown" when the raw
+        // spellings differ; an identical verbatim type is still equal.
+        _ => {
+            if norm_type_text(src) == norm_type_text(tgt) {
+                TypeVerdict::Same
+            } else {
+                TypeVerdict::Unknown
+            }
+        }
+    }
+}
+
+/// Map a source type spelling onto the target dialect, for a generated `ALTER`.
+/// Returns `None` when the type is outside the common table.
+fn map_type_to_dialect(raw: &str, target: DatabaseType) -> Option<String> {
+    let canon = canonical_type(raw)?;
+    let (head, params) = split_type_params(&canon);
+    let params = params.replace(' ', "");
+    let mut words = head.split_whitespace();
+    let family = words.next().unwrap_or("");
+    let rest: Vec<&str> = words.collect();
+    let unsigned = rest.contains(&"unsigned");
+    let pg = is_postgres_family(target.as_str());
+    let mysql = is_mysql_family(target.as_str());
+    let mut suffix = "";
+    if unsigned {
+        suffix = " unsigned";
+    }
+    let mapped = match family {
+        "varchar" => {
+            if pg {
+                format!("character varying{params}")
+            } else {
+                format!("varchar{params}")
+            }
+        }
+        "char" => {
+            if pg {
+                format!("character{params}")
+            } else {
+                format!("char{params}")
+            }
+        }
+        "int" => {
+            if pg {
+                "integer".to_string()
+            } else {
+                format!("int{suffix}")
+            }
+        }
+        "bigint" => format!("bigint{suffix}"),
+        "smallint" => format!("smallint{suffix}"),
+        "tinyint" => {
+            if pg {
+                "smallint".to_string()
+            } else {
+                "tinyint".to_string()
+            }
+        }
+        "text" => "text".to_string(),
+        "boolean" => {
+            if mysql {
+                "tinyint(1)".to_string()
+            } else {
+                "boolean".to_string()
+            }
+        }
+        "decimal" => {
+            if pg {
+                format!("numeric{params}")
+            } else {
+                format!("decimal{params}")
+            }
+        }
+        "float" => {
+            if pg {
+                "real".to_string()
+            } else {
+                "float".to_string()
+            }
+        }
+        "double" => {
+            if pg {
+                "double precision".to_string()
+            } else {
+                "double".to_string()
+            }
+        }
+        "timestamp" => {
+            if rest.contains(&"tz") {
+                if mysql {
+                    "timestamp".to_string()
+                } else {
+                    "timestamp with time zone".to_string()
+                }
+            } else if mysql {
+                "datetime".to_string()
+            } else {
+                "timestamp".to_string()
+            }
+        }
+        "date" => "date".to_string(),
+        "time" => "time".to_string(),
+        "json" => {
+            if pg {
+                "jsonb".to_string()
+            } else {
+                "json".to_string()
+            }
+        }
+        "blob" => {
+            if pg {
+                "bytea".to_string()
+            } else {
+                "blob".to_string()
+            }
+        }
+        _ => return None,
+    };
+    Some(mapped)
+}
+
+/// `Y` / `N` marker used in the copied summary and the `~` detail lines.
+fn yn(b: bool) -> &'static str {
+    if b {
+        "Y"
+    } else {
+        "N"
+    }
+}
+
+/// Normalise an optional string for equality (trimmed; `None` == empty).
+fn norm_opt(v: &Option<String>) -> String {
+    v.as_deref().map(str::trim).unwrap_or("").to_string()
+}
+
+/// Display an optional string, `-` when absent/blank.
+fn opt_or_dash(v: &Option<String>) -> String {
+    match v.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
+        Some(s) => s.to_string(),
+        None => "-".to_string(),
+    }
+}
+
+/// Find a column by exact name, falling back to a case-insensitive match.
+fn find_column<'a>(cols: &'a [ColumnInfo], name: &str) -> Option<&'a ColumnInfo> {
+    cols.iter()
+        .find(|c| c.name == name)
+        .or_else(|| cols.iter().find(|c| c.name.eq_ignore_ascii_case(name)))
+}
+
+/// Render a column's attributes as one line (`varchar(20) NOT NULL DEFAULT ''`).
+fn render_column_attrs(c: &ColumnInfo) -> String {
+    let mut s = c.data_type.clone();
+    s.push_str(if c.is_nullable { " NULL" } else { " NOT NULL" });
+    if let Some(d) = c
+        .column_default
+        .as_deref()
+        .map(str::trim)
+        .filter(|d| !d.is_empty())
+    {
+        s.push_str(&format!(" DEFAULT {d}"));
+    }
+    if let Some(cs) = c
+        .character_set
+        .as_deref()
+        .map(str::trim)
+        .filter(|v| !v.is_empty())
+    {
+        s.push_str(&format!(" {cs}"));
+    }
+    if let Some(col) = c.collation.as_deref().map(str::trim).filter(|v| !v.is_empty()) {
+        s.push_str(&format!(" {col}"));
+    }
+    if let Some(cm) = c.comment.as_deref().map(str::trim).filter(|v| !v.is_empty()) {
+        s.push_str(&format!(" COMMENT {cm}"));
+    }
+    s
+}
+
+/// The attribute deltas between two columns of the same name. Empty means the
+/// columns are identical. Tokens are deliberately language-neutral so the same
+/// text can be pasted into a ticket in either language.
+fn column_changes(src: &ColumnInfo, tgt: &ColumnInfo, cross: bool) -> Vec<String> {
+    let mut out = Vec::new();
+    match compare_types(&src.data_type, &tgt.data_type, cross) {
+        TypeVerdict::Same => {}
+        TypeVerdict::Diff => out.push(format!("type {}→{}", src.data_type, tgt.data_type)),
+        TypeVerdict::Unknown => out.push(format!("type ? {}→{}", src.data_type, tgt.data_type)),
+    }
+    if src.is_nullable != tgt.is_nullable {
+        out.push(format!("null {}→{}", yn(src.is_nullable), yn(tgt.is_nullable)));
+    }
+    if norm_opt(&src.column_default) != norm_opt(&tgt.column_default) {
+        out.push(format!(
+            "default {}→{}",
+            opt_or_dash(&src.column_default),
+            opt_or_dash(&tgt.column_default)
+        ));
+    }
+    if norm_opt(&src.comment) != norm_opt(&tgt.comment) {
+        out.push(format!(
+            "comment {}→{}",
+            opt_or_dash(&src.comment),
+            opt_or_dash(&tgt.comment)
+        ));
+    }
+    if norm_opt(&src.character_set) != norm_opt(&tgt.character_set) {
+        out.push(format!(
+            "charset {}→{}",
+            opt_or_dash(&src.character_set),
+            opt_or_dash(&tgt.character_set)
+        ));
+    }
+    if norm_opt(&src.collation) != norm_opt(&tgt.collation) {
+        out.push(format!(
+            "collation {}→{}",
+            opt_or_dash(&src.collation),
+            opt_or_dash(&tgt.collation)
+        ));
+    }
+    if norm_opt(&src.extra) != norm_opt(&tgt.extra) {
+        out.push(format!(
+            "extra {}→{}",
+            opt_or_dash(&src.extra),
+            opt_or_dash(&tgt.extra)
+        ));
+    }
+    if src.is_primary_key != tgt.is_primary_key {
+        out.push(format!(
+            "pk {}→{}",
+            yn(src.is_primary_key),
+            yn(tgt.is_primary_key)
+        ));
+    }
+    if src.is_unique != tgt.is_unique {
+        out.push(format!("unique {}→{}", yn(src.is_unique), yn(tgt.is_unique)));
+    }
+    out
+}
+
+/// Canonical key an index is matched on: primary indexes collapse to one name
+/// (`PRIMARY`), everything else is compared case-insensitively by name.
+fn index_key(ix: &IndexInfo) -> String {
+    if ix.is_primary {
+        "primary".to_string()
+    } else {
+        ix.name.to_ascii_lowercase()
+    }
+}
+
+/// Human-readable index signature (`UNIQUE (a, b) WHERE …`).
+fn index_signature(ix: &IndexInfo) -> String {
+    let mut s = String::new();
+    if ix.is_primary {
+        s.push_str("PRIMARY ");
+    } else if ix.is_unique {
+        s.push_str("UNIQUE ");
+    }
+    s.push('(');
+    s.push_str(&ix.columns.join(", "));
+    s.push(')');
+    if let Some(f) = ix.filter.as_deref().map(str::trim).filter(|f| !f.is_empty()) {
+        s.push_str(&format!(" WHERE {f}"));
+    }
+    s
+}
+
+fn index_shape(ix: &IndexInfo) -> IndexShape {
+    IndexShape {
+        name: ix.name.clone(),
+        columns: ix.columns.clone(),
+        is_unique: ix.is_unique,
+        is_primary: ix.is_primary,
+    }
+}
+
+/// Build the full column + index diff between two sides.
+fn build_table_diff(src: DiffSide, tgt: DiffSide) -> TableDiff {
+    let cross = src.db_type != tgt.db_type;
+
+    let mut cols: Vec<ColDiffRow> = Vec::new();
+    let mut used_tgt = vec![false; tgt.columns.len()];
+    for sc in &src.columns {
+        match tgt.columns.iter().position(|c| {
+            c.name == sc.name || c.name.eq_ignore_ascii_case(&sc.name)
+        }) {
+            Some(ti) => {
+                used_tgt[ti] = true;
+                let tc = &tgt.columns[ti];
+                let changes = column_changes(sc, tc, cross);
+                let mark = if changes.is_empty() {
+                    DiffMark::Same
+                } else {
+                    DiffMark::Modify
+                };
+                cols.push(ColDiffRow {
+                    name: sc.name.clone(),
+                    mark,
+                    src: render_column_attrs(sc),
+                    tgt: render_column_attrs(tc),
+                    detail: changes.join(" · "),
+                });
+            }
+            None => {
+                let attrs = render_column_attrs(sc);
+                cols.push(ColDiffRow {
+                    name: sc.name.clone(),
+                    mark: DiffMark::Add,
+                    src: attrs.clone(),
+                    tgt: String::new(),
+                    detail: attrs,
+                });
+            }
+        }
+    }
+    for (ti, tc) in tgt.columns.iter().enumerate() {
+        if used_tgt[ti] {
+            continue;
+        }
+        let attrs = render_column_attrs(tc);
+        cols.push(ColDiffRow {
+            name: tc.name.clone(),
+            mark: DiffMark::Drop,
+            src: String::new(),
+            tgt: attrs.clone(),
+            detail: attrs,
+        });
+    }
+
+    let mut idx: Vec<IndexDiffRow> = Vec::new();
+    let mut used_tgt_ix = vec![false; tgt.indexes.len()];
+    for si in &src.indexes {
+        let key = index_key(si);
+        match tgt.indexes.iter().position(|i| index_key(i) == key) {
+            Some(ti) => {
+                used_tgt_ix[ti] = true;
+                let ti_ix = &tgt.indexes[ti];
+                let ss = index_signature(si);
+                let ts = index_signature(ti_ix);
+                let mark = if ss == ts { DiffMark::Same } else { DiffMark::Modify };
+                let detail = if mark == DiffMark::Same {
+                    ss.clone()
+                } else {
+                    format!("{} → {}", ss, ts)
+                };
+                idx.push(IndexDiffRow {
+                    mark,
+                    tgt: ts,
+                    detail,
+                    src_shape: Some(index_shape(si)),
+                    tgt_shape: Some(index_shape(ti_ix)),
+                });
+            }
+            None => {
+                let ss = index_signature(si);
+                idx.push(IndexDiffRow {
+                    mark: DiffMark::Add,
+                    tgt: String::new(),
+                    detail: ss,
+                    src_shape: Some(index_shape(si)),
+                    tgt_shape: None,
+                });
+            }
+        }
+    }
+    for (ti, ix) in tgt.indexes.iter().enumerate() {
+        if used_tgt_ix[ti] {
+            continue;
+        }
+        let ts = index_signature(ix);
+        idx.push(IndexDiffRow {
+            mark: DiffMark::Drop,
+            tgt: ts.clone(),
+            detail: ts,
+            src_shape: None,
+            tgt_shape: Some(index_shape(ix)),
+        });
+    }
+
+    TableDiff {
+        src,
+        tgt,
+        cols,
+        idx,
+        cross,
+    }
+}
+
+/// Coerce a column default onto the target dialect. A cross-dialect default may
+/// carry a PostgreSQL `::type` cast (`''::character varying`) that MySQL would
+/// reject, so the cast is dropped.
+fn render_default(d: &str, tgt_dt: DatabaseType, cross: bool) -> String {
+    let d = d.trim();
+    if cross && is_mysql_family(tgt_dt.as_str()) {
+        if let Some((base, _cast)) = d.split_once("::") {
+            return base.trim().to_string();
+        }
+    }
+    d.to_string()
+}
+
+/// Render a column definition in the **target** dialect for a generated
+/// `ALTER`. A cross-dialect type is mapped when possible, otherwise the source
+/// spelling is kept so the statement stays inspectable.
+fn render_column_def(c: &ColumnInfo, tgt_dt: DatabaseType, cross: bool) -> String {
+    let mut parts = vec![quote_table_identifier(Some(tgt_dt), &c.name)];
+    let ty = if cross {
+        map_type_to_dialect(&c.data_type, tgt_dt).unwrap_or_else(|| c.data_type.clone())
+    } else {
+        c.data_type.clone()
+    };
+    parts.push(ty);
+    let mysql = is_mysql_family(tgt_dt.as_str());
+    if mysql {
+        if let Some(cs) = c.character_set.as_deref().map(str::trim).filter(|v| !v.is_empty()) {
+            parts.push(format!("CHARACTER SET {cs}"));
+        }
+        if let Some(col) = c.collation.as_deref().map(str::trim).filter(|v| !v.is_empty()) {
+            parts.push(format!("COLLATE {col}"));
+        }
+    }
+    if !c.is_nullable {
+        parts.push("NOT NULL".to_string());
+    }
+    if let Some(d) = c
+        .column_default
+        .as_deref()
+        .map(str::trim)
+        .filter(|v| !v.is_empty())
+    {
+        parts.push(format!("DEFAULT {}", render_default(d, tgt_dt, cross)));
+    }
+    if mysql {
+        if let Some(extra) = c.extra.as_deref() {
+            if extra.to_ascii_lowercase().contains("auto_increment") {
+                parts.push("AUTO_INCREMENT".to_string());
+            }
+        }
+        if let Some(cm) = c.comment.as_deref().map(str::trim).filter(|v| !v.is_empty()) {
+            parts.push(format!("COMMENT {}", sql_literal(cm)));
+        }
+    }
+    parts.join(" ")
+}
+
+/// Quote an identifier list for `CREATE INDEX … (a, b)`.
+fn quoted_cols(cols: &[String], dt: DatabaseType) -> String {
+    cols.iter()
+        .map(|c| quote_table_identifier(Some(dt), c))
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+/// Generate the `ALTER` script that rewrites the **target** to match the source.
+/// Never executed by dbxt: the user copies it into another client or the editor.
+fn generate_alter(diff: &TableDiff) -> String {
+    let tgt_dt = diff.tgt.db_type;
+    let pg = is_postgres_family(tgt_dt.as_str());
+    let mysql = is_mysql_family(tgt_dt.as_str());
+    let table = table_ref(tgt_dt, &diff.tgt.schema, &diff.tgt.table);
+    let mut out = String::new();
+    out.push_str(&format!("-- {}\n", t("-- dbxt 结构对比（源 → 目标，对目标执行）")));
+    out.push_str(&format!("-- source: {}\n", diff.src.label()));
+    out.push_str(&format!(
+        "-- target: {} ({})\n",
+        diff.tgt.label(),
+        tgt_dt.as_str()
+    ));
+    if diff.cross {
+        out.push_str(&format!("-- {}\n", t("⚠ 跨方言：类型按常见映射转换，映射不了的请人工确认")));
+    }
+    out.push('\n');
+
+    let mut any = false;
+    for row in &diff.cols {
+        let q = quote_table_identifier(Some(tgt_dt), &row.name);
+        match row.mark {
+            DiffMark::Add => {
+                let Some(sc) = find_column(&diff.src.columns, &row.name) else {
+                    continue;
+                };
+                let def = render_column_def(sc, tgt_dt, diff.cross);
+                out.push_str(&format!("ALTER TABLE {table} ADD COLUMN {def};\n"));
+                if pg {
+                    if let Some(cm) = sc.comment.as_deref().map(str::trim).filter(|v| !v.is_empty()) {
+                        out.push_str(&format!(
+                            "COMMENT ON COLUMN {table}.{q} IS {};\n",
+                            sql_literal(cm)
+                        ));
+                    }
+                }
+                any = true;
+            }
+            DiffMark::Drop => {
+                out.push_str("-- ⚠ DROP COLUMN 会丢弃目标列的数据\n");
+                out.push_str(&format!("ALTER TABLE {table} DROP COLUMN {q};\n"));
+                any = true;
+            }
+            DiffMark::Modify => {
+                let (Some(sc), Some(tc)) = (
+                    find_column(&diff.src.columns, &row.name),
+                    find_column(&diff.tgt.columns, &row.name),
+                ) else {
+                    continue;
+                };
+                if mysql {
+                    let def = render_column_def(sc, tgt_dt, diff.cross);
+                    out.push_str(&format!("ALTER TABLE {table} MODIFY COLUMN {def};\n"));
+                } else {
+                    if compare_types(&sc.data_type, &tc.data_type, diff.cross) != TypeVerdict::Same {
+                        let ty = if diff.cross {
+                            map_type_to_dialect(&sc.data_type, tgt_dt)
+                        } else {
+                            Some(sc.data_type.clone())
+                        };
+                        match ty {
+                            Some(ty) => out.push_str(&format!(
+                                "ALTER TABLE {table} ALTER COLUMN {q} TYPE {ty};\n"
+                            )),
+                            None => out.push_str(&format!(
+                                "-- TODO 类型需人工确认: {q} {} → {}\n",
+                                sc.data_type, tc.data_type
+                            )),
+                        }
+                    }
+                    if sc.is_nullable != tc.is_nullable {
+                        if sc.is_nullable {
+                            out.push_str(&format!(
+                                "ALTER TABLE {table} ALTER COLUMN {q} DROP NOT NULL;\n"
+                            ));
+                        } else {
+                            out.push_str(&format!(
+                                "ALTER TABLE {table} ALTER COLUMN {q} SET NOT NULL;\n"
+                            ));
+                        }
+                    }
+                    if norm_opt(&sc.column_default) != norm_opt(&tc.column_default) {
+                        match sc
+                            .column_default
+                            .as_deref()
+                            .map(str::trim)
+                            .filter(|v| !v.is_empty())
+                        {
+                            Some(d) => out.push_str(&format!(
+                                "ALTER TABLE {table} ALTER COLUMN {q} SET DEFAULT {d};\n"
+                            )),
+                            None => out.push_str(&format!(
+                                "ALTER TABLE {table} ALTER COLUMN {q} DROP DEFAULT;\n"
+                            )),
+                        }
+                    }
+                    if pg && norm_opt(&sc.comment) != norm_opt(&tc.comment) {
+                        match sc.comment.as_deref().map(str::trim).filter(|v| !v.is_empty()) {
+                            Some(cm) => out.push_str(&format!(
+                                "COMMENT ON COLUMN {table}.{q} IS {};\n",
+                                sql_literal(cm)
+                            )),
+                            None => out.push_str(&format!(
+                                "COMMENT ON COLUMN {table}.{q} IS NULL;\n"
+                            )),
+                        }
+                    }
+                }
+                any = true;
+            }
+            DiffMark::Same => {}
+        }
+    }
+
+    for row in &diff.idx {
+        match row.mark {
+            DiffMark::Add => {
+                let Some(sh) = &row.src_shape else { continue };
+                if sh.is_primary {
+                    out.push_str("-- TODO 目标缺少主键，请手工添加\n");
+                } else {
+                    out.push_str(&format!(
+                        "CREATE {}INDEX {} ON {table} ({});\n",
+                        if sh.is_unique { "UNIQUE " } else { "" },
+                        quote_table_identifier(Some(tgt_dt), &sh.name),
+                        quoted_cols(&sh.columns, tgt_dt)
+                    ));
+                }
+                any = true;
+            }
+            DiffMark::Drop => {
+                let Some(th) = &row.tgt_shape else { continue };
+                if th.is_primary {
+                    out.push_str("-- TODO 目标主键多余，请手工删除\n");
+                } else if mysql {
+                    out.push_str(&format!(
+                        "DROP INDEX {} ON {table};\n",
+                        quote_table_identifier(Some(tgt_dt), &th.name)
+                    ));
+                } else {
+                    let qualified = if diff.tgt.schema.trim().is_empty() {
+                        quote_table_identifier(Some(tgt_dt), &th.name)
+                    } else {
+                        format!(
+                            "{}.{}",
+                            quote_table_identifier(Some(tgt_dt), &diff.tgt.schema),
+                            quote_table_identifier(Some(tgt_dt), &th.name)
+                        )
+                    };
+                    out.push_str(&format!("DROP INDEX {qualified};\n"));
+                }
+                any = true;
+            }
+            DiffMark::Modify => {
+                if let Some(th) = &row.tgt_shape {
+                    if !th.is_primary {
+                        if mysql {
+                            out.push_str(&format!(
+                                "DROP INDEX {} ON {table};\n",
+                                quote_table_identifier(Some(tgt_dt), &th.name)
+                            ));
+                        } else {
+                            out.push_str(&format!(
+                                "DROP INDEX {};\n",
+                                quote_table_identifier(Some(tgt_dt), &th.name)
+                            ));
+                        }
+                    }
+                }
+                if let Some(sh) = &row.src_shape {
+                    if !sh.is_primary {
+                        out.push_str(&format!(
+                            "CREATE {}INDEX {} ON {table} ({});\n",
+                            if sh.is_unique { "UNIQUE " } else { "" },
+                            quote_table_identifier(Some(tgt_dt), &sh.name),
+                            quoted_cols(&sh.columns, tgt_dt)
+                        ));
+                    }
+                }
+                any = true;
+            }
+            DiffMark::Same => {}
+        }
+    }
+
+    if !any {
+        out.push_str(&format!("-- {}\n", t("结构一致，无需同步")));
+    }
+    out
+}
+
+/// Plain-text summary of the differences, for `y` (paste into a ticket).
+fn diff_summary_text(diff: &TableDiff) -> String {
+    let mut out = String::new();
+    out.push_str(&format!("-- {}\n", t("-- dbxt 结构对比")));
+    out.push_str(&format!(
+        "-- {}: {} ({})\n",
+        t("源"),
+        diff.src.label(),
+        diff.src.db_type.as_str()
+    ));
+    out.push_str(&format!(
+        "-- {}: {} ({})\n",
+        t("目标"),
+        diff.tgt.label(),
+        diff.tgt.db_type.as_str()
+    ));
+    out.push_str(&format!("-- {}\n", t("方向：源 → 目标")));
+    if diff.equal() {
+        out.push_str(&format!("-- {}\n", t("结构一致，无差异")));
+        return out;
+    }
+    out.push('\n');
+    for row in diff.cols.iter().filter(|r| r.mark != DiffMark::Same) {
+        let text = if row.detail.is_empty() {
+            row.src.clone()
+        } else {
+            row.detail.clone()
+        };
+        out.push_str(&format!("{} {} {}  {}\n", row.mark.sign(), t("列"), row.name, text));
+    }
+    for row in diff.idx.iter().filter(|r| r.mark != DiffMark::Same) {
+        out.push_str(&format!("{} {}  {}\n", row.mark.sign(), t("索引"), row.detail));
+    }
+    out
 }
 
 // ─── cell values ─────────────────────────────────────────────────────────────
@@ -2540,6 +3586,37 @@ enum Op {
         gen: u64,
         cancel: Arc<AtomicBool>,
     },
+    /// Fetch both tables' columns and indexes and diff them (source is the
+    /// desired structure, the generated ALTER rewrites the target).
+    DiffTable {
+        src_cfg: Box<ConnectionConfig>,
+        src_db: String,
+        src_schema: String,
+        src_table: String,
+        tgt_cfg: Box<ConnectionConfig>,
+        tgt_db: String,
+        tgt_schema: String,
+        tgt_table: String,
+        gen: u64,
+    },
+    /// Compare two databases' table lists.
+    DiffDatabase {
+        src_cfg: Box<ConnectionConfig>,
+        src_db: String,
+        src_schema: String,
+        tgt_cfg: Box<ConnectionConfig>,
+        tgt_db: String,
+        tgt_schema: String,
+        gen: u64,
+    },
+    /// List a (possibly other) connection's tables to populate the diff target
+    /// picker when comparing across connections.
+    DiffTablesFor {
+        cfg: Box<ConnectionConfig>,
+        db: String,
+        schema: String,
+        gen: u64,
+    },
 }
 
 impl Op {
@@ -2720,6 +3797,23 @@ enum OpResult {
     SshPrompt(Box<SshPromptEnvelope>),
     /// A best-effort host-key notice (changed / rejected / learn failed).
     SshNotice(Box<SshHostKeyNotice>),
+    /// A two-table structure diff finished (source → target).
+    DiffReady {
+        gen: u64,
+        diff: Box<TableDiff>,
+    },
+    /// A two-database table-list diff finished.
+    DbDiffReady {
+        gen: u64,
+        diff: Box<DbDiff>,
+    },
+    /// A cross-connection target's table list, for the diff picker.
+    DiffTablesFor {
+        gen: u64,
+        db: String,
+        schema: String,
+        tables: Vec<String>,
+    },
     Error(String),
 }
 
@@ -3869,7 +4963,147 @@ async fn run_op(backend: &LocalBackend, op: Op, tx: &Tx) -> OpResult {
             )
             .await
         }
+        Op::DiffTable {
+            src_cfg,
+            src_db,
+            src_schema,
+            src_table,
+            tgt_cfg,
+            tgt_db,
+            tgt_schema,
+            tgt_table,
+            gen,
+        } => {
+            let src = match fetch_diff_side(backend, &src_cfg, &src_db, &src_schema, &src_table).await
+            {
+                Ok(s) => s,
+                Err(e) => return OpResult::Error(format!("diff source: {e}")),
+            };
+            let tgt = match fetch_diff_side(backend, &tgt_cfg, &tgt_db, &tgt_schema, &tgt_table).await
+            {
+                Ok(s) => s,
+                Err(e) => return OpResult::Error(format!("diff target: {e}")),
+            };
+            OpResult::DiffReady {
+                gen,
+                diff: Box::new(build_table_diff(src, tgt)),
+            }
+        }
+        Op::DiffDatabase {
+            src_cfg,
+            src_db,
+            src_schema,
+            tgt_cfg,
+            tgt_db,
+            tgt_schema,
+            gen,
+        } => {
+            let src = match backend.list_tables(&src_cfg, &src_db, &src_schema).await {
+                Ok(t) => t,
+                Err(e) => return OpResult::Error(format!("diff source tables: {e}")),
+            };
+            let tgt = match backend.list_tables(&tgt_cfg, &tgt_db, &tgt_schema).await {
+                Ok(t) => t,
+                Err(e) => return OpResult::Error(format!("diff target tables: {e}")),
+            };
+            let mut src_names: Vec<String> = src.into_iter().map(|t| t.name).collect();
+            let mut tgt_names: Vec<String> = tgt.into_iter().map(|t| t.name).collect();
+            // Deterministic, human-friendly order.
+            src_names.sort_by_key(|a| a.to_ascii_lowercase());
+            tgt_names.sort_by_key(|a| a.to_ascii_lowercase());
+            let src_set: HashSet<String> = src_names.iter().map(|n| n.to_ascii_lowercase()).collect();
+            let tgt_set: HashSet<String> = tgt_names.iter().map(|n| n.to_ascii_lowercase()).collect();
+            let mut entries: Vec<DbDiffEntry> = Vec::new();
+            for n in &src_names {
+                let mark = if tgt_set.contains(&n.to_ascii_lowercase()) {
+                    DbTableMark::Both
+                } else {
+                    DbTableMark::OnlySrc
+                };
+                entries.push(DbDiffEntry {
+                    table: n.clone(),
+                    mark,
+                });
+            }
+            for n in &tgt_names {
+                if !src_set.contains(&n.to_ascii_lowercase()) {
+                    entries.push(DbDiffEntry {
+                        table: n.clone(),
+                        mark: DbTableMark::OnlyTgt,
+                    });
+                }
+            }
+            let src_label = if src_schema.trim().is_empty() {
+                fix_double_encoding(&src_db)
+            } else {
+                format!("{}.{}", fix_double_encoding(&src_db), fix_double_encoding(&src_schema))
+            };
+            let tgt_label = if tgt_schema.trim().is_empty() {
+                fix_double_encoding(&tgt_db)
+            } else {
+                format!("{}.{}", fix_double_encoding(&tgt_db), fix_double_encoding(&tgt_schema))
+            };
+            OpResult::DbDiffReady {
+                gen,
+                diff: Box::new(DbDiff {
+                    src_label,
+                    tgt_label,
+                    entries,
+                    src_db,
+                    tgt_db,
+                    src_schema,
+                    tgt_schema,
+                }),
+            }
+        }
+        Op::DiffTablesFor {
+            cfg,
+            db,
+            schema,
+            gen,
+        } => match backend.list_tables(&cfg, &db, &schema).await {
+            Ok(tables) => {
+                let mut names: Vec<String> = tables.into_iter().map(|t| t.name).collect();
+                names.sort_by_key(|a| a.to_ascii_lowercase());
+                OpResult::DiffTablesFor {
+                    gen,
+                    db,
+                    schema,
+                    tables: names,
+                }
+            }
+            Err(e) => OpResult::Error(format!("diff target tables: {e}")),
+        },
     }
+}
+
+/// Fetch one side of a table diff: columns (required) plus indexes (best
+/// effort — a driver that cannot list them still diffs columns).
+async fn fetch_diff_side(
+    backend: &LocalBackend,
+    cfg: &ConnectionConfig,
+    db: &str,
+    schema: &str,
+    table: &str,
+) -> Result<DiffSide, String> {
+    let columns = backend.get_columns(cfg, db, schema, table).await?;
+    let indexes = dbx_core::schema::list_indexes_core(
+        backend.state().as_ref(),
+        &cfg.id,
+        db,
+        schema,
+        table,
+    )
+    .await
+    .unwrap_or_default();
+    Ok(DiffSide {
+        db: db.to_string(),
+        schema: schema.to_string(),
+        table: table.to_string(),
+        db_type: cfg.db_type,
+        columns,
+        indexes,
+    })
 }
 
 /// The global-search worker: enumerate tables, skip the big ones, then scan each
@@ -4721,6 +5955,16 @@ struct App {
     /// True when the hit list was capped at [`SEARCH_MAX_HITS`].
     search_truncated: bool,
 
+    // ── schema diff (Alt-D / Shift+Alt-D) ──
+    /// The `Alt-D` target picker (source is the focused table / current database).
+    diff_picker: Option<DiffPicker>,
+    /// The open two-table diff overlay.
+    diff: Option<Box<SchemaDiffState>>,
+    /// The open two-database table-list diff overlay.
+    db_diff: Option<Box<DbDiffState>>,
+    /// Monotonic id of the latest diff request; a stale reply is discarded.
+    diff_gen: u64,
+
     // ── SQL file execution (Alt-L) ──
     /// The modal file-path input.
     file_load_prompt: Option<TextArea<'static>>,
@@ -5234,6 +6478,10 @@ impl App {
             search_gen: 0,
             search_cancel: Arc::new(AtomicBool::new(false)),
             search_truncated: false,
+            diff_picker: None,
+            diff: None,
+            db_diff: None,
+            diff_gen: 0,
             file_load_prompt: None,
             file_load_plan: None,
             filter_prompt: None,
@@ -6281,6 +7529,98 @@ fn apply_op_result(app: &mut App, res: OpResult, tx: &Tx) {
             app.search_progress = None;
             app.status = t("已中止全库搜索（保留已扫描的部分结果）").into();
         }
+        OpResult::DiffReady { gen, diff } => {
+            // A reply for a superseded request must not replace the open overlay.
+            if gen != app.diff_gen {
+                return;
+            }
+            let changed = diff.changed();
+            let equal = diff.equal();
+            let cross = diff.cross;
+            let src = diff.src.label();
+            let tgt = diff.tgt.label();
+            app.diff_picker = None;
+            app.db_diff = None;
+            app.diff = Some(Box::new(SchemaDiffState {
+                diff: *diff,
+                tab: DiffTab::Columns,
+                list: ListState::default(),
+                scroll: 0,
+                alter: String::new(),
+            }));
+            if let Some(state) = app.diff.as_mut() {
+                if !state.diff.cols.is_empty() {
+                    state.list.select(Some(0));
+                }
+            }
+            let cross_note = if cross {
+                tf(" · {}", &[&t("⚠ 跨方言")])
+            } else {
+                String::new()
+            };
+            app.status = if equal {
+                tf(
+                    "结构对比 {} → {} · {} · Tab 切换 · Esc 关{}",
+                    &[&src, &tgt, &t("结构一致"), &cross_note],
+                )
+            } else {
+                tf(
+                    "结构对比 {} → {} · {} 处差异 · y 摘要 · g ALTER{}",
+                    &[&src, &tgt, &changed, &cross_note],
+                )
+            };
+        }
+        OpResult::DbDiffReady { gen, diff } => {
+            if gen != app.diff_gen {
+                return;
+            }
+            let only_src = diff.count(DbTableMark::OnlySrc);
+            let only_tgt = diff.count(DbTableMark::OnlyTgt);
+            let both = diff.count(DbTableMark::Both);
+            let src = diff.src_label.clone();
+            let tgt = diff.tgt_label.clone();
+            app.diff_picker = None;
+            app.diff = None;
+            app.db_diff = Some(Box::new(DbDiffState {
+                diff: *diff,
+                list: ListState::default(),
+            }));
+            if let Some(state) = app.db_diff.as_mut() {
+                if !state.diff.entries.is_empty() {
+                    state.list.select(Some(0));
+                }
+            }
+            app.status = tf(
+                "库结构对比 {} → {} · 仅源 {} · 仅目标 {} · 共有 {} · Enter 对比两库都有的表",
+                &[&src, &tgt, &only_src, &only_tgt, &both],
+            );
+        }
+        OpResult::DiffTablesFor {
+            gen,
+            db,
+            schema,
+            tables,
+        } => {
+            let Some(p) = app.diff_picker.as_mut() else {
+                return;
+            };
+            if p.gen != gen || p.stage != DiffPickStage::Lists {
+                return;
+            }
+            p.loading = false;
+            p.target_db = db;
+            p.target_schema = schema;
+            p.entries = tables;
+            p.list
+                .select(if p.entries.is_empty() { None } else { Some(0) });
+            let empty = p.entries.is_empty();
+            let n = p.entries.len();
+            app.status = if empty {
+                t("目标连接里没有表").into()
+            } else {
+                tf("{} 张表 · Enter 对比 · c 换连接 · Esc 返回", &[&n])
+            };
+        }
         // Handled before the spinner accounting above; unreachable here.
         OpResult::SshPrompt(_) | OpResult::SshNotice(_) | OpResult::SearchProgress { .. } => {}
         OpResult::Error(e) => {
@@ -6292,6 +7632,11 @@ fn apply_op_result(app: &mut App, res: OpResult, tx: &Tx) {
             app.pending_write_msg = None;
             app.search_running = false;
             app.search_progress = None;
+            // A failed cross-connection table fetch must not leave the picker
+            // stuck on its spinner.
+            if let Some(p) = app.diff_picker.as_mut() {
+                p.loading = false;
+            }
             // A failed scan must not leave the key list permanently unable to
             // load another page.
             app.redis_scan.pending = false;
@@ -6680,6 +8025,21 @@ fn browse_key(app: &mut App, tx: &Tx, k: KeyEvent) {
         return;
     }
 
+    // Schema diff overlays (Alt-D / Shift+Alt-D) are modal: the target picker,
+    // the two-table diff and the two-database diff.
+    if app.diff_picker.is_some() {
+        diff_picker_key(app, tx, k);
+        return;
+    }
+    if app.diff.is_some() {
+        diff_key(app, tx, k);
+        return;
+    }
+    if app.db_diff.is_some() {
+        db_diff_key(app, tx, k);
+        return;
+    }
+
     // Recent-table overlay (Ctrl-Shift-R) is modal.
     if app.recent_open {
         recent_key(app, tx, k);
@@ -6833,6 +8193,15 @@ fn browse_key(app: &mut App, tx: &Tx, k: KeyEvent) {
             // Alt-G: scan every table's text columns for a term.
             KeyCode::Char('g') | KeyCode::Char('G') => {
                 open_global_search(app);
+                return;
+            }
+            // Alt-D: two-table structure diff; Shift+Alt-D: two-database diff.
+            KeyCode::Char('d') => {
+                open_diff_picker(app, DiffPickMode::Table);
+                return;
+            }
+            KeyCode::Char('D') => {
+                open_diff_picker(app, DiffPickMode::Database);
                 return;
             }
             _ => {}
@@ -11062,6 +12431,515 @@ fn search_key(app: &mut App, tx: &Tx, k: KeyEvent) {
     }
 }
 
+// ── schema diff (Alt-D / Shift+Alt-D) ──
+
+/// The table `Alt-D` uses as the source: the table open in the results pane
+/// when it is focused, else the sidebar selection.
+fn diff_source(app: &App) -> Option<(String, String, String)> {
+    if app.focus == Focus::Preview {
+        if let Some(ps) = &app.page_state {
+            if !ps.table.is_empty() {
+                return Some((app.current_db(), ps.schema.clone(), ps.table.clone()));
+            }
+        }
+    }
+    app.selected_table()
+        .map(|t| (app.current_db(), app.schema.clone(), t.name.clone()))
+}
+
+/// Open the target picker. The source is the focused table (table mode) or the
+/// current database (database mode).
+/// Other SQL connections that can serve as a cross-connection diff target.
+fn diff_other_connections(app: &App) -> Vec<ConnectionConfig> {
+    let cur = app.selected.as_ref().map(|c| c.id.clone());
+    app.connections
+        .iter()
+        .filter(|c| Some(c.id.clone()) != cur && backend_for_connection(c) == Backend::Sql)
+        .cloned()
+        .collect()
+}
+
+/// The schema a target connection's tables are listed under: only schema-aware
+/// engines get one (the source schema when set, otherwise `public`), so a MySQL
+/// or SQLite target is never handed a bogus schema name.
+fn diff_target_schema(cfg: &ConnectionConfig, src_schema: &str) -> String {
+    if !schema_picker_engine(cfg.db_type) {
+        return String::new();
+    }
+    if !src_schema.trim().is_empty() {
+        return src_schema.to_string();
+    }
+    "public".to_string()
+}
+
+fn open_diff_picker(app: &mut App, mode: DiffPickMode) {
+    if app.backend_kind != Backend::Sql || app.selected.is_none() {
+        app.status = t("结构对比仅支持 SQL 连接").into();
+        return;
+    }
+    let entries: Vec<String> = match mode {
+        DiffPickMode::Table => {
+            let Some((_, _, src)) = diff_source(app) else {
+                app.status = t("先选中一张表再按 Alt-D").into();
+                return;
+            };
+            app.tables
+                .iter()
+                .filter(|t| t.name != src)
+                .map(|t| t.name.clone())
+                .collect()
+        }
+        DiffPickMode::Database => {
+            let cur = app.current_db();
+            app.databases
+                .iter()
+                .filter(|d| **d != cur)
+                .cloned()
+                .collect()
+        }
+    };
+    if entries.is_empty() {
+        app.status = match mode {
+            DiffPickMode::Table => t("当前库里没有别的表可对比").into(),
+            DiffPickMode::Database => t("没有别的数据库可对比").into(),
+        };
+        return;
+    }
+    app.diff_gen += 1;
+    let gen = app.diff_gen;
+    let mut list = ListState::default();
+    list.select(Some(0));
+    app.diff_picker = Some(DiffPicker {
+        mode,
+        stage: DiffPickStage::Lists,
+        list,
+        src_entries: entries.clone(),
+        entries,
+        target_conn: None,
+        target_db: String::new(),
+        target_schema: String::new(),
+        loading: false,
+        gen,
+    });
+    app.status = match mode {
+        DiffPickMode::Table => {
+            t("选择目标表（源 = 当前表；c 换连接做跨库/跨方言对比）").into()
+        }
+        DiffPickMode::Database => t("选择目标库（源 = 当前库）").into(),
+    };
+}
+
+fn diff_picker_key(app: &mut App, tx: &Tx, k: KeyEvent) {
+    let Some((mode, stage)) = app.diff_picker.as_ref().map(|p| (p.mode, p.stage)) else {
+        return;
+    };
+    let n = app.diff_picker.as_ref().map(|p| p.entries.len()).unwrap_or(0);
+    let step = |app: &mut App, delta: i32| {
+        if n == 0 {
+            return;
+        }
+        if let Some(p) = app.diff_picker.as_mut() {
+            let cur = p.list.selected().unwrap_or(0) as i32;
+            let next = (cur + delta).clamp(0, n as i32 - 1) as usize;
+            p.list.select(Some(next));
+        }
+    };
+    let back_to_lists = |app: &mut App| {
+        // Invalidate any in-flight cross-connection table fetch so its reply is
+        // dropped instead of replacing the restored list.
+        app.diff_gen += 1;
+        let gen = app.diff_gen;
+        if let Some(p) = app.diff_picker.as_mut() {
+            p.stage = DiffPickStage::Lists;
+            p.entries = p.src_entries.clone();
+            p.target_conn = None;
+            p.target_db.clear();
+            p.target_schema.clear();
+            p.loading = false;
+            p.gen = gen;
+            p.list.select(if p.entries.is_empty() { None } else { Some(0) });
+        }
+        app.status = t("选择目标表（源 = 当前表；c 换连接做跨库/跨方言对比）").into();
+    };
+    match k.code {
+        KeyCode::Esc | KeyCode::Char('q') => {
+            if stage == DiffPickStage::Connections {
+                back_to_lists(app);
+                return;
+            }
+            app.diff_picker = None;
+            app.status = t("已取消结构对比").into();
+        }
+        // Toggle target kind: table (Alt-D) ↔ database (Shift+Alt-D).
+        KeyCode::Char('d') | KeyCode::Char('D') if stage == DiffPickStage::Lists => {
+            let next = if mode == DiffPickMode::Table {
+                DiffPickMode::Database
+            } else {
+                DiffPickMode::Table
+            };
+            open_diff_picker(app, next);
+        }
+        // `c`: pick another connection as the diff target (cross-dialect).
+        KeyCode::Char('c') if mode == DiffPickMode::Table && stage == DiffPickStage::Lists => {
+            let conns = diff_other_connections(app);
+            if conns.is_empty() {
+                app.status = t("没有别的 SQL 连接可做跨连接对比").into();
+                return;
+            }
+            let names: Vec<String> = conns
+                .iter()
+                .map(|c| format!("{} ({})", c.name, c.db_type.as_str()))
+                .collect();
+            if let Some(p) = app.diff_picker.as_mut() {
+                p.stage = DiffPickStage::Connections;
+                p.entries = names;
+                p.list.select(Some(0));
+            }
+            app.status = t("选择目标连接（Enter 进入其表列表 · Esc 返回）").into();
+        }
+        KeyCode::Up | KeyCode::Char('k') => step(app, -1),
+        KeyCode::Down | KeyCode::Char('j') => step(app, 1),
+        KeyCode::PageUp => step(app, -10),
+        KeyCode::PageDown => step(app, 10),
+        KeyCode::Home => {
+            if let Some(p) = app.diff_picker.as_mut() {
+                if n > 0 {
+                    p.list.select(Some(0));
+                }
+            }
+        }
+        KeyCode::End => {
+            if let Some(p) = app.diff_picker.as_mut() {
+                if n > 0 {
+                    p.list.select(Some(n - 1));
+                }
+            }
+        }
+        KeyCode::Enter => {
+            let Some(p) = app.diff_picker.as_ref() else {
+                return;
+            };
+            let Some(idx) = p.list.selected() else {
+                return;
+            };
+            if stage == DiffPickStage::Connections {
+                let Some(cfg) = diff_other_connections(app).into_iter().nth(idx) else {
+                    return;
+                };
+                let db = cfg.database.clone().unwrap_or_default();
+                let schema = diff_target_schema(&cfg, &app.schema);
+                app.diff_gen += 1;
+                let gen = app.diff_gen;
+                if let Some(p) = app.diff_picker.as_mut() {
+                    p.target_conn = Some(Box::new(cfg.clone()));
+                    p.target_db = db.clone();
+                    p.target_schema = schema.clone();
+                    p.loading = true;
+                    p.gen = gen;
+                    p.stage = DiffPickStage::Lists;
+                }
+                app.loading = true;
+                app.status = tf("加载 {} 的表…", &[&cfg.name]);
+                app.spawn(
+                    tx,
+                    Op::DiffTablesFor {
+                        cfg: Box::new(cfg),
+                        db,
+                        schema,
+                        gen,
+                    },
+                );
+                return;
+            }
+            let Some(choice) = p.entries.get(idx).cloned() else {
+                return;
+            };
+            match mode {
+                DiffPickMode::Table => {
+                    let Some((db, schema, src)) = diff_source(app) else {
+                        return;
+                    };
+                    let Some(src_cfg) = app.selected.clone() else {
+                        return;
+                    };
+                    let (tgt_cfg, tgt_db, tgt_schema) = {
+                        let p = app.diff_picker.as_ref().unwrap();
+                        match &p.target_conn {
+                            Some(c) => {
+                                ((**c).clone(), p.target_db.clone(), p.target_schema.clone())
+                            }
+                            None => (src_cfg.clone(), db.clone(), schema.clone()),
+                        }
+                    };
+                    start_table_diff(
+                        app, tx, src_cfg, db, schema, src, tgt_cfg, tgt_db, tgt_schema, choice,
+                    );
+                }
+                DiffPickMode::Database => {
+                    let src_db = app.current_db();
+                    let schema = app.schema.clone();
+                    let tgt_schema = schema.clone();
+                    start_db_diff(app, tx, src_db, schema, choice, tgt_schema);
+                }
+            }
+        }
+        _ => {}
+    }
+}
+
+/// Start a two-table diff (source is the desired structure). The two sides may
+/// be on different connections and dialects.
+#[allow(clippy::too_many_arguments)]
+fn start_table_diff(
+    app: &mut App,
+    tx: &Tx,
+    src_cfg: ConnectionConfig,
+    src_db: String,
+    src_schema: String,
+    src_table: String,
+    tgt_cfg: ConnectionConfig,
+    tgt_db: String,
+    tgt_schema: String,
+    tgt_table: String,
+) {
+    app.diff_picker = None;
+    app.diff = None;
+    app.db_diff = None;
+    app.diff_gen += 1;
+    let gen = app.diff_gen;
+    app.loading = true;
+    app.status = tf(
+        "对比 {} → {}…",
+        &[
+            &fix_double_encoding(&qualified_display(&src_schema, &src_table)),
+            &fix_double_encoding(&qualified_display(&tgt_schema, &tgt_table)),
+        ],
+    );
+    app.spawn(
+        tx,
+        Op::DiffTable {
+            src_cfg: Box::new(src_cfg),
+            src_db,
+            src_schema,
+            src_table,
+            tgt_cfg: Box::new(tgt_cfg),
+            tgt_db,
+            tgt_schema,
+            tgt_table,
+            gen,
+        },
+    );
+}
+
+/// Start a two-database table-list diff.
+fn start_db_diff(
+    app: &mut App,
+    tx: &Tx,
+    src_db: String,
+    src_schema: String,
+    tgt_db: String,
+    tgt_schema: String,
+) {
+    let Some(cfg) = app.selected.clone() else {
+        return;
+    };
+    app.diff_picker = None;
+    app.diff = None;
+    app.db_diff = None;
+    app.diff_gen += 1;
+    let gen = app.diff_gen;
+    app.loading = true;
+    app.status = tf(
+        "对比库 {} → {}…",
+        &[&fix_double_encoding(&src_db), &fix_double_encoding(&tgt_db)],
+    );
+    app.spawn(
+        tx,
+        Op::DiffDatabase {
+            src_cfg: Box::new(cfg.clone()),
+            src_db,
+            src_schema,
+            tgt_cfg: Box::new(cfg),
+            tgt_db,
+            tgt_schema,
+            gen,
+        },
+    );
+}
+
+/// Number of selectable rows in the active tab (`Alter` is scroll-only).
+fn diff_row_count(state: &SchemaDiffState) -> usize {
+    match state.tab {
+        DiffTab::Columns => state.diff.cols.len(),
+        DiffTab::Indexes => state.diff.idx.len(),
+        DiffTab::Alter => 0,
+    }
+}
+
+fn diff_move(app: &mut App, delta: i32) {
+    let Some(state) = app.diff.as_mut() else {
+        return;
+    };
+    if state.tab == DiffTab::Alter {
+        state.scroll = (state.scroll as i32 + delta).max(0) as u16;
+        return;
+    }
+    let n = diff_row_count(state);
+    if n == 0 {
+        return;
+    }
+    let cur = state.list.selected().unwrap_or(0) as i32;
+    let next = (cur + delta).clamp(0, n as i32 - 1) as usize;
+    state.list.select(Some(next));
+}
+
+fn diff_key(app: &mut App, _tx: &Tx, k: KeyEvent) {
+    match k.code {
+        KeyCode::Esc | KeyCode::Char('q') => {
+            app.diff = None;
+            app.status = t("已关闭结构对比").into();
+        }
+        KeyCode::Char('y') => copy_diff_summary(app),
+        KeyCode::Char('g') => {
+            if let Some(state) = app.diff.as_mut() {
+                if state.alter.is_empty() {
+                    state.alter = generate_alter(&state.diff);
+                }
+                state.tab = DiffTab::Alter;
+                state.scroll = 0;
+            }
+            app.status = t("已生成 ALTER 同步语句（只生成不执行）· Tab 回差异 · Esc 关").into();
+        }
+        KeyCode::Tab | KeyCode::Char('t') => {
+            if let Some(state) = app.diff.as_mut() {
+                state.tab = state.tab.next();
+                state.scroll = 0;
+            }
+        }
+        KeyCode::Up | KeyCode::Char('k') => diff_move(app, -1),
+        KeyCode::Down | KeyCode::Char('j') => diff_move(app, 1),
+        KeyCode::PageUp => diff_move(app, -10),
+        KeyCode::PageDown => diff_move(app, 10),
+        KeyCode::Home => {
+            if let Some(state) = app.diff.as_mut() {
+                if state.tab == DiffTab::Alter {
+                    state.scroll = 0;
+                } else if diff_row_count(state) > 0 {
+                    state.list.select(Some(0));
+                }
+            }
+        }
+        KeyCode::End => {
+            if let Some(state) = app.diff.as_mut() {
+                let n = diff_row_count(state);
+                if state.tab != DiffTab::Alter && n > 0 {
+                    state.list.select(Some(n - 1));
+                }
+            }
+        }
+        _ => {}
+    }
+}
+
+/// `y` in the table-diff overlay: copy the plain-text summary.
+fn copy_diff_summary(app: &mut App) {
+    let Some(state) = app.diff.as_ref() else {
+        return;
+    };
+    let text = diff_summary_text(&state.diff);
+    let lines = text.lines().count();
+    match clipboard_copy(&text) {
+        Some(p) => {
+            app.status = tf(
+                "✓ 已复制差异摘要（{} 行）· 兜底 {}",
+                &[&lines, &(p.display())],
+            )
+        }
+        None => app.status = tf("✓ 已复制差异摘要（{} 行）· OSC52 剪贴板", &[&lines]),
+    }
+}
+
+fn db_diff_key(app: &mut App, tx: &Tx, k: KeyEvent) {
+    let n = app.db_diff.as_ref().map(|s| s.diff.entries.len()).unwrap_or(0);
+    let step = |app: &mut App, delta: i32| {
+        if n == 0 {
+            return;
+        }
+        if let Some(state) = app.db_diff.as_mut() {
+            let cur = state.list.selected().unwrap_or(0) as i32;
+            let next = (cur + delta).clamp(0, n as i32 - 1) as usize;
+            state.list.select(Some(next));
+        }
+    };
+    match k.code {
+        KeyCode::Esc | KeyCode::Char('q') => {
+            app.db_diff = None;
+            app.status = t("已关闭库结构对比").into();
+        }
+        KeyCode::Up | KeyCode::Char('k') => step(app, -1),
+        KeyCode::Down | KeyCode::Char('j') => step(app, 1),
+        KeyCode::PageUp => step(app, -10),
+        KeyCode::PageDown => step(app, 10),
+        KeyCode::Home => {
+            if let Some(state) = app.db_diff.as_mut() {
+                if n > 0 {
+                    state.list.select(Some(0));
+                }
+            }
+        }
+        KeyCode::End => {
+            if let Some(state) = app.db_diff.as_mut() {
+                if n > 0 {
+                    state.list.select(Some(n - 1));
+                }
+            }
+        }
+        KeyCode::Enter => {
+            // Only a table present on both sides can be opened as a table diff.
+            let picked = app.db_diff.as_ref().and_then(|s| {
+                let idx = s.list.selected()?;
+                let entry = s.diff.entries.get(idx)?.clone();
+                Some((
+                    entry,
+                    s.diff.src_db.clone(),
+                    s.diff.src_schema.clone(),
+                    s.diff.tgt_db.clone(),
+                    s.diff.tgt_schema.clone(),
+                ))
+            });
+            let Some((entry, src_db, src_schema, tgt_db, tgt_schema)) = picked else {
+                return;
+            };
+            match entry.mark {
+                DbTableMark::Both => {
+                    let Some(cfg) = app.selected.clone() else {
+                        return;
+                    };
+                    start_table_diff(
+                        app,
+                        tx,
+                        cfg.clone(),
+                        src_db,
+                        src_schema,
+                        entry.table.clone(),
+                        cfg,
+                        tgt_db,
+                        tgt_schema,
+                        entry.table,
+                    )
+                }
+                DbTableMark::OnlySrc => {
+                    app.status = tf("{} 只在源库", &[&fix_double_encoding(&entry.table)])
+                }
+                DbTableMark::OnlyTgt => {
+                    app.status = tf("{} 只在目标库", &[&fix_double_encoding(&entry.table)])
+                }
+            }
+        }
+        _ => {}
+    }
+}
+
 // ── SQL file execution (Alt-L) ──
 
 /// A read `.sql` file waiting for the user's confirmation before it runs.
@@ -15215,6 +17093,15 @@ fn ui(f: &mut Frame, app: &mut App) {
     if app.search_input.is_some() {
         render_search_input(f, f.area(), app);
     }
+    if app.diff_picker.is_some() {
+        render_diff_picker(f, f.area(), app);
+    }
+    if app.diff.is_some() {
+        render_diff_panel(f, chunks[1], app);
+    }
+    if app.db_diff.is_some() {
+        render_db_diff(f, chunks[1], app);
+    }
     if app.file_load_plan.is_some() {
         render_file_load_plan(f, f.area(), app);
     }
@@ -15614,6 +17501,9 @@ enum FooterView {
     History,
     SearchInput,
     Search,
+    DiffPicker,
+    SchemaDiff,
+    DbDiff,
     Recent,
     ColPicker,
     ConnPicker,
@@ -15690,6 +17580,12 @@ fn footer_ctx(app: &App) -> FooterCtx {
         FooterView::SearchInput
     } else if app.search_open {
         FooterView::Search
+    } else if app.diff_picker.is_some() {
+        FooterView::DiffPicker
+    } else if app.diff.is_some() {
+        FooterView::SchemaDiff
+    } else if app.db_diff.is_some() {
+        FooterView::DbDiff
     } else if app.recent_open {
         FooterView::Recent
     } else if app.col_picker_open {
@@ -15766,6 +17662,24 @@ fn footer_hints_ctx(ctx: FooterCtx) -> Vec<Hint> {
             ("y", t("复制命中")),
             ("r", t("重搜")),
             ("Esc", t("中止/关闭")),
+        ],
+        FooterView::DiffPicker => vec![
+            ("↑↓", t("选择")),
+            ("Enter", t("对比")),
+            ("d", t("表/库")),
+            ("Esc", t("取消")),
+        ],
+        FooterView::SchemaDiff => vec![
+            ("Tab", t("切换")),
+            ("y", t("摘要")),
+            ("g", t("ALTER")),
+            ("↑↓", t("滚动")),
+            ("Esc", t("关闭")),
+        ],
+        FooterView::DbDiff => vec![
+            ("↑↓", t("选择")),
+            ("Enter", t("对比两库同有表")),
+            ("Esc", t("关闭")),
         ],
         FooterView::Recent => vec![
             ("↑↓", t("选择")),
@@ -18169,6 +20083,378 @@ fn render_search_input(f: &mut Frame, area: Rect, app: &mut App) {
     }
 }
 
+/// One row of the column diff list. Wide screens show `src → tgt`; a narrow
+/// screen folds to the mark + the changed-attribute summary.
+fn diff_col_line(row: &ColDiffRow, width: usize, narrow: bool) -> Line<'static> {
+    let same = row.mark == DiffMark::Same;
+    let mark = Span::styled(
+        format!(" {} ", row.mark.sign()),
+        Style::default()
+            .fg(row.mark.color())
+            .add_modifier(Modifier::BOLD),
+    );
+    let name_style = if same {
+        Style::default().fg(Color::DarkGray)
+    } else {
+        Style::default()
+            .fg(Color::White)
+            .add_modifier(Modifier::BOLD)
+    };
+    let name = Span::styled(
+        truncate_disp(&fix_double_encoding(&row.name), 20),
+        name_style,
+    );
+    let rest = if narrow {
+        row.detail.clone()
+    } else {
+        match row.mark {
+            DiffMark::Add => row.src.clone(),
+            DiffMark::Drop => row.tgt.clone(),
+            DiffMark::Modify => format!("{}  →  {}", row.src, row.tgt),
+            DiffMark::Same => row.src.clone(),
+        }
+    };
+    // An unmapped cross-dialect type is flagged with `?` (the detail line always
+    // carries it; the wide layout gets it prepended).
+    let rest = if !narrow && row.detail.contains("type ?") {
+        format!("? {rest}")
+    } else {
+        rest
+    };
+    let room = width.saturating_sub(24).max(6);
+    let rest = Span::styled(
+        truncate_disp(&one_line(&rest), room),
+        if same {
+            Style::default().fg(Color::DarkGray)
+        } else {
+            Style::default().fg(Color::Gray)
+        },
+    );
+    Line::from(vec![mark, name, Span::raw("  "), rest])
+}
+
+/// One row of the index diff list.
+fn diff_index_line(row: &IndexDiffRow, width: usize) -> Line<'static> {
+    let same = row.mark == DiffMark::Same;
+    let mark = Span::styled(
+        format!(" {} ", row.mark.sign()),
+        Style::default()
+            .fg(row.mark.color())
+            .add_modifier(Modifier::BOLD),
+    );
+    let text = if same {
+        row.detail.clone()
+    } else if row.mark == DiffMark::Drop {
+        row.tgt.clone()
+    } else {
+        row.detail.clone()
+    };
+    Line::from(vec![
+        mark,
+        Span::styled(
+            truncate_disp(&one_line(&text), width.saturating_sub(3).max(6)),
+            if same {
+                Style::default().fg(Color::DarkGray)
+            } else {
+                Style::default().fg(Color::Gray)
+            },
+        ),
+    ])
+}
+
+/// The `Alt-D` target picker overlay.
+fn render_diff_picker(f: &mut Frame, area: Rect, app: &mut App) {
+    let Some((mode, stage)) = app.diff_picker.as_ref().map(|p| (p.mode, p.stage)) else {
+        return;
+    };
+    if area.width < 12 || area.height < 5 {
+        return;
+    }
+    let src = match diff_source(app) {
+        Some((_, schema, table)) => {
+            fix_double_encoding(&qualified_display(&schema, &table))
+        }
+        None => fix_double_encoding(&app.current_db()),
+    };
+    let target_conn = app
+        .diff_picker
+        .as_ref()
+        .and_then(|p| p.target_conn.as_ref())
+        .map(|c| c.name.clone());
+    let loading = app.diff_picker.as_ref().map(|p| p.loading).unwrap_or(false);
+    let entries = app
+        .diff_picker
+        .as_ref()
+        .map(|p| p.entries.clone())
+        .unwrap_or_default();
+    let w = if area.width > 82 {
+        78
+    } else {
+        area.width.saturating_sub(2).max(10)
+    };
+    let h = if entries.is_empty() {
+        4
+    } else {
+        (entries.len() as u16 + 3).min(area.height.saturating_sub(2).max(4))
+    };
+    let box_area = centered_overlay(area, w, h);
+    f.render_widget(Clear, box_area);
+    let title = if stage == DiffPickStage::Connections {
+        t(" 结构对比 · 选择目标连接 · Enter 进入 · Esc 返回 ").to_string()
+    } else if let Some(tn) = target_conn {
+        tf(
+            " 结构对比 · 源 {} → 连接 {} · Enter 对比 · c 换连接 · Esc 关 ",
+            &[&src, &tn],
+        )
+    } else {
+        match mode {
+            DiffPickMode::Table => tf(
+                " 结构对比 · 源表 {} · 选择目标 · d 表/库 · c 换连接 · Enter 对比 · Esc 关 ",
+                &[&src],
+            ),
+            DiffPickMode::Database => tf(
+                " 结构对比 · 源库 {} · 选择目标 · d 表/库 · c 换连接 · Enter 对比 · Esc 关 ",
+                &[&src],
+            ),
+        }
+    };
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_set(border::ROUNDED)
+        .border_style(Style::default().fg(Color::Magenta))
+        .title(Span::styled(title, Style::default().fg(Color::Magenta)));
+    let inner = block.inner(box_area);
+    f.render_widget(block, box_area);
+    if inner.width < 4 || inner.height < 1 {
+        return;
+    }
+    if entries.is_empty() {
+        let msg = if loading {
+            t("加载表…").to_string()
+        } else {
+            t("（没有可选项）").to_string()
+        };
+        f.render_widget(
+            Paragraph::new(Line::from(Span::styled(msg, Style::default().fg(Color::DarkGray)))),
+            inner,
+        );
+        return;
+    }
+    let items: Vec<ListItem> = entries
+        .iter()
+        .map(|e| {
+            ListItem::new(Line::from(truncate_disp(
+                &fix_double_encoding(e),
+                inner.width as usize,
+            )))
+        })
+        .collect();
+    let list = List::new(items).highlight_style(
+        Style::default()
+            .bg(Color::DarkGray)
+            .add_modifier(Modifier::BOLD),
+    );
+    if let Some(p) = app.diff_picker.as_mut() {
+        f.render_stateful_widget(list, inner, &mut p.list);
+    }
+}
+
+/// The two-table diff overlay (columns / indexes / generated ALTER).
+fn render_diff_panel(f: &mut Frame, area: Rect, app: &mut App) {
+    let Some(state) = app.diff.as_mut() else {
+        return;
+    };
+    if area.width < 10 || area.height < 5 {
+        return;
+    }
+    let narrow = area.width < 64;
+    let badge = if state.diff.equal() {
+        t("结构一致").to_string()
+    } else {
+        tf("{} 处差异", &[&state.diff.changed()])
+    };
+    let tab_label = t(state.tab.label());
+    let cross = state.diff.cross;
+    let alter = state.alter.clone();
+    let mut title = tf(
+        " 结构对比 {} → {} · {} · {} · Tab 切换 · y 摘要 · g ALTER · Esc 关 ",
+        &[
+            &state.diff.src.label(),
+            &state.diff.tgt.label(),
+            &badge,
+            &tab_label,
+        ],
+    );
+    if cross {
+        title.push_str(&format!(" · {} ", t("⚠ 跨方言")));
+    }
+    f.render_widget(Clear, area);
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_set(border::ROUNDED)
+        .border_style(Style::default().fg(Color::Magenta))
+        .title(Span::styled(title, Style::default().fg(Color::Magenta)));
+    let inner = block.inner(area);
+    f.render_widget(block, area);
+    if inner.width < 4 || inner.height < 2 {
+        return;
+    }
+    // Legend line so the `+` / `-` / `~` markers read without guessing.
+    let legend = if narrow {
+        t("+ 新增  - 多余  ~ 差异").to_string()
+    } else {
+        t("+ 目标缺少（新增）   - 目标多余（删除）   ~ 属性不同").to_string()
+    };
+    let legend_area = Rect {
+        x: inner.x,
+        y: inner.y,
+        width: inner.width,
+        height: 1,
+    };
+    f.render_widget(
+        Paragraph::new(Line::from(Span::styled(
+            truncate_disp(&legend, inner.width as usize),
+            Style::default().fg(Color::DarkGray),
+        ))),
+        legend_area,
+    );
+    let body = Rect {
+        x: inner.x,
+        y: inner.y + 1,
+        width: inner.width,
+        height: inner.height.saturating_sub(1),
+    };
+    if body.height == 0 {
+        return;
+    }
+    let width = body.width as usize;
+    match state.tab {
+        DiffTab::Columns => {
+            let items: Vec<ListItem> = state
+                .diff
+                .cols
+                .iter()
+                .map(|row| ListItem::new(diff_col_line(row, width, narrow)))
+                .collect();
+            let list = List::new(items).highlight_style(
+                Style::default()
+                    .bg(Color::DarkGray)
+                    .add_modifier(Modifier::BOLD),
+            );
+            f.render_stateful_widget(list, body, &mut state.list);
+        }
+        DiffTab::Indexes => {
+            if state.diff.idx.is_empty() {
+                f.render_widget(
+                    Paragraph::new(Line::from(Span::styled(
+                        t("（没有索引信息）"),
+                        Style::default().fg(Color::DarkGray),
+                    ))),
+                    body,
+                );
+                return;
+            }
+            let items: Vec<ListItem> = state
+                .diff
+                .idx
+                .iter()
+                .map(|row| ListItem::new(diff_index_line(row, width)))
+                .collect();
+            let list = List::new(items).highlight_style(
+                Style::default()
+                    .bg(Color::DarkGray)
+                    .add_modifier(Modifier::BOLD),
+            );
+            f.render_stateful_widget(list, body, &mut state.list);
+        }
+        DiffTab::Alter => {
+            let lines: Vec<Line> = alter
+                .lines()
+                .map(|l| {
+                    let color = if l.trim_start().starts_with("--") {
+                        Color::DarkGray
+                    } else {
+                        Color::White
+                    };
+                    Line::from(Span::styled(l.to_string(), Style::default().fg(color)))
+                })
+                .collect();
+            f.render_widget(
+                Paragraph::new(lines).scroll((state.scroll, 0)),
+                body,
+            );
+        }
+    }
+}
+
+/// The two-database table-list diff overlay.
+fn render_db_diff(f: &mut Frame, area: Rect, app: &mut App) {
+    let Some(state) = app.db_diff.as_mut() else {
+        return;
+    };
+    if area.width < 10 || area.height < 5 {
+        return;
+    }
+    let only_src = state.diff.count(DbTableMark::OnlySrc);
+    let only_tgt = state.diff.count(DbTableMark::OnlyTgt);
+    let both = state.diff.count(DbTableMark::Both);
+    let title = tf(
+        " 库结构对比 {} → {} · 仅源 {} · 仅目标 {} · 共有 {} · Enter 对比同有表 · Esc 关 ",
+        &[
+            &state.diff.src_label,
+            &state.diff.tgt_label,
+            &only_src,
+            &only_tgt,
+            &both,
+        ],
+    );
+    f.render_widget(Clear, area);
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_set(border::ROUNDED)
+        .border_style(Style::default().fg(Color::Magenta))
+        .title(Span::styled(title, Style::default().fg(Color::Magenta)));
+    let inner = block.inner(area);
+    f.render_widget(block, area);
+    if inner.width < 4 || inner.height < 1 {
+        return;
+    }
+    let width = inner.width as usize;
+    let items: Vec<ListItem> = state
+        .diff
+        .entries
+        .iter()
+        .map(|e| {
+            let (sign, color) = match e.mark {
+                DbTableMark::OnlySrc => ("+", Color::Green),
+                DbTableMark::OnlyTgt => ("-", Color::Red),
+                DbTableMark::Both => ("=", Color::Gray),
+            };
+            Line::from(vec![
+                Span::styled(
+                    format!(" {sign} "),
+                    Style::default().fg(color).add_modifier(Modifier::BOLD),
+                ),
+                Span::styled(
+                    truncate_disp(&fix_double_encoding(&e.table), width.saturating_sub(3).max(4)),
+                    Style::default().fg(if e.mark == DbTableMark::Both {
+                        Color::White
+                    } else {
+                        color
+                    }),
+                ),
+            ])
+            .into()
+        })
+        .collect();
+    let list = List::new(items).highlight_style(
+        Style::default()
+            .bg(Color::DarkGray)
+            .add_modifier(Modifier::BOLD),
+    );
+    f.render_stateful_widget(list, inner, &mut state.list);
+}
+
 /// The `Alt-L` file-path input, drawn as a one-line box at the bottom.
 fn render_file_load_prompt(f: &mut Frame, area: Rect, app: &mut App) {
     if area.height < 3 || area.width < 12 {
@@ -19008,6 +21294,15 @@ const HELP_ROWS: &[(&str, &str)] = &[
     ("y / r", "复制命中值 / 以同一关键词重搜"),
     ("Esc", "关闭；扫描中按一下中止（保留已扫描结果）"),
     ("Alt-L", "加载并执行 .sql 文件（预览语句数/大小/目标库，危险语句先确认）"),
+    ("— 结构对比（Alt-D）—", ""),
+    ("Alt-D", "结构对比：源 = 当前表，选择目标表（对比列 / 主键 / 索引 / 字符集）"),
+    ("c（对比浮层内）", "选择其他连接作为目标（跨库 / 跨方言对比）"),
+    ("Shift+Alt-D", "库对库对比：两库的表清单（仅源 / 仅目标 / 共有）"),
+    ("d（对比浮层内）", "切换 表 / 库 两种对比模式"),
+    ("Tab", "切换 列 / 索引 / ALTER 三个视图"),
+    ("y", "复制差异摘要（纯文本，可贴进工单）"),
+    ("g", "生成 ALTER 同步语句（方向：源 → 目标，只生成不执行）"),
+    ("Enter", "对比：库清单里两库都有的表进入单表对比"),
     ("补全上下文", "表名. 后只补该表列名；FROM/JOIN 后优先表名；WHERE/ON 后优先列名"),
     ("↑ ↓", "历史（首行 / 末行）"),
     ("Esc", "回到侧栏"),
@@ -21827,6 +24122,7 @@ mod tests {
             "Alt-/",
             "Alt-G",
             "Alt-L",
+            "Alt-D",
         ] {
             assert!(
                 keys.iter().any(|k| k.contains(needle)),
@@ -24732,4 +27028,484 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    // ── schema diff (R32) ───────────────────────────────────────────────────
+
+    fn diff_side(
+        db_type: &str,
+        db: &str,
+        schema: &str,
+        table: &str,
+        cols: Vec<ColumnInfo>,
+    ) -> DiffSide {
+        DiffSide {
+            db: db.into(),
+            schema: schema.into(),
+            table: table.into(),
+            db_type: parse_database_type(db_type).unwrap(),
+            columns: cols,
+            indexes: Vec::new(),
+        }
+    }
+
+    fn idx_info(name: &str, cols: &[&str], unique: bool, primary: bool) -> IndexInfo {
+        IndexInfo {
+            name: name.into(),
+            columns: cols.iter().map(|s| s.to_string()).collect(),
+            is_unique: unique,
+            is_primary: primary,
+            filter: None,
+            index_type: None,
+            included_columns: None,
+            comment: None,
+            key_is_expression: Vec::new(),
+            column_opclasses: Vec::new(),
+            key_options: Vec::new(),
+            constraint_backed: false,
+        }
+    }
+
+    fn col_full(
+        name: &str,
+        ty: &str,
+        nullable: bool,
+        default: Option<&str>,
+        comment: Option<&str>,
+        pk: bool,
+    ) -> ColumnInfo {
+        ColumnInfo {
+            name: name.into(),
+            data_type: ty.into(),
+            is_nullable: nullable,
+            column_default: default.map(str::to_string),
+            comment: comment.map(str::to_string),
+            is_primary_key: pk,
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn canonical_type_maps_the_common_ten() {
+        assert_eq!(canonical_type("varchar(255)").as_deref(), Some("varchar(255)"));
+        assert_eq!(
+            canonical_type("character varying(255)").as_deref(),
+            Some("varchar(255)")
+        );
+        assert_eq!(canonical_type("int").as_deref(), Some("int"));
+        assert_eq!(canonical_type("integer").as_deref(), Some("int"));
+        assert_eq!(canonical_type("int4").as_deref(), Some("int"));
+        assert_eq!(canonical_type("bigint").as_deref(), Some("bigint"));
+        assert_eq!(canonical_type("bool").as_deref(), Some("boolean"));
+        assert_eq!(canonical_type("boolean").as_deref(), Some("boolean"));
+        assert_eq!(canonical_type("numeric(10, 2)").as_deref(), Some("decimal(10,2)"));
+        assert_eq!(
+            canonical_type("timestamp with time zone").as_deref(),
+            Some("timestamp tz")
+        );
+        assert_eq!(canonical_type("timestamptz").as_deref(), Some("timestamp tz"));
+        assert_eq!(canonical_type("jsonb").as_deref(), Some("json"));
+        assert_eq!(canonical_type("bytea").as_deref(), Some("blob"));
+        assert_eq!(canonical_type("int unsigned").as_deref(), Some("int unsigned"));
+        assert!(canonical_type("geometry").is_none());
+    }
+
+    #[test]
+    fn type_comparison_is_dialect_aware() {
+        // Same dialect: cosmetic display width is ignored, real differences kept.
+        assert_eq!(compare_types("int(11)", "int", false), TypeVerdict::Same);
+        assert_eq!(compare_types("varchar(255)", "varchar(200)", false), TypeVerdict::Diff);
+        assert_eq!(compare_types("int unsigned", "int", false), TypeVerdict::Diff);
+        // Cross dialect: the common map bridges the spellings.
+        assert_eq!(
+            compare_types("varchar(255)", "character varying(255)", true),
+            TypeVerdict::Same
+        );
+        assert_eq!(compare_types("int", "integer", true), TypeVerdict::Same);
+        assert_eq!(compare_types("int", "bigint", true), TypeVerdict::Diff);
+        // Unmapped: `?` when the spellings differ, equal when they do not.
+        assert_eq!(compare_types("geometry", "integer", true), TypeVerdict::Unknown);
+        assert_eq!(compare_types("geometry", "geometry", true), TypeVerdict::Same);
+    }
+
+    #[test]
+    fn column_diff_marks_add_drop_and_modify() {
+        let src = diff_side(
+            "mysql",
+            "shop",
+            "",
+            "a",
+            vec![
+                col_full("id", "int", false, None, None, true),
+                col_full("name", "varchar(200)", false, Some("''"), None, false),
+                col_full("email", "varchar(255)", true, None, None, false),
+            ],
+        );
+        let tgt = diff_side(
+            "mysql",
+            "shop",
+            "",
+            "b",
+            vec![
+                col_full("id", "int", false, None, None, true),
+                col_full("name", "varchar(100)", false, Some("''"), None, false),
+                col_full("fax", "varchar(20)", true, None, None, false),
+            ],
+        );
+        let diff = build_table_diff(src, tgt);
+        assert!(!diff.equal());
+        let marks: Vec<(&str, DiffMark)> = diff
+            .cols
+            .iter()
+            .map(|r| (r.name.as_str(), r.mark))
+            .collect();
+        assert_eq!(
+            marks,
+            vec![
+                ("id", DiffMark::Same),
+                ("name", DiffMark::Modify),
+                ("email", DiffMark::Add),
+                ("fax", DiffMark::Drop),
+            ]
+        );
+        let name = diff.cols.iter().find(|r| r.name == "name").unwrap();
+        assert!(name.detail.contains("type varchar(200)→varchar(100)"));
+        assert_eq!(diff.changed(), 3);
+    }
+
+    #[test]
+    fn index_diff_matches_by_name_and_marks_changes() {
+        let mut src = diff_side("mysql", "shop", "", "a", vec![col_info("id", "int")]);
+        src.indexes = vec![
+            idx_info("PRIMARY", &["id"], true, true),
+            idx_info("idx_name", &["name"], false, false),
+        ];
+        let mut tgt = diff_side("mysql", "shop", "", "b", vec![col_info("id", "int")]);
+        tgt.indexes = vec![
+            idx_info("PRIMARY", &["id"], true, true),
+            idx_info("idx_name", &["name", "id"], false, false),
+            idx_info("idx_old", &["old"], false, false),
+        ];
+        let diff = build_table_diff(src, tgt);
+        let count = |m: DiffMark| diff.idx.iter().filter(|r| r.mark == m).count();
+        assert_eq!(count(DiffMark::Same), 1);
+        assert_eq!(count(DiffMark::Modify), 1);
+        assert_eq!(count(DiffMark::Drop), 1);
+        let changed = diff.idx.iter().find(|r| r.mark == DiffMark::Modify).unwrap();
+        assert!(changed.detail.contains("(name)"));
+        assert!(changed.detail.contains("(name, id)"));
+    }
+
+    #[test]
+    fn generate_alter_mysql_rewrites_the_target() {
+        let src = diff_side(
+            "mysql",
+            "shop",
+            "",
+            "a",
+            vec![
+                col_full("id", "int", false, None, None, true),
+                col_full("name", "varchar(200)", false, None, None, false),
+                col_full("email", "varchar(255)", true, None, None, false),
+            ],
+        );
+        let tgt = diff_side(
+            "mysql",
+            "shop",
+            "",
+            "b",
+            vec![
+                col_full("id", "int", false, None, None, true),
+                col_full("name", "varchar(100)", false, None, None, false),
+                col_full("fax", "varchar(20)", true, None, None, false),
+            ],
+        );
+        let sql = generate_alter(&build_table_diff(src, tgt));
+        assert!(sql.contains("ALTER TABLE `b` ADD COLUMN `email` varchar(255);"), "{sql}");
+        assert!(
+            sql.contains("ALTER TABLE `b` MODIFY COLUMN `name` varchar(200) NOT NULL;"),
+            "{sql}"
+        );
+        assert!(sql.contains("ALTER TABLE `b` DROP COLUMN `fax`;"), "{sql}");
+    }
+
+    #[test]
+    fn generate_alter_postgres_uses_alter_column() {
+        let src = diff_side(
+            "postgres",
+            "shop",
+            "public",
+            "a",
+            vec![col_full("name", "character varying(200)", false, None, None, false)],
+        );
+        let tgt = diff_side(
+            "postgres",
+            "shop",
+            "public",
+            "b",
+            vec![col_full("name", "character varying(100)", true, None, None, false)],
+        );
+        let sql = generate_alter(&build_table_diff(src, tgt));
+        assert!(
+            sql.contains(
+                "ALTER TABLE \"public\".\"b\" ALTER COLUMN \"name\" TYPE character varying(200);"
+            ),
+            "{sql}"
+        );
+        assert!(
+            sql.contains("ALTER TABLE \"public\".\"b\" ALTER COLUMN \"name\" SET NOT NULL;"),
+            "{sql}"
+        );
+    }
+
+    #[test]
+    fn generate_alter_maps_types_across_dialects() {
+        // MySQL source → PostgreSQL target.
+        let src = diff_side(
+            "mysql",
+            "shop",
+            "",
+            "a",
+            vec![
+                col_full("id", "int", false, None, None, true),
+                col_full("email", "varchar(255)", false, None, None, false),
+                col_full("flag", "tinyint(1)", false, None, None, false),
+            ],
+        );
+        let tgt = diff_side("postgres", "shop", "public", "b", vec![]);
+        let diff = build_table_diff(src, tgt);
+        assert!(diff.cross);
+        let sql = generate_alter(&diff);
+        assert!(sql.contains("ADD COLUMN \"id\" integer NOT NULL;"), "{sql}");
+        assert!(
+            sql.contains("ADD COLUMN \"email\" character varying(255) NOT NULL;"),
+            "{sql}"
+        );
+        assert!(sql.contains("ADD COLUMN \"flag\" smallint NOT NULL;"), "{sql}");
+
+        // PostgreSQL source → MySQL target.
+        let src = diff_side(
+            "postgres",
+            "shop",
+            "public",
+            "a",
+            vec![
+                col_full(
+                    "email",
+                    "character varying(255)",
+                    true,
+                    Some("''::character varying"),
+                    None,
+                    false,
+                ),
+                col_full("flag", "boolean", true, None, None, false),
+                col_full("data", "jsonb", true, None, None, false),
+            ],
+        );
+        let tgt = diff_side("mysql", "shop", "", "b", vec![]);
+        let diff = build_table_diff(src, tgt);
+        assert!(diff.cross);
+        let sql = generate_alter(&diff);
+        // The PostgreSQL `::type` default cast is dropped for MySQL.
+        assert!(sql.contains("ADD COLUMN `email` varchar(255) DEFAULT '';"), "{sql}");
+        assert!(sql.contains("ADD COLUMN `flag` tinyint(1);"), "{sql}");
+        assert!(sql.contains("ADD COLUMN `data` json;"), "{sql}");
+    }
+
+    #[test]
+    fn identical_tables_report_equal_and_no_alter() {
+        let cols = vec![col_full("id", "int", false, None, None, true)];
+        let src = diff_side("mysql", "shop", "", "a", cols.clone());
+        let tgt = diff_side("mysql", "shop", "", "b", cols);
+        let diff = build_table_diff(src, tgt);
+        assert!(diff.equal());
+        assert_eq!(diff.changed(), 0);
+        assert!(generate_alter(&diff).contains("无需同步"));
+        assert!(diff_summary_text(&diff).contains("结构一致"));
+    }
+
+    #[test]
+    fn diff_summary_lists_changed_columns() {
+        let src = diff_side(
+            "mysql",
+            "shop",
+            "",
+            "a",
+            vec![
+                col_full("name", "varchar(200)", false, None, None, false),
+                col_full("email", "varchar(255)", true, None, None, false),
+            ],
+        );
+        let tgt = diff_side(
+            "mysql",
+            "shop",
+            "",
+            "b",
+            vec![
+                col_full("name", "varchar(100)", false, None, None, false),
+                col_full("fax", "varchar(20)", true, None, None, false),
+            ],
+        );
+        let text = diff_summary_text(&build_table_diff(src, tgt));
+        assert!(text.contains("+ 列 email"), "{text}");
+        assert!(text.contains("- 列 fax"), "{text}");
+        assert!(text.contains("~ 列 name"), "{text}");
+    }
+
+    #[test]
+    fn unmapped_cross_dialect_type_is_flagged() {
+        let src = diff_side(
+            "mysql",
+            "shop",
+            "",
+            "a",
+            vec![col_full("g", "geometry", true, None, None, false)],
+        );
+        let tgt = diff_side(
+            "postgres",
+            "shop",
+            "public",
+            "b",
+            vec![col_full("g", "point", true, None, None, false)],
+        );
+        let diff = build_table_diff(src, tgt);
+        let row = diff.cols.iter().find(|r| r.name == "g").unwrap();
+        assert_eq!(row.mark, DiffMark::Modify);
+        assert!(row.detail.contains("type ?"), "{}", row.detail);
+        assert!(diff_summary_text(&diff).contains("type ?"));
+    }
+
+    #[test]
+    fn diff_overlays_render_at_extreme_sizes() {
+        let src = diff_side(
+            "mysql",
+            "shop",
+            "",
+            "a",
+            vec![
+                col_full("id", "int", false, None, None, true),
+                col_full("name", "varchar(200)", false, Some("''"), None, false),
+                col_full("email", "varchar(255)", true, None, Some("email addr"), false),
+            ],
+        );
+        let tgt = diff_side(
+            "mysql",
+            "shop",
+            "",
+            "b",
+            vec![
+                col_full("id", "int", false, None, None, true),
+                col_full("name", "varchar(100)", false, Some("''"), None, false),
+                col_full("fax", "varchar(20)", true, None, None, false),
+            ],
+        );
+        let diff = build_table_diff(src, tgt);
+        let mut app = test_app();
+        app.selected = Some(test_conn("mysql"));
+        let mut list = ListState::default();
+        list.select(Some(0));
+        app.diff = Some(Box::new(SchemaDiffState {
+            diff,
+            tab: DiffTab::Columns,
+            list,
+            scroll: 0,
+            alter: String::new(),
+        }));
+        let sizes = [(42u16, 22u16), (120, 40), (20, 6), (1, 1)];
+        for (w, h) in sizes {
+            draw(&mut app, w, h);
+        }
+        for tab in [DiffTab::Indexes, DiffTab::Alter] {
+            if let Some(s) = app.diff.as_mut() {
+                s.tab = tab;
+                if tab == DiffTab::Alter {
+                    let sql = generate_alter(&s.diff);
+                    s.alter = sql;
+                }
+            }
+            for (w, h) in sizes {
+                draw(&mut app, w, h);
+            }
+        }
+        // Picker overlay (table and database modes).
+        app.diff = None;
+        let mut list = ListState::default();
+        list.select(Some(0));
+        app.diff_picker = Some(DiffPicker {
+            mode: DiffPickMode::Database,
+            stage: DiffPickStage::Lists,
+            list,
+            src_entries: vec!["shop2".into(), "shop3".into()],
+            entries: vec!["shop2".into(), "shop3".into()],
+            target_conn: None,
+            target_db: String::new(),
+            target_schema: String::new(),
+            loading: false,
+            gen: 0,
+        });
+        for (w, h) in sizes {
+            draw(&mut app, w, h);
+        }
+        // Connection step of the picker (cross-connection target).
+        if let Some(p) = app.diff_picker.as_mut() {
+            p.mode = DiffPickMode::Table;
+            p.stage = DiffPickStage::Connections;
+            p.entries = vec!["r31-postgres (postgres)".into()];
+        }
+        for (w, h) in sizes {
+            draw(&mut app, w, h);
+        }
+        // Loading placeholder (no entries yet).
+        if let Some(p) = app.diff_picker.as_mut() {
+            p.stage = DiffPickStage::Lists;
+            p.loading = true;
+            p.entries.clear();
+        }
+        for (w, h) in sizes {
+            draw(&mut app, w, h);
+        }
+        // Database-list diff overlay.
+        app.diff_picker = None;
+        let mut list = ListState::default();
+        list.select(Some(0));
+        app.db_diff = Some(Box::new(DbDiffState {
+            diff: DbDiff {
+                src_label: "shop".into(),
+                tgt_label: "shop2".into(),
+                entries: vec![
+                    DbDiffEntry {
+                        table: "orders".into(),
+                        mark: DbTableMark::Both,
+                    },
+                    DbDiffEntry {
+                        table: "only_src".into(),
+                        mark: DbTableMark::OnlySrc,
+                    },
+                    DbDiffEntry {
+                        table: "only_tgt".into(),
+                        mark: DbTableMark::OnlyTgt,
+                    },
+                ],
+                src_db: "shop".into(),
+                tgt_db: "shop2".into(),
+                src_schema: String::new(),
+                tgt_schema: String::new(),
+            },
+            list,
+        }));
+        for (w, h) in sizes {
+            draw(&mut app, w, h);
+        }
+    }
+
+    #[test]
+    fn diff_strings_have_english_translations() {
+        use ui_text::Lang;
+        assert_eq!(ui_text::t_lang("结构一致", Lang::En), "identical");
+        assert_eq!(ui_text::t_lang("索引", Lang::En), "index");
+        assert_eq!(ui_text::t_lang("源", Lang::En), "source");
+        assert_eq!(ui_text::t_lang("目标", Lang::En), "target");
+        assert_ne!(
+            ui_text::t_lang("+ 新增  - 多余  ~ 差异", Lang::En),
+            "+ 新增  - 多余  ~ 差异"
+        );
+    }
 }
