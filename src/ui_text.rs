@@ -982,6 +982,55 @@ pub static ALL_KEYS: &[&str] = &[
 /// The Chinese → English table. Keys must match the source literals exactly.
 fn en_of(zh: &'static str) -> Option<&'static str> {
     match zh {
+        // ── R41 connection quick-switch / run scope / small-screen wrap-up ──
+        "→ {} 首屏（无 {}）" => Some("→ {} first screen (no {})"),
+        "已在连接 {} · 无需切换" => Some("already on connection {} · no switch needed"),
+        "编辑器仍有未提交内容（切连接不会清空，Ctrl-J 可执行）" => {
+            Some("editor still has uncommitted text (the switch keeps it; Ctrl-J runs it)")
+        }
+        "还没有连接 · c 新建" => Some("no connections yet · c to create one"),
+        "没有第 {} 个连接（共 {} 个）" => Some("no connection #{} ({} total)"),
+        "先连接一个数据库" => Some("connect to a database first"),
+        "还没有上一个连接（Alt+数字 切换一次后即可对切）" => {
+            Some("no previous connection yet (switch once with Alt+digit to enable toggling)")
+        }
+        "上一个连接就是当前连接" => Some("the previous connection is the current one"),
+        "上一个连接已不存在" => Some("the previous connection no longer exists"),
+        "光标处没有可执行的语句" => Some("no statement to run at the cursor"),
+        "看全量" => Some("full text"),
+        "直切" => Some("jump"),
+        "切连接" => Some("switch conn"),
+        "当前句" => Some("stmt"),
+        "片段" => Some("snippet"),
+        "执行 SQL（有选区只跑选区，否则整段）" => {
+            Some("run SQL (selection only when highlighted, else all)")
+        }
+        "只执行光标处语句（有选区则执行选区；分号分隔，字面量/注释里的分号不算）" => {
+            Some("run only the statement at the cursor (selection wins; `;` in literals/comments ignored)")
+        }
+        "直切第 N 个连接（侧栏连接顺序；智能恢复上次库/表）" => {
+            Some("jump to the Nth connection (sidebar order; smart db/table restore)")
+        }
+        "当前连接与上一个连接对切" => Some("toggle with the previous connection"),
+        "直接聚焦 侧栏 / 编辑器 / 结果（终端可能报成 Alt-! @ #）" => {
+            Some("focus sidebar / editor / results (terminal may report Alt-! @ #)")
+        }
+        "直切第 N 个连接（按当前排序；同库表存在则直达，否则落首屏）" => {
+            Some("jump to the Nth connection (current order; same-named db/table opens, else first screen)")
+        }
+        "与上一个连接对切（双缓冲，来回横跳）" => {
+            Some("toggle with the previous connection (double buffer)")
+        }
+        "片段收藏：选中即插到光标处（一步）" => {
+            Some("snippets: pick one and paste at the cursor (one step)")
+        }
+        "SQL 片段收藏（追加到编辑器末尾）" => Some("SQL snippets (appends to the editor)"),
+        "执行错误" => Some("Execution error"),
+        "✗ {} · 共 {} 行 · Enter 看全量 · Esc 关 " => {
+            Some("✗ {} · {} lines · Enter for full text · Esc close ")
+        }
+        "✗ {} · Enter 看全量 · Esc 关 " => Some("✗ {} · Enter for full text · Esc close "),
+        " 执行错误 " => Some(" Execution error "),
         // ── R39 table quick-locate / grid locate / column jump ──
         "首字母跳「{}」→ {} · Alt+字母 循环 · ; , 前后跳" => {
             Some("first-letter jump `{}` → {} · Alt+letter cycles · ; , step")

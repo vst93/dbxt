@@ -5068,7 +5068,10 @@ struct SearchHit {
 
 enum Op {
     ListConnections,
-    Databases(Box<ConnectionConfig>),
+    /// Enumerate a connection's databases. The id is [`App::conn_gen`], bumped on
+    /// every switch so a slow reply for the connection the user just left is
+    /// dropped instead of overwriting the new one's list.
+    Databases(Box<ConnectionConfig>, u64),
     /// Enumerate the schemas of one database (PostgreSQL and other
     /// schema-aware engines).
     ListSchemas(Box<ConnectionConfig>, String),
@@ -5301,6 +5304,8 @@ enum OpResult {
         /// connection's configured database is still usable — surfaced so the
         /// failure is never silent.
         warning: Option<String>,
+        /// [`App::conn_gen`] at request time; a stale reply is dropped.
+        gen: u64,
     },
     /// A table list plus the request id it answers, so a slow reply for a
     /// database / schema the user already left cannot overwrite the current one.
@@ -5865,16 +5870,18 @@ async fn run_op(backend: &LocalBackend, op: Op, tx: &Tx) -> OpResult {
             Ok(cs) => OpResult::Connections(cs),
             Err(e) => OpResult::Error(format!("load connections: {e}")),
         },
-        Op::Databases(cfg) => match backend.list_databases(&cfg).await {
+        Op::Databases(cfg, gen) => match backend.list_databases(&cfg).await {
             Ok(dbs) if !dbs.is_empty() => OpResult::Databases {
                 databases: dbs,
                 warning: None,
+                gen,
             },
             // A backend that legitimately exposes no database list (e.g. SQLite)
             // still connects using the configured database.
             Ok(_) => OpResult::Databases {
                 databases: vec![cfg.database.clone().unwrap_or_default()],
                 warning: None,
+                gen,
             },
             Err(e) => {
                 let warning = if cfg.has_effective_ssh_tunnels() {
@@ -5890,6 +5897,7 @@ async fn run_op(backend: &LocalBackend, op: Op, tx: &Tx) -> OpResult {
                 OpResult::Databases {
                     databases: vec![cfg.database.clone().unwrap_or_default()],
                     warning: Some(warning),
+                    gen,
                 }
             }
         },
@@ -8392,6 +8400,28 @@ fn form_rows(f: &ConnForm) -> Vec<(FormRow, &'static str)> {
     rows
 }
 
+/// R41: abbreviated form labels for a very narrow terminal. The SSH section
+/// (which expands dynamically with the tunnel toggle) keeps a recognisable
+/// `ssh.*` shape while the value column gains the reclaimed width.
+fn form_label_short(label: &'static str) -> &'static str {
+    match label {
+        "db_type" => "type",
+        "username" => "user",
+        "password" => "pass",
+        "database" => "db",
+        "ssh_tunnel" => "ssh",
+        "ssh_host" => "ssh.host",
+        "ssh_port" => "ssh.port",
+        "ssh_user" => "ssh.user",
+        "ssh_auth" => "ssh.auth",
+        "ssh_password" => "ssh.pass",
+        "ssh_key" => "ssh.key",
+        "ssh_passphrase" => "ssh.pass",
+        "ssh_agent" => "ssh.agent",
+        other => other,
+    }
+}
+
 /// The editable string behind a text row, if any (toggles return `None`).
 fn form_text_mut(f: &mut ConnForm, row: FormRow) -> Option<&mut String> {
     match row {
@@ -8663,6 +8693,26 @@ struct HistoryConfirm {
     sql: String,
 }
 
+/// Where the user was browsing on one connection (R41 smart restore): the
+/// database / schema plus the table open in the data browser. Restoring it on a
+/// later switch lands back on the same spot when the new connection still has a
+/// database / table with those names.
+#[derive(Clone, Default, PartialEq, Debug)]
+struct ConnPointer {
+    db: String,
+    schema: String,
+    table: Option<String>,
+}
+
+/// A compact execution-error overlay (R41). The first line plus a line count is
+/// shown on a small screen; `Enter` widens it to the full, scrollable text.
+#[derive(Clone)]
+struct ErrorPopup {
+    lines: Vec<String>,
+    expanded: bool,
+    scroll: u16,
+}
+
 struct App {
     backend: Arc<LocalBackend>,
     page: Page,
@@ -8674,6 +8724,23 @@ struct App {
     picker_open: bool,
     /// Order of the connection picker (`s` cycles name / type / colour).
     conn_sort: ConnSort,
+    /// Bumped on every connection switch; a `list_databases` reply that carries
+    /// an older id is dropped so a slow enumeration cannot clobber the new
+    /// connection's database list (R41 makes switching a one-keystroke affair).
+    conn_gen: u64,
+    /// The connection the user was on before the current one (R41 `Alt-Tab` /
+    /// `Alt-`` toggles the two). Updated by every switch, including `Alt-<n>`.
+    last_conn_id: Option<String>,
+    /// Per-connection memory of where the user was browsing (`database` /
+    /// `schema` / open table), so switching back lands on the same spot when it
+    /// still exists. Keyed by connection id.
+    conn_pointers: HashMap<String, ConnPointer>,
+    /// The pointer a switch in flight wants to restore once the new
+    /// connection's database / table lists arrive.
+    pending_restore: Option<ConnPointer>,
+    /// One-shot notice appended to the landing status after a switch (e.g. the
+    /// editor still holds uncommitted text).
+    switch_notice: Option<String>,
 
     selected: Option<ConnectionConfig>,
     databases: Vec<String>,
@@ -8748,6 +8815,8 @@ struct App {
     freeze_first: bool, // pin the first data column (row-number gutter is always pinned)
     cell_popup: Option<CellPopup>,
     row_popup: Option<RowPopup>,
+    /// Compact / expandable execution-error overlay (R41).
+    error_popup: Option<ErrorPopup>,
 
     // ── mobile efficiency ──
     /// Compact column-width mode (`None` = automatic for a narrow terminal).
@@ -8910,6 +8979,9 @@ struct App {
     snippet_open: bool,
     snippet_list: ListState,
     snippets: Vec<(String, String)>,
+    /// True when the snippet overlay was opened with `Alt-P` (quick paste at the
+    /// cursor) instead of `Ctrl-O` (append to the editor).
+    snippet_insert: bool,
     /// Name prompt shown when saving the editor's SQL as a DBX favourite.
     snippet_name: Option<TextArea<'static>>,
 
@@ -9350,6 +9422,11 @@ impl App {
             conn_list: ListState::default(),
             picker_open: true,
             conn_sort: ConnSort::Name,
+            conn_gen: 0,
+            last_conn_id: None,
+            conn_pointers: HashMap::new(),
+            pending_restore: None,
+            switch_notice: None,
             selected: None,
             databases: Vec::new(),
             db_index: 0,
@@ -9392,6 +9469,7 @@ impl App {
             grid_max_cell: 44,
             freeze_first: true,
             cell_popup: None,
+            error_popup: None,
             row_popup: None,
             compact: config_compact,
             col_hidden: HashSet::new(),
@@ -9462,6 +9540,7 @@ impl App {
             snippet_open: false,
             snippet_list: ListState::default(),
             snippets: Vec::new(),
+            snippet_insert: false,
             snippet_name: None,
             table_meta: None,
             count_cache: HashMap::new(),
@@ -9750,13 +9829,31 @@ fn apply_op_result(app: &mut App, res: OpResult, tx: &Tx) {
             app.conn_list.select((n > 0).then_some(sel));
             app.status = format!("✓ {}", tf("已删除连接 {}", &[&name]));
         }
-        OpResult::Databases { databases: dbs, warning } => {
+        OpResult::Databases {
+            databases: dbs,
+            warning,
+            gen,
+        } => {
+            // A slow enumeration for the connection the user already left must
+            // not clobber the new connection's database list.
+            if gen != app.conn_gen {
+                return;
+            }
             let configured = app.selected.as_ref().and_then(|c| c.database.clone());
             app.databases = dbs;
             app.db_index = configured
                 .as_deref()
                 .and_then(|db| app.databases.iter().position(|d| d == db))
                 .unwrap_or(0);
+            // R41 smart restore: prefer the database the switch wanted to return
+            // to, but only when this connection actually exposes it.
+            if let Some(p) = &app.pending_restore {
+                if !p.db.is_empty() {
+                    if let Some(i) = app.databases.iter().position(|d| d == &p.db) {
+                        app.db_index = i;
+                    }
+                }
+            }
             // A fresh database list invalidates the cached schema list.
             app.schemas.clear();
             app.schemas_db.clear();
@@ -9812,6 +9909,13 @@ fn apply_op_result(app: &mut App, res: OpResult, tx: &Tx) {
             if !app.schemas.contains(&app.schema) {
                 app.schema = default_schema(&app.schemas);
             }
+            // R41 smart restore: a switch may have asked for a specific schema;
+            // honour it when this connection has one by that name.
+            if let Some(p) = &app.pending_restore {
+                if !p.schema.is_empty() && app.schemas.contains(&p.schema) {
+                    app.schema = p.schema.clone();
+                }
+            }
             if let Some(cfg) = app.selected.clone() {
                 let schema = app.schema.clone();
                 spawn_list_tables(app, tx, Box::new(cfg), db, schema);
@@ -9841,6 +9945,30 @@ fn apply_op_result(app: &mut App, res: OpResult, tx: &Tx) {
             app.ddl = None;
             // The browsed table's column metadata may belong to another database.
             app.table_meta = None;
+            // R41 smart restore: a connection switch wants to land on the same
+            // database / table when this connection has one by that name.
+            let mut notice = app.switch_notice.take();
+            if let Some(p) = app.pending_restore.take() {
+                let db = fix_double_encoding(&app.current_db());
+                if let Some(name) = p.table.clone() {
+                    if let Some(pos) = focus_table_in_sidebar(app, &name) {
+                        app.table_list.select(Some(pos));
+                        app.nav_landing =
+                            Some(tf("→ {}.{}", &[&db, &(fix_double_encoding(&name))]));
+                        open_table_data(app, tx);
+                        if let Some(nt) = notice {
+                            app.status = format!("{} · ⚠ {nt}", app.status);
+                        }
+                        return;
+                    }
+                    app.nav_landing = Some(tf(
+                        "→ {} 首屏（无 {}）",
+                        &[&db, &(fix_double_encoding(&name))],
+                    ));
+                } else {
+                    app.nav_landing = Some(tf("→ {}", &[&db]));
+                }
+            }
             // A recent-table jump that had to switch database / schema first:
             // open the requested table now that the list has arrived.
             if let Some((schema, name)) = app.pending_open_table.take() {
@@ -9855,11 +9983,15 @@ fn apply_op_result(app: &mut App, res: OpResult, tx: &Tx) {
                 app.status = tf("✗ 未找到表 {}", &[&(fix_double_encoding(&name))]);
                 return;
             }
-            app.status = if app.table_filter.is_empty() {
+            let mut status = if app.table_filter.is_empty() {
                 tf("{} 个表/视图 · Enter 数据 · r 结构 · / 过滤 · Tab 编辑SQL", &[&(n)])
             } else {
                 tf("过滤「{}」· {}/{} 个表 · Esc 清除", &[&(app.table_filter), &(app.tables.len()), &(n)])
             };
+            if let Some(nt) = notice.take() {
+                status = format!("{status} · ⚠ {nt}");
+            }
+            app.status = status;
         }
         OpResult::Columns { table, schema, columns: cols } => {
             // Ignore a late result for a table the user has already navigated away from.
@@ -10828,6 +10960,15 @@ fn apply_op_result(app: &mut App, res: OpResult, tx: &Tx) {
                 app.pending_sel.get_or_insert(0);
                 spawn_table_page(app, tx, 0);
             }
+            // R41: on a small terminal a long SQL execution error is compressed
+            // into the compact error box (first line + line count); `Enter` shows
+            // the whole message. Other failures stay on the status line.
+            if app.term_h > 0
+                && app.term_h <= 24
+                && (e.starts_with("query:") || e.starts_with("script:"))
+            {
+                open_error_popup(app, &e);
+            }
             app.status = format!("✗ {e}");
         }
     }
@@ -11133,6 +11274,7 @@ fn reset_overlays_for_backend_switch(app: &mut App) {
     app.filter_prompt = None;
     app.cell_popup = None;
     app.row_popup = None;
+    app.error_popup = None;
 }
 
 fn key(app: &mut App, tx: &Tx, k: KeyEvent) {
@@ -11377,6 +11519,10 @@ fn browse_key(app: &mut App, tx: &Tx, k: KeyEvent) {
     }
     if app.filter_prompt.is_some() {
         filter_prompt_key(app, tx, k);
+        return;
+    }
+    if app.error_popup.is_some() {
+        error_popup_key(app, k);
         return;
     }
     if app.row_popup.is_some() {
@@ -11631,26 +11777,55 @@ fn browse_key(app: &mut App, tx: &Tx, k: KeyEvent) {
         return;
     }
 
-    // responsive layout: Alt-1/2/3 focus a pane and reset the collapse overrides.
-    // Alt-C / Alt-V / Alt-R / Alt-H are the mobile-efficiency view commands
-    // (compact columns / column visibility / recent tables / query history): an
-    // Alt combo is reported distinctly by every terminal, unlike Ctrl-Shift-X
-    // which tmux and legacy terminals fold back into Ctrl-X.
+    // R41: Alt-<digit> jumps straight to the Nth saved connection (in the same
+    // order the picker shows), Alt-Tab / Alt-` toggles with the previous
+    // connection, and Alt-Enter runs the statement under the cursor (or the
+    // selection). Pane focus moves to Alt-Shift-1/2/3 — most terminals report
+    // that as Alt-! / Alt-@ / Alt-#, which is accepted too — so it no longer
+    // collides with the connection keys; Tab / Shift-Tab still cycle panes.
     if k.modifiers.contains(KeyModifiers::ALT) {
         match k.code {
-            KeyCode::Char('1') => {
+            KeyCode::Char('1') if !k.modifiers.contains(KeyModifiers::SHIFT) => {
+                quick_switch_connection(app, tx, 1);
+                return;
+            }
+            KeyCode::Char('2') if !k.modifiers.contains(KeyModifiers::SHIFT) => {
+                quick_switch_connection(app, tx, 2);
+                return;
+            }
+            KeyCode::Char('3') if !k.modifiers.contains(KeyModifiers::SHIFT) => {
+                quick_switch_connection(app, tx, 3);
+                return;
+            }
+            KeyCode::Char(c @ '4'..='9') if !k.modifiers.contains(KeyModifiers::SHIFT) => {
+                quick_switch_connection(app, tx, (c as u8 - b'0') as usize);
+                return;
+            }
+            KeyCode::Char('!') | KeyCode::Char('1') => {
                 app.focus = Focus::Sidebar;
                 app.pane_override = [None; 3];
                 return;
             }
-            KeyCode::Char('2') => {
+            KeyCode::Char('@') | KeyCode::Char('2') => {
                 app.focus = Focus::Editor;
                 app.pane_override = [None; 3];
                 return;
             }
-            KeyCode::Char('3') => {
+            KeyCode::Char('#') | KeyCode::Char('3') => {
                 app.focus = Focus::Preview;
                 app.pane_override = [None; 3];
+                return;
+            }
+            KeyCode::Tab => {
+                toggle_last_connection(app, tx);
+                return;
+            }
+            KeyCode::Char('`') => {
+                toggle_last_connection(app, tx);
+                return;
+            }
+            KeyCode::Enter => {
+                run_current_scoped(app, tx, RunScope::CurrentStatement);
                 return;
             }
             KeyCode::Char('c') | KeyCode::Char('C') => {
@@ -11704,6 +11879,12 @@ fn browse_key(app: &mut App, tx: &Tx, k: KeyEvent) {
             // Alt-I: import connections from a dbxt / DBeaver / Navicat file.
             KeyCode::Char('i') | KeyCode::Char('I') => {
                 open_conn_import(app);
+                return;
+            }
+            // Alt-P: pick a saved SQL snippet and paste it at the cursor — the
+            // one-step version of the Ctrl-O panel (which appends to the end).
+            KeyCode::Char('p') | KeyCode::Char('P') => {
+                open_snippets_at_cursor(app, tx);
                 return;
             }
             // Alt-← / Alt-→: browser-style back / forward through the tables you
@@ -13319,49 +13500,166 @@ fn rect_contains(r: Rect, x: u16, y: u16) -> bool {
 }
 
 fn connect_selected(app: &mut App, tx: &Tx) {
-    if let Some(idx) = app.conn_list.selected() {
-        if let Some(cfg) = app.connections.get(idx).cloned() {
-            app.selected = Some(cfg.clone());
-            app.picker_open = false;
-            app.backend_kind = backend_for_connection(&cfg);
-            app.schemas.clear();
-            app.schema.clear();
-            app.schemas_db.clear();
-            app.clear_grid();
-            app.script = None;
-            app.ddl = None;
-            app.page_state = None;
-            app.col_offset = 0;
-            app.col_cursor = 0;
-            app.cell_popup = None;
-            app.cmd_output.clear();
-            app.redis_value = None;
-            app.redis_prompt = None;
-            app.redis_scan = RedisScanState::default();
-            app.redis_list = ListState::default();
-            app.mongo_filter.clear();
-            app.mongo_page = 0;
-            app.set_placeholder();
-            app.loading = true;
-            app.status = match first_ssh_layer(&cfg) {
-                Some(ssh) => tf(
-                    "SSH 连接 {}@{}:{} → {}…",
-                    &[&(ssh.user), &(ssh.host), &(ssh.port), &(cfg.name)],
-                ),
-                None => tf("连接 {} ({})…", &[&(cfg.name), &(cfg.db_type.as_str())]),
-            };
-            if app.backend_kind == Backend::Redis {
-                // Redis exposes 16 fixed logical databases; there is nothing to
-                // enumerate, so go straight to the first SCAN page.
-                app.databases = (0..16).map(|i| i.to_string()).collect();
-                app.db_index = 0;
-                app.redis_db = 0;
-                start_redis_scan(app, tx, true);
-                app.spawn(tx, Op::History(Box::new(cfg)));
-            } else {
-                app.spawn(tx, Op::Databases(Box::new(cfg)));
-            }
-        }
+    let Some(idx) = app.conn_list.selected() else {
+        return;
+    };
+    let Some(cfg) = app.connections.get(idx).cloned() else {
+        return;
+    };
+    // Connecting from the picker has no previous connection to carry a pointer
+    // from, but a connection remembered from an earlier session still restores.
+    let restore = app.conn_pointers.get(&cfg.id).cloned();
+    let prev = app.selected.as_ref().map(|c| c.id.clone());
+    app.last_conn_id = prev;
+    activate_connection(app, tx, cfg, restore, None);
+}
+
+/// R41: switch to the connection at `idx` in the picker order, remembering where
+/// the user was on both connections. This is the fast path shared by `Alt-<n>`
+/// (direct) and `Alt-Tab` / `Alt-`` (toggle with the previous connection).
+fn switch_connection(app: &mut App, tx: &Tx, idx: usize) {
+    let Some(target) = app.connections.get(idx).cloned() else {
+        return;
+    };
+    if app.selected.as_ref().map(|c| c.id.as_str()) == Some(target.id.as_str()) {
+        app.status = tf("已在连接 {} · 无需切换", &[&(target.name)]);
+        return;
+    }
+    let prev_id = app.selected.as_ref().map(|c| c.id.clone());
+    let carry = prev_id.as_ref().map(|_| snapshot_pointer(app));
+    if let (Some(pid), Some(p)) = (prev_id.clone(), carry.clone()) {
+        app.conn_pointers.insert(pid, p);
+    }
+    // Prefer this connection's own last position; fall back to carrying the
+    // current connection's database / table names (same-named restore).
+    let restore = app
+        .conn_pointers
+        .get(&target.id)
+        .cloned()
+        .or(carry);
+    let notice = (!app.editor_sql().trim().is_empty()).then(|| {
+        t("编辑器仍有未提交内容（切连接不会清空，Ctrl-J 可执行）").to_string()
+    });
+    app.last_conn_id = prev_id;
+    app.conn_list.select(Some(idx));
+    activate_connection(app, tx, target, restore, notice);
+}
+
+/// `Alt-<n>`: jump straight to the Nth connection in the picker order.
+fn quick_switch_connection(app: &mut App, tx: &Tx, n: usize) {
+    if n == 0 {
+        return;
+    }
+    if app.connections.is_empty() {
+        app.status = t("还没有连接 · c 新建").into();
+        return;
+    }
+    if n > app.connections.len() {
+        app.status = tf(
+            "没有第 {} 个连接（共 {} 个）",
+            &[&n, &(app.connections.len())],
+        );
+        return;
+    }
+    switch_connection(app, tx, n - 1);
+}
+
+/// `Alt-Tab` / `Alt-``: toggle between the current connection and the one used
+/// just before it — the fastest way to compare two connections.
+fn toggle_last_connection(app: &mut App, tx: &Tx) {
+    let Some(cur) = app.selected.as_ref().map(|c| c.id.clone()) else {
+        app.status = t("先连接一个数据库").into();
+        return;
+    };
+    let Some(prev) = app.last_conn_id.clone() else {
+        app.status = t("还没有上一个连接（Alt+数字 切换一次后即可对切）").into();
+        return;
+    };
+    if prev == cur {
+        app.status = t("上一个连接就是当前连接").into();
+        return;
+    }
+    let Some(idx) = app.connections.iter().position(|c| c.id == prev) else {
+        app.status = t("上一个连接已不存在").into();
+        app.last_conn_id = None;
+        return;
+    };
+    switch_connection(app, tx, idx);
+}
+
+/// Where the user currently is, for the per-connection restore memory.
+fn snapshot_pointer(app: &App) -> ConnPointer {
+    ConnPointer {
+        db: app.current_db(),
+        schema: app.schema.clone(),
+        table: app
+            .page_state
+            .as_ref()
+            .map(|p| p.table.clone())
+            .or_else(|| app.selected_table().map(|t| t.name.clone())),
+    }
+}
+
+/// Select `cfg` as the active connection and start loading its database list.
+/// `restore` is the pointer a switch wants to land on once the lists arrive;
+/// `notice` is a one-shot warning folded into the landing status.
+fn activate_connection(
+    app: &mut App,
+    tx: &Tx,
+    cfg: ConnectionConfig,
+    restore: Option<ConnPointer>,
+    notice: Option<String>,
+) {
+    app.conn_gen = app.conn_gen.wrapping_add(1);
+    let gen = app.conn_gen;
+    app.selected = Some(cfg.clone());
+    app.picker_open = false;
+    app.backend_kind = backend_for_connection(&cfg);
+    // The pointer is only meaningful for the engines whose browse state is a
+    // database / table pair; Redis has no such list.
+    app.pending_restore = if app.backend_kind == Backend::Redis {
+        None
+    } else {
+        restore
+    };
+    app.switch_notice = notice;
+    app.schemas.clear();
+    app.schema.clear();
+    app.schemas_db.clear();
+    app.clear_grid();
+    app.script = None;
+    app.ddl = None;
+    app.page_state = None;
+    app.col_offset = 0;
+    app.col_cursor = 0;
+    app.cell_popup = None;
+    app.row_popup = None;
+    app.cmd_output.clear();
+    app.redis_value = None;
+    app.redis_prompt = None;
+    app.redis_scan = RedisScanState::default();
+    app.redis_list = ListState::default();
+    app.mongo_filter.clear();
+    app.mongo_page = 0;
+    app.set_placeholder();
+    app.loading = true;
+    app.status = match first_ssh_layer(&cfg) {
+        Some(ssh) => tf(
+            "SSH 连接 {}@{}:{} → {}…",
+            &[&(ssh.user), &(ssh.host), &(ssh.port), &(cfg.name)],
+        ),
+        None => tf("连接 {} ({})…", &[&(cfg.name), &(cfg.db_type.as_str())]),
+    };
+    if app.backend_kind == Backend::Redis {
+        // Redis exposes 16 fixed logical databases; there is nothing to
+        // enumerate, so go straight to the first SCAN page.
+        app.databases = (0..16).map(|i| i.to_string()).collect();
+        app.db_index = 0;
+        app.redis_db = 0;
+        start_redis_scan(app, tx, true);
+        app.spawn(tx, Op::History(Box::new(cfg)));
+    } else {
+        app.spawn(tx, Op::Databases(Box::new(cfg), gen));
     }
 }
 
@@ -13662,6 +13960,15 @@ fn open_mongo_collection(app: &mut App, tx: &Tx) {
 
 /// Drop the current connection and show the connection picker again.
 fn back_to_picker(app: &mut App) {
+    // Remember where the user was so a later picker connect can restore it, and
+    // invalidate any database list still in flight for the connection left.
+    if let Some(cur) = app.selected.as_ref().map(|c| c.id.clone()) {
+        let p = snapshot_pointer(app);
+        app.conn_pointers.insert(cur, p);
+    }
+    app.conn_gen = app.conn_gen.wrapping_add(1);
+    app.pending_restore = None;
+    app.switch_notice = None;
     app.selected = None;
     app.tables.clear();
     app.tables_all.clear();
@@ -13903,6 +14210,7 @@ fn mouse(app: &mut App, tx: &Tx, m: MouseEvent) {
         || app.edit_dialog.is_some()
         || app.cell_popup.is_some()
         || app.row_popup.is_some()
+        || app.error_popup.is_some()
         || app.filter_prompt.is_some()
         || app.db_picker_open
         || app.snippet_open
@@ -13992,7 +14300,7 @@ fn mouse(app: &mut App, tx: &Tx, m: MouseEvent) {
             {
                 return;
             }
-            if app.cell_popup.is_some() {
+            if app.cell_popup.is_some() || app.row_popup.is_some() || app.error_popup.is_some() {
                 return;
             }
             if r.db_picker_visible && rect_contains(r.db_picker, m.column, m.row) {
@@ -14367,11 +14675,12 @@ fn offset_to_cursor(text: &str, off: usize) -> (usize, usize) {
     (row, col)
 }
 
-/// Every bracket that sits in *code* — outside string literals, quoted
-/// identifiers (`"…"`, `` `…` ``) and comments — paired with its char offset.
-/// The lexer is deliberately small: SQL's escaping rules (doubled quotes,
-/// backslash escapes) are honoured so a bracket in a literal is never seen.
-fn code_brackets(text: &str) -> Vec<(usize, char)> {
+/// Classify every character as *code* (`true`) or as part of a string literal,
+/// quoted identifier (`"…"`, `` `…` ``) or comment (`false`). The lexer is
+/// deliberately small but honours SQL's escaping rules (doubled quotes,
+/// backslash escapes) so a `;` or bracket inside a literal is never mistaken for
+/// code. Shared by the `%` bracket matcher and the R41 statement splitter.
+fn code_mask(chars: &[char]) -> Vec<bool> {
     #[derive(Clone, Copy, PartialEq)]
     enum St {
         Normal,
@@ -14381,12 +14690,12 @@ fn code_brackets(text: &str) -> Vec<(usize, char)> {
         Line,
         Block,
     }
-    let chars: Vec<char> = text.chars().collect();
-    let mut out = Vec::new();
+    let mut mask = vec![false; chars.len()];
     let mut state = St::Normal;
     let mut i = 0usize;
     while i < chars.len() {
         let c = chars[i];
+        mask[i] = state == St::Normal;
         match state {
             St::Normal => {
                 if c == '\'' {
@@ -14401,8 +14710,6 @@ fn code_brackets(text: &str) -> Vec<(usize, char)> {
                 } else if c == '/' && chars.get(i + 1) == Some(&'*') {
                     state = St::Block;
                     i += 1;
-                } else if is_bracket(c) {
-                    out.push((i, c));
                 }
             }
             St::Sq => {
@@ -14450,7 +14757,73 @@ fn code_brackets(text: &str) -> Vec<(usize, char)> {
         }
         i += 1;
     }
-    out
+    mask
+}
+
+/// Every bracket that sits in *code* — outside string literals, quoted
+/// identifiers (`"…"`, `` `…` ``) and comments — paired with its char offset.
+fn code_brackets(text: &str) -> Vec<(usize, char)> {
+    let chars: Vec<char> = text.chars().collect();
+    let mask = code_mask(&chars);
+    chars
+        .iter()
+        .enumerate()
+        .filter(|(i, c)| mask[*i] && is_bracket(**c))
+        .map(|(i, c)| (i, *c))
+        .collect()
+}
+
+/// Split `text` into statement spans (char-offset ranges, whitespace-trimmed)
+/// at every semicolon that sits in code. A `;` inside a string literal or
+/// comment never splits, so `SELECT ';'` stays one statement.
+fn statement_ranges(text: &str) -> Vec<(usize, usize)> {
+    let chars: Vec<char> = text.chars().collect();
+    let mask = code_mask(&chars);
+    let mut ranges = Vec::new();
+    let mut start = 0usize;
+    let mut i = 0usize;
+    while i <= chars.len() {
+        let split = i == chars.len() || (mask[i] && chars[i] == ';');
+        if split {
+            if let Some(r) = trim_char_range(&chars, start, i) {
+                ranges.push(r);
+            }
+            start = i + 1;
+        }
+        i += 1;
+    }
+    ranges
+}
+
+/// Trim ASCII/Unicode whitespace off both ends of a char range, dropping it when
+/// nothing but whitespace remains.
+fn trim_char_range(chars: &[char], start: usize, end: usize) -> Option<(usize, usize)> {
+    let mut a = start;
+    let mut b = end.min(chars.len());
+    while a < b && chars[a].is_whitespace() {
+        a += 1;
+    }
+    while b > a && chars[b - 1].is_whitespace() {
+        b -= 1;
+    }
+    (a < b).then_some((a, b))
+}
+
+/// The statement span containing `cursor` (a char offset). A cursor parked on a
+/// separator or the whitespace between statements resolves to the following
+/// statement, or the last one when the cursor trails the whole buffer.
+fn statement_range_at(ranges: &[(usize, usize)], cursor: usize) -> Option<(usize, usize)> {
+    if ranges.is_empty() {
+        return None;
+    }
+    if let Some(&r) = ranges.iter().find(|&&(s, e)| cursor >= s && cursor < e) {
+        return Some(r);
+    }
+    ranges
+        .iter()
+        .copied()
+        .find(|&(s, _)| cursor < s)
+        .or_else(|| ranges.last().copied())
 }
 
 /// Offset of the bracket matching the bracket at `pos`, or `None` when it is
@@ -15738,6 +16111,13 @@ fn preview_key(app: &mut App, tx: &Tx, k: KeyEvent) {
             if let Some(s) = &app.script {
                 if s.drilled.is_none() {
                     let idx = s.sel;
+                    // R41: an errored statement opens the compact error box
+                    // (first line + line count) instead of drilling into an
+                    // empty grid; Enter again widens it to the full text.
+                    if let Some(err) = s.outcomes.get(idx).and_then(|o| o.error.clone()) {
+                        open_error_popup(app, &err);
+                        return;
+                    }
                     drill_script(app, idx);
                     return;
                 }
@@ -15794,6 +16174,56 @@ fn popup_key(app: &mut App, k: KeyEvent, target: PopupTarget) {
             if let Some(p) = &mut app.row_popup {
                 p.scroll = (p.scroll as i32 + delta).max(0) as u16;
             }
+        }
+    }
+}
+
+/// Open the compact execution-error box. `Enter` widens it to the full text.
+fn open_error_popup(app: &mut App, err: &str) {
+    let lines: Vec<String> = err.lines().map(|l| l.to_string()).collect();
+    let lines = if lines.is_empty() {
+        vec![String::new()]
+    } else {
+        lines
+    };
+    app.error_popup = Some(ErrorPopup {
+        lines,
+        expanded: false,
+        scroll: 0,
+    });
+}
+
+/// Key handling for the compact error box: `Esc`/`q` close, `Enter` widens a
+/// compact box to the full scrollable text (and closes an expanded one), and the
+/// usual scroll keys page the expanded view.
+fn error_popup_key(app: &mut App, k: KeyEvent) {
+    if app.error_popup.is_none() {
+        return;
+    }
+    let mut scroll_delta: i32 = 0;
+    match k.code {
+        KeyCode::Esc | KeyCode::Char('q') => {
+            app.error_popup = None;
+            return;
+        }
+        KeyCode::Enter => {
+            let expanded = app.error_popup.as_ref().is_some_and(|p| p.expanded);
+            if expanded {
+                app.error_popup = None;
+            } else if let Some(p) = app.error_popup.as_mut() {
+                p.expanded = true;
+            }
+            return;
+        }
+        KeyCode::Up | KeyCode::Char('k') => scroll_delta = -1,
+        KeyCode::Down | KeyCode::Char('j') => scroll_delta = 1,
+        KeyCode::PageUp => scroll_delta = -5,
+        KeyCode::PageDown => scroll_delta = 5,
+        _ => {}
+    }
+    if scroll_delta != 0 {
+        if let Some(p) = app.error_popup.as_mut() {
+            p.scroll = (p.scroll as i32 + scroll_delta).max(0) as u16;
         }
     }
 }
@@ -16594,6 +17024,17 @@ fn history_summary(sql: &str) -> String {
         .find(|l| !l.is_empty())
         .unwrap_or("");
     one_line(first)
+}
+
+/// The `HH:MM` tail of a history timestamp, used on a very narrow panel so the
+/// statement summary keeps a usable width (R41).
+fn history_time_label_short(executed_at: &str) -> String {
+    let b = executed_at.as_bytes();
+    if b.len() >= 16 && b[..16].is_ascii() && b.get(10) == Some(&b'T') {
+        executed_at[11..16].to_string()
+    } else {
+        truncate_disp(executed_at, 5)
+    }
 }
 
 fn history_key(app: &mut App, tx: &Tx, k: KeyEvent) {
@@ -20256,16 +20697,71 @@ fn drill_script(app: &mut App, idx: usize) {
     }
 }
 
+/// What the run keys should execute when there is no selection.
+#[derive(Clone, Copy, PartialEq)]
+enum RunScope {
+    /// `F5` / `Ctrl-J`: the whole editor (the historical behaviour).
+    All,
+    /// `Alt-Enter`: only the statement under the cursor.
+    CurrentStatement,
+}
+
 fn run_current(app: &mut App, tx: &Tx) {
+    run_current_scoped(app, tx, RunScope::All);
+}
+
+fn run_current_scoped(app: &mut App, tx: &Tx, scope: RunScope) {
     match app.backend_kind {
-        Backend::Sql => run_sql(app, tx),
+        Backend::Sql => run_sql(app, tx, scope),
         Backend::Redis | Backend::Mongo => run_cmd_line(app, tx),
     }
 }
 
-fn run_sql(app: &mut App, tx: &Tx) {
-    let sql = app.editor_sql();
-    let sql = sql.trim().to_string();
+/// The editor's current selection, trimmed, or `None` when nothing (usable) is
+/// selected. Shift+arrows build the selection inside tui-textarea.
+fn editor_selection_text(app: &App) -> Option<String> {
+    let ((r1, c1), (r2, c2)) = app.editor.selection_range()?;
+    let text = app.editor_sql();
+    let a = text_offset(&text, r1, c1)?;
+    let b = text_offset(&text, r2, c2)?;
+    let (lo, hi) = if a <= b { (a, b) } else { (b, a) };
+    let sel: String = text.chars().skip(lo).take(hi - lo).collect();
+    let sel = sel.trim().to_string();
+    (!sel.is_empty()).then_some(sel)
+}
+
+/// The statement under the editor cursor (semicolon-delimited, literals and
+/// comments ignored), trimmed, or `None` when the cursor is not on a statement.
+fn current_statement_text(app: &App) -> Option<String> {
+    let text = app.editor_sql();
+    let (row, col) = app.editor.cursor();
+    let off = text_offset(&text, row, col)?;
+    let ranges = statement_ranges(&text);
+    let (s, e) = statement_range_at(&ranges, off)?;
+    let chars: Vec<char> = text.chars().collect();
+    let stmt: String = chars[s..e].iter().collect();
+    let stmt = stmt.trim().to_string();
+    (!stmt.is_empty()).then_some(stmt)
+}
+
+fn run_sql(app: &mut App, tx: &Tx, scope: RunScope) {
+    // R41: a selection always wins (run only what is highlighted); otherwise
+    // `Alt-Enter` narrows to the statement under the cursor while `F5`/`Ctrl-J`
+    // keep running the whole editor.
+    let sql = if let Some(sel) = editor_selection_text(app) {
+        sel
+    } else {
+        match scope {
+            RunScope::All => app.editor_sql().trim().to_string(),
+            RunScope::CurrentStatement => match current_statement_text(app) {
+                Some(stmt) => stmt,
+                None => {
+                    app.status = t("光标处没有可执行的语句").into();
+                    return;
+                }
+            },
+        }
+    };
     if sql.is_empty() {
         return;
     }
@@ -20386,7 +20882,7 @@ fn run_cmd_line(app: &mut App, tx: &Tx) {
                 Op::Mongo(Box::new(cfg), app.current_db(), cmd),
             );
         }
-        Backend::Sql => run_sql(app, tx),
+        Backend::Sql => run_sql(app, tx, RunScope::All),
     }
 }
 
@@ -23571,10 +24067,20 @@ fn run_conn_import(app: &mut App, tx: &Tx, plan: &ConnImportPlan) {
 
 /// `Ctrl-O`: open the saved-SQL snippet overlay for the current connection.
 fn open_snippets(app: &mut App, tx: &Tx) {
+    open_snippets_impl(app, tx, false);
+}
+
+/// `Alt-P`: open the same overlay but paste the chosen snippet at the cursor.
+fn open_snippets_at_cursor(app: &mut App, tx: &Tx) {
+    open_snippets_impl(app, tx, true);
+}
+
+fn open_snippets_impl(app: &mut App, tx: &Tx, insert_at_cursor: bool) {
     let Some(cfg) = app.selected.clone() else {
         app.status = t("先选择连接").into();
         return;
     };
+    app.snippet_insert = insert_at_cursor;
     app.loading = true;
     app.status = t("加载 SQL 片段…").into();
     app.spawn(tx, Op::Snippets(Box::new(cfg)));
@@ -23583,7 +24089,10 @@ fn open_snippets(app: &mut App, tx: &Tx) {
 fn snippet_key(app: &mut App, tx: &Tx, k: KeyEvent) {
     let n = app.snippets.len();
     match k.code {
-        KeyCode::Esc | KeyCode::Char('q') => app.snippet_open = false,
+        KeyCode::Esc | KeyCode::Char('q') => {
+            app.snippet_open = false;
+            app.snippet_insert = false;
+        }
         KeyCode::Up => {
             let i = app
                 .snippet_list
@@ -23604,21 +24113,29 @@ fn snippet_key(app: &mut App, tx: &Tx, k: KeyEvent) {
                 app.snippet_list.select(Some(i));
             }
         }
-        KeyCode::Char('r') if k.modifiers.is_empty() => open_snippets(app, tx),
+        KeyCode::Char('r') if k.modifiers.is_empty() => open_snippets_impl(app, tx, app.snippet_insert),
         // `s`: save the editor's SQL as a new DBX favourite.
         KeyCode::Char('s') if k.modifiers.is_empty() => open_snippet_name(app),
         KeyCode::Enter => {
             if let Some(i) = app.snippet_list.selected() {
                 if let Some((name, sql)) = app.snippets.get(i).cloned() {
-                    let existing = app.editor_sql();
-                    let merged = if existing.trim().is_empty() {
-                        sql
+                    if app.snippet_insert {
+                        // R41: drop the snippet in at the cursor (replacing the
+                        // selection when there is one) instead of appending.
+                        app.editor.insert_str(&sql);
+                        app.focus = Focus::Editor;
                     } else {
-                        format!("{}\n{sql}",  existing.trim_end())
-                    };
-                    app.set_editor_text(&merged);
+                        let existing = app.editor_sql();
+                        let merged = if existing.trim().is_empty() {
+                            sql
+                        } else {
+                            format!("{}\n{sql}", existing.trim_end())
+                        };
+                        app.set_editor_text(&merged);
+                        app.focus = Focus::Editor;
+                    }
                     app.snippet_open = false;
-                    app.focus = Focus::Editor;
+                    app.snippet_insert = false;
                     app.status = tf("✓ 已插入 {}", &[&(name)]);
                 }
             }
@@ -23844,6 +24361,9 @@ fn ui(f: &mut Frame, app: &mut App) {
     }
     if let Some(popup) = app.row_popup.clone() {
         render_text_popup(f, f.area(), &popup.title, &popup.lines, popup.scroll);
+    }
+    if app.error_popup.is_some() {
+        render_error_popup(f, f.area(), app);
     }
     if app.filter_prompt.is_some() {
         render_filter_prompt(f, f.area(), app);
@@ -24238,6 +24758,7 @@ enum FooterView {
     ConnImportPlan,
     FilterPrompt,
     Popup,
+    ErrorBox,
     ResultFilter,
     LocatePrompt,
     ColJump,
@@ -24327,6 +24848,8 @@ fn footer_ctx_inner(app: &App, include_help: bool) -> FooterCtx {
         FooterView::ConnImportPlan
     } else if app.filter_prompt.is_some() {
         FooterView::FilterPrompt
+    } else if app.error_popup.is_some() {
+        FooterView::ErrorBox
     } else if app.row_popup.is_some() || app.cell_popup.is_some() {
         FooterView::Popup
     } else if app.result_filter.is_some() {
@@ -24557,6 +25080,11 @@ fn footer_hints_ctx(ctx: FooterCtx) -> Vec<Hint> {
             vec![("Enter", t("应用")), ("Esc", t("取消")), ("⏎", t("清除"))]
         }
         FooterView::Popup => vec![("↑↓", t("滚动")), ("Esc/Enter", t("关闭"))],
+        FooterView::ErrorBox => vec![
+            ("Enter", t("看全量")),
+            ("↑↓", t("滚动")),
+            ("Esc", t("关闭")),
+        ],
         FooterView::EditDialog => vec![
             ("Enter", t("执行")),
             ("Esc", t("取消")),
@@ -24582,6 +25110,7 @@ fn footer_hints_ctx(ctx: FooterCtx) -> Vec<Hint> {
         FooterView::ConnPicker => vec![
             ("↑↓", t("选择连接")),
             ("Enter", t("连接")),
+            ("Alt-1..9", t("直切")),
             ("c", t("新建")),
             ("e", t("编辑")),
             ("p", t("复制")),
@@ -24635,6 +25164,7 @@ fn footer_hints_ctx(ctx: FooterCtx) -> Vec<Hint> {
             Focus::Sidebar if !ctx.has_connection => vec![
                 ("↑↓", t("选择连接")),
                 ("Enter", t("连接")),
+                ("Alt-1..9", t("直切")),
                 ("c", t("新建")),
                 ("p", t("复制")),
                 ("q", t("显隐")),
@@ -24646,13 +25176,16 @@ fn footer_hints_ctx(ctx: FooterCtx) -> Vec<Hint> {
                 ("r", t("结构")),
                 ("s", t("排序")),
                 ("Alt+a-z", t("首字母跳")),
+                ("Alt-1..9", t("切连接")),
                 ("d", t("切库")),
                 ("Tab", t("SQL")),
                 ("1-9", t("直跳")),
             ],
             Focus::Editor => vec![
                 ("Ctrl-J", t("运行")),
+                ("Alt-Enter", t("当前句")),
                 ("Alt-/", t("补全")),
+                ("Alt-P", t("片段")),
                 ("Enter", t("换行")),
                 ("↑↓", t("历史")),
                 ("Tab", t("下一区")),
@@ -26247,9 +26780,15 @@ fn render_form(f: &mut Frame, area: Rect, app: &mut App) {
     app.form.scroll = scroll;
 
     let mut lines: Vec<Line> = Vec::new();
+    // R41: on a very narrow terminal the label column shrinks and the SSH
+    // section's labels are abbreviated so the value keeps a readable width. The
+    // rows themselves already expand / collapse with the tunnel toggle.
+    let narrow = app.layout_mode == LayoutMode::Narrow || box_w < 44;
+    let label_w = if narrow { 9usize } else { 16 };
     let end = (scroll + visible).min(rows.len());
     for (i, (row, label)) in rows.iter().enumerate().take(end).skip(scroll) {
         let (row, label) = (*row, *label);
+        let label = if narrow { form_label_short(label) } else { label };
         let is_active = i == active;
         let mut value = form_row_value(&form, row);
         if form.editing && is_active {
@@ -26263,7 +26802,7 @@ fn render_form(f: &mut Frame, area: Rect, app: &mut App) {
         };
         lines.push(Line::from({
             let mut spans = vec![Span::styled(
-                format!("{marker}{label:16} {value}"),
+                format!("{marker}{label:<label_w$} {value}"),
                 style,
             )];
             // Read-only colour preview swatch: the connection colour when set,
@@ -26286,8 +26825,8 @@ fn render_form(f: &mut Frame, area: Rect, app: &mut App) {
             };
             lines.push(Line::from(Span::styled(
                 format!(
-                    "  {:<16} {}:{}",
-                    t("远端目标"),
+                    "  {:<label_w$} {}:{}",
+                    if narrow { "remote" } else { t("远端目标") },
                     form.host.trim(),
                     target_port
                 ),
@@ -26792,10 +27331,14 @@ fn render_history_panel(f: &mut Frame, area: Rect, app: &mut App) {
             .map(|&ri| {
                 let r = &app.history_rows[ri];
                 let fav = app.history_favorites.contains(&r.sql);
-                let time = history_time_label(&r.executed_at);
-                // On a narrow pane the source connection is dropped entirely so
-                // the statement summary keeps a usable width; a wide pane keeps
-                // the full time / favourite / summary / source row.
+                // On a very narrow panel the time shrinks to `HH:MM` and the
+                // source connection is dropped entirely so the statement summary
+                // keeps a usable width (R41).
+                let time = if list_w >= 44 {
+                    history_time_label(&r.executed_at)
+                } else {
+                    history_time_label_short(&r.executed_at)
+                };
                 let src = if list_w >= 56 {
                     truncate_disp(&r.connection_name, 18)
                 } else {
@@ -28680,6 +29223,55 @@ fn render_text_popup(f: &mut Frame, area: Rect, title: &str, lines: &[PopupLine]
     );
 }
 
+/// R41: the compact execution-error box. On a small screen it shows only the
+/// first line plus the line count; `Enter` widens it to the full scrollable
+/// text. `Enter` again (or `Esc`) closes it.
+fn render_error_popup(f: &mut Frame, area: Rect, app: &mut App) {
+    let Some(popup) = app.error_popup.clone() else {
+        return;
+    };
+    let total = popup.lines.len().max(1);
+    if popup.expanded {
+        let lines: Vec<PopupLine> = popup
+            .lines
+            .iter()
+            .map(|l| PopupLine {
+                text: l.clone(),
+                style: Style::default().fg(Color::Red),
+            })
+            .collect();
+        render_text_popup(f, area, t("执行错误"), &lines, popup.scroll);
+        return;
+    }
+    let w = overlay_width(area.width, 72, 24);
+    let inner_w = w.saturating_sub(4).max(1) as usize;
+    let box_area = centered_overlay(area, w, 5);
+    f.render_widget(Clear, box_area);
+    let first = truncate_disp(popup.lines.first().map(String::as_str).unwrap_or(""), inner_w);
+    let hint = if total > 1 {
+        tf("✗ {} · 共 {} 行 · Enter 看全量 · Esc 关 ", &[&first, &total])
+    } else {
+        tf("✗ {} · Enter 看全量 · Esc 关 ", &[&first])
+    };
+    f.render_widget(
+        Paragraph::new(Line::from(Span::styled(
+            hint,
+            Style::default().fg(Color::Red),
+        )))
+        .block(
+            Block::default()
+                .borders(Borders::ALL)
+                .title(Span::styled(
+                    t(" 执行错误 "),
+                    Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
+                ))
+                .border_set(border::THICK)
+                .border_style(Style::default().fg(Color::Red)),
+        ),
+        box_area,
+    );
+}
+
 fn render_edit_dialog(f: &mut Frame, area: Rect, app: &mut App) {
     let Some(d) = app.edit_dialog.clone() else {
         return;
@@ -29086,9 +29678,12 @@ const HELP_ROWS: &[(&str, &str)] = &[
     ("— 全局 —", ""),
     ("Ctrl-C", "退出"),
     ("Ctrl-L", "切换命令模式 SQL → Redis → MongoDB"),
-    ("F5 / Ctrl-J", "执行当前 SQL"),
+    ("F5 / Ctrl-J", "执行 SQL（有选区只跑选区，否则整段）"),
+    ("Alt-Enter", "只执行光标处语句（有选区则执行选区；分号分隔，字面量/注释里的分号不算）"),
     ("Tab / Shift-Tab", "循环切换区域（侧栏 → 编辑器 → 结果）"),
-    ("Alt-1 / 2 / 3", "直接聚焦 侧栏 / 编辑器 / 结果"),
+    ("Alt-1..9", "直切第 N 个连接（侧栏连接顺序；智能恢复上次库/表）"),
+    ("Alt-Tab / Alt-`", "当前连接与上一个连接对切"),
+    ("Alt-Shift-1/2/3", "直接聚焦 侧栏 / 编辑器 / 结果（终端可能报成 Alt-! @ #）"),
     ("Ctrl-A", "自动折叠 开 / 关（开=非焦点栏收起）"),
     ("Ctrl-W", "收起 / 展开当前焦点区域"),
     ("Ctrl-G", "横滚模式（触屏兜底：滚轮/上下滑 = 横滚列）"),
@@ -29106,6 +29701,8 @@ const HELP_ROWS: &[(&str, &str)] = &[
     ("''", "空字符串：灰色，带引号的空串，不会与 NULL 混淆"),
     ("DBXT_NO_ITALIC=1", "强制 NULL 仅用灰色，不依赖终端斜体"),
     ("— 连接选择 —", ""),
+    ("Alt-1..9", "直切第 N 个连接（按当前排序；同库表存在则直达，否则落首屏）"),
+    ("Alt-Tab / Alt-`", "与上一个连接对切（双缓冲，来回横跳）"),
     ("↑ ↓ / Enter", "选择 / 连接"),
     ("c", "新建连接"),
     ("e", "编辑选中连接（含 SSH 隧道，预填表单）"),
@@ -29203,6 +29800,7 @@ const HELP_ROWS: &[(&str, &str)] = &[
     ("Alt-F", "格式化当前 SQL（关键字大写 / 子句换行）；再按压缩为单行"),
     ("Ctrl-U", "撤销上一次 Alt-F 格式化"),
     ("Alt-/", "SQL 前缀补全（表名 T / 列名 C / 关键字 K，Tab 上屏）"),
+    ("Alt-P", "片段收藏：选中即插到光标处（一步）"),
     ("%", "跳到配对括号（光标在 ()[]{} 上或旁；否则照常输入 %）"),
     ("Ctrl-A / Ctrl-E", "行首 / 行尾（Home / End 同）"),
     ("Ctrl-K / Ctrl-⇧K", "删至行尾（kill line）"),
@@ -33286,6 +33884,10 @@ mod tests {
             "Shift+Alt-D",
             "Alt-K",
             "Alt-T",
+            "Alt-1..9",
+            "Alt-Tab / Alt-`",
+            "Alt-Enter",
+            "Alt-P",
         ] {
             assert!(
                 keys.iter().any(|k| k.contains(needle)),
@@ -38826,5 +39428,291 @@ mod tests {
         // Esc drops the preview entirely.
         conn_import_plan_key(&mut app, &tx, KeyEvent::from(KeyCode::Esc));
         assert!(app.conn_import_plan.is_none());
+    }
+
+    // ── R41: connection quick-switch, statement scope, error box ──
+
+    fn conn(id: &str, name: &str, db_type: &str) -> ConnectionConfig {
+        new_connection_config(
+            id.to_string(),
+            name.to_string(),
+            parse_database_type(db_type).unwrap(),
+            "127.0.0.1".into(),
+            3306,
+            "u".into(),
+            "p".into(),
+            None,
+            false,
+            None,
+        )
+        .unwrap()
+    }
+
+    /// Run a closure on a current-thread Tokio runtime so code paths that call
+    /// `tokio::spawn` (connection switching, table loads) work in tests.
+    fn run_rt<F: FnOnce()>(f: F) {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        rt.block_on(async { f() });
+    }
+
+    fn page_of(table: &str) -> PageState {
+        PageState {
+            table: table.into(),
+            schema: String::new(),
+            table_type: Some("TABLE".into()),
+            page: 0,
+            page_size: PAGE_SIZE,
+            total: None,
+            total_lower_bound: false,
+            has_next: false,
+            filter: String::new(),
+            order_by: None,
+            keyset: None,
+        }
+    }
+
+    /// The statement splitter must ignore semicolons inside string literals,
+    /// quoted identifiers and comments, and honour doubled quotes / backslash
+    /// escapes.
+    #[test]
+    fn statement_ranges_ignore_literals_and_comments() {
+        let text = "SELECT ';' AS a; SELECT \"b;c\"; -- trailing ; comment\nSELECT 3; /* ; */ SELECT 4";
+        let ranges = statement_ranges(text);
+        let chars: Vec<char> = text.chars().collect();
+        let stmts: Vec<String> = ranges
+            .iter()
+            .map(|&(s, e)| chars[s..e].iter().collect::<String>())
+            .collect();
+        assert_eq!(stmts.len(), 4, "four statements, got {stmts:?}");
+        assert_eq!(stmts[0], "SELECT ';' AS a");
+        assert_eq!(stmts[1], "SELECT \"b;c\"");
+        assert_eq!(stmts[2], "-- trailing ; comment\nSELECT 3");
+        assert_eq!(stmts[3], "/* ; */ SELECT 4");
+        // A doubled quote keeps the literal open: the `;` stays inside it.
+        let doubled = statement_ranges("SELECT 'a'';b'");
+        assert_eq!(doubled.len(), 1);
+        // A trailing semicolon yields no empty statement.
+        assert_eq!(statement_ranges("SELECT 1;").len(), 1);
+    }
+
+    /// The cursor-to-statement resolver picks the span under the cursor and
+    /// falls forward across a separator / whitespace gap.
+    #[test]
+    fn statement_range_at_follows_the_cursor() {
+        let text = "SELECT 1; SELECT 2;\nSELECT 3";
+        let ranges = statement_ranges(text);
+        let chars: Vec<char> = text.chars().collect();
+        let at = |off: usize| {
+            let (s, e) = statement_range_at(&ranges, off).unwrap();
+            chars[s..e].iter().collect::<String>()
+        };
+        assert_eq!(at(0), "SELECT 1");
+        assert_eq!(at(7), "SELECT 1"); // on the statement
+        assert_eq!(at(8), "SELECT 2"); // on the `;` separator -> next
+        assert_eq!(at(10), "SELECT 2");
+        assert_eq!(at(19), "SELECT 3"); // trailing newline -> last
+        assert!(statement_range_at(&[], 0).is_none());
+    }
+
+    /// A selection runs only the highlighted text, trimmed of surrounding
+    /// whitespace.
+    #[test]
+    fn editor_selection_is_trimmed_to_the_highlighted_sql() {
+        let mut app = test_app();
+        app.set_editor_text("SELECT 1;\n   SELECT 2;\nSELECT 3");
+        assert!(editor_selection_text(&app).is_none(), "no selection yet");
+        // Select all of line 1 (which has leading spaces) through its `;`.
+        app.editor.move_cursor(CursorMove::Jump(1, 0));
+        app.editor.start_selection();
+        app.editor.move_cursor(CursorMove::Jump(1, 12));
+        assert_eq!(editor_selection_text(&app).as_deref(), Some("SELECT 2;"));
+        // A whitespace-only selection is treated as no selection.
+        app.editor.cancel_selection();
+        app.editor.move_cursor(CursorMove::Jump(1, 0));
+        app.editor.start_selection();
+        app.editor.move_cursor(CursorMove::Jump(1, 3));
+        assert!(editor_selection_text(&app).is_none());
+    }
+
+    /// `Alt-<n>` switches to the Nth connection and `Alt-Tab` / `Alt-`` toggles
+    /// back — the last-connection double buffer.
+    #[test]
+    fn alt_digit_switches_connections_and_alt_tab_toggles_back() {
+        run_rt(|| {
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel::<OpResult>();
+        let mut app = test_app();
+        app.connections = vec![
+            conn("id-a", "A", "mysql"),
+            conn("id-b", "B", "postgres"),
+            conn("id-c", "C", "sqlite"),
+        ];
+        app.conn_list.select(Some(0));
+        app.selected = Some(conn("id-a", "A", "mysql"));
+        app.backend_kind = Backend::Sql;
+        // Alt-3 jumps straight to the third connection.
+        key(
+            &mut app,
+            &tx,
+            KeyEvent::new(KeyCode::Char('3'), KeyModifiers::ALT),
+        );
+        assert_eq!(app.selected.as_ref().unwrap().id, "id-c");
+        assert_eq!(app.last_conn_id.as_deref(), Some("id-a"));
+        // Alt-Tab toggles back to A, and again to C.
+        key(&mut app, &tx, KeyEvent::new(KeyCode::Tab, KeyModifiers::ALT));
+        assert_eq!(app.selected.as_ref().unwrap().id, "id-a");
+        assert_eq!(app.last_conn_id.as_deref(), Some("id-c"));
+        key(
+            &mut app,
+            &tx,
+            KeyEvent::new(KeyCode::Char('`'), KeyModifiers::ALT),
+        );
+        assert_eq!(app.selected.as_ref().unwrap().id, "id-c");
+        // Alt-9 out of range reports instead of switching.
+        key(
+            &mut app,
+            &tx,
+            KeyEvent::new(KeyCode::Char('9'), KeyModifiers::ALT),
+        );
+        assert_eq!(app.selected.as_ref().unwrap().id, "id-c");
+        assert!(app.status.contains("没有第"));
+        });
+    }
+
+    /// A switch remembers where the user was and restores a same-named table on
+    /// the new connection; a missing table falls back to the first screen with a
+    /// landing hint.
+    #[test]
+    fn connection_switch_restores_a_same_named_table() {
+        run_rt(|| {
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel::<OpResult>();
+        let mut app = test_app();
+        app.connections = vec![conn("id-a", "A", "mysql"), conn("id-b", "B", "mysql")];
+        app.conn_list.select(Some(0));
+        app.selected = Some(conn("id-a", "A", "mysql"));
+        app.backend_kind = Backend::Sql;
+        app.databases = vec!["shop".into()];
+        app.db_index = 0;
+        app.tables_all = vec![table_info("orders", "TABLE"), table_info("users", "TABLE")];
+        apply_table_filter(&mut app);
+        app.page_state = Some(page_of("orders"));
+        // Alt-2 switches to B, carrying `shop.orders`.
+        key(
+            &mut app,
+            &tx,
+            KeyEvent::new(KeyCode::Char('2'), KeyModifiers::ALT),
+        );
+        assert_eq!(app.selected.as_ref().unwrap().id, "id-b");
+        let gen = app.conn_gen;
+        apply_op_result(
+            &mut app,
+            OpResult::Databases {
+                databases: vec!["shop".into()],
+                warning: None,
+                gen,
+            },
+            &tx,
+        );
+        assert_eq!(app.current_db(), "shop");
+        let tgen = app.tables_gen;
+        apply_op_result(
+            &mut app,
+            OpResult::TablesFor {
+                tables: vec![table_info("orders", "TABLE"), table_info("other", "TABLE")],
+                gen: tgen,
+            },
+            &tx,
+        );
+        assert_eq!(
+            app.page_state.as_ref().map(|p| p.table.as_str()),
+            Some("orders"),
+            "the same-named table is reopened"
+        );
+        assert!(app.nav_landing.as_deref().unwrap_or("").contains("orders"));
+        });
+    }
+
+    /// A stale `list_databases` reply (older `conn_gen`) is dropped, so a fast
+    /// switch cannot be clobbered by the connection it left.
+    #[test]
+    fn stale_database_list_is_discarded() {
+        run_rt(|| {
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel::<OpResult>();
+        let mut app = test_app();
+        app.connections = vec![conn("id-a", "A", "mysql"), conn("id-b", "B", "mysql")];
+        app.selected = Some(conn("id-a", "A", "mysql"));
+        app.conn_gen = 5;
+        apply_op_result(
+            &mut app,
+            OpResult::Databases {
+                databases: vec!["stale".into()],
+                warning: None,
+                gen: 4,
+            },
+            &tx,
+        );
+        assert!(app.databases.is_empty(), "stale reply dropped");
+        apply_op_result(
+            &mut app,
+            OpResult::Databases {
+                databases: vec!["fresh".into()],
+                warning: None,
+                gen: 5,
+            },
+            &tx,
+        );
+        assert_eq!(app.databases, vec!["fresh".to_string()]);
+        });
+    }
+
+    /// The execution-error box starts compact (first line + line count) and
+    /// `Enter` widens it; `Esc` closes it.
+    #[test]
+    fn error_popup_compacts_then_expands() {
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel::<OpResult>();
+        let mut app = test_app();
+        app.focus = Focus::Preview;
+        open_error_popup(&mut app, "line one\nline two\nline three");
+        let p = app.error_popup.as_ref().unwrap();
+        assert_eq!(p.lines.len(), 3);
+        assert!(!p.expanded, "starts compact");
+        // A compact box renders at 42×22 without panicking.
+        let rows = draw(&mut app, 42, 22);
+        let text: String = rows.join("\n").chars().filter(|c| !c.is_whitespace()).collect();
+        assert!(text.contains("执行错误"), "{text}");
+        key(&mut app, &tx, KeyEvent::from(KeyCode::Enter));
+        assert!(app.error_popup.as_ref().unwrap().expanded, "Enter expands");
+        key(&mut app, &tx, KeyEvent::from(KeyCode::Enter));
+        assert!(app.error_popup.is_none(), "Enter again closes");
+    }
+
+    /// R41 small-screen wrap-up: the connection form and the history panel draw
+    /// at 42×22 without panicking, with the form labels abbreviated.
+    #[test]
+    fn narrow_form_and_history_render_without_panicking() {
+        let mut app = test_app();
+        app.page = Page::NewConn;
+        app.form = ConnForm::default();
+        app.form.ssh_enabled = true;
+        let rows = draw(&mut app, 42, 22);
+        assert!(rows.iter().any(|r| r.contains("ssh.host")), "SSH label abbreviated");
+        assert!(rows.iter().any(|r| r.contains("type")), "db_type abbreviated");
+        // History panel at 42×22 with a long statement: the preview must not
+        // push the panel outside the buffer.
+        app.page = Page::Browse;
+        app.history_open = true;
+        app.history_rows = vec![history_row(
+            "1",
+            "SELECT very_long_column_name, another_long_column FROM a_very_long_table_name WHERE x = 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa'",
+        )];
+        app.history_view = vec![0];
+        app.history_list.select(Some(0));
+        let rows = draw(&mut app, 42, 22);
+        // The TestBackend pads each wide CJK glyph with a space cell, so strip
+        // whitespace before matching a multi-character title.
+        let text: String = rows.join("\n").chars().filter(|c| !c.is_whitespace()).collect();
+        assert!(text.contains("查询历史"), "{text}");
     }
 }
