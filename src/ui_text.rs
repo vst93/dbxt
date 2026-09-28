@@ -884,6 +884,11 @@ pub static ALL_KEYS: &[&str] = &[
     "已格式化 · {} 行 · Ctrl-U 撤销",
     "已压缩为单行 · Ctrl-U 撤销",
     "已撤销格式化",
+    "已跳到配对括号",
+    "未找到配对括号",
+    "已经是最早的表",
+    "已经是最新的表",
+    "列 {} {}/{}",
     "查询历史仅用于 SQL 编辑器",
     "加载查询历史…",
     "已关闭查询历史",
@@ -966,6 +971,12 @@ pub static ALL_KEYS: &[&str] = &[
     "两边使用相同条件；列名按各自方言书写 · 留空 = 无过滤",
     "例: status = 'active'（留空回车 = 无过滤）",
     "数据对比 WHERE 过滤（两边同时生效）· Enter 开始 · Esc 返回",
+    "配对括号",
+    "最近表后退 / 前进（浏览器语义，最多 50 张，跨库可用）",
+    "跳到配对括号（光标在 ()[]{} 上或旁；否则照常输入 %）",
+    "行首 / 行尾（Home / End 同）",
+    "删至行尾（kill line）",
+    "删前一个词",
 ];
 
 /// The Chinese → English table. Keys must match the source literals exactly.
@@ -2020,6 +2031,11 @@ fn en_of(zh: &'static str) -> Option<&'static str> {
         "已格式化 · {} 行 · Ctrl-U 撤销" => Some("Formatted · {} lines · Ctrl-U to undo"),
         "已压缩为单行 · Ctrl-U 撤销" => Some("Compressed to one line · Ctrl-U to undo"),
         "已撤销格式化" => Some("Formatting undone"),
+        "已跳到配对括号" => Some("Jumped to the matching bracket"),
+        "未找到配对括号" => Some("No matching bracket"),
+        "已经是最早的表" => Some("Already at the oldest table"),
+        "已经是最新的表" => Some("Already at the newest table"),
+        "列 {} {}/{}" => Some("col {} {}/{}"),
         "查询历史仅用于 SQL 编辑器" => Some("Query history is only available for the SQL editor"),
         "加载查询历史…" => Some("Loading query history…"),
         "已关闭查询历史" => Some("Query history closed"),
@@ -2399,6 +2415,16 @@ fn en_of(zh: &'static str) -> Option<&'static str> {
         "下一页 / 上一页（可计数：5 n = 翻 5 页）" => Some("next / previous page (countable: 5 n = 5 pages)"),
         "直跳第 N 个连接 / 表" => Some("jump straight to the Nth connection / table"),
         "直跳" => Some("jump"),
+        "配对括号" => Some("brackets"),
+        "最近表后退 / 前进（浏览器语义，最多 50 张，跨库可用）" => {
+            Some("recent-table back / forward (browser semantics, up to 50, across databases)")
+        }
+        "跳到配对括号（光标在 ()[]{} 上或旁；否则照常输入 %）" => {
+            Some("jump to the matching bracket (cursor on or beside ()[]{}; otherwise types %)")
+        }
+        "行首 / 行尾（Home / End 同）" => Some("line head / tail (Home / End too)"),
+        "删至行尾（kill line）" => Some("kill to end of line"),
+        "删前一个词" => Some("delete previous word"),
         _ => None,
     }
 }

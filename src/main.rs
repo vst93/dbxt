@@ -8763,6 +8763,15 @@ struct App {
     recent_tables: Vec<(String, String, String)>,
     recent_open: bool,
     recent_list: ListState,
+    /// Browser-style back/forward history of browsed tables (`Alt-←` / `Alt-→`).
+    /// `nav_pos` is the cursor into it; opening a table truncates the forward
+    /// branch and appends, exactly like a browser.
+    nav_history: Vec<(String, String, String)>,
+    nav_pos: usize,
+    /// The transient `← table` / `→ table` landing hint from the last history
+    /// step. Shown at the head of the status bar's context block (where a narrow
+    /// screen cannot truncate it) and cleared by the next key press.
+    nav_landing: Option<String>,
     /// A `(schema, table)` to open as soon as the (new) table list arrives.
     pending_open_table: Option<(String, String)>,
     /// A `WHERE` predicate to apply when the next table opens (a search-hit
@@ -9392,6 +9401,9 @@ impl App {
             recent_tables: Vec::new(),
             recent_open: false,
             recent_list: ListState::default(),
+            nav_history: Vec::new(),
+            nav_pos: 0,
+            nav_landing: None,
             pending_open_table: None,
             pending_table_filter: None,
             completion: None,
@@ -11124,6 +11136,13 @@ fn reset_overlays_for_backend_switch(app: &mut App) {
 }
 
 fn key(app: &mut App, tx: &Tx, k: KeyEvent) {
+    // The back/forward landing hint is transient: it survives until the next
+    // key press (the history keys themselves refresh it).
+    let is_nav_key = k.modifiers.contains(KeyModifiers::ALT)
+        && matches!(k.code, KeyCode::Left | KeyCode::Right);
+    if !is_nav_key {
+        app.nav_landing = None;
+    }
     // global: quit. Ctrl-Shift-C is a *view* toggle (compact columns), so the
     // quit must not swallow it on terminals that report Shift as a modifier.
     if k.modifiers.contains(KeyModifiers::CONTROL)
@@ -11685,6 +11704,19 @@ fn browse_key(app: &mut App, tx: &Tx, k: KeyEvent) {
             // Alt-I: import connections from a dbxt / DBeaver / Navicat file.
             KeyCode::Char('i') | KeyCode::Char('I') => {
                 open_conn_import(app);
+                return;
+            }
+            // Alt-← / Alt-→: browser-style back / forward through the tables you
+            // have browsed (max 50). The text panes keep the arrows local so
+            // editing SQL is never yanked into another table; the history keys
+            // are for the sidebar and results panes, where the A→B→A workflow
+            // lives.
+            KeyCode::Left if !matches!(app.focus, Focus::Editor | Focus::CmdInput) => {
+                nav_back(app, tx);
+                return;
+            }
+            KeyCode::Right if !matches!(app.focus, Focus::Editor | Focus::CmdInput) => {
+                nav_forward(app, tx);
                 return;
             }
             _ => {}
@@ -12882,6 +12914,62 @@ fn max_cell_width(mode: LayoutMode) -> usize {
         LayoutMode::Mid => 28,
         LayoutMode::Wide => 44,
     }
+}
+
+// ── sidebar width (side-by-side layout) ──
+
+/// Readable floor for the sidebar: the `▸ ` marker plus a short table name.
+const SIDEBAR_MIN_W: u16 = 14;
+/// Sidebar width in the mid layout, and the ceiling the auto-width can reach.
+const SIDEBAR_MID_W: u16 = 22;
+/// Sidebar width on a wide screen — the historical value, kept unchanged.
+const SIDEBAR_WIDE_W: u16 = 28;
+
+/// Width of the sidebar in the side-by-side layout. On a wide screen the
+/// historical 28 columns are kept. On a mid screen the sidebar shrinks toward
+/// the widest `schema.table` name so the freed columns go to the data area,
+/// never below the readable floor. The narrow layout stacks the sidebar, so its
+/// width there is simply the terminal width (the data area is already maximal).
+fn sidebar_width(term_w: u16, mode: LayoutMode, longest_name: usize) -> u16 {
+    match mode {
+        LayoutMode::Wide => SIDEBAR_WIDE_W,
+        LayoutMode::Narrow => term_w.max(SIDEBAR_MIN_W),
+        LayoutMode::Mid => (longest_name as u16 + 4).clamp(SIDEBAR_MIN_W, SIDEBAR_MID_W),
+    }
+}
+
+/// Display width of the widest `schema.table` name in the sidebar list, so the
+/// sidebar can be sized to its content.
+fn sidebar_longest_name(tables: &[TableInfo], schema: &str) -> usize {
+    tables
+        .iter()
+        .map(|t| disp_width(&fix_double_encoding(&qualified_display(schema, &t.name))))
+        .max()
+        .unwrap_or(0)
+}
+
+/// Truncate a table name to `max` display cells, marking the cut with a trailing
+/// `~` (distinct from the generic `…` ellipsis, so a clipped identifier is
+/// obvious in the sidebar).
+fn truncate_table_name(s: &str, max: usize) -> String {
+    if max == 0 {
+        return String::new();
+    }
+    if disp_width(s) <= max {
+        return s.to_string();
+    }
+    let mut out = String::new();
+    let mut w = 0usize;
+    for c in s.chars() {
+        let cw = UnicodeWidthChar::width(c).unwrap_or(0);
+        if w + cw > max.saturating_sub(1) {
+            break;
+        }
+        out.push(c);
+        w += cw;
+    }
+    out.push('~');
+    out
 }
 
 const MIN_CELL_WIDTH: usize = 6;
@@ -14246,6 +14334,197 @@ fn toggle_format_editor(app: &mut App) {
     };
 }
 
+/// True for the bracket characters `%` can jump between.
+fn is_bracket(c: char) -> bool {
+    matches!(c, '(' | ')' | '[' | ']' | '{' | '}')
+}
+
+/// `(row, col)` (char index in the line) → offset in the flattened text. Returns
+/// `None` when the position does not exist (a stale cursor after an edit).
+fn text_offset(text: &str, row: usize, col: usize) -> Option<usize> {
+    let mut off = 0usize;
+    for (i, line) in text.split('\n').enumerate() {
+        if i == row {
+            return (col <= line.chars().count()).then_some(off + col);
+        }
+        off += line.chars().count() + 1;
+    }
+    None
+}
+
+/// Offset in the flattened text → `(row, col)`.
+fn offset_to_cursor(text: &str, off: usize) -> (usize, usize) {
+    let mut row = 0usize;
+    let mut col = 0usize;
+    for c in text.chars().take(off) {
+        if c == '\n' {
+            row += 1;
+            col = 0;
+        } else {
+            col += 1;
+        }
+    }
+    (row, col)
+}
+
+/// Every bracket that sits in *code* — outside string literals, quoted
+/// identifiers (`"…"`, `` `…` ``) and comments — paired with its char offset.
+/// The lexer is deliberately small: SQL's escaping rules (doubled quotes,
+/// backslash escapes) are honoured so a bracket in a literal is never seen.
+fn code_brackets(text: &str) -> Vec<(usize, char)> {
+    #[derive(Clone, Copy, PartialEq)]
+    enum St {
+        Normal,
+        Sq,
+        Dq,
+        Bt,
+        Line,
+        Block,
+    }
+    let chars: Vec<char> = text.chars().collect();
+    let mut out = Vec::new();
+    let mut state = St::Normal;
+    let mut i = 0usize;
+    while i < chars.len() {
+        let c = chars[i];
+        match state {
+            St::Normal => {
+                if c == '\'' {
+                    state = St::Sq;
+                } else if c == '"' {
+                    state = St::Dq;
+                } else if c == '`' {
+                    state = St::Bt;
+                } else if c == '-' && chars.get(i + 1) == Some(&'-') {
+                    state = St::Line;
+                    i += 1;
+                } else if c == '/' && chars.get(i + 1) == Some(&'*') {
+                    state = St::Block;
+                    i += 1;
+                } else if is_bracket(c) {
+                    out.push((i, c));
+                }
+            }
+            St::Sq => {
+                if c == '\\' {
+                    i += 1;
+                } else if c == '\'' {
+                    if chars.get(i + 1) == Some(&'\'') {
+                        i += 1;
+                    } else {
+                        state = St::Normal;
+                    }
+                }
+            }
+            St::Dq => {
+                if c == '\\' {
+                    i += 1;
+                } else if c == '"' {
+                    if chars.get(i + 1) == Some(&'"') {
+                        i += 1;
+                    } else {
+                        state = St::Normal;
+                    }
+                }
+            }
+            St::Bt => {
+                if c == '`' {
+                    if chars.get(i + 1) == Some(&'`') {
+                        i += 1;
+                    } else {
+                        state = St::Normal;
+                    }
+                }
+            }
+            St::Line => {
+                if c == '\n' {
+                    state = St::Normal;
+                }
+            }
+            St::Block => {
+                if c == '*' && chars.get(i + 1) == Some(&'/') {
+                    state = St::Normal;
+                    i += 1;
+                }
+            }
+        }
+        i += 1;
+    }
+    out
+}
+
+/// Offset of the bracket matching the bracket at `pos`, or `None` when it is
+/// unbalanced. Brackets inside strings / comments are ignored, so a `)` in a
+/// literal never pairs with a `(` in code.
+fn matching_bracket(text: &str, pos: usize) -> Option<usize> {
+    let brackets = code_brackets(text);
+    let idx = brackets.iter().position(|(p, _)| *p == pos)?;
+    let c = brackets[idx].1;
+    let (open, close) = match c {
+        '(' | ')' => ('(', ')'),
+        '[' | ']' => ('[', ']'),
+        '{' | '}' => ('{', '}'),
+        _ => return None,
+    };
+    if matches!(c, '(' | '[' | '{') {
+        let mut depth = 0i32;
+        for &(p, cc) in &brackets[idx..] {
+            if cc == open {
+                depth += 1;
+            } else if cc == close {
+                depth -= 1;
+                if depth == 0 {
+                    return Some(p);
+                }
+            }
+        }
+    } else {
+        let mut depth = 0i32;
+        for &(p, cc) in brackets[..=idx].iter().rev() {
+            if cc == close {
+                depth += 1;
+            } else if cc == open {
+                depth -= 1;
+                if depth == 0 {
+                    return Some(p);
+                }
+            }
+        }
+    }
+    None
+}
+
+/// `%` in the editor: when the cursor is on, or immediately after, a bracket,
+/// move it to the matching bracket and report `true`. Reports `false` when there
+/// is no bracket there, so the caller inserts a literal `%` instead.
+fn jump_matching_bracket(app: &mut App) -> bool {
+    let text = app.editor_sql();
+    let (row, col) = app.editor.cursor();
+    let Some(off) = text_offset(&text, row, col) else {
+        return false;
+    };
+    let chars: Vec<char> = text.chars().collect();
+    let at = |i: usize| chars.get(i).copied();
+    let pos = if at(off).is_some_and(is_bracket) {
+        off
+    } else if off > 0 && at(off - 1).is_some_and(is_bracket) {
+        off - 1
+    } else {
+        return false;
+    };
+    match matching_bracket(&text, pos) {
+        Some(m) => {
+            let (r, c) = offset_to_cursor(&text, m);
+            app.editor.move_cursor(CursorMove::Jump(r as u16, c as u16));
+            app.status = t("已跳到配对括号").into();
+        }
+        None => {
+            app.status = t("未找到配对括号").into();
+        }
+    }
+    true
+}
+
 fn editor_key(app: &mut App, tx: &Tx, k: KeyEvent) {
     // The completion popup owns the keyboard while it is open: Tab / Enter
     // accept, Esc cancels, arrows move, anything else keeps typing (and refines
@@ -14286,6 +14565,28 @@ fn editor_key(app: &mut App, tx: &Tx, k: KeyEvent) {
                 app.editor.undo();
             }
         }
+        // `%`: vim's bracket jump. It only fires when the cursor sits on, or
+        // immediately after, a `()[]{}` bracket — anywhere else `%` is typed
+        // literally, so `LIKE '%x%'` and `a % b` are never hijacked.
+        (m, KeyCode::Char('%'))
+            if !m.contains(KeyModifiers::CONTROL) && !m.contains(KeyModifiers::ALT) =>
+        {
+            if !jump_matching_bracket(app) {
+                app.editor.input(k);
+            }
+        }
+        // Ctrl-Shift-K kills to the end of the line. Terminals report the shifted
+        // key as an uppercase `K`, which tui-textarea's lowercase Ctrl-K binding
+        // does not match, so it is claimed here (lowercase Ctrl-K still reaches
+        // the built-in binding below).
+        (m, KeyCode::Char('K')) if m.contains(KeyModifiers::CONTROL) => {
+            app.editor.delete_line_by_end();
+        }
+        // Readline-style line editing rides tui-textarea's built-in bindings,
+        // which reach `_` below: Ctrl-A / Home = line head, Ctrl-E / End = line
+        // tail, Ctrl-K (and Ctrl-Shift-K) = kill to end of line, Ctrl-W = delete
+        // the previous word. `browse_key` deliberately does not claim those
+        // combos while the editor is focused, so the muscle memory survives.
         (KeyModifiers::NONE, KeyCode::F(5)) => run_current(app, tx),
         (KeyModifiers::NONE, KeyCode::Tab) => {
             app.focus = if app.backend_kind == Backend::Sql {
@@ -16104,12 +16405,78 @@ fn recent_key(app: &mut App, tx: &Tx, k: KeyEvent) {
     }
 }
 
-/// Remember a table at the head of the recents list (max 5, unique).
+/// Remember a table at the head of the recents list (max 5, unique) and push it
+/// onto the browser-style back/forward history.
 fn remember_recent_table(app: &mut App, db: &str, schema: &str, table: &str) {
     let entry = (db.to_string(), schema.to_string(), table.to_string());
     app.recent_tables.retain(|e| e != &entry);
-    app.recent_tables.insert(0, entry);
+    app.recent_tables.insert(0, entry.clone());
     app.recent_tables.truncate(5);
+    record_nav(app, entry);
+}
+
+/// How deep the `Alt-←` / `Alt-→` history goes. Fifty tables is far more than a
+/// session ever walks back through, and bounds the memory.
+const NAV_DEPTH: usize = 50;
+
+/// Push a browsed table onto the back/forward history with browser semantics:
+/// re-opening the entry the cursor already points at is a no-op; anything else
+/// drops the forward branch and appends, moving the cursor to the new tail.
+fn record_nav(app: &mut App, entry: (String, String, String)) {
+    if app.nav_history.get(app.nav_pos).is_some_and(|e| *e == entry) {
+        return;
+    }
+    app.nav_history.truncate(app.nav_pos + 1);
+    app.nav_history.push(entry);
+    if app.nav_history.len() > NAV_DEPTH {
+        let drop = app.nav_history.len() - NAV_DEPTH;
+        app.nav_history.drain(0..drop);
+    }
+    app.nav_pos = app.nav_history.len().saturating_sub(1);
+}
+
+/// `Alt-←` — step back to the previously browsed table. The cursor moves first,
+/// then the table is opened; the re-open does not push a second history entry
+/// because [`record_nav`] sees the entry it already points at.
+fn nav_back(app: &mut App, tx: &Tx) {
+    if app.nav_pos == 0 {
+        app.status = if app.nav_history.is_empty() {
+            t("还没有浏览过表").into()
+        } else {
+            t("已经是最早的表").into()
+        };
+        return;
+    }
+    app.nav_pos -= 1;
+    let (db, schema, table) = app.nav_history[app.nav_pos].clone();
+    open_nav_entry(app, tx, &db, &schema, &table, "←");
+}
+
+/// `Alt-→` — step forward again after a back. Disabled once the cursor is at the
+/// tail (the forward branch is empty).
+fn nav_forward(app: &mut App, tx: &Tx) {
+    if app.nav_history.is_empty() || app.nav_pos + 1 >= app.nav_history.len() {
+        app.status = if app.nav_history.is_empty() {
+            t("还没有浏览过表").into()
+        } else {
+            t("已经是最新的表").into()
+        };
+        return;
+    }
+    app.nav_pos += 1;
+    let (db, schema, table) = app.nav_history[app.nav_pos].clone();
+    open_nav_entry(app, tx, &db, &schema, &table, "→");
+}
+
+/// The transient status that confirms where a history step landed. The same
+/// hint is kept in `nav_landing` so the status bar's context block (which a
+/// narrow screen cannot truncate) can show it too.
+fn set_nav_status(app: &mut App, arrow: &str, qualified: &str) {
+    if !arrow.is_empty() {
+        let hint = format!("{arrow} {qualified}");
+        app.status = hint.clone();
+        app.nav_landing = Some(hint);
+    }
 }
 
 fn open_recent(app: &mut App, tx: &Tx, idx: usize) {
@@ -16117,18 +16484,27 @@ fn open_recent(app: &mut App, tx: &Tx, idx: usize) {
         return;
     };
     app.recent_open = false;
+    open_nav_entry(app, tx, &db, &schema, &table, "");
+}
+
+/// Jump to a `(database, schema, table)` triple, switching database / schema
+/// first when needed. `arrow` (`←` / `→` / empty) prefixes the status hint so a
+/// history step confirms its landing; the recent-table overlay passes empty.
+fn open_nav_entry(app: &mut App, tx: &Tx, db: &str, schema: &str, table: &str, arrow: &str) {
     let db_changed = db != app.current_db();
+    let qualified = qualified_display(&fix_double_encoding(schema), &fix_double_encoding(table));
     // Same database and schema: the table is already listed, jump straight to it.
     if !db_changed && schema == app.schema {
-        if let Some(pos) = focus_table_in_sidebar(app, &table) {
+        if let Some(pos) = focus_table_in_sidebar(app, table) {
             app.table_list.select(Some(pos));
             open_table_data(app, tx);
+            set_nav_status(app, arrow, &qualified);
             return;
         }
     }
     if db_changed {
         let Some(pos) = app.databases.iter().position(|d| *d == db) else {
-            app.status = tf("✗ 数据库 {} 不在当前连接中", &[&(fix_double_encoding(&db))]);
+            app.status = tf("✗ 数据库 {} 不在当前连接中", &[&(fix_double_encoding(db))]);
             return;
         };
         app.db_index = pos;
@@ -16136,14 +16512,15 @@ fn open_recent(app: &mut App, tx: &Tx, idx: usize) {
         app.schemas.clear();
         app.schemas_db.clear();
     }
-    app.schema = schema.clone();
-    app.pending_open_table = Some((schema.clone(), table.clone()));
+    app.schema = schema.to_string();
+    app.pending_open_table = Some((schema.to_string(), table.to_string()));
     app.pending_table = None;
     app.status = tf(
         "切换到 {} 并打开 {} …",
-        &[&(fix_double_encoding(&db)), &(fix_double_encoding(&qualified_display(&schema, &table)))],
+        &[&(fix_double_encoding(db)), &qualified],
     );
     reload_tables(app, tx);
+    set_nav_status(app, arrow, &qualified);
 }
 
 // ── query-history panel (Alt-H) ──
@@ -23656,7 +24033,12 @@ fn spinner_frame(i: usize) -> char {
 /// Right-hand section of the status bar: context about the current result set.
 fn context_info(app: &App) -> String {
     let mut parts: Vec<String> = Vec::new();
-    // Mobile efficiency markers go first: on a phone the status bar is narrow,
+    // A back/forward landing goes first so even a 42-column status bar shows it
+    // (the block is truncated from the tail, not the head).
+    if let Some(hint) = &app.nav_landing {
+        parts.push(hint.clone());
+    }
+    // Mobile efficiency markers go next: on a phone the status bar is narrow,
     // and whether the wide table now fits is the single most useful fact.
     let mut fits: Option<usize> = None;
     if let Some(grid) = &app.grid {
@@ -23679,6 +24061,26 @@ fn context_info(app: &App) -> String {
     }
     if !app.col_hidden.is_empty() {
         parts.push(tf("隐藏列 {}", &[&(app.col_hidden.len())]));
+    }
+    // Narrow screens clip the grid columns, so the focused column's name goes
+    // here (early in the line, before the width cap can truncate it): after a
+    // header click or a pan the user still knows which column the cursor is on.
+    if app.term_w > 0 && app.term_w < 56 && app.grid_kind != GridKind::Columns {
+        if let Some(grid) = &app.grid {
+            let ncols = grid.columns.len();
+            if ncols > 0 && app.grid_frozen + app.vis_cols.max(1) < ncols {
+                if let Some(name) = grid.columns.get(app.col_cursor) {
+                    parts.push(tf(
+                        "列 {} {}/{}",
+                        &[
+                            &truncate_disp(&fix_double_encoding(name), 12),
+                            &(app.col_cursor + 1),
+                            &ncols,
+                        ],
+                    ));
+                }
+            }
+        }
     }
     // Redis multi-select count (batch operations target the selection).
     if app.backend_kind == Backend::Redis && !app.redis_selected.is_empty() {
@@ -24254,6 +24656,7 @@ fn footer_hints_ctx(ctx: FooterCtx) -> Vec<Hint> {
                 ("Enter", t("换行")),
                 ("↑↓", t("历史")),
                 ("Tab", t("下一区")),
+                ("%", t("配对括号")),
                 ("Esc", t("侧栏")),
             ],
             Focus::CmdInput => vec![
@@ -24418,7 +24821,11 @@ fn render_browse(f: &mut Frame, area: Rect, app: &mut App) {
         }
         render_main_area(f, v[1], app, editor_collapsed, results_collapsed, has_cmd);
     } else {
-        let sidebar_w = if mode == LayoutMode::Wide { 28 } else { 22 };
+        let sidebar_w = sidebar_width(
+            app.term_w,
+            mode,
+            sidebar_longest_name(&app.tables, &app.schema),
+        );
         let hz =
             Layout::horizontal([Constraint::Length(sidebar_w), Constraint::Min(20)]).split(area);
         app.rects.sidebar = hz[0];
@@ -25608,7 +26015,13 @@ fn render_sidebar(f: &mut Frame, area: Rect, app: &mut App) {
             } else {
                 Style::default()
             };
-            let disp = fix_double_encoding(&qualified_display(&app.schema, &t.name));
+            let disp_full = fix_double_encoding(&qualified_display(&app.schema, &t.name));
+            // The sidebar border (2) and the `▸ ` marker (2) are not available to
+            // the name; the VIEW badge takes one more cell.
+            let name_w = (area.width as usize)
+                .saturating_sub(4)
+                .saturating_sub(view.len());
+            let disp = truncate_table_name(&disp_full, name_w);
             let hit = style.add_modifier(Modifier::UNDERLINED);
             let mut spans = vec![Span::styled(marker.to_string(), style)];
             spans.extend(highlight_match_spans(&disp, &needle, style, hit));
@@ -28682,6 +29095,7 @@ const HELP_ROWS: &[(&str, &str)] = &[
     ("Alt-C / w", "紧凑列宽：窄屏自动共享列宽，宽表尽量一屏放下"),
     ("Alt-V / c", "列显隐：空格勾选显示的列（按 库.表 记住，跨会话）"),
     ("Alt-R / t", "最近浏览的 5 张表，Enter 直达（侧栏 t）"),
+    ("Alt-← →", "最近表后退 / 前进（浏览器语义，最多 50 张，跨库可用）"),
     ("Shift+← →", "列窗口横滚一列（任意区域，按住连滚）"),
     ("Ctrl-O", "SQL 片段收藏（DBX saved_sql_files）"),
     ("Ctrl-P", "EXPLAIN 当前 SQL（SQL 后端）"),
@@ -28789,6 +29203,10 @@ const HELP_ROWS: &[(&str, &str)] = &[
     ("Alt-F", "格式化当前 SQL（关键字大写 / 子句换行）；再按压缩为单行"),
     ("Ctrl-U", "撤销上一次 Alt-F 格式化"),
     ("Alt-/", "SQL 前缀补全（表名 T / 列名 C / 关键字 K，Tab 上屏）"),
+    ("%", "跳到配对括号（光标在 ()[]{} 上或旁；否则照常输入 %）"),
+    ("Ctrl-A / Ctrl-E", "行首 / 行尾（Home / End 同）"),
+    ("Ctrl-K / Ctrl-⇧K", "删至行尾（kill line）"),
+    ("Ctrl-W", "删前一个词"),
     ("— 全库搜索（Alt-G）—", ""),
     ("Alt-G", "全库搜索：扫描当前连接所有表的文本列（每表 LIMIT，大表跳过）"),
     ("↑ ↓ / Enter", "选择命中 / 跳到该表并定位到命中行"),
@@ -32338,6 +32756,261 @@ mod tests {
         );
         assert_eq!(app.editor_sql(), formatted);
         assert!(app.editor_undo.is_none());
+    }
+
+    /// `%` jumps to the matching bracket only when the cursor is on, or right
+    /// after, a bracket — anywhere else it is typed literally.
+    #[test]
+    fn percent_jumps_between_brackets_and_otherwise_types() {
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel::<OpResult>();
+        let mut app = test_app();
+        app.focus = Focus::Editor;
+        app.set_editor_text("SELECT f(a, (b)) FROM t");
+        // On the inner `(` at col 12 -> the inner `)` at col 14.
+        app.editor.move_cursor(CursorMove::Jump(0, 12));
+        key(&mut app, &tx, KeyEvent::new(KeyCode::Char('%'), KeyModifiers::NONE));
+        assert_eq!(app.editor.cursor(), (0, 14));
+        // On the closing bracket it jumps back (round trip).
+        key(&mut app, &tx, KeyEvent::new(KeyCode::Char('%'), KeyModifiers::NONE));
+        assert_eq!(app.editor.cursor(), (0, 12));
+        // Just after a bracket (`b` at 13) it still jumps from the bracket.
+        app.editor.move_cursor(CursorMove::Jump(0, 13));
+        key(&mut app, &tx, KeyEvent::new(KeyCode::Char('%'), KeyModifiers::NONE));
+        assert_eq!(app.editor.cursor(), (0, 14));
+        // Away from any bracket `%` is a normal character (LIKE patterns / modulo).
+        app.editor.move_cursor(CursorMove::Jump(0, 17));
+        key(&mut app, &tx, KeyEvent::new(KeyCode::Char('%'), KeyModifiers::NONE));
+        assert!(app.editor_sql().contains('%'), "{} ", app.editor_sql());
+    }
+
+    /// Brackets inside string literals / comments are invisible to `%`, so a `)`
+    /// in a literal never pairs with a `(` in code.
+    #[test]
+    fn percent_ignores_brackets_in_literals_and_comments() {
+        let mut app = test_app();
+        app.focus = Focus::Editor;
+        app.set_editor_text("f(')')");
+        app.editor.move_cursor(CursorMove::Jump(0, 1));
+        assert!(jump_matching_bracket(&mut app));
+        assert_eq!(app.editor.cursor(), (0, 5));
+        // An unbalanced bracket reports failure but is still consumed.
+        app.set_editor_text("(a");
+        app.editor.move_cursor(CursorMove::Jump(0, 0));
+        assert!(jump_matching_bracket(&mut app));
+        assert!(app.status.contains("配对"));
+        // No bracket under or beside the cursor: the key is not consumed.
+        app.set_editor_text("abc");
+        app.editor.move_cursor(CursorMove::Jump(0, 1));
+        assert!(!jump_matching_bracket(&mut app));
+    }
+
+    #[test]
+    fn text_offset_and_cursor_round_trip() {
+        let text = "SELECT a\nFROM t\nWHERE x = 1";
+        assert_eq!(text_offset(text, 0, 0), Some(0));
+        assert_eq!(text_offset(text, 0, 6), Some(6));
+        assert_eq!(text_offset(text, 1, 0), Some(9));
+        assert_eq!(text_offset(text, 2, 4), Some(20));
+        assert_eq!(text_offset(text, 9, 0), None);
+        for off in 0..text.chars().count() {
+            let (r, c) = offset_to_cursor(text, off);
+            assert_eq!(text_offset(text, r, c), Some(off));
+        }
+    }
+
+    #[test]
+    fn matching_bracket_pairs_nesting_and_kinds() {
+        assert_eq!(matching_bracket("SELECT (a + b)", 7), Some(13));
+        assert_eq!(matching_bracket("SELECT (a + b)", 13), Some(7));
+        assert_eq!(matching_bracket("f(a, (b))", 1), Some(8));
+        assert_eq!(matching_bracket("f(a, (b))", 5), Some(7));
+        assert_eq!(matching_bracket("a[b{c}d]", 1), Some(7));
+        assert_eq!(matching_bracket("(a", 0), None);
+        assert_eq!(matching_bracket("a)", 1), None);
+    }
+
+    /// tui-textarea's readline bindings must survive `browse_key`'s routing:
+    /// Ctrl-A / Ctrl-E move to the line ends, Ctrl-W deletes the previous word
+    /// and Ctrl-K (and Ctrl-Shift-K) kill to the end of the line.
+    #[test]
+    fn readline_line_editing_keys_reach_the_editor() {
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel::<OpResult>();
+        let mut app = test_app();
+        app.focus = Focus::Editor;
+        app.set_editor_text("aaa bbb ccc");
+        let k = |c: char, m: KeyModifiers| KeyEvent::new(KeyCode::Char(c), m);
+        key(&mut app, &tx, k('a', KeyModifiers::CONTROL));
+        assert_eq!(app.editor.cursor(), (0, 0));
+        key(&mut app, &tx, k('e', KeyModifiers::CONTROL));
+        assert_eq!(app.editor.cursor(), (0, 11));
+        key(&mut app, &tx, k('w', KeyModifiers::CONTROL));
+        assert_eq!(app.editor_sql(), "aaa bbb ");
+        app.set_editor_text("SELECT 1 -- tail");
+        app.editor.move_cursor(CursorMove::Jump(0, 8));
+        key(&mut app, &tx, k('k', KeyModifiers::CONTROL));
+        assert_eq!(app.editor_sql(), "SELECT 1");
+        app.set_editor_text("abc def");
+        app.editor.move_cursor(CursorMove::Jump(0, 4));
+        key(
+            &mut app,
+            &tx,
+            k('K', KeyModifiers::CONTROL | KeyModifiers::SHIFT),
+        );
+        assert_eq!(app.editor_sql(), "abc ");
+    }
+
+    /// Shift+arrow selection already works in the editor (tui-textarea's built-in
+    /// binding), and the pan gesture stays outside the text panes.
+    #[test]
+    fn shift_arrows_select_inside_the_editor() {
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel::<OpResult>();
+        let mut app = test_app();
+        app.focus = Focus::Editor;
+        app.set_editor_text("abc");
+        key(&mut app, &tx, KeyEvent::new(KeyCode::Left, KeyModifiers::SHIFT));
+        assert!(
+            app.editor.selection_range().is_some(),
+            "Shift+← starts a selection in the editor"
+        );
+    }
+
+    /// The back/forward history is browser-shaped: re-opening the entry the
+    /// cursor points at is a no-op, a fresh table truncates the forward branch,
+    /// and the depth is capped.
+    #[test]
+    fn nav_history_is_browser_style() {
+        let mut app = test_app();
+        let e = |t: &str| ("db".to_string(), "public".to_string(), t.to_string());
+        record_nav(&mut app, e("a"));
+        record_nav(&mut app, e("b"));
+        record_nav(&mut app, e("c"));
+        assert_eq!(app.nav_history.len(), 3);
+        assert_eq!(app.nav_pos, 2);
+        // Re-opening the current entry does not add a step.
+        record_nav(&mut app, e("c"));
+        assert_eq!(app.nav_history.len(), 3);
+        assert_eq!(app.nav_pos, 2);
+        // A back step moves the cursor; the forward branch is kept.
+        app.nav_pos -= 1;
+        record_nav(&mut app, e("b"));
+        assert_eq!(app.nav_history.len(), 3);
+        assert_eq!(app.nav_pos, 1);
+        // Opening a new table drops the forward branch (browser semantics).
+        record_nav(&mut app, e("d"));
+        assert_eq!(app.nav_history.len(), 3);
+        assert_eq!(app.nav_pos, 2);
+        let names: Vec<&str> = app.nav_history.iter().map(|e| e.2.as_str()).collect();
+        assert_eq!(names, vec!["a", "b", "d"]);
+        // The stack is bounded; the oldest steps fall off the front.
+        for i in 0..NAV_DEPTH * 2 {
+            record_nav(&mut app, ("db".into(), "public".into(), format!("t{i}")));
+        }
+        assert_eq!(app.nav_history.len(), NAV_DEPTH);
+        assert_eq!(app.nav_pos, NAV_DEPTH - 1);
+    }
+
+    #[test]
+    fn remember_recent_table_dedups_and_records_nav() {
+        let mut app = test_app();
+        remember_recent_table(&mut app, "shop", "public", "orders");
+        remember_recent_table(&mut app, "shop", "public", "items");
+        remember_recent_table(&mut app, "shop", "public", "orders");
+        assert_eq!(app.recent_tables.len(), 2);
+        assert_eq!(app.recent_tables[0].2, "orders");
+        // The history keeps the visit order, the repeat included.
+        assert_eq!(app.nav_history.len(), 3);
+        assert_eq!(app.nav_pos, 2);
+    }
+
+    /// Alt-← / Alt-→ are the history keys outside the text panes; the editor
+    /// keeps them local so editing SQL is never interrupted.
+    #[test]
+    fn alt_arrows_navigate_outside_the_editor() {
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel::<OpResult>();
+        let mut app = test_app();
+        app.focus = Focus::Sidebar;
+        key(&mut app, &tx, KeyEvent::new(KeyCode::Left, KeyModifiers::ALT));
+        assert!(app.status.contains("还没有浏览过表"), "{}", app.status);
+        key(&mut app, &tx, KeyEvent::new(KeyCode::Right, KeyModifiers::ALT));
+        assert!(app.status.contains("还没有浏览过表"), "{}", app.status);
+        // In the editor the arrow is left alone (it does not navigate).
+        app.focus = Focus::Editor;
+        app.status.clear();
+        key(&mut app, &tx, KeyEvent::new(KeyCode::Left, KeyModifiers::ALT));
+        assert!(app.status.is_empty(), "editor Alt-← stayed local: {}", app.status);
+        // The landing hint is both the status and the context-block entry, and
+        // any other key clears the latter.
+        set_nav_status(&mut app, "←", "public.orders");
+        assert_eq!(app.status, "← public.orders");
+        assert_eq!(app.nav_landing.as_deref(), Some("← public.orders"));
+        assert!(context_info(&app).starts_with("← public.orders"));
+        key(&mut app, &tx, KeyEvent::new(KeyCode::Char('x'), KeyModifiers::NONE));
+        assert!(app.nav_landing.is_none());
+    }
+
+    #[test]
+    fn sidebar_width_shrinks_toward_the_longest_name() {
+        // Wide screens keep the historical 28 columns.
+        assert_eq!(sidebar_width(120, LayoutMode::Wide, 40), 28);
+        assert_eq!(sidebar_width(110, LayoutMode::Wide, 8), 28);
+        // Mid screens shrink to the longest name, clamped to the readable floor.
+        assert_eq!(sidebar_width(60, LayoutMode::Mid, 6), SIDEBAR_MIN_W);
+        assert_eq!(sidebar_width(60, LayoutMode::Mid, 15), 19);
+        assert_eq!(sidebar_width(60, LayoutMode::Mid, 40), SIDEBAR_MID_W);
+        // The narrow layout stacks the sidebar, so it spans the terminal.
+        assert_eq!(sidebar_width(42, LayoutMode::Narrow, 15), 42);
+    }
+
+    #[test]
+    fn truncate_table_name_marks_the_cut() {
+        assert_eq!(truncate_table_name("orders", 10), "orders");
+        assert_eq!(truncate_table_name("public.accounts", 10), "public.ac~");
+        assert_eq!(truncate_table_name("public.accounts", 15), "public.accounts");
+        assert_eq!(truncate_table_name("x", 0), "");
+    }
+
+    /// The sidebar renders the `~` marker on a name it had to cut, so a clipped
+    /// identifier is obvious on a narrow screen.
+    #[test]
+    fn narrow_sidebar_marks_truncated_table_names() {
+        let mut app = test_app();
+        app.selected = Some(test_conn("mysql"));
+        app.backend_kind = Backend::Sql;
+        app.schema = String::new();
+        app.tables = vec![
+            table_info("a_very_long_table_name_that_cannot_fit", "TABLE"),
+            table_info("short", "TABLE"),
+        ];
+        app.tables_all = app.tables.clone();
+        app.table_list.select(Some(0));
+        app.term_w = 60;
+        let rows = draw(&mut app, 60, 22);
+        let joined = rows.join("\n");
+        assert!(
+            joined.contains("a_very_long_table~"),
+            "cut name is marked with ~: {joined}"
+        );
+        assert!(joined.contains("short"), "short name is untouched: {joined}");
+    }
+
+    /// A narrow grid that clips columns shows the focused column's name early in
+    /// the status line, where the width cap cannot truncate it away.
+    #[test]
+    fn narrow_status_bar_names_the_focused_column() {
+        let mut app = test_app();
+        app.term_w = 42;
+        app.grid_kind = GridKind::TableData;
+        app.set_grid(sample_grid());
+        app.grid_frozen = 1;
+        app.vis_cols = 2;
+        app.col_cursor = 3;
+        app.focus = Focus::Preview;
+        let info = context_info(&app);
+        assert!(info.contains("column_3"), "{info}");
+        assert!(info.contains("4/8"), "{info}");
+        // A wide terminal keeps its richer context and skips the name.
+        app.term_w = 120;
+        assert!(!context_info(&app).contains("column_3"));
     }
 
     fn history_row(id: &str, sql: &str) -> HistoryRow {
