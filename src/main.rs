@@ -1350,7 +1350,7 @@ fn generate_alter(diff: &TableDiff) -> String {
                 any = true;
             }
             DiffMark::Drop => {
-                out.push_str("-- ⚠ DROP COLUMN 会丢弃目标列的数据\n");
+                out.push_str(&format!("{}\n", t("-- ⚠ DROP COLUMN 会丢弃目标列的数据")));
                 out.push_str(&format!("ALTER TABLE {table} DROP COLUMN {q};\n"));
                 any = true;
             }
@@ -1376,8 +1376,11 @@ fn generate_alter(diff: &TableDiff) -> String {
                                 "ALTER TABLE {table} ALTER COLUMN {q} TYPE {ty};\n"
                             )),
                             None => out.push_str(&format!(
-                                "-- TODO 类型需人工确认: {q} {} → {}\n",
-                                sc.data_type, tc.data_type
+                                "{}\n",
+                                tf(
+                                    "-- TODO 类型需人工确认: {q} {} → {}",
+                                    &[&sc.data_type, &tc.data_type]
+                                )
                             )),
                         }
                     }
@@ -1430,7 +1433,7 @@ fn generate_alter(diff: &TableDiff) -> String {
             DiffMark::Add => {
                 let Some(sh) = &row.src_shape else { continue };
                 if sh.is_primary {
-                    out.push_str("-- TODO 目标缺少主键，请手工添加\n");
+                    out.push_str(&format!("{}\n", t("-- TODO 目标缺少主键，请手工添加")));
                 } else {
                     out.push_str(&format!(
                         "CREATE {}INDEX {} ON {table} ({});\n",
@@ -1444,7 +1447,7 @@ fn generate_alter(diff: &TableDiff) -> String {
             DiffMark::Drop => {
                 let Some(th) = &row.tgt_shape else { continue };
                 if th.is_primary {
-                    out.push_str("-- TODO 目标主键多余，请手工删除\n");
+                    out.push_str(&format!("{}\n", t("-- TODO 目标主键多余，请手工删除")));
                 } else if mysql {
                     out.push_str(&format!(
                         "DROP INDEX {} ON {table};\n",
@@ -1650,6 +1653,22 @@ fn norm_bool(s: &str) -> Option<bool> {
     }
 }
 
+/// Order two numeric spellings exactly. Integers are compared as `i128` first,
+/// so a `bigint` primary key beyond 2^53 — a snowflake id, say — is never
+/// collapsed to “equal” by the `/f64` rounding a decimal/float fallback would
+/// apply. Only a value that is not an integer (or overflows `i128`) falls back
+/// to `f64` and finally to a plain string comparison.
+fn cmp_numeric_text(a: &str, b: &str) -> std::cmp::Ordering {
+    let (a, b) = (a.trim(), b.trim());
+    if let (Ok(x), Ok(y)) = (a.parse::<i128>(), b.parse::<i128>()) {
+        return x.cmp(&y);
+    }
+    match (a.parse::<f64>(), b.parse::<f64>()) {
+        (Ok(x), Ok(y)) => x.partial_cmp(&y).unwrap_or(std::cmp::Ordering::Equal),
+        _ => a.cmp(b),
+    }
+}
+
 /// Compare two text values under a shared canonical type, so `1` == `1.0` in a
 /// numeric family and `true` == `1` for a boolean. Falls back to an exact
 /// comparison when a value does not parse for the family.
@@ -1664,10 +1683,7 @@ fn canon_cell_equal(a: &str, b: &str, canon: &str) -> bool {
             _ => a == b,
         },
         "int" | "bigint" | "smallint" | "tinyint" | "decimal" | "float" | "double" => {
-            match (a.trim().parse::<f64>(), b.trim().parse::<f64>()) {
-                (Ok(x), Ok(y)) => x == y,
-                _ => a == b,
-            }
+            cmp_numeric_text(a, b) == std::cmp::Ordering::Equal
         }
         "timestamp" => a.replace('T', " ") == b.replace('T', " "),
         _ => a == b,
@@ -1713,10 +1729,7 @@ fn cmp_pk_row(a: &[Val], b: &[Val], modes: &[PkCmp]) -> std::cmp::Ordering {
             (Val::Null, _) => Ordering::Less,
             (_, Val::Null) => Ordering::Greater,
             (Val::Text(x), Val::Text(y)) => match modes[i] {
-                PkCmp::Numeric => match (x.trim().parse::<f64>(), y.trim().parse::<f64>()) {
-                    (Ok(nx), Ok(ny)) => nx.partial_cmp(&ny).unwrap_or(Ordering::Equal),
-                    _ => x.cmp(y),
-                },
+                PkCmp::Numeric => cmp_numeric_text(x, y),
                 PkCmp::Text => x.cmp(y),
             },
         };
@@ -1812,14 +1825,12 @@ fn merge_next(
 
 /// A SQL literal for one cell, dialect-aware (a binary cell → hex literal).
 fn data_val_literal(v: &Val, data_type: Option<&str>, db_type: DatabaseType) -> String {
-    if let Val::Text(s) = v {
-        if data_type.map(is_binary_type).unwrap_or(false) {
-            if let Some(hex) = binary_hex_digits(s) {
-                return binary_literal(hex, Some(db_type.as_str()));
-            }
-        }
-    }
-    val_literal(v, data_type)
+    // Delegate to the shared insert-literal rules so a value is escaped the same
+    // way everywhere: binary columns become hex literals and PostgreSQL array
+    // cells (which arrive as JSON) become `ARRAY[…]`. The data-compare sync SQL
+    // and the transfer both used to fall back to a plain quoted string here,
+    // which produced invalid SQL for a `bytea` / `text[]` column.
+    insert_literal(v, data_type, Some(db_type.as_str()))
 }
 
 /// `(k1 > v1) OR (k1 = v1 AND k2 > v2) OR …` — portable keyset pagination that
@@ -7078,6 +7089,13 @@ async fn data_count(
     })
 }
 
+/// A keyset key tuple holding a NULL cannot drive a `>` / `<` seek (`k > NULL`
+/// is never true), so a caller about to build the next chunk must stop instead
+/// of issuing a query that returns nothing and looks like end-of-table.
+fn pk_tuple_has_null(tuple: &[Val]) -> bool {
+    tuple.iter().any(|v| matches!(v, Val::Null))
+}
+
 /// Feed one fetched chunk into a side stream: append the rows, mark the side
 /// exhausted on a short/empty chunk, and advance the keyset cursor to the
 /// chunk's last primary key (so the next refill reads the following rows).
@@ -7118,6 +7136,12 @@ async fn data_refill(
 ) -> Result<bool, String> {
     if stream.exhausted || !stream.buf.is_empty() {
         return Ok(false);
+    }
+    // A NULL in the last row's key cannot drive a `k > NULL` seek (`k > NULL` is
+    // never true), so the next chunk would read empty and the merge would look
+    // finished. Stop loudly instead of silently truncating the compare.
+    if stream.last.as_deref().is_some_and(pk_tuple_has_null) {
+        return Err(t("主键含 NULL，无法按主键继续分块对比").into());
     }
     let sql = build_data_select(
         cfg.db_type,
@@ -7378,6 +7402,13 @@ async fn transfer_read_chunk(
 ) -> Result<Vec<Vec<Val>>, String> {
     let cols = align.src_select();
     let sql = if align.keyset() {
+        // A NULL in the key of the last copied row makes `k > NULL` never true;
+        // the next read would come back empty and the copy would stop early,
+        // silently dropping the remaining rows. Abort with a clear reason
+        // instead (the batches already committed are kept).
+        if last.is_some_and(pk_tuple_has_null) {
+            return Err(t("源表主键含 NULL，无法按主键继续分块搬运").into());
+        }
         build_data_select(
             cfg.db_type,
             schema,
@@ -9657,7 +9688,7 @@ fn apply_op_result(app: &mut App, res: OpResult, tx: &Tx) {
             // A recent-table jump that had to switch database / schema first:
             // open the requested table now that the list has arrived.
             if let Some((schema, name)) = app.pending_open_table.take() {
-                if let Some(pos) = app.tables.iter().position(|t| t.name == name) {
+                if let Some(pos) = focus_table_in_sidebar(app, &name) {
                     app.table_list.select(Some(pos));
                     if app.schema != schema {
                         app.schema = schema;
@@ -10488,6 +10519,11 @@ fn apply_op_result(app: &mut App, res: OpResult, tx: &Tx) {
                 w.large_warn = Some(estimated);
                 w.error = None;
                 w.submitted = false;
+                // On the options step, put the cursor on “start” so the
+                // advertised “press Enter again” works with one key.
+                if w.step == TransferStep::Options {
+                    w.opt_list.select(Some(TRANSFER_OPTION_ROWS - 1));
+                }
             }
             app.status = tf(
                 "⚠ 源表预估至少 {} 行，再按 Enter 确认开始搬运（Esc 取消）",
@@ -10500,8 +10536,10 @@ fn apply_op_result(app: &mut App, res: OpResult, tx: &Tx) {
             }
             app.transfer = None;
             app.transfer_progress = None;
-            if report.moved > 0 {
-                // Rows were written, so cached counts may be stale.
+            if report.moved > 0 || report.created {
+                // Rows were written, or the target table was (re)created (an
+                // overwrite / create-only leaves a freshly empty table), so any
+                // cached COUNT(*) for it is stale.
                 app.count_cache.clear();
             }
             let moved = report.moved;
@@ -10859,6 +10897,65 @@ fn handle_event(app: &mut App, tx: &Tx, ev: Event) {
     }
 }
 
+/// Close every modal overlay and cancel / invalidate the background tasks that
+/// belonged to the outgoing backend. Called by Ctrl-L: the backend line switch
+/// must not leave a diff / transfer / search surface owning the keyboard over a
+/// different backend. Background tasks tied to the old backend are asked to stop
+/// and their reply generation is bumped so a late result cannot reopen a panel.
+fn reset_overlays_for_backend_switch(app: &mut App) {
+    // Global search.
+    app.search_cancel.store(true, Ordering::Relaxed);
+    app.search_gen = app.search_gen.wrapping_add(1);
+    app.search_open = false;
+    app.search_input = None;
+    app.search_running = false;
+    app.search_progress = None;
+    // Data compare.
+    app.data_cancel.store(true, Ordering::Relaxed);
+    app.data_diff_gen = app.data_diff_gen.wrapping_add(1);
+    app.data_diff = None;
+    app.data_where = None;
+    app.data_progress = None;
+    // Schema / database diff.
+    app.diff_gen = app.diff_gen.wrapping_add(1);
+    app.diff_picker = None;
+    app.diff = None;
+    app.db_diff = None;
+    // Data transfer (a running copy is aborted; committed batches stay).
+    if app.transfer.as_ref().is_some_and(|w| w.submitted) {
+        app.transfer_cancel.store(true, Ordering::Relaxed);
+    }
+    app.transfer_gen = app.transfer_gen.wrapping_add(1);
+    app.transfer = None;
+    app.transfer_progress = None;
+    app.transfer_report = None;
+    // Import / export / everything else that can own the keyboard.
+    app.import_prompt = None;
+    app.import_plan = None;
+    app.import_report = None;
+    app.export_open = false;
+    app.export_path = None;
+    app.export_pending = None;
+    app.recent_open = false;
+    app.col_picker_open = false;
+    app.snippet_open = false;
+    app.snippet_name = None;
+    app.completion = None;
+    app.table_prompt = None;
+    app.result_filter = None;
+    app.mongo_dialog = None;
+    app.redis_prompt = None;
+    app.help_open = false;
+    app.db_picker_open = false;
+    app.history_open = false;
+    app.history_filter = None;
+    app.file_load_prompt = None;
+    app.file_load_plan = None;
+    app.filter_prompt = None;
+    app.cell_popup = None;
+    app.row_popup = None;
+}
+
 fn key(app: &mut App, tx: &Tx, k: KeyEvent) {
     // global: quit. Ctrl-Shift-C is a *view* toggle (compact columns), so the
     // quit must not swallow it on terminals that report Shift as a modifier.
@@ -10910,19 +11007,19 @@ fn key(app: &mut App, tx: &Tx, k: KeyEvent) {
         app.struct_view = StructView::Fields;
         app.col_offset = 0;
         app.col_cursor = 0;
-        app.cell_popup = None;
-        app.row_popup = None;
-        app.filter_prompt = None;
-        app.help_open = false;
-        app.db_picker_open = false;
-        app.history_open = false;
-        app.history_filter = None;
-        app.search_open = false;
-        app.search_input = None;
-        app.search_cancel.store(true, Ordering::Relaxed);
-        app.file_load_prompt = None;
-        app.file_load_plan = None;
+        // Close every overlay and cancel the background tasks that belonged to
+        // the old backend; otherwise a diff / transfer / search surface opened
+        // on the SQL side kept owning the keyboard over the new backend.
+        reset_overlays_for_backend_switch(app);
         app.set_placeholder();
+        app.status = tf(
+            "命令模式：{}",
+            &[&match app.backend_kind {
+                Backend::Sql => "SQL",
+                Backend::Redis => "Redis",
+                Backend::Mongo => "MongoDB",
+            }],
+        );
         return;
     }
 
@@ -15168,7 +15265,7 @@ fn open_recent(app: &mut App, tx: &Tx, idx: usize) {
     let db_changed = db != app.current_db();
     // Same database and schema: the table is already listed, jump straight to it.
     if !db_changed && schema == app.schema {
-        if let Some(pos) = app.tables.iter().position(|t| t.name == table) {
+        if let Some(pos) = focus_table_in_sidebar(app, &table) {
             app.table_list.select(Some(pos));
             open_table_data(app, tx);
             return;
@@ -15534,10 +15631,12 @@ fn search_copy_hit(app: &mut App) {
 /// Enter on a hit: open its table and pre-filter to the row that matched.
 fn open_search_hit(app: &mut App, tx: &Tx, hit: &SearchHit) {
     let label = qualified_display(&hit.schema, &hit.table);
-    let found = app.tables.iter().position(|t| t.name == hit.table);
     app.search_open = false;
     app.search_input = None;
     app.pending_table_filter = Some(hit.filter.clone());
+    // The global search scans every table, so a leftover sidebar `/` filter that
+    // hides the hit must not turn the jump into "table not found".
+    let found = focus_table_in_sidebar(app, &hit.table);
     match found {
         Some(pos) => {
             app.table_list.select(Some(pos));
@@ -16406,7 +16505,7 @@ fn transfer_name_key(app: &mut App, k: KeyEvent) {
             w.opt_list.select(Some(0));
             w.step = TransferStep::Options;
             app.status =
-                t("数据搬运 ③ 模式与选项 · ↑↓ 选择 · Space/Enter 切换 · Enter 开搬 · Esc 返回")
+                t("数据搬运 ③ 模式与选项 · ↑↓ 选择 · Space/Enter 切换 · Enter 开搬 · Esc 取消")
                     .into();
         }
         _ => {
@@ -17248,6 +17347,22 @@ fn apply_table_filter(app: &mut App) {
         .unwrap_or(0)
         .min(n - 1);
     app.table_list.select(Some(sel));
+}
+
+/// Make `name` the selectable sidebar table and return its index in
+/// `app.tables`. An active `/` name filter that hides the table is cleared
+/// first: a global-search hit (`Alt-G`) or a recent-table jump is an explicit
+/// request for that table, so a leftover filter must not turn it into a bogus
+/// "table not found".
+fn focus_table_in_sidebar(app: &mut App, name: &str) -> Option<usize> {
+    if !app.tables.iter().any(|t| t.name == name)
+        && app.tables_all.iter().any(|t| t.name == name)
+    {
+        app.table_filter.clear();
+        app.table_prompt = None;
+        apply_table_filter(app);
+    }
+    app.tables.iter().position(|t| t.name == name)
 }
 
 fn open_table_filter(app: &mut App) {
@@ -24331,6 +24446,9 @@ fn render_diff_picker(f: &mut Frame, area: Rect, app: &mut App) {
         }
         None => fix_double_encoding(&app.current_db()),
     };
+    // Database mode compares whole databases, so its title names the source
+    // database rather than the focused table.
+    let src_db = fix_double_encoding(&app.current_db());
     let target_conn = app
         .diff_picker
         .as_ref()
@@ -24419,8 +24537,8 @@ fn render_diff_picker(f: &mut Frame, area: Rect, app: &mut App) {
                 &[&src, &mode_key],
             ),
             DiffPickMode::Database => tf(
-                " 结构对比 · 源库 {} · 选择目标 · {} · c 换连接 · Enter 对比 · Esc 关 ",
-                &[&src, &mode_key],
+                " 结构对比 · 源库 {} · 选择目标 · {} · Enter 对比 · Esc 关 ",
+                &[&src_db, &mode_key],
             ),
         }
     };
@@ -28097,6 +28215,48 @@ mod tests {
         assert!(app.import_report.is_some());
     }
 
+    /// A transfer that (re)creates the target table leaves it freshly empty even
+    /// when no row moved (create-only, or an overwrite of an empty source), so
+    /// the session COUNT(*) cache must drop too — not only when `moved > 0`.
+    #[test]
+    fn transfer_done_invalidates_the_count_cache_when_the_table_is_created() {
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel::<OpResult>();
+        let report = |moved: u64, created: bool| {
+            let mut rep = transfer_report_fixture();
+            rep.moved = moved;
+            rep.created = created;
+            rep.cancelled = false;
+            rep.aborted = None;
+            Box::new(rep)
+        };
+        let mut app = test_app();
+        app.count_cache.insert("d\u{1}\u{1}t\u{1}".into(), (5, false));
+        apply_op_result(
+            &mut app,
+            OpResult::TransferDone {
+                gen: 0,
+                report: report(0, true),
+            },
+            &tx,
+        );
+        assert!(
+            app.count_cache.is_empty(),
+            "stale COUNT(*) survived a create/overwrite"
+        );
+
+        // An append that moved nothing changed no rows, so the cache stays.
+        app.count_cache.insert("d\u{1}\u{1}t\u{1}".into(), (5, false));
+        apply_op_result(
+            &mut app,
+            OpResult::TransferDone {
+                gen: 0,
+                report: report(0, false),
+            },
+            &tx,
+        );
+        assert!(!app.count_cache.is_empty());
+    }
+
     #[test]
     fn grid_at_zero_height_does_not_panic() {
         // The results pane can be squeezed to zero rows on a tiny terminal; the
@@ -29457,13 +29617,83 @@ mod tests {
         )
         .unwrap();
         let q = Op::Query(
-            Box::new(cfg),
+            Box::new(cfg.clone()),
             "db".into(),
             "SELECT 1".into(),
             QUERY_MAX_ROWS,
         );
         assert_eq!(q.watchdog(), OP_WATCHDOG_SQL);
         assert!(OP_WATCHDOG_FALLBACK < OP_WATCHDOG_SQL);
+        // Every R30–R35 long-running task has its own generous tier instead of
+        // silently falling back to the 60 s default.
+        let cancel = Arc::new(AtomicBool::new(false));
+        let export = Op::Export(Box::new(ExportJob {
+            format: ExportFormat::Csv,
+            path: std::env::temp_dir().join("dbxt-watchdog.csv"),
+            grid: Grid::default(),
+            cfg: None,
+            schema: String::new(),
+            table: String::new(),
+            types: Vec::new(),
+        }));
+        assert_eq!(export.watchdog(), OP_WATCHDOG_EXPORT);
+        let import = Op::Import(Box::new(ImportJob {
+            cfg: Box::new(cfg.clone()),
+            db: "db".into(),
+            schema: String::new(),
+            table: "t".into(),
+            columns: Vec::new(),
+            rows: Vec::new(),
+            mode: ImportMode::Append,
+            on_error: ImportOnError::Stop,
+        }));
+        assert_eq!(import.watchdog(), OP_WATCHDOG_IMPORT);
+        let search = Op::GlobalSearch {
+            cfg: Box::new(cfg.clone()),
+            db: "db".into(),
+            schema: String::new(),
+            needle: "x".into(),
+            scan_limit: 1000,
+            max_rows: 1_000_000,
+            gen: 0,
+            cancel: cancel.clone(),
+        };
+        assert_eq!(search.watchdog(), OP_WATCHDOG_SEARCH);
+        let data_diff = Op::DataDiff {
+            src_cfg: Box::new(cfg.clone()),
+            src_db: "db".into(),
+            src_schema: String::new(),
+            src_table: "a".into(),
+            tgt_cfg: Box::new(cfg.clone()),
+            tgt_db: "db".into(),
+            tgt_schema: String::new(),
+            tgt_table: "b".into(),
+            where_input: String::new(),
+            gen: 0,
+            cancel: cancel.clone(),
+        };
+        assert_eq!(data_diff.watchdog(), OP_WATCHDOG_DATA_DIFF);
+        let transfer = Op::DataTransfer(Box::new(TransferJob {
+            src_cfg: Box::new(cfg.clone()),
+            src_db: "db".into(),
+            src_schema: String::new(),
+            src_table: "a".into(),
+            tgt_cfg: Box::new(cfg),
+            tgt_db: "db".into(),
+            tgt_schema: String::new(),
+            tgt_table: "b".into(),
+            mode: TransferMode::CreateAndCopy,
+            conflict: TransferConflict::Stop,
+            on_error: TransferOnError::Stop,
+            where_input: String::new(),
+            limit: None,
+            with_indexes: true,
+            with_auto_increment: true,
+            allow_large: false,
+            gen: 0,
+            cancel,
+        }));
+        assert_eq!(transfer.watchdog(), OP_WATCHDOG_TRANSFER);
     }
 
     #[test]
@@ -29526,9 +29756,13 @@ mod tests {
             "Ctrl-T",
             "Alt-/",
             "Alt-G",
+            "Alt-H",
+            "Alt-F",
             "Alt-L",
             "Alt-D",
+            "Shift+Alt-D",
             "Alt-K",
+            "Alt-T",
         ] {
             assert!(
                 keys.iter().any(|k| k.contains(needle)),
@@ -30173,6 +30407,62 @@ mod tests {
             insert_literal(&Val::Text("[1,2]".into()), Some("jsonb"), Some("postgres")),
             "'[1,2]'"
         );
+    }
+
+    /// R36 seam: the data-compare sync SQL and the transfer share the literal
+    /// rules with the copy-as-INSERT / export path, so a PostgreSQL array (JSON
+    /// cell) or a `bytea` cell is escaped correctly there too — not as a plain
+    /// quoted string the server rejects.
+    #[test]
+    fn data_literal_handles_arrays_and_binary_like_the_insert_path() {
+        let pg = parse_database_type("postgres").unwrap();
+        assert_eq!(
+            data_val_literal(&Val::Text("[\"admin\",\"beta\"]".into()), Some("text[]"), pg),
+            "ARRAY['admin', 'beta']::text[]"
+        );
+        assert_eq!(
+            data_val_literal(&Val::Text("0xdeadbeef".into()), Some("bytea"), pg),
+            "'\\xdeadbeef'::bytea"
+        );
+        // A raw (non-0x) binary value falls back to a hex of its bytes, like the
+        // insert / export path, instead of a quoted control-character string.
+        assert_eq!(
+            data_val_literal(&Val::Text("\u{0}\u{1}A".into()), Some("bytea"), pg),
+            "'\\x000141'::bytea"
+        );
+        // The sync script for a changed array column carries the ARRAY literal.
+        let src = vec![
+            col_full("id", "int", false, None, None, true),
+            col_full("tags", "text[]", true, None, None, false),
+        ];
+        let tgt = src.clone();
+        let align = data_align(src, tgt, &["id"], &["id"], false).unwrap();
+        let row = compare_data_row(
+            &align,
+            &[Val::Text("1".into()), Val::Text("[\"a\"]".into())],
+            &[Val::Text("1".into()), Val::Text("[\"b\"]".into())],
+        )
+        .unwrap();
+        let cmp = DataCompare {
+            src_label: "a".into(),
+            tgt_label: "b".into(),
+            src_db_type: pg,
+            tgt_schema: "public".into(),
+            tgt_table: "b".into(),
+            tgt_db_type: pg,
+            src_count: Some(1),
+            tgt_count: Some(1),
+            filter: String::new(),
+            align,
+            rows: vec![row],
+            only_src: 0,
+            only_tgt: 0,
+            differing: 1,
+            truncated: false,
+            cancelled: false,
+        };
+        let sql = generate_data_sync(&cmp);
+        assert!(sql.contains("ARRAY['a']::text[]"), "{sql}");
     }
 
     #[test]
@@ -30835,6 +31125,79 @@ mod tests {
             &tx,
         );
         assert_eq!(app.tables_all.len(), 2);
+    }
+
+    /// R36 seam: an `Alt-G` hit (or a recent-table jump) must still land when
+    /// the sidebar `/` filter hides the table — the global search scans every
+    /// table, so a leftover filter must not report “table not found”.
+    #[test]
+    fn sidebar_jump_reveals_a_table_hidden_by_the_name_filter() {
+        let table = |name: &str| TableInfo {
+            name: name.into(),
+            table_type: "TABLE".into(),
+            comment: None,
+            parent_schema: None,
+            parent_name: None,
+        };
+        let mut app = test_app();
+        app.tables_all = vec![table("orders"), table("users")];
+        app.table_filter = "users".into();
+        apply_table_filter(&mut app);
+        // The active filter hides `orders`.
+        assert_eq!(app.tables.len(), 1);
+        assert!(app.tables.iter().all(|t| t.name == "users"));
+        // Jumping to the hit clears it and returns the now-visible index.
+        assert_eq!(focus_table_in_sidebar(&mut app, "orders"), Some(0));
+        assert!(app.table_filter.is_empty());
+        assert_eq!(app.tables.len(), 2);
+        // A genuinely absent table leaves the filter untouched.
+        app.table_filter = "users".into();
+        apply_table_filter(&mut app);
+        assert_eq!(focus_table_in_sidebar(&mut app, "missing"), None);
+        assert_eq!(app.table_filter, "users");
+    }
+
+    /// R36 seam: Ctrl-L switches the backend line, so every modal opened on the
+    /// old backend must be closed and its background task cancelled / invalidated
+    /// — otherwise a SQL diff or transfer wizard kept owning the keyboard over
+    /// the Redis / Mongo view.
+    #[test]
+    fn backend_switch_closes_every_overlay_and_cancels_its_task() {
+        let mut app = test_app();
+        app.search_open = true;
+        app.search_running = true;
+        app.data_where = Some(TextArea::default());
+        app.data_diff = Some(Box::new(DataDiffState {
+            result: data_cmp_fixture(),
+            tab: DataTab::Summary,
+            list: ListState::default(),
+            scroll: 0,
+            sync_sql: String::new(),
+        }));
+        let mut w = transfer_wizard_fixture();
+        w.submitted = true;
+        app.transfer = Some(Box::new(w));
+        app.help_open = true;
+        app.file_load_prompt = Some(TextArea::default());
+        app.recent_open = true;
+        app.result_filter = Some(TextArea::default());
+        let search_gen = app.search_gen;
+        let diff_gen = app.data_diff_gen;
+        let transfer_gen = app.transfer_gen;
+
+        reset_overlays_for_backend_switch(&mut app);
+
+        assert!(app.search_cancel.load(Ordering::Relaxed));
+        assert!(app.data_cancel.load(Ordering::Relaxed));
+        assert!(app.transfer_cancel.load(Ordering::Relaxed));
+        assert_ne!(app.search_gen, search_gen);
+        assert_ne!(app.data_diff_gen, diff_gen);
+        assert_ne!(app.transfer_gen, transfer_gen);
+        assert!(!app.search_open && !app.search_running);
+        assert!(app.data_diff.is_none() && app.data_where.is_none());
+        assert!(app.transfer.is_none() && app.transfer_report.is_none());
+        assert!(!app.help_open && !app.recent_open);
+        assert!(app.file_load_prompt.is_none() && app.result_filter.is_none());
     }
 
     #[test]
@@ -32815,7 +33178,7 @@ mod tests {
             scroll: 0,
             alter: String::new(),
         }));
-        let sizes = [(42u16, 22u16), (120, 40), (20, 6), (1, 1)];
+        let sizes = [(40u16, 12u16), (42, 22), (120, 40), (250, 70), (20, 6), (1, 1)];
         for (w, h) in sizes {
             draw(&mut app, w, h);
         }
@@ -33005,6 +33368,41 @@ mod tests {
         assert_eq!(align.tgt_select(), vec!["id".to_string(), "NAME".to_string()]);
     }
 
+    /// R36 seam: when the source PK is `(a, b)` and the target's primary index
+    /// lists `(b, a)`, the aligned order follows the *source* key order, and the
+    /// SELECT / ORDER BY / keyset seek stay consistent on each side.
+    #[test]
+    fn composite_pk_order_mismatch_still_aligns_by_name() {
+        let src = vec![
+            col_full("a", "int", false, None, None, true),
+            col_full("b", "int", false, None, None, true),
+            col_full("v", "text", true, None, None, false),
+        ];
+        let tgt = src.clone();
+        let align = data_align(src, tgt, &["a", "b"], &["b", "a"], false).unwrap();
+        assert_eq!(align.pk_len, 2);
+        assert_eq!(align.src_pk_names(), vec!["a".to_string(), "b".to_string()]);
+        assert_eq!(align.tgt_pk_names(), vec!["a".to_string(), "b".to_string()]);
+        // The composite seek predicate uses the aligned order, matching ORDER BY.
+        let dt = parse_database_type("mysql").unwrap();
+        let sql = build_data_select(
+            dt,
+            "",
+            "t",
+            &align.src_select(),
+            &align.src_pk_names(),
+            &align.src_types(),
+            "",
+            Some(&[Val::Text("1".into()), Val::Text("2".into())]),
+            DATA_CHUNK,
+        );
+        assert!(sql.contains("ORDER BY `a`, `b`"), "{sql}");
+        assert!(sql.contains("(`a` > 1) OR (`a` = 1 AND `b` > 2)"), "{sql}");
+        // Row values line up positionally: the pk tuple is (a, b) on both sides.
+        let s = [Val::Text("1".into()), Val::Text("2".into()), Val::Text("x".into())];
+        assert_eq!(&s[..align.pk_len], &[Val::Text("1".into()), Val::Text("2".into())]);
+    }
+
     #[test]
     fn data_align_rejects_tables_without_pk() {
         let no_pk = vec![col_full("a", "int", false, None, None, false)];
@@ -33160,6 +33558,49 @@ mod tests {
         assert!(text.contains("[name]"), "{text}");
     }
 
+    /// R36 seam: the generated sync SQL must survive a value with a quote, a
+    /// backslash, a newline and an emoji without breaking the literal.
+    #[test]
+    fn data_sync_sql_escapes_hostile_values() {
+        let src = vec![
+            col_full("id", "int", false, None, None, true),
+            col_full("name", "text", true, None, None, false),
+        ];
+        let tgt = src.clone();
+        let align = data_align(src, tgt, &["id"], &["id"], false).unwrap();
+        let hostile = "O'Brien\nback\\slash 😀";
+        let row = only_data_row(
+            &align,
+            &[Val::Text("7".into()), Val::Text(hostile.into())],
+            RowMark::OnlySrc,
+        );
+        let dt = parse_database_type("mysql").unwrap();
+        let cmp = DataCompare {
+            src_label: "a".into(),
+            tgt_label: "b".into(),
+            src_db_type: dt,
+            tgt_schema: String::new(),
+            tgt_table: "b".into(),
+            tgt_db_type: dt,
+            src_count: Some(1),
+            tgt_count: Some(0),
+            filter: String::new(),
+            align,
+            rows: vec![row],
+            only_src: 1,
+            only_tgt: 0,
+            differing: 0,
+            truncated: false,
+            cancelled: false,
+        };
+        let sql = generate_data_sync(&cmp);
+        // The single quote is doubled, the backslash doubled, and the newline /
+        // emoji stay inside the single literal without escaping.
+        assert!(sql.contains("'O''Brien"), "{sql}");
+        assert!(sql.contains("back\\\\slash"), "{sql}");
+        assert!(sql.contains("😀"), "{sql}");
+    }
+
     #[test]
     fn data_cross_dialect_value_comparison() {
         // Boolean family: true == 1, false == 0.
@@ -33188,6 +33629,64 @@ mod tests {
         let align = data_align(src, tgt, &["g"], &["g"], true).unwrap();
         assert!(align.cols[0].unknown_type);
         assert!(align.cols[0].canon.is_none());
+    }
+
+    /// R36 seam: a `bigint` key beyond `f64`'s exact range (2^53) must not
+    /// collapse two adjacent ids to “equal”. Snowflake ids live here, so the
+    /// old `f64`-only comparison could silently misalign the whole merge.
+    #[test]
+    fn numeric_comparison_keeps_bigint_precision() {
+        use std::cmp::Ordering;
+        assert!(!canon_cell_equal(
+            "9007199254740993",
+            "9007199254740992",
+            "bigint"
+        ));
+        assert!(canon_cell_equal(
+            "9007199254740992",
+            "9007199254740992",
+            "bigint"
+        ));
+        assert!(!canon_cell_equal(
+            "9223372036854775807",
+            "9223372036854775806",
+            "bigint"
+        ));
+        assert_eq!(
+            cmp_numeric_text("9007199254740993", "9007199254740992"),
+            Ordering::Greater
+        );
+        assert_eq!(
+            cmp_numeric_text("9223372036854775807", "9223372036854775806"),
+            Ordering::Greater
+        );
+        // Decimals still normalise through the float fallback.
+        assert_eq!(cmp_numeric_text("1.0", "1"), Ordering::Equal);
+        assert!(canon_cell_equal("1.50", "1.5", "decimal(10,2)"));
+        // The merge ordering keeps the exact distinction too.
+        let modes = vec![PkCmp::Numeric];
+        let a = vec![Val::Text("9007199254740993".into())];
+        let b = vec![Val::Text("9007199254740992".into())];
+        assert_eq!(cmp_pk_row(&a, &b, &modes), Ordering::Greater);
+    }
+
+    /// R36 seam: a NULL in a keyset tuple makes `k > NULL` never true, so the
+    /// next chunk read would come back empty and look like end-of-table. The
+    /// compare / transfer guards must detect it before issuing that query.
+    #[test]
+    fn null_primary_key_is_detected_before_a_keyset_seek() {
+        assert!(pk_tuple_has_null(&[Val::Text("1".into()), Val::Null]));
+        assert!(!pk_tuple_has_null(&[Val::Text("1".into()), Val::Text(String::new())]));
+        assert!(!pk_tuple_has_null(&[]));
+        // The data-compare predicate renders a NULL key as SQL NULL (never
+        // true), which is exactly why the guard exists.
+        let pred = keyset_predicate(
+            &["a".to_string()],
+            &["int".to_string()],
+            &[Val::Null],
+            DatabaseType::Mysql,
+        );
+        assert!(pred.to_ascii_uppercase().contains("NULL"), "{pred}");
     }
 
     #[test]
@@ -33303,7 +33802,7 @@ mod tests {
             scroll: 0,
             sync_sql: String::new(),
         }));
-        let sizes = [(42u16, 22u16), (120, 40), (20, 6), (1, 1)];
+        let sizes = [(40u16, 12u16), (42, 22), (120, 40), (250, 70), (20, 6), (1, 1)];
         for tab in [
             DataTab::Summary,
             DataTab::OnlySrc,
@@ -33633,7 +34132,7 @@ mod tests {
         let mut app = test_app();
         app.selected = Some(test_conn("mysql"));
         app.transfer = Some(Box::new(transfer_wizard_fixture()));
-        let sizes = [(42u16, 22u16), (120, 40), (20, 6), (1, 1)];
+        let sizes = [(40u16, 12u16), (42, 22), (120, 40), (250, 70), (20, 6), (1, 1)];
         for step in [
             TransferStep::Connection,
             TransferStep::Name,
@@ -33668,6 +34167,29 @@ mod tests {
         for (w, h) in sizes {
             draw(&mut app, w, h);
         }
+    }
+
+    #[test]
+    fn transfer_large_warn_points_at_the_start_row() {
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel::<OpResult>();
+        let mut app = test_app();
+        // The fixture is on the options step with the cursor on row 0.
+        app.transfer = Some(Box::new(transfer_wizard_fixture()));
+        app.transfer_gen = 0;
+        apply_op_result(
+            &mut app,
+            OpResult::TransferNeedsConfirm {
+                gen: 0,
+                estimated: 2_000_000,
+            },
+            &tx,
+        );
+        let w = app.transfer.as_ref().unwrap();
+        assert_eq!(w.large_warn, Some(2_000_000));
+        assert!(!w.submitted);
+        // The cursor sits on “start”, so the advertised “press Enter again” is
+        // a single key.
+        assert_eq!(w.opt_list.selected(), Some(TRANSFER_OPTION_ROWS - 1));
     }
 
     #[test]
