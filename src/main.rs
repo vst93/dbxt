@@ -129,6 +129,23 @@ const DATA_MAX_DIFF_ROWS: usize = 5000;
 /// A data compare is many sequential bounded queries, so the last-resort
 /// watchdog is generous (every statement still has its own driver timeout).
 const OP_WATCHDOG_DATA_DIFF: Duration = Duration::from_secs(900);
+/// Rows read per source chunk during a data transfer (`Alt-T`). Reuses the
+/// keyset paging of R34; a chunk is then written as one or more `INSERT`
+/// batches so the target transaction stays small.
+const TRANSFER_CHUNK: usize = 1000;
+/// Rows per transactional `INSERT` batch on the target. Matches the CSV-import
+/// chunk size, so a mid-batch failure rolls back at most this many rows.
+const TRANSFER_INSERT_BATCH: usize = 500;
+/// A transfer whose source estimate reaches this many rows warns for a second
+/// confirmation before it starts (a full-table copy should be deliberate).
+const TRANSFER_WARN_ROWS: u64 = 1_000_000;
+/// The bounded `COUNT(*)` probes at most this many rows: once it is reached the
+/// estimate is reported as "at least this many" rather than scanning a whole
+/// huge table just to warn.
+const TRANSFER_COUNT_PROBE: u64 = 1_000_001;
+/// A data transfer is a long sequence of chunk reads and batched writes; the
+/// last-resort watchdog is generous (each statement keeps its 60 s timeout).
+const OP_WATCHDOG_TRANSFER: Duration = Duration::from_secs(3600);
 
 // ─── pages & focus ───────────────────────────────────────────────────────────
 
@@ -2075,6 +2092,771 @@ fn data_diff_summary_text(cmp: &DataCompare) -> String {
                 ));
             }
         }
+    }
+    out
+}
+
+// ─── data transfer (Alt-T) ───────────────────────────────────────────────────
+//
+// Copies one table's structure and/or rows from the focused connection to
+// another SQL connection (possibly a different dialect). Like the diff
+// features, everything below the async op is pure data so type mapping, the
+// `CREATE TABLE` generator, the option state machine and the breakpoint report
+// are unit-testable without a backend.
+
+/// What the transfer creates on the target.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum TransferMode {
+    /// Create the table (structure + optional indexes) and copy every row.
+    CreateAndCopy,
+    /// Create the table only; no rows are read.
+    CreateOnly,
+    /// Insert into an existing table (`INSERT` only, no DDL).
+    Append,
+}
+
+impl TransferMode {
+    fn label(self) -> &'static str {
+        match self {
+            TransferMode::CreateAndCopy => "建表+搬数据",
+            TransferMode::CreateOnly => "仅建表",
+            TransferMode::Append => "插入已有表",
+        }
+    }
+    fn next(self) -> Self {
+        match self {
+            TransferMode::CreateAndCopy => TransferMode::CreateOnly,
+            TransferMode::CreateOnly => TransferMode::Append,
+            TransferMode::Append => TransferMode::CreateAndCopy,
+        }
+    }
+}
+
+/// What to do when the target table already exists.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum TransferConflict {
+    /// Stop with an error — never silently overwrite (the default).
+    Stop,
+    /// `DROP TABLE` first, then recreate (must pass a red confirmation).
+    Drop,
+}
+
+impl TransferConflict {
+    fn label(self) -> &'static str {
+        match self {
+            TransferConflict::Stop => "报错停下",
+            TransferConflict::Drop => "覆盖（先 DROP）",
+        }
+    }
+    fn next(self) -> Self {
+        match self {
+            TransferConflict::Stop => TransferConflict::Drop,
+            TransferConflict::Drop => TransferConflict::Stop,
+        }
+    }
+}
+
+/// How a failing row is handled during the copy.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum TransferOnError {
+    /// Stop and report the row number (the default).
+    Stop,
+    /// Skip the bad row and keep going.
+    Skip,
+}
+
+impl TransferOnError {
+    fn label(self) -> &'static str {
+        match self {
+            TransferOnError::Stop => "停止报行号",
+            TransferOnError::Skip => "跳过继续",
+        }
+    }
+    fn next(self) -> Self {
+        match self {
+            TransferOnError::Stop => TransferOnError::Skip,
+            TransferOnError::Skip => TransferOnError::Stop,
+        }
+    }
+}
+
+/// The wizard's three content steps plus the red overwrite confirmation.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum TransferStep {
+    /// ① target connection (source is the focused table's connection).
+    Connection,
+    /// ② target database / schema / table name (default = same name).
+    Name,
+    /// ③ mode and options.
+    Options,
+    /// Red layer shown when overwrite was chosen; Enter applies on a commit.
+    Confirm,
+}
+
+/// One aligned source → target column of the copy.
+#[derive(Clone, Debug)]
+struct TransferCol {
+    src_name: String,
+    tgt_name: String,
+    src_type: String,
+    /// Declared type on the target, already mapped to its dialect (used for
+    /// literal escaping and shown in the wizard).
+    tgt_type: String,
+}
+
+/// The columns a transfer writes, plus where the primary key lives inside the
+/// selected source columns (so a keyset cursor can be advanced).
+#[derive(Clone, Debug)]
+struct TransferAlign {
+    cols: Vec<TransferCol>,
+    /// Positions, in `cols`, of the primary-key columns (empty when the key is
+    /// not fully present → the copy falls back to OFFSET paging).
+    pk_idx: Vec<usize>,
+    /// The primary key names in key order (source spelling).
+    pk_names: Vec<String>,
+    /// The primary key types in key order.
+    pk_types: Vec<String>,
+}
+
+impl TransferAlign {
+    fn src_select(&self) -> Vec<String> {
+        self.cols.iter().map(|c| c.src_name.clone()).collect()
+    }
+    fn keyset(&self) -> bool {
+        !self.pk_idx.is_empty() && self.pk_idx.len() == self.pk_names.len()
+    }
+    /// The primary-key values carried by one source row (for the keyset cursor).
+    fn pk_of(&self, row: &[Val]) -> Option<Vec<Val>> {
+        if !self.keyset() {
+            return None;
+        }
+        Some(
+            self.pk_idx
+                .iter()
+                .map(|i| row.get(*i).cloned().unwrap_or(Val::Null))
+                .collect(),
+        )
+    }
+}
+
+/// Build the write alignment for a transfer.
+///
+/// * `create` — the table is being created, so the target columns are the source
+///   columns with their types mapped to the target dialect.
+/// * append — the target already exists, so only columns present on **both**
+///   sides are written, matched case-insensitively by name and named with the
+///   target spelling.
+fn build_transfer_align(
+    src_cols: &[ColumnInfo],
+    tgt_cols: &[ColumnInfo],
+    src_pk: &[String],
+    src_dt: DatabaseType,
+    tgt_dt: DatabaseType,
+    create: bool,
+) -> Result<TransferAlign, String> {
+    let cross = src_dt != tgt_dt;
+    let mut cols: Vec<TransferCol> = Vec::new();
+    if create {
+        for sc in src_cols {
+            let tgt_type = transfer_target_type(sc, tgt_dt, cross, true);
+            cols.push(TransferCol {
+                src_name: sc.name.clone(),
+                tgt_name: sc.name.clone(),
+                src_type: sc.data_type.clone(),
+                tgt_type,
+            });
+        }
+    } else {
+        for sc in src_cols {
+            let Some(tc) = find_column(tgt_cols, &sc.name) else {
+                continue;
+            };
+            let tgt_type = if cross {
+                tc.data_type.clone()
+            } else {
+                sc.data_type.clone()
+            };
+            cols.push(TransferCol {
+                src_name: sc.name.clone(),
+                tgt_name: tc.name.clone(),
+                src_type: sc.data_type.clone(),
+                tgt_type,
+            });
+        }
+    }
+    if cols.is_empty() {
+        return Err(t("没有可写入的列（源与目标没有同名列）").into());
+    }
+    // Locate the primary key inside the selected source columns.
+    let mut pk_idx = Vec::new();
+    let mut pk_names = Vec::new();
+    let mut pk_types = Vec::new();
+    for key in src_pk {
+        if let Some(pos) = cols.iter().position(|c| col_key(&c.src_name) == col_key(key)) {
+            pk_idx.push(pos);
+            pk_names.push(cols[pos].src_name.clone());
+            pk_types.push(cols[pos].src_type.clone());
+        } else {
+            // A key column was not selected (append alignment); disable keyset.
+            pk_idx.clear();
+            pk_names.clear();
+            pk_types.clear();
+            break;
+        }
+    }
+    Ok(TransferAlign {
+        cols,
+        pk_idx,
+        pk_names,
+        pk_types,
+    })
+}
+
+/// True for a column the server fills itself with an increasing value — MySQL
+/// `AUTO_INCREMENT`, or a PostgreSQL `serial` column.
+fn column_is_auto_increment(c: &ColumnInfo) -> bool {
+    let extra = c.extra.as_deref().unwrap_or("").trim().to_ascii_lowercase();
+    if extra.contains("auto_increment") {
+        return true;
+    }
+    if matches!(extra.as_str(), "serial" | "bigserial" | "smallserial") {
+        return true;
+    }
+    c.column_default
+        .as_deref()
+        .map(|d| d.trim().to_ascii_lowercase().starts_with("nextval("))
+        .unwrap_or(false)
+}
+
+/// The declared type a source column gets on the target. A cross-dialect type is
+/// mapped through the R32 table. An auto-increment column keeps its counter on a
+/// **same-dialect** PostgreSQL copy (`serial` family); on a cross-dialect copy it
+/// stays a plain integer, because a freshly created sequence would not know the
+/// copied IDs (`AUTO_INCREMENT` on a MySQL target is still emitted by
+/// [`transfer_column_def`]).
+fn transfer_target_type(
+    c: &ColumnInfo,
+    tgt_dt: DatabaseType,
+    cross: bool,
+    with_auto_increment: bool,
+) -> String {
+    let src = c.data_type.trim();
+    if with_auto_increment
+        && !cross
+        && column_is_auto_increment(c)
+        && is_postgres_family(tgt_dt.as_str())
+    {
+        return match base_type(src).as_str() {
+            "bigint" | "int8" | "int64" => "bigserial".to_string(),
+            "smallint" | "int2" | "int16" => "smallserial".to_string(),
+            _ => "serial".to_string(),
+        };
+    }
+    if cross {
+        map_type_to_dialect(src, tgt_dt).unwrap_or_else(|| src.to_string())
+    } else {
+        src.to_string()
+    }
+}
+
+/// One column definition inside a generated `CREATE TABLE`.
+fn transfer_column_def(
+    c: &ColumnInfo,
+    tgt_dt: DatabaseType,
+    cross: bool,
+    with_auto_increment: bool,
+) -> String {
+    let mysql = is_mysql_family(tgt_dt.as_str());
+    let auto = with_auto_increment && column_is_auto_increment(c);
+    let mut parts = vec![quote_table_identifier(Some(tgt_dt), &c.name)];
+    parts.push(transfer_target_type(c, tgt_dt, cross, with_auto_increment));
+    if mysql {
+        // Charset/collation only carry meaning for a MySQL target; skip them on
+        // a cross-dialect copy (the target's database default is the sane
+        // choice) but keep them when both sides are MySQL.
+        if !cross {
+            if let Some(cs) = c.character_set.as_deref().map(str::trim).filter(|v| !v.is_empty()) {
+                parts.push(format!("CHARACTER SET {cs}"));
+            }
+            if let Some(col) = c.collation.as_deref().map(str::trim).filter(|v| !v.is_empty()) {
+                parts.push(format!("COLLATE {col}"));
+            }
+        }
+    }
+    if !c.is_nullable {
+        parts.push("NOT NULL".to_string());
+    }
+    if let Some(d) = c
+        .column_default
+        .as_deref()
+        .map(str::trim)
+        .filter(|v| !v.is_empty())
+    {
+        // A server-generated default (`nextval(...)`) has no meaning once the
+        // column is re-created (serial / auto-increment covers it).
+        let server_default = d.to_ascii_lowercase().starts_with("nextval(");
+        if !(server_default && auto) {
+            parts.push(format!("DEFAULT {}", render_default(d, tgt_dt, cross)));
+        }
+    }
+    if mysql && auto {
+        parts.push("AUTO_INCREMENT".to_string());
+    }
+    if mysql {
+        if let Some(cm) = c.comment.as_deref().map(str::trim).filter(|v| !v.is_empty()) {
+            parts.push(format!("COMMENT {}", sql_literal(cm)));
+        }
+    }
+    parts.join(" ")
+}
+
+/// Generate the `CREATE TABLE` script (structure + primary key + optional
+/// secondary indexes) that mirrors the source table on the target dialect.
+/// Returns the script plus non-fatal warnings for the summary overlay.
+#[allow(clippy::too_many_arguments)]
+fn generate_transfer_create(
+    src_cols: &[ColumnInfo],
+    src_indexes: &[IndexInfo],
+    src_pk: &[String],
+    src_dt: DatabaseType,
+    tgt_dt: DatabaseType,
+    tgt_schema: &str,
+    tgt_table: &str,
+    with_indexes: bool,
+    with_auto_increment: bool,
+) -> Result<(String, Vec<String>), String> {
+    if src_cols.is_empty() {
+        return Err(t("源表没有列，无法建表").into());
+    }
+    let cross = src_dt != tgt_dt;
+    let pg = is_postgres_family(tgt_dt.as_str());
+    let tref = table_ref(tgt_dt, tgt_schema, tgt_table);
+    let mut warnings: Vec<String> = Vec::new();
+    let mut lines: Vec<String> = Vec::new();
+
+    let mut defs: Vec<String> = src_cols
+        .iter()
+        .map(|c| transfer_column_def(c, tgt_dt, cross, with_auto_increment))
+        .collect();
+    if !src_pk.is_empty() {
+        let keys: Vec<String> = src_pk
+            .iter()
+            .filter(|k| src_cols.iter().any(|c| col_key(&c.name) == col_key(k)))
+            .map(|k| quote_table_identifier(Some(tgt_dt), k))
+            .collect();
+        if !keys.is_empty() {
+            defs.push(format!("PRIMARY KEY ({})", keys.join(", ")));
+        }
+    } else {
+        warnings.push(t("源表没有主键：搬运将退回 OFFSET 分页，顺序可能不稳定").to_string());
+    }
+    lines.push(format!(
+        "CREATE TABLE {tref} (\n  {}\n);",
+        defs.join(",\n  ")
+    ));
+
+    // PostgreSQL keeps comments out of the DDL, as separate statements.
+    if pg {
+        for c in src_cols {
+            if let Some(cm) = c.comment.as_deref().map(str::trim).filter(|v| !v.is_empty()) {
+                lines.push(format!(
+                    "COMMENT ON COLUMN {tref}.{} IS {};",
+                    quote_table_identifier(Some(tgt_dt), &c.name),
+                    sql_literal(cm)
+                ));
+            }
+        }
+    }
+
+    if with_indexes {
+        for ix in src_indexes {
+            if ix.is_primary || ix.columns.is_empty() {
+                continue;
+            }
+            // Skip an index whose columns did not survive the copy.
+            if !ix
+                .columns
+                .iter()
+                .all(|c| src_cols.iter().any(|sc| col_key(&sc.name) == col_key(c)))
+            {
+                warnings.push(tf("跳过索引 {}（引用了缺失的列）", &[&ix.name]));
+                continue;
+            }
+            lines.push(format!(
+                "CREATE {}INDEX {} ON {tref} ({});",
+                if ix.is_unique { "UNIQUE " } else { "" },
+                quote_table_identifier(Some(tgt_dt), &ix.name),
+                quoted_cols(&ix.columns, tgt_dt)
+            ));
+        }
+    }
+    Ok((lines.join("\n"), warnings))
+}
+
+/// Strip a trailing timezone offset from a timestamp rendering so a value read
+/// from PostgreSQL fits MySQL's `DATETIME`/`TIMESTAMP`. The wall-clock part is
+/// kept (a full timezone conversion is deliberately out of scope; the wizard
+/// warns on cross-dialect temporal columns).
+fn strip_tz_suffix(s: &str) -> Option<String> {
+    let t = s.trim();
+    let cut = t.find(['+', 'Z']).or_else(|| {
+        t.char_indices()
+            .skip(11)
+            .find(|(_, c)| *c == '-')
+            .map(|(i, _)| i)
+    })?;
+    if cut == 0 {
+        return None;
+    }
+    let head = t[..cut].trim().replace('T', " ");
+    if head.is_empty() {
+        None
+    } else {
+        Some(head)
+    }
+}
+
+/// True for the date/time families whose textual rendering may carry a timezone
+/// offset MySQL cannot parse.
+fn is_tz_prone_type(t: &str) -> bool {
+    matches!(
+        canonical_type(t).as_deref(),
+        Some("timestamp tz")
+    )
+}
+
+/// A SQL literal for one copied cell, escaped for the **target** dialect. On a
+/// cross-dialect copy a timestamp read from the source is normalised when the
+/// target is MySQL (offset stripped), so `2024-01-01 12:00:00+00` lands as a
+/// valid `DATETIME`.
+fn transfer_value_literal(
+    v: &Val,
+    src_type: &str,
+    tgt_type: &str,
+    tgt_dt: DatabaseType,
+) -> String {
+    if let Val::Text(s) = v {
+        if is_mysql_family(tgt_dt.as_str())
+            && is_tz_prone_type(src_type)
+            && matches!(canonical_type(tgt_type).as_deref(), Some("timestamp"))
+        {
+            if let Some(norm) = strip_tz_suffix(s) {
+                return sql_literal(&norm);
+            }
+        }
+    }
+    data_val_literal(v, Some(tgt_type), tgt_dt)
+}
+
+/// A bounded `COUNT(*)` used as the transfer's size forecast: at most
+/// [`TRANSFER_COUNT_PROBE`] rows are examined, so a huge table still answers
+/// quickly. `Some(TRANSFER_COUNT_PROBE)` means "at least this many".
+fn build_transfer_count_sql(
+    db_type: DatabaseType,
+    schema: &str,
+    table: &str,
+    filter: &str,
+    limit: Option<u64>,
+) -> String {
+    let probe = TRANSFER_COUNT_PROBE.min(limit.unwrap_or(u64::MAX)).max(1);
+    let tref = table_ref(db_type, schema, table);
+    let where_clause = if filter.trim().is_empty() {
+        String::new()
+    } else {
+        format!(" WHERE ({})", filter.trim())
+    };
+    format!(
+        "SELECT COUNT(*) FROM (SELECT 1 FROM {tref}{where_clause} LIMIT {probe}) AS _dbxt_c"
+    )
+}
+
+/// A source `SELECT … LIMIT chunk OFFSET n` used when the table has no usable
+/// primary key (the keyset path reuses [`build_data_select`]).
+fn build_transfer_offset_select(
+    db_type: DatabaseType,
+    schema: &str,
+    table: &str,
+    cols: &[String],
+    filter: &str,
+    limit: usize,
+    offset: u64,
+) -> String {
+    let select = cols
+        .iter()
+        .map(|c| quote_table_identifier(Some(db_type), c))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let mut sql = format!("SELECT {select} FROM {}", table_ref(db_type, schema, table));
+    if !filter.trim().is_empty() {
+        sql.push_str(&format!(" WHERE ({})", filter.trim()));
+    }
+    if let Some(first) = cols.first() {
+        sql.push_str(&format!(
+            " ORDER BY {}",
+            quote_table_identifier(Some(db_type), first)
+        ));
+    }
+    sql.push_str(&format!(" LIMIT {limit} OFFSET {offset}"));
+    sql
+}
+
+/// The completed (or aborted) transfer, shown in the summary overlay.
+#[derive(Clone)]
+struct TransferReport {
+    src_label: String,
+    tgt_label: String,
+    src_db_type: DatabaseType,
+    tgt_db_type: DatabaseType,
+    mode: TransferMode,
+    conflict: TransferConflict,
+    on_error: TransferOnError,
+    tgt_db: String,
+    tgt_schema: String,
+    tgt_table: String,
+    /// The target connection id, so the report can offer to browse the table
+    /// when it lives on the connection already open.
+    tgt_conn_id: String,
+    /// Source rows read (after WHERE / LIMIT).
+    src_rows: u64,
+    /// Rows successfully written to the target.
+    moved: u64,
+    /// `(1-based source row number, error)` for rows skipped in skip mode.
+    skipped: Vec<(u64, String)>,
+    /// The error that stopped the transfer: failing row number + message.
+    aborted: Option<(u64, String)>,
+    /// The user aborted with Esc (committed batches are kept).
+    cancelled: bool,
+    /// Source row estimate from the bounded `COUNT(*)`.
+    estimated: Option<u64>,
+    /// The structure was created (CREATE TABLE ran).
+    created: bool,
+    /// The primary-key cursor of the last committed row, for a resume.
+    breakpoint: Option<String>,
+    /// Non-fatal warnings from the `CREATE TABLE` generator.
+    warnings: Vec<String>,
+    elapsed_ms: u128,
+    chunks_done: usize,
+}
+
+impl TransferReport {
+    fn ok(&self) -> bool {
+        self.aborted.is_none() && !self.cancelled
+    }
+    /// Rows per second, rounded.
+    fn rate(&self) -> u64 {
+        if self.elapsed_ms == 0 {
+            return self.moved;
+        }
+        (self.moved as u128 * 1000 / self.elapsed_ms) as u64
+    }
+}
+
+/// The transfer handed to the background worker.
+struct TransferJob {
+    src_cfg: Box<ConnectionConfig>,
+    src_db: String,
+    src_schema: String,
+    src_table: String,
+    tgt_cfg: Box<ConnectionConfig>,
+    tgt_db: String,
+    tgt_schema: String,
+    tgt_table: String,
+    mode: TransferMode,
+    conflict: TransferConflict,
+    on_error: TransferOnError,
+    where_input: String,
+    limit: Option<u64>,
+    with_indexes: bool,
+    with_auto_increment: bool,
+    /// Set once the user confirmed a >[`TRANSFER_WARN_ROWS`] source.
+    allow_large: bool,
+    gen: u64,
+    cancel: Arc<AtomicBool>,
+}
+
+/// A text field edited inside the transfer wizard's options step.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum TransferField {
+    Where,
+    Limit,
+}
+
+/// The modal input for the `WHERE` / `LIMIT` option (`Alt-T` step ③).
+struct TransferPrompt {
+    field: TransferField,
+    input: TextArea<'static>,
+}
+
+/// Which of the three name fields (database / schema / table) has focus in the
+/// wizard's name step.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum NameFocus {
+    Db,
+    Schema,
+    Table,
+}
+
+impl NameFocus {
+    fn index(self) -> usize {
+        match self {
+            NameFocus::Db => 0,
+            NameFocus::Schema => 1,
+            NameFocus::Table => 2,
+        }
+    }
+    fn from_index(i: usize) -> Self {
+        match i {
+            1 => NameFocus::Schema,
+            2 => NameFocus::Table,
+            _ => NameFocus::Db,
+        }
+    }
+}
+
+/// The `Alt-T` data-transfer wizard: three steps plus the red overwrite layer.
+struct TransferWizard {
+    step: TransferStep,
+    /// ① the selectable target connections (the source connection is first).
+    conn_list: ListState,
+    conns: Vec<ConnectionConfig>,
+    /// The chosen target connection (starts as the source connection).
+    target_conn: ConnectionConfig,
+    /// ② the three name fields, plus the one currently being typed.
+    name_focus: NameFocus,
+    name_values: [String; 3],
+    name_input: TextArea<'static>,
+    /// ③ the option list cursor and its values.
+    opt_list: ListState,
+    mode: TransferMode,
+    conflict: TransferConflict,
+    on_error: TransferOnError,
+    where_input: String,
+    limit_input: String,
+    with_indexes: bool,
+    with_auto_increment: bool,
+    /// Set after a >1M source triggered [`OpResult::TransferNeedsConfirm`].
+    large_warn: Option<u64>,
+    /// Inline error from a rejected start.
+    error: Option<String>,
+    /// The `WHERE` / `LIMIT` sub-prompt.
+    prompt: Option<TransferPrompt>,
+    /// A job has been dispatched and is running in the background; the wizard
+    /// becomes a read-only progress overlay whose only action is Esc (abort).
+    submitted: bool,
+    /// Source identity captured when the wizard opened.
+    src_conn: ConnectionConfig,
+    src_db: String,
+    src_schema: String,
+    src_table: String,
+}
+
+impl TransferWizard {
+    /// Persist the live input into `name_values` before a focus change.
+    fn stash_name(&mut self) {
+        self.name_values[self.name_focus.index()] = self.name_input.lines().join("\n");
+    }
+    fn focus_name(&mut self, focus: NameFocus) {
+        self.stash_name();
+        self.name_focus = focus;
+        self.name_input = TextArea::from(vec![self.name_values[focus.index()].clone()]);
+        self.name_input.move_cursor(CursorMove::End);
+    }
+    /// Parse the `LIMIT` option (`None` = no limit).
+    fn limit(&self) -> Option<u64> {
+        self.limit_input.trim().parse::<u64>().ok().filter(|n| *n > 0)
+    }
+}
+
+/// The number of selectable rows in the options step (the last row starts).
+const TRANSFER_OPTION_ROWS: usize = 8;
+
+/// Label + value for one option row (`Alt-T` step ③). The last row is the
+/// start action.
+fn transfer_option_rows(w: &TransferWizard) -> Vec<(String, String)> {
+    let where_v = if w.where_input.trim().is_empty() {
+        t("(无)").to_string()
+    } else {
+        w.where_input.trim().to_string()
+    };
+    let limit_v = match w.limit() {
+        Some(n) => n.to_string(),
+        None => t("(不限)").to_string(),
+    };
+    let yn = |b: bool| if b { t("是").to_string() } else { t("否").to_string() };
+    vec![
+        (t("搬运模式").to_string(), t(w.mode.label()).to_string()),
+        (t("表已存在").to_string(), t(w.conflict.label()).to_string()),
+        (t("出错处理").to_string(), t(w.on_error.label()).to_string()),
+        (t("WHERE 过滤").to_string(), where_v),
+        (t("LIMIT 上限").to_string(), limit_v),
+        (t("带索引").to_string(), yn(w.with_indexes)),
+        (t("自增值").to_string(), yn(w.with_auto_increment)),
+        (t("开始搬运").to_string(), "".to_string()),
+    ]
+}
+
+/// Plain-text transfer summary, for `g` (ticket / clipboard friendly).
+fn transfer_summary_text(rep: &TransferReport) -> String {
+    let mut out = String::new();
+    out.push_str(&format!("{}\n", t("-- dbxt 数据搬运")));
+    out.push_str(&format!(
+        "-- {}: {} ({})\n",
+        t("源"),
+        rep.src_label,
+        rep.src_db_type.as_str()
+    ));
+    out.push_str(&format!(
+        "-- {}: {} ({})\n",
+        t("目标"),
+        rep.tgt_label,
+        rep.tgt_db_type.as_str()
+    ));
+    let conflict = if rep.mode == TransferMode::Append {
+        String::new()
+    } else {
+        format!(" / {}", t(rep.conflict.label()))
+    };
+    out.push_str(&format!(
+        "-- {}: {}{} / {}\n",
+        t("模式"),
+        t(rep.mode.label()),
+        conflict,
+        t(rep.on_error.label())
+    ));
+    out.push_str(&format!(
+        "-- {}: {} / {} / {}ms / {} {}\n",
+        t("结果"),
+        tf("已搬 {} 行", &[&rep.moved]),
+        tf("跳过 {}", &[&rep.skipped.len()]),
+        rep.elapsed_ms,
+        rep.rate(),
+        t("行/秒")
+    ));
+    out.push_str(&format!(
+        "-- {}: {}\n",
+        t("已完成块"),
+        rep.chunks_done
+    ));
+    if let Some(bp) = &rep.breakpoint {
+        out.push_str(&format!("-- {}: {bp}\n", t("断点主键")));
+    }
+    if rep.created {
+        out.push_str(&format!("-- {}\n", t("已在目标建表")));
+    }
+    if rep.cancelled {
+        out.push_str(&format!("-- {}\n", t("已中止（已提交批次保留）")));
+    }
+    if let Some((row, err)) = &rep.aborted {
+        out.push_str(&format!("-- {} {}: {err}\n", t("中止于源行"), row));
+    }
+    for (row, err) in rep.skipped.iter().take(20) {
+        out.push_str(&format!("-- {} {row}: {err}\n", t("跳过源行")));
+    }
+    if rep.skipped.len() > 20 {
+        out.push_str(&format!("-- … {} {}\n", t("其余跳过"), rep.skipped.len() - 20));
+    }
+    for w in &rep.warnings {
+        out.push_str(&format!("-- ⚠ {w}\n"));
     }
     out
 }
@@ -4466,6 +5248,10 @@ enum Op {
         gen: u64,
         cancel: Arc<AtomicBool>,
     },
+    /// Copy one table's structure and/or rows between two SQL connections
+    /// (possibly cross-dialect). Streams [`OpResult::TransferProgress`] between
+    /// batches and aborts when `cancel` is set (keeping the committed batches).
+    DataTransfer(Box<TransferJob>),
 }
 
 impl Op {
@@ -4480,6 +5266,7 @@ impl Op {
             Op::Export(_) => OP_WATCHDOG_EXPORT,
             Op::GlobalSearch { .. } => OP_WATCHDOG_SEARCH,
             Op::DataDiff { .. } => OP_WATCHDOG_DATA_DIFF,
+            Op::DataTransfer(_) => OP_WATCHDOG_TRANSFER,
             _ => OP_WATCHDOG_FALLBACK,
         }
     }
@@ -4679,6 +5466,26 @@ enum OpResult {
     DataDiffDone {
         gen: u64,
         result: Box<DataCompare>,
+    },
+    /// Intermediate transfer progress: rows written and chunks done so far.
+    TransferProgress {
+        gen: u64,
+        rows: u64,
+        chunks: usize,
+        elapsed_ms: u128,
+        total: Option<u64>,
+    },
+    /// A transfer's source is large; it waits for a second confirmation before
+    /// copying. The wizard sets its warning and re-dispatches with
+    /// `allow_large = true` on the next Enter.
+    TransferNeedsConfirm {
+        gen: u64,
+        estimated: u64,
+    },
+    /// A transfer finished (or was aborted / cancelled; see the report).
+    TransferDone {
+        gen: u64,
+        report: Box<TransferReport>,
     },
     Error(String),
 }
@@ -6177,6 +6984,7 @@ async fn run_op(backend: &LocalBackend, op: Op, tx: &Tx) -> OpResult {
             )
             .await
         }
+        Op::DataTransfer(job) => Box::pin(run_data_transfer(backend, *job, tx)).await,
     }
 }
 
@@ -6524,6 +7332,509 @@ async fn run_data_diff(
             differing,
             truncated,
             cancelled,
+        }),
+    }
+}
+
+// ── data transfer worker ──
+
+/// The bounded source `COUNT(*)` used as the transfer's size forecast.
+async fn transfer_count(
+    backend: &LocalBackend,
+    cfg: &ConnectionConfig,
+    db: &str,
+    schema: &str,
+    table: &str,
+    filter: &str,
+    limit: Option<u64>,
+) -> Option<u64> {
+    let sql = build_transfer_count_sql(cfg.db_type, schema, table, filter, limit);
+    let r = backend
+        .execute_query(cfg, db, &sql, Some(1), Some(30))
+        .await
+        .ok()?;
+    r.rows.first().and_then(|row| row.first()).and_then(|v| match v {
+        serde_json::Value::Number(n) => n.as_u64(),
+        serde_json::Value::String(s) => s.parse().ok(),
+        _ => None,
+    })
+}
+
+/// Read one chunk of source rows for a transfer: keyset-paginated when the
+/// primary key is available, otherwise plain `LIMIT … OFFSET` (deterministic
+/// only up to the first column, hence the generator's warning).
+#[allow(clippy::too_many_arguments)]
+async fn transfer_read_chunk(
+    backend: &LocalBackend,
+    cfg: &ConnectionConfig,
+    db: &str,
+    schema: &str,
+    table: &str,
+    align: &TransferAlign,
+    filter: &str,
+    last: Option<&[Val]>,
+    offset: u64,
+    read_limit: usize,
+) -> Result<Vec<Vec<Val>>, String> {
+    let cols = align.src_select();
+    let sql = if align.keyset() {
+        build_data_select(
+            cfg.db_type,
+            schema,
+            table,
+            &cols,
+            &align.pk_names,
+            &align.pk_types,
+            filter,
+            last,
+            read_limit,
+        )
+    } else {
+        build_transfer_offset_select(cfg.db_type, schema, table, &cols, filter, read_limit, offset)
+    };
+    let r = backend
+        .execute_query(cfg, db, &sql, Some(read_limit), Some(60))
+        .await?;
+    Ok(r.rows
+        .iter()
+        .map(|row| row.iter().map(value_to_val).collect())
+        .collect())
+}
+
+/// Display a primary-key tuple (`1, 42`) for the report's breakpoint line.
+fn transfer_pk_display(pk: &[Val]) -> String {
+    pk.iter()
+        .map(|v| value_display(v).0)
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+/// Execute one `INSERT` batch on the target, retrying a transport failure once.
+/// Returns the per-statement results (skip mode) or an empty vec (stop mode).
+async fn transfer_exec_batch(
+    backend: &LocalBackend,
+    cfg: &ConnectionConfig,
+    db: &str,
+    script: &str,
+    stop_mode: bool,
+) -> Result<Vec<BatchStatementResult>, String> {
+    let options = if stop_mode {
+        QueryExecutionOptions {
+            max_rows: Some(1),
+            timeout_secs: Some(60),
+            use_transaction: Some(true),
+            ..Default::default()
+        }
+    } else {
+        QueryExecutionOptions {
+            max_rows: Some(1),
+            timeout_secs: Some(60),
+            continue_on_error: true,
+            ..Default::default()
+        }
+    };
+    match backend.execute_batch(cfg, db, None, script, options.clone()).await {
+        Ok(v) => Ok(v),
+        // One retry: a dropped connection or a transient deadlock should not
+        // abort a long copy on its first hiccup.
+        Err(_) => backend.execute_batch(cfg, db, None, script, options).await,
+    }
+}
+
+/// The data-transfer worker: fetch the source shape, create / reshape the target
+/// when asked, then stream rows through keyset paging into transactional
+/// batches. Progress is sent between chunks; the shared `cancel` flag aborts
+/// between batches, keeping everything already committed.
+async fn run_data_transfer(backend: &LocalBackend, job: TransferJob, tx: &Tx) -> OpResult {
+    let TransferJob {
+        src_cfg,
+        src_db,
+        src_schema,
+        src_table,
+        tgt_cfg,
+        tgt_db,
+        tgt_schema,
+        tgt_table,
+        mode,
+        conflict,
+        on_error,
+        where_input,
+        limit,
+        with_indexes,
+        with_auto_increment,
+        allow_large,
+        gen,
+        cancel,
+    } = job;
+    let start = Instant::now();
+    let src_label = data_table_label(&src_db, &src_schema, &src_table);
+    let tgt_label = data_table_label(&tgt_db, &tgt_schema, &tgt_table);
+    let error_report = |aborted: (u64, String), created: bool, estimated: Option<u64>| {
+        OpResult::TransferDone {
+            gen,
+            report: Box::new(TransferReport {
+                src_label: src_label.clone(),
+                tgt_label: tgt_label.clone(),
+                src_db_type: src_cfg.db_type,
+                tgt_db_type: tgt_cfg.db_type,
+                mode,
+                conflict,
+                on_error,
+                tgt_db: tgt_db.clone(),
+                tgt_schema: tgt_schema.clone(),
+                tgt_table: tgt_table.clone(),
+                tgt_conn_id: tgt_cfg.id.clone(),
+                src_rows: 0,
+                moved: 0,
+                skipped: Vec::new(),
+                aborted: Some(aborted),
+                cancelled: false,
+                estimated,
+                created,
+                breakpoint: None,
+                warnings: Vec::new(),
+                elapsed_ms: start.elapsed().as_millis(),
+                chunks_done: 0,
+            }),
+        }
+    };
+
+    // 1. Source shape.
+    let src_cols = match backend.get_columns(&src_cfg, &src_db, &src_schema, &src_table).await {
+        Ok(c) => c,
+        Err(e) => return error_report((0, format!("读取源表结构失败: {e}")), false, None),
+    };
+    let src_indexes = dbx_core::schema::list_indexes_core(
+        backend.state().as_ref(),
+        &src_cfg.id,
+        &src_db,
+        &src_schema,
+        &src_table,
+    )
+    .await
+    .unwrap_or_default();
+    let src_pk = pk_from_metadata(&src_cols, &src_indexes);
+    let filter = normalize_where_input(Some(&where_input));
+
+    // 2. Size forecast + the >1M confirmation gate (only for a row copy).
+    let estimated = if mode == TransferMode::CreateOnly {
+        None
+    } else {
+        transfer_count(
+            backend,
+            &src_cfg,
+            &src_db,
+            &src_schema,
+            &src_table,
+            &filter,
+            limit,
+        )
+        .await
+    };
+    if mode != TransferMode::CreateOnly && !allow_large {
+        if let Some(n) = estimated {
+            if n >= TRANSFER_WARN_ROWS {
+                return OpResult::TransferNeedsConfirm { gen, estimated: n };
+            }
+        }
+    }
+
+    // 3. Structure (CREATE + optional DROP when overwriting).
+    let create = mode != TransferMode::CreateOnly && mode != TransferMode::Append;
+    let tgt_exists = backend
+        .list_tables(&tgt_cfg, &tgt_db, &tgt_schema)
+        .await
+        .map(|ts| ts.iter().any(|t| t.name.eq_ignore_ascii_case(&tgt_table)))
+        .unwrap_or(false);
+    if mode == TransferMode::Append && !tgt_exists {
+        return error_report((0, tf("目标表不存在: {}", &[&tgt_label])), false, estimated);
+    }
+    let mut created = false;
+    let mut warnings: Vec<String> = Vec::new();
+    if create {
+        if tgt_exists {
+            match conflict {
+                TransferConflict::Stop => {
+                    return error_report(
+                        (
+                            0,
+                            tf(
+                                "目标表已存在: {}（按 o 选择覆盖）",
+                                &[&tgt_label]
+                            ),
+                        ),
+                        false,
+                        estimated,
+                    );
+                }
+                TransferConflict::Drop => {
+                    let drop = format!(
+                        "DROP TABLE {};",
+                        table_ref(tgt_cfg.db_type, &tgt_schema, &tgt_table)
+                    );
+                    if let Err(e) = backend
+                        .execute_query(&tgt_cfg, &tgt_db, &drop, Some(1), Some(60))
+                        .await
+                    {
+                        return error_report((0, format!("DROP TABLE 失败: {e}")), false, estimated);
+                    }
+                }
+            }
+        }
+        let generated = generate_transfer_create(
+            &src_cols,
+            &src_indexes,
+            &src_pk,
+            src_cfg.db_type,
+            tgt_cfg.db_type,
+            &tgt_schema,
+            &tgt_table,
+            with_indexes,
+            with_auto_increment,
+        );
+        let (script, warn) = match generated {
+            Ok(v) => v,
+            Err(e) => return error_report((0, e), false, estimated),
+        };
+        warnings = warn;
+        let options = QueryExecutionOptions {
+            max_rows: Some(1),
+            timeout_secs: Some(120),
+            ..Default::default()
+        };
+        if let Err(e) = backend
+            .execute_batch(&tgt_cfg, &tgt_db, None, &script, options)
+            .await
+        {
+            return error_report((0, format!("建表失败: {e}")), false, estimated);
+        }
+        created = true;
+    }
+
+    // 4. Append-only finishes here.
+    if mode == TransferMode::CreateOnly {
+        return OpResult::TransferDone {
+            gen,
+            report: Box::new(TransferReport {
+                src_label,
+                tgt_label,
+                src_db_type: src_cfg.db_type,
+                tgt_db_type: tgt_cfg.db_type,
+                mode,
+                conflict,
+                on_error,
+                tgt_db,
+                tgt_schema,
+                tgt_table,
+                tgt_conn_id: tgt_cfg.id.clone(),
+                src_rows: 0,
+                moved: 0,
+                skipped: Vec::new(),
+                aborted: None,
+                cancelled: false,
+                estimated,
+                created,
+                breakpoint: None,
+                warnings,
+                elapsed_ms: start.elapsed().as_millis(),
+                chunks_done: 0,
+            }),
+        };
+    }
+
+    // 5. Write alignment. For a fresh table the target columns mirror the source
+    //    with mapped types; for append only the name-intersection is written.
+    let tgt_cols = if create {
+        Vec::new()
+    } else {
+        match backend
+            .get_columns(&tgt_cfg, &tgt_db, &tgt_schema, &tgt_table)
+            .await
+        {
+            Ok(c) => c,
+            Err(e) => return error_report((0, format!("读取目标表结构失败: {e}")), created, estimated),
+        }
+    };
+    let align = match build_transfer_align(
+        &src_cols,
+        &tgt_cols,
+        &src_pk,
+        src_cfg.db_type,
+        tgt_cfg.db_type,
+        create,
+    ) {
+        Ok(a) => a,
+        Err(e) => return error_report((0, e), created, estimated),
+    };
+    let tref = table_ref(tgt_cfg.db_type, &tgt_schema, &tgt_table);
+    let col_names = align
+        .cols
+        .iter()
+        .map(|c| quote_table_identifier(Some(tgt_cfg.db_type), &c.tgt_name))
+        .collect::<Vec<_>>()
+        .join(", ");
+
+    // 6. The copy loop.
+    let mut src_rows = 0u64;
+    let mut moved = 0u64;
+    let mut skipped: Vec<(u64, String)> = Vec::new();
+    let mut aborted: Option<(u64, String)> = None;
+    let mut cancelled = false;
+    let mut chunks_done = 0usize;
+    let mut breakpoint: Option<String> = None;
+    let mut last_pk: Option<Vec<Val>> = None;
+    let mut offset = 0u64;
+    let read_limit = |src_rows: u64| -> usize {
+        match limit {
+            Some(l) => TRANSFER_CHUNK.min(l.saturating_sub(src_rows).max(1) as usize),
+            None => TRANSFER_CHUNK,
+        }
+    };
+    'outer: loop {
+        if cancel.load(Ordering::Relaxed) {
+            cancelled = true;
+            break;
+        }
+        if limit.is_some_and(|l| src_rows >= l) {
+            break;
+        }
+        let rl = read_limit(src_rows);
+        let rows = match transfer_read_chunk(
+            backend,
+            &src_cfg,
+            &src_db,
+            &src_schema,
+            &src_table,
+            &align,
+            &filter,
+            last_pk.as_deref(),
+            offset,
+            rl,
+        )
+        .await
+        {
+            Ok(r) => r,
+            Err(e) => {
+                aborted = Some((src_rows + 1, format!("读取源数据失败: {e}")));
+                break;
+            }
+        };
+        if rows.is_empty() {
+            break;
+        }
+        let n = rows.len();
+        let chunk_base = src_rows;
+        src_rows += n as u64;
+        // Advance the cursor before writing so an abort keeps the right position.
+        if align.keyset() {
+            last_pk = rows.last().and_then(|r| align.pk_of(r));
+        } else {
+            offset += n as u64;
+        }
+        for (bi, batch) in rows.chunks(TRANSFER_INSERT_BATCH).enumerate() {
+            if cancel.load(Ordering::Relaxed) {
+                cancelled = true;
+                break 'outer;
+            }
+            let base_row = chunk_base + (bi * TRANSFER_INSERT_BATCH) as u64;
+            let script = batch
+                .iter()
+                .map(|row| {
+                    let vals = align
+                        .cols
+                        .iter()
+                        .enumerate()
+                        .map(|(i, c)| {
+                            let v = row.get(i).cloned().unwrap_or(Val::Null);
+                            transfer_value_literal(&v, &c.src_type, &c.tgt_type, tgt_cfg.db_type)
+                        })
+                        .collect::<Vec<_>>()
+                        .join(", ");
+                    format!("INSERT INTO {tref} ({col_names}) VALUES ({vals});")
+                })
+                .collect::<Vec<_>>()
+                .join("\n");
+            match transfer_exec_batch(backend, &tgt_cfg, &tgt_db, &script, on_error == TransferOnError::Stop)
+                .await
+            {
+                Ok(results) => {
+                    if on_error == TransferOnError::Stop {
+                        moved += batch.len() as u64;
+                    } else {
+                        let mut bad = 0usize;
+                        for (i, r) in results.iter().enumerate() {
+                            if r.execution_error {
+                                bad += 1;
+                                skipped.push((
+                                    base_row + i as u64 + 1,
+                                    r.error_message
+                                        .clone()
+                                        .unwrap_or_else(|| "unknown error".to_string()),
+                                ));
+                            }
+                        }
+                        moved += results.len().saturating_sub(bad) as u64;
+                        if results.len() < batch.len() {
+                            aborted = Some((
+                                base_row + results.len() as u64 + 1,
+                                t("批量在中途停止（连接或会话错误）").to_string(),
+                            ));
+                            break 'outer;
+                        }
+                    }
+                    if let Some(last) = batch.last() {
+                        if let Some(pk) = align.pk_of(last) {
+                            breakpoint = Some(transfer_pk_display(&pk));
+                        }
+                    }
+                }
+                Err(e) => {
+                    aborted = Some((base_row + 1, format!("写入失败: {e}")));
+                    break 'outer;
+                }
+            }
+        }
+        chunks_done += 1;
+        let _ = tx.send(OpResult::TransferProgress {
+            gen,
+            rows: moved,
+            chunks: chunks_done,
+            elapsed_ms: start.elapsed().as_millis(),
+            total: estimated,
+        });
+        if n < rl {
+            break;
+        }
+    }
+    if cancel.load(Ordering::Relaxed) {
+        cancelled = true;
+    }
+
+    OpResult::TransferDone {
+        gen,
+        report: Box::new(TransferReport {
+            src_label,
+            tgt_label,
+            src_db_type: src_cfg.db_type,
+            tgt_db_type: tgt_cfg.db_type,
+            mode,
+            conflict,
+            on_error,
+            tgt_db,
+            tgt_schema,
+            tgt_table,
+            tgt_conn_id: tgt_cfg.id.clone(),
+            src_rows,
+            moved,
+            skipped,
+            aborted,
+            cancelled,
+            estimated,
+            created,
+            breakpoint,
+            warnings,
+            elapsed_ms: start.elapsed().as_millis(),
+            chunks_done,
         }),
     }
 }
@@ -7564,6 +8875,18 @@ struct App {
     /// The completion overlay.
     import_report: Option<Box<ImportReport>>,
 
+    // ── data transfer (Alt-T) ──
+    /// The three-step transfer wizard (target connection → name → options).
+    transfer: Option<Box<TransferWizard>>,
+    /// The completion summary overlay.
+    transfer_report: Option<Box<TransferReport>>,
+    /// Monotonic id of the latest transfer request; a stale reply is discarded.
+    transfer_gen: u64,
+    /// Live progress: `(rows, chunks, elapsed_ms, total_rows)`.
+    transfer_progress: Option<(u64, usize, u128, Option<u64>)>,
+    /// Cancellation flag shared with the running transfer (Esc aborts).
+    transfer_cancel: Arc<AtomicBool>,
+
     // ── result export (Ctrl-Y) ──
     /// The format picker.
     export_open: bool,
@@ -7758,8 +9081,21 @@ fn write_stderr(text: &str) {
     let _ = err.flush();
 }
 
-#[tokio::main]
-async fn main() -> Result<()> {
+fn main() -> Result<()> {
+    // A generous worker stack is deliberate: the PostgreSQL / SQL Server drivers
+    // parse every statement with `sqlparser`, whose DDL handling is deeply
+    // recursive, and the async call chain above it is long. The 2 MiB tokio
+    // default can be exhausted by a debug build while running a large
+    // `CREATE TABLE` / multi-statement script, aborting the whole process. The
+    // stack is reserved lazily, so the larger ceiling costs nothing until used.
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .thread_stack_size(16 * 1024 * 1024)
+        .build()?;
+    runtime.block_on(run_async())
+}
+
+async fn run_async() -> Result<()> {
     // Resolve the UI language once, before any text is drawn.
     ui_text::set_lang(ui_text::detect_lang());
     // `--version` / `--help` answer before the TUI is initialised, so they work
@@ -8007,6 +9343,11 @@ impl App {
             import_scroll: 0,
             import_progress: None,
             import_report: None,
+            transfer: None,
+            transfer_report: None,
+            transfer_gen: 0,
+            transfer_progress: None,
+            transfer_cancel: Arc::new(AtomicBool::new(false)),
             export_open: false,
             export_list: ListState::default(),
             export_pending: None,
@@ -8119,6 +9460,7 @@ fn apply_op_result(app: &mut App, res: OpResult, tx: &Tx) {
             | OpResult::SshNotice(_)
             | OpResult::SearchProgress { .. }
             | OpResult::DataDiffProgress { .. }
+            | OpResult::TransferProgress { .. }
     ) {
         match res {
             OpResult::SearchProgress { gen, done, total } => {
@@ -8143,6 +9485,30 @@ fn apply_op_result(app: &mut App, res: OpResult, tx: &Tx) {
             OpResult::ImportProgress { done, total } => {
                 app.import_progress = Some((done, total));
                 app.status = tf("导入 {} / {} 行…", &[&done, &total]);
+            }
+            OpResult::TransferProgress {
+                gen,
+                rows,
+                chunks,
+                elapsed_ms,
+                total,
+            } => {
+                if gen == app.transfer_gen {
+                    app.transfer_progress = Some((rows, chunks, elapsed_ms, total));
+                    let rate = (rows as u128 * 1000)
+                        .checked_div(elapsed_ms)
+                        .unwrap_or(rows as u128) as u64;
+                    app.status = match total.filter(|t| *t > 0) {
+                        Some(t) => tf(
+                            "搬运中… {} 行 / 已完成 {} 块 / ~{} 行 ({} 行/秒)",
+                            &[&rows, &chunks, &t, &rate],
+                        ),
+                        None => tf(
+                            "搬运中… {} 行 / 已完成 {} 块 ({} 行/秒)",
+                            &[&rows, &chunks, &rate],
+                        ),
+                    };
+                }
             }
             OpResult::SshPrompt(env) => {
                 let kind = env.request.kind;
@@ -8938,6 +10304,7 @@ fn apply_op_result(app: &mut App, res: OpResult, tx: &Tx) {
             app.import_report = Some(rep);
         }
         OpResult::ImportProgress { .. } => {}
+        OpResult::TransferProgress { .. } => {}
         OpResult::ExportDone {
             format,
             path,
@@ -9112,6 +10479,55 @@ fn apply_op_result(app: &mut App, res: OpResult, tx: &Tx) {
                 )
             };
         }
+        OpResult::TransferNeedsConfirm { gen, estimated } => {
+            if gen != app.transfer_gen {
+                return;
+            }
+            app.transfer_progress = None;
+            if let Some(w) = app.transfer.as_mut() {
+                w.large_warn = Some(estimated);
+                w.error = None;
+                w.submitted = false;
+            }
+            app.status = tf(
+                "⚠ 源表预估至少 {} 行，再按 Enter 确认开始搬运（Esc 取消）",
+                &[&estimated],
+            );
+        }
+        OpResult::TransferDone { gen, report } => {
+            if gen != app.transfer_gen {
+                return;
+            }
+            app.transfer = None;
+            app.transfer_progress = None;
+            if report.moved > 0 {
+                // Rows were written, so cached counts may be stale.
+                app.count_cache.clear();
+            }
+            let moved = report.moved;
+            let skipped = report.skipped.len();
+            let aborted = report.aborted.clone();
+            let cancelled = report.cancelled;
+            let created = report.created;
+            let tgt = report.tgt_label.clone();
+            app.status = if let Some((row, err)) = &aborted {
+                tf(
+                    "✗ 搬运中止于源行 {}: {} · 已搬 {} 行{}",
+                    &[&row, &err, &moved, &(if created { " · 已建表" } else { "" })],
+                )
+            } else if cancelled {
+                tf(
+                    "⚠ 搬运已中止 · 已搬 {} 行（已提交批次保留）· 目标 {}",
+                    &[&moved, &tgt],
+                )
+            } else {
+                tf(
+                    "✓ 搬运完成 · 已搬 {} 行 · 跳过 {} 行 · 目标 {}{}",
+                    &[&moved, &skipped, &tgt, &(if created { " · 已建表" } else { "" })],
+                )
+            };
+            app.transfer_report = Some(report);
+        }
         OpResult::DbDiffReady { gen, diff } => {
             if gen != app.diff_gen {
                 return;
@@ -9178,6 +10594,12 @@ fn apply_op_result(app: &mut App, res: OpResult, tx: &Tx) {
             app.search_running = false;
             app.search_progress = None;
             app.data_progress = None;
+            // A watchdog timeout or any unexpected failure of a transfer must not
+            // leave its progress overlay stuck with no job behind it.
+            if app.transfer.as_ref().is_some_and(|w| w.submitted) {
+                app.transfer = None;
+                app.transfer_progress = None;
+            }
             // A failed cross-connection table fetch — or a rejected data compare
             // (no primary key) — must not leave the picker stuck on its spinner.
             if let Some(p) = app.diff_picker.as_mut() {
@@ -9749,6 +11171,20 @@ fn browse_key(app: &mut App, tx: &Tx, k: KeyEvent) {
         data_diff_key(app, tx, k);
         return;
     }
+    // Data transfer (Alt-T): the wizard, its WHERE/LIMIT prompt and the report
+    // are all modal.
+    if app.transfer.as_ref().is_some_and(|w| w.prompt.is_some()) {
+        transfer_prompt_key(app, tx, k);
+        return;
+    }
+    if app.transfer.is_some() {
+        transfer_key(app, tx, k);
+        return;
+    }
+    if app.transfer_report.is_some() {
+        transfer_report_key(app, tx, k);
+        return;
+    }
     if app.diff.is_some() {
         diff_key(app, tx, k);
         return;
@@ -9925,6 +11361,12 @@ fn browse_key(app: &mut App, tx: &Tx, k: KeyEvent) {
             // Alt-K: two-table data compare (primary-key aligned).
             KeyCode::Char('k') | KeyCode::Char('K') => {
                 open_diff_picker(app, DiffPickMode::Table, DiffKind::Data);
+                return;
+            }
+            // Alt-T: copy a table's structure and/or rows to another SQL
+            // connection (cross-dialect supported).
+            KeyCode::Char('t') | KeyCode::Char('T') => {
+                open_transfer_wizard(app);
                 return;
             }
             _ => {}
@@ -14753,6 +16195,514 @@ fn db_diff_key(app: &mut App, tx: &Tx, k: KeyEvent) {
     }
 }
 
+// ── data transfer (Alt-T) ──
+
+/// All SQL connections, with the source connection moved to the front so the
+/// same-connection (and same-dialect) case is the default selection.
+fn transfer_connections(app: &App, src_id: &str) -> Vec<ConnectionConfig> {
+    let mut conns: Vec<ConnectionConfig> = app
+        .connections
+        .iter()
+        .filter(|c| backend_for_connection(c) == Backend::Sql)
+        .cloned()
+        .collect();
+    if let Some(pos) = conns.iter().position(|c| c.id == src_id) {
+        conns.swap(0, pos);
+    }
+    conns
+}
+
+/// Open the `Alt-T` wizard for the focused table.
+fn open_transfer_wizard(app: &mut App) {
+    if app.backend_kind != Backend::Sql || app.selected.is_none() {
+        app.status = t("数据搬运仅支持 SQL 连接").into();
+        return;
+    }
+    let Some((src_db, src_schema, src_table)) = diff_source(app) else {
+        app.status = t("先选中一张表再按 Alt-T").into();
+        return;
+    };
+    let Some(src_conn) = app.selected.clone() else {
+        return;
+    };
+    let conns = transfer_connections(app, &src_conn.id);
+    if conns.is_empty() {
+        app.status = t("没有可用的 SQL 连接").into();
+        return;
+    }
+    let mut conn_list = ListState::default();
+    conn_list.select(Some(0));
+    let mut opt_list = ListState::default();
+    opt_list.select(Some(0));
+    let mut name_input = TextArea::from(vec![src_table.clone()]);
+    name_input.move_cursor(CursorMove::End);
+    app.transfer_gen += 1;
+    app.transfer = Some(Box::new(TransferWizard {
+        step: TransferStep::Connection,
+        conn_list,
+        conns,
+        target_conn: src_conn.clone(),
+        name_focus: NameFocus::Table,
+        name_values: [src_db.clone(), src_schema.clone(), src_table.clone()],
+        name_input,
+        opt_list,
+        mode: TransferMode::CreateAndCopy,
+        conflict: TransferConflict::Stop,
+        on_error: TransferOnError::Stop,
+        where_input: String::new(),
+        limit_input: String::new(),
+        with_indexes: true,
+        with_auto_increment: true,
+        large_warn: None,
+        error: None,
+        prompt: None,
+        submitted: false,
+        src_conn,
+        src_db,
+        src_schema,
+        src_table,
+    }));
+    app.transfer_report = None;
+    app.status = t("数据搬运 ① 选择目标连接（源 = 当前表；Enter 下一步 · Esc 取消）").into();
+}
+
+fn transfer_key(app: &mut App, tx: &Tx, k: KeyEvent) {
+    if app.transfer.as_ref().is_some_and(|w| w.submitted) {
+        transfer_running_key(app, k);
+        return;
+    }
+    let Some(step) = app.transfer.as_ref().map(|w| w.step) else {
+        return;
+    };
+    match step {
+        TransferStep::Connection => transfer_conn_key(app, k),
+        TransferStep::Name => transfer_name_key(app, k),
+        TransferStep::Options => transfer_options_key(app, tx, k),
+        TransferStep::Confirm => transfer_confirm_key(app, tx, k),
+    }
+}
+
+/// While a transfer runs the wizard is read-only: Esc (or q) requests an abort
+/// and everything else is ignored. The committed batches are always kept.
+fn transfer_running_key(app: &mut App, k: KeyEvent) {
+    match k.code {
+        KeyCode::Esc | KeyCode::Char('q') => {
+            app.transfer_cancel.store(true, Ordering::Relaxed);
+            app.status = t("正在中止搬运…（已提交批次保留）").into();
+        }
+        _ => {}
+    }
+}
+
+fn transfer_conn_key(app: &mut App, k: KeyEvent) {
+    let n = app.transfer.as_ref().map(|w| w.conns.len()).unwrap_or(0);
+    let step = |app: &mut App, delta: i32| {
+        if n == 0 {
+            return;
+        }
+        if let Some(w) = app.transfer.as_mut() {
+            let cur = w.conn_list.selected().unwrap_or(0) as i32;
+            w.conn_list
+                .select(Some((cur + delta).clamp(0, n as i32 - 1) as usize));
+        }
+    };
+    match k.code {
+        KeyCode::Esc | KeyCode::Char('q') => {
+            app.transfer = None;
+            app.status = t("已取消数据搬运").into();
+        }
+        KeyCode::Up | KeyCode::Char('k') => step(app, -1),
+        KeyCode::Down | KeyCode::Char('j') => step(app, 1),
+        KeyCode::PageUp => step(app, -10),
+        KeyCode::PageDown => step(app, 10),
+        KeyCode::Home => {
+            if let Some(w) = app.transfer.as_mut() {
+                if n > 0 {
+                    w.conn_list.select(Some(0));
+                }
+            }
+        }
+        KeyCode::End => {
+            if let Some(w) = app.transfer.as_mut() {
+                if n > 0 {
+                    w.conn_list.select(Some(n - 1));
+                }
+            }
+        }
+        KeyCode::Enter => {
+            let Some(idx) = app.transfer.as_ref().and_then(|w| w.conn_list.selected()) else {
+                return;
+            };
+            let Some(cfg) = app.transfer.as_ref().and_then(|w| w.conns.get(idx).cloned()) else {
+                return;
+            };
+            let src_schema = app
+                .transfer
+                .as_ref()
+                .map(|w| w.src_schema.clone())
+                .unwrap_or_default();
+            let db = cfg
+                .database
+                .clone()
+                .filter(|d| !d.trim().is_empty())
+                .unwrap_or_default();
+            let schema = diff_target_schema(&cfg, &src_schema);
+            if let Some(w) = app.transfer.as_mut() {
+                w.target_conn = cfg.clone();
+                w.name_values[0] = db;
+                w.name_values[1] = schema;
+                w.error = None;
+                w.focus_name(NameFocus::Table);
+                w.step = TransferStep::Name;
+            }
+            app.status = tf(
+                "数据搬运 ② 目标库/表（{}）· Tab 切换字段 · Enter 下一步 · Esc 返回",
+                &[&format!("{} ({})", cfg.name, cfg.db_type.as_str())],
+            );
+        }
+        _ => {}
+    }
+}
+
+fn transfer_name_key(app: &mut App, k: KeyEvent) {
+    match k.code {
+        KeyCode::Esc => {
+            if let Some(w) = app.transfer.as_mut() {
+                w.step = TransferStep::Connection;
+                w.error = None;
+            }
+            app.status = t("数据搬运 ① 选择目标连接").into();
+        }
+        KeyCode::Tab => {
+            let next = app
+                .transfer
+                .as_ref()
+                .map(|w| NameFocus::from_index((w.name_focus.index() + 1) % 3))
+                .unwrap_or(NameFocus::Db);
+            if let Some(w) = app.transfer.as_mut() {
+                w.focus_name(next);
+            }
+        }
+        KeyCode::BackTab => {
+            let next = app
+                .transfer
+                .as_ref()
+                .map(|w| NameFocus::from_index((w.name_focus.index() + 2) % 3))
+                .unwrap_or(NameFocus::Db);
+            if let Some(w) = app.transfer.as_mut() {
+                w.focus_name(next);
+            }
+        }
+        KeyCode::Enter => {
+            let Some(w) = app.transfer.as_mut() else {
+                return;
+            };
+            w.stash_name();
+            if w.name_values[2].trim().is_empty() {
+                w.error = Some(t("目标表名不能为空").to_string());
+                return;
+            }
+            w.error = None;
+            w.opt_list.select(Some(0));
+            w.step = TransferStep::Options;
+            app.status =
+                t("数据搬运 ③ 模式与选项 · ↑↓ 选择 · Space/Enter 切换 · Enter 开搬 · Esc 返回")
+                    .into();
+        }
+        _ => {
+            if let Some(w) = app.transfer.as_mut() {
+                w.name_input.input(k);
+            }
+        }
+    }
+}
+
+fn transfer_cycle_conflict(app: &mut App) {
+    let mut entered_confirm = false;
+    if let Some(w) = app.transfer.as_mut() {
+        w.conflict = w.conflict.next();
+        if w.conflict == TransferConflict::Drop {
+            w.step = TransferStep::Confirm;
+            w.error = None;
+            entered_confirm = true;
+        }
+    }
+    if entered_confirm {
+        app.status = t("⚠ 覆盖会先 DROP 目标表（数据不可恢复）· Enter 确认 · Esc 返回").into();
+    }
+}
+
+fn transfer_open_prompt(app: &mut App, field: TransferField) {
+    let Some(w) = app.transfer.as_mut() else {
+        return;
+    };
+    let initial = match field {
+        TransferField::Where => w.where_input.clone(),
+        TransferField::Limit => w.limit_input.clone(),
+    };
+    let mut input = TextArea::from(vec![initial]);
+    input.move_cursor(CursorMove::End);
+    w.prompt = Some(TransferPrompt { field, input });
+    app.status = match field {
+        TransferField::Where => t("输入 WHERE 过滤（只搬子集，留空 = 全表）").into(),
+        TransferField::Limit => t("输入 LIMIT 上限（留空 = 不限）").into(),
+    };
+}
+
+fn transfer_opt_activate(app: &mut App, tx: &Tx) {
+    let Some(idx) = app.transfer.as_ref().and_then(|w| w.opt_list.selected()) else {
+        return;
+    };
+    match idx {
+        0 => {
+            if let Some(w) = app.transfer.as_mut() {
+                w.mode = w.mode.next();
+            }
+        }
+        1 => transfer_cycle_conflict(app),
+        2 => {
+            if let Some(w) = app.transfer.as_mut() {
+                w.on_error = w.on_error.next();
+            }
+        }
+        3 => transfer_open_prompt(app, TransferField::Where),
+        4 => transfer_open_prompt(app, TransferField::Limit),
+        5 => {
+            if let Some(w) = app.transfer.as_mut() {
+                w.with_indexes = !w.with_indexes;
+            }
+        }
+        6 => {
+            if let Some(w) = app.transfer.as_mut() {
+                w.with_auto_increment = !w.with_auto_increment;
+            }
+        }
+        7 => start_transfer(app, tx),
+        _ => {}
+    }
+}
+
+fn transfer_options_key(app: &mut App, tx: &Tx, k: KeyEvent) {
+    let step = |app: &mut App, delta: i32| {
+        if let Some(w) = app.transfer.as_mut() {
+            let cur = w.opt_list.selected().unwrap_or(0) as i32;
+            w.opt_list.select(Some(
+                (cur + delta).clamp(0, TRANSFER_OPTION_ROWS as i32 - 1) as usize,
+            ));
+        }
+    };
+    match k.code {
+        KeyCode::Esc | KeyCode::Char('q') => {
+            app.transfer = None;
+            app.status = t("已取消数据搬运").into();
+        }
+        KeyCode::Up | KeyCode::Char('k') => step(app, -1),
+        KeyCode::Down | KeyCode::Char('j') => step(app, 1),
+        KeyCode::PageUp => step(app, -10),
+        KeyCode::PageDown => step(app, 10),
+        KeyCode::Home => {
+            if let Some(w) = app.transfer.as_mut() {
+                w.opt_list.select(Some(0));
+            }
+        }
+        KeyCode::End => {
+            if let Some(w) = app.transfer.as_mut() {
+                w.opt_list.select(Some(TRANSFER_OPTION_ROWS - 1));
+            }
+        }
+        KeyCode::Enter | KeyCode::Char(' ') => transfer_opt_activate(app, tx),
+        // Direct shortcuts so each option is one key away from anywhere in the
+        // step (mirrors the diff picker's `m` / `w`).
+        KeyCode::Char('m') => {
+            if let Some(w) = app.transfer.as_mut() {
+                w.mode = w.mode.next();
+            }
+        }
+        KeyCode::Char('o') => transfer_cycle_conflict(app),
+        KeyCode::Char('s') => {
+            if let Some(w) = app.transfer.as_mut() {
+                w.on_error = w.on_error.next();
+            }
+        }
+        KeyCode::Char('w') => transfer_open_prompt(app, TransferField::Where),
+        KeyCode::Char('l') => transfer_open_prompt(app, TransferField::Limit),
+        KeyCode::Char('i') => {
+            if let Some(w) = app.transfer.as_mut() {
+                w.with_indexes = !w.with_indexes;
+            }
+        }
+        KeyCode::Char('a') => {
+            if let Some(w) = app.transfer.as_mut() {
+                w.with_auto_increment = !w.with_auto_increment;
+            }
+        }
+        _ => {}
+    }
+}
+
+fn transfer_prompt_key(app: &mut App, _tx: &Tx, k: KeyEvent) {
+    match k.code {
+        KeyCode::Enter => {
+            let parsed = app.transfer.as_ref().and_then(|w| {
+                w.prompt
+                    .as_ref()
+                    .map(|p| (p.field, p.input.lines().join(" ").trim().to_string()))
+            });
+            if let Some((field, text)) = parsed {
+                if let Some(w) = app.transfer.as_mut() {
+                    match field {
+                        TransferField::Where => w.where_input = text,
+                        TransferField::Limit => w.limit_input = text,
+                    }
+                    w.prompt = None;
+                }
+                app.status = t("已更新搬运选项").into();
+            }
+        }
+        KeyCode::Esc => {
+            if let Some(w) = app.transfer.as_mut() {
+                w.prompt = None;
+            }
+        }
+        _ => {
+            if let Some(w) = app.transfer.as_mut() {
+                if let Some(p) = w.prompt.as_mut() {
+                    p.input.input(k);
+                }
+            }
+        }
+    }
+}
+
+fn transfer_confirm_key(app: &mut App, tx: &Tx, k: KeyEvent) {
+    match k.code {
+        KeyCode::Enter | KeyCode::Char('y') => start_transfer(app, tx),
+        KeyCode::Esc | KeyCode::Char('n') => {
+            if let Some(w) = app.transfer.as_mut() {
+                w.conflict = TransferConflict::Stop;
+                w.step = TransferStep::Options;
+            }
+            app.status = t("已取消覆盖，保持报错停下").into();
+        }
+        _ => {}
+    }
+}
+
+/// Build the job from the wizard and dispatch it in the background. A >1M source
+/// must pass the wizard's `large_warn` gate first.
+fn start_transfer(app: &mut App, tx: &Tx) {
+    app.transfer_gen += 1;
+    let gen = app.transfer_gen;
+    let Some(w) = app.transfer.as_mut() else {
+        return;
+    };
+    w.stash_name();
+    let table = w.name_values[2].trim().to_string();
+    if table.is_empty() {
+        w.error = Some(t("目标表名不能为空").to_string());
+        w.step = TransferStep::Name;
+        return;
+    }
+    let allow_large = w.large_warn.is_some();
+    let cancel = Arc::new(AtomicBool::new(false));
+    app.transfer_cancel = cancel.clone();
+    let job = TransferJob {
+        src_cfg: Box::new(w.src_conn.clone()),
+        src_db: w.src_db.clone(),
+        src_schema: w.src_schema.clone(),
+        src_table: w.src_table.clone(),
+        tgt_cfg: Box::new(w.target_conn.clone()),
+        tgt_db: w.name_values[0].trim().to_string(),
+        tgt_schema: w.name_values[1].trim().to_string(),
+        tgt_table: table.clone(),
+        mode: w.mode,
+        conflict: w.conflict,
+        on_error: w.on_error,
+        where_input: w.where_input.clone(),
+        limit: w.limit(),
+        with_indexes: w.with_indexes,
+        with_auto_increment: w.with_auto_increment,
+        allow_large,
+        gen,
+        cancel,
+    };
+    let src_label = qualified_display(&w.src_schema, &w.src_table);
+    w.submitted = true;
+    app.transfer_report = None;
+    app.transfer_progress = None;
+    app.loading = true;
+    app.status = tf(
+        "开始搬运 {} → {} · Esc 中止（已提交批次保留）",
+        &[&fix_double_encoding(&src_label), &fix_double_encoding(&table)],
+    );
+    app.spawn(tx, Op::DataTransfer(Box::new(job)));
+}
+
+fn transfer_report_key(app: &mut App, tx: &Tx, k: KeyEvent) {
+    match k.code {
+        KeyCode::Esc | KeyCode::Char('q') | KeyCode::Enter => {
+            app.transfer_report = None;
+            app.status = t("已关闭搬运汇总").into();
+        }
+        KeyCode::Char('g') | KeyCode::Char('y') => {
+            let Some(rep) = app.transfer_report.as_ref() else {
+                return;
+            };
+            let text = transfer_summary_text(rep);
+            let lines = text.lines().count();
+            match clipboard_copy(&text) {
+                Some(p) => {
+                    app.status = tf(
+                        "✓ 已复制搬运摘要（{} 行）· 兜底 {}",
+                        &[&lines, &(p.display())],
+                    )
+                }
+                None => {
+                    app.status =
+                        tf("✓ 已复制搬运摘要（{} 行）· OSC52 剪贴板", &[&lines])
+                }
+            }
+        }
+        KeyCode::Char('b') => open_transfer_target(app, tx),
+        _ => {}
+    }
+}
+
+/// `b` in the report: jump to the copied table when it lives on the connection
+/// and database already open.
+fn open_transfer_target(app: &mut App, tx: &Tx) {
+    let Some(rep) = app.transfer_report.as_ref() else {
+        return;
+    };
+    let tgt_conn_id = rep.tgt_conn_id.clone();
+    let tgt_db = rep.tgt_db.clone();
+    let tgt_schema = rep.tgt_schema.clone();
+    let tgt_table = rep.tgt_table.clone();
+    let same_conn = app.selected.as_ref().is_some_and(|c| c.id == tgt_conn_id);
+    if !same_conn || app.current_db() != tgt_db || app.schema != tgt_schema {
+        app.status = t("目标表在其他连接/库/模式：请切换到该连接后用 d 浏览").into();
+        return;
+    }
+    let Some(idx) = app
+        .tables
+        .iter()
+        .position(|t| t.name.eq_ignore_ascii_case(&tgt_table))
+    else {
+        // The table was just created by the transfer, so the sidebar list is
+        // stale: clear any filter, refresh, and open it when the list lands.
+        app.transfer_report = None;
+        app.table_filter.clear();
+        app.table_prompt = None;
+        app.pending_open_table = Some((tgt_schema.clone(), tgt_table.clone()));
+        app.status = tf("刷新表列表并打开 {} …", &[&tgt_table]);
+        spawn_table_list(app, tx);
+        return;
+    };
+    app.transfer_report = None;
+    app.table_list.select(Some(idx));
+    open_table_data(app, tx);
+}
+
 // ── data compare (Alt-K) ──
 
 /// Start a two-table data compare. The picker stays open (with `comparing` set)
@@ -19235,6 +21185,15 @@ fn ui(f: &mut Frame, app: &mut App) {
     if app.data_diff.is_some() {
         render_data_diff(f, chunks[1], app);
     }
+    if app.transfer.as_ref().is_some_and(|w| w.prompt.is_some()) {
+        render_transfer_prompt(f, f.area(), app);
+    }
+    if app.transfer.is_some() {
+        render_transfer_wizard(f, chunks[1], app);
+    }
+    if app.transfer_report.is_some() {
+        render_transfer_report(f, chunks[1], app);
+    }
     if app.diff.is_some() {
         render_diff_panel(f, chunks[1], app);
     }
@@ -19647,6 +21606,11 @@ enum FooterView {
     DbDiff,
     DataDiff,
     DataWhere,
+    TransferWizard,
+    TransferConfirm,
+    TransferRunning,
+    TransferPrompt,
+    TransferReport,
     Recent,
     ColPicker,
     ConnPicker,
@@ -19725,6 +21689,16 @@ fn footer_ctx(app: &App) -> FooterCtx {
         FooterView::Search
     } else if app.data_where.is_some() {
         FooterView::DataWhere
+    } else if app.transfer.as_ref().is_some_and(|w| w.prompt.is_some()) {
+        FooterView::TransferPrompt
+    } else if app.transfer.as_ref().is_some_and(|w| w.submitted) {
+        FooterView::TransferRunning
+    } else if app.transfer.as_ref().is_some_and(|w| w.step == TransferStep::Confirm) {
+        FooterView::TransferConfirm
+    } else if app.transfer.is_some() {
+        FooterView::TransferWizard
+    } else if app.transfer_report.is_some() {
+        FooterView::TransferReport
     } else if app.diff_picker.is_some() {
         FooterView::DiffPicker
     } else if app.data_diff.is_some() {
@@ -19840,6 +21814,24 @@ fn footer_hints_ctx(ctx: FooterCtx) -> Vec<Hint> {
         FooterView::DataWhere => vec![
             ("Enter", t("开始对比")),
             ("Esc", t("取消")),
+        ],
+        FooterView::TransferWizard => vec![
+            ("↑↓", t("选择")),
+            ("Enter", t("下一步/切换")),
+            ("m", t("模式")),
+            ("w/l", t("WHERE/LIMIT")),
+            ("Esc", t("取消")),
+        ],
+        FooterView::TransferConfirm => vec![
+            ("Enter", t("确认覆盖")),
+            ("Esc", t("返回")),
+        ],
+        FooterView::TransferRunning => vec![("Esc", t("中止搬运"))],
+        FooterView::TransferPrompt => vec![("Enter", t("确定")), ("Esc", t("取消"))],
+        FooterView::TransferReport => vec![
+            ("g", t("复制摘要")),
+            ("b", t("浏览目标表")),
+            ("Esc", t("关闭")),
         ],
         FooterView::Recent => vec![
             ("↑↓", t("选择")),
@@ -22987,6 +24979,498 @@ fn render_data_where(f: &mut Frame, area: Rect, app: &mut App) {
     }
 }
 
+/// The `Alt-T` transfer wizard overlay (three steps + the red overwrite layer).
+fn render_transfer_wizard(f: &mut Frame, area: Rect, app: &mut App) {
+    if app
+        .transfer
+        .as_ref()
+        .is_some_and(|w| w.submitted)
+    {
+        render_transfer_running(f, area, app);
+        return;
+    }
+    let step = match app.transfer.as_ref().map(|w| w.step) {
+        Some(s) => s,
+        None => return,
+    };
+    if area.width < 12 || area.height < 5 {
+        return;
+    }
+    let w = if area.width > 88 {
+        84
+    } else {
+        area.width.saturating_sub(2).max(10)
+    };
+    match step {
+        TransferStep::Connection => {
+            let (src, entries) = {
+                let w = app.transfer.as_ref().unwrap();
+                (
+                    fix_double_encoding(&qualified_display(&w.src_schema, &w.src_table)),
+                    w.conns
+                        .iter()
+                        .map(|c| format!("{}  ({})", c.name, c.db_type.as_str()))
+                        .collect::<Vec<_>>(),
+                )
+            };
+            let h = (entries.len() as u16 + 3).min(area.height.saturating_sub(2).max(4));
+            let box_area = centered_overlay(area, w, h);
+            f.render_widget(Clear, box_area);
+            let block = Block::default()
+                .borders(Borders::ALL)
+                .border_set(border::ROUNDED)
+                .border_style(Style::default().fg(Color::Cyan))
+                .title(tf(
+                    " 数据搬运 ① 目标连接 · 源 {} · Enter 下一步 · Esc 取消 ",
+                    &[&src],
+                ));
+            let inner = block.inner(box_area);
+            f.render_widget(block, box_area);
+            let items: Vec<ListItem> = entries.iter().map(|e| ListItem::new(e.clone())).collect();
+            let list = List::new(items)
+                .highlight_style(
+                    Style::default()
+                        .fg(Color::Black)
+                        .bg(Color::Cyan)
+                        .add_modifier(Modifier::BOLD),
+                )
+                .highlight_symbol("▸ ");
+            let list_state = &mut app.transfer.as_mut().unwrap().conn_list;
+            f.render_stateful_widget(list, inner, list_state);
+        }
+        TransferStep::Name => {
+            let (tgt, lines, focus_label, live) = {
+                let w = app.transfer.as_ref().unwrap();
+                let tgt = format!(
+                    "{} ({})",
+                    w.target_conn.name,
+                    w.target_conn.db_type.as_str()
+                );
+                let labels = [t("数据库"), t("模式/Schema"), t("目标表名")];
+                let live = w.name_input.lines().join("\n");
+                let mut lines = Vec::new();
+                for (i, label) in labels.iter().enumerate() {
+                    let val = if i == w.name_focus.index() {
+                        live.clone()
+                    } else {
+                        w.name_values[i].clone()
+                    };
+                    let mark = if i == w.name_focus.index() {
+                        "▸"
+                    } else {
+                        " "
+                    };
+                    lines.push(format!("{mark} {label:<10} {val}"));
+                }
+                (tgt, lines, labels[w.name_focus.index()], live)
+            };
+            let _ = live;
+            let h = 9.min(area.height.saturating_sub(2).max(5));
+            let box_area = centered_overlay(area, w, h);
+            f.render_widget(Clear, box_area);
+            let block = Block::default()
+                .borders(Borders::ALL)
+                .border_set(border::ROUNDED)
+                .border_style(Style::default().fg(Color::Cyan))
+                .title(tf(
+                    " 数据搬运 ② 目标库/表 · {} · Tab 切换 · Enter 下一步 · Esc 返回 ",
+                    &[&tgt],
+                ));
+            let inner = block.inner(box_area);
+            f.render_widget(block, box_area);
+            let err = app.transfer.as_ref().and_then(|w| w.error.clone());
+            let mut text_lines: Vec<Line> = lines
+                .iter()
+                .map(|l| Line::from(Span::styled(l.clone(), Style::default().fg(Color::Gray))))
+                .collect();
+            text_lines.push(Line::from(""));
+            text_lines.push(Line::from(Span::styled(
+                tf("编辑字段: {}（直接输入，Tab 切换）", &[&focus_label]),
+                Style::default().fg(Color::DarkGray),
+            )));
+            if let Some(e) = err {
+                text_lines.push(Line::from(Span::styled(
+                    e,
+                    Style::default().fg(Color::Red),
+                )));
+            }
+            let list_h = text_lines.len() as u16;
+            let para = Paragraph::new(text_lines);
+            f.render_widget(
+                para,
+                Rect {
+                    x: inner.x,
+                    y: inner.y,
+                    width: inner.width,
+                    height: list_h.min(inner.height),
+                },
+            );
+            // The live one-line editor for the focused field.
+            let input_y = inner.y + list_h.min(inner.height);
+            if input_y < inner.y + inner.height {
+                let input_area = Rect {
+                    x: inner.x,
+                    y: input_y,
+                    width: inner.width,
+                    height: 1,
+                };
+                if let Some(w) = app.transfer.as_mut() {
+                    w.name_input.set_block(Block::default());
+                    f.render_widget(&w.name_input, input_area);
+                }
+            }
+        }
+        TransferStep::Options => {
+            let (rows, cursor, mode, where_v, large) = {
+                let w = app.transfer.as_ref().unwrap();
+                (
+                    transfer_option_rows(w),
+                    w.opt_list.selected().unwrap_or(0),
+                    w.mode,
+                    w.where_input.clone(),
+                    w.large_warn,
+                )
+            };
+            let _ = mode;
+            let _ = where_v;
+            let h = (rows.len() as u16 + 4).min(area.height.saturating_sub(2).max(5));
+            let box_area = centered_overlay(area, w, h);
+            f.render_widget(Clear, box_area);
+            let block = Block::default()
+                .borders(Borders::ALL)
+                .border_set(border::ROUNDED)
+                .border_style(Style::default().fg(Color::Cyan))
+                .title(t(" 数据搬运 ③ 模式与选项 · ↑↓ 选择 · Enter 切换 · Enter 开搬 · Esc 取消 "));
+            let inner = block.inner(box_area);
+            f.render_widget(block, box_area);
+            let items: Vec<ListItem> = rows
+                .iter()
+                .enumerate()
+                .map(|(i, (label, value))| {
+                    if i == rows.len() - 1 {
+                        ListItem::new(Line::from(Span::styled(
+                            format!("▶ {label}"),
+                            Style::default()
+                                .fg(Color::Green)
+                                .add_modifier(Modifier::BOLD),
+                        )))
+                    } else {
+                        ListItem::new(format!("{label:<12} {value}"))
+                    }
+                })
+                .collect();
+            let list = List::new(items)
+                .highlight_style(
+                    Style::default()
+                        .fg(Color::Black)
+                        .bg(Color::Cyan)
+                        .add_modifier(Modifier::BOLD),
+                )
+                .highlight_symbol("▸ ");
+            let mut state = ListState::default();
+            state.select(Some(cursor));
+            let list_h = (rows.len() as u16).min(inner.height.saturating_sub(2));
+            f.render_stateful_widget(
+                list,
+                Rect {
+                    x: inner.x,
+                    y: inner.y,
+                    width: inner.width,
+                    height: list_h,
+                },
+                &mut state,
+            );
+            let note_y = inner.y + list_h;
+            if note_y < inner.y + inner.height {
+                let note = if let Some(n) = large {
+                    Line::from(Span::styled(
+                        tf("⚠ 预估 {} 行，再按 Enter 确认开始", &[&n]),
+                        Style::default().fg(Color::Yellow),
+                    ))
+                } else {
+                    Line::from(Span::styled(
+                        t("m 模式 · o 覆盖 · s 出错处理 · w/l WHERE/LIMIT · i 索引 · a 自增"),
+                        Style::default().fg(Color::DarkGray),
+                    ))
+                };
+                f.render_widget(
+                    Paragraph::new(note),
+                    Rect {
+                        x: inner.x,
+                        y: note_y,
+                        width: inner.width,
+                        height: 1,
+                    },
+                );
+            }
+        }
+        TransferStep::Confirm => {
+            let tgt = {
+                let w = app.transfer.as_ref().unwrap();
+                format!(
+                    "{} · {} · {}",
+                    w.target_conn.name,
+                    w.name_values[0],
+                    qualified_display(&w.name_values[1], &w.name_values[2])
+                )
+            };
+            let h = 8.min(area.height.saturating_sub(2).max(5));
+            let box_area = centered_overlay(area, w, h);
+            f.render_widget(Clear, box_area);
+            let block = Block::default()
+                .borders(Borders::ALL)
+                .border_set(border::ROUNDED)
+                .border_style(Style::default().fg(Color::Red).add_modifier(Modifier::BOLD))
+                .title(t(" ⚠ 覆盖确认 · 将先 DROP 目标表 "));
+            let inner = block.inner(box_area);
+            f.render_widget(block, box_area);
+            let lines = vec![
+                Line::from(Span::styled(
+                    tf("目标表: {}", &[&tgt]),
+                    Style::default().fg(Color::White),
+                )),
+                Line::from(Span::styled(
+                    t("DROP TABLE 会永久删除目标表的全部数据，且无法恢复。"),
+                    Style::default().fg(Color::Red),
+                )),
+                Line::from(""),
+                Line::from(Span::styled(
+                    t("Enter 确认覆盖并开始搬运 · Esc 返回（保持报错停下）"),
+                    Style::default().fg(Color::Yellow),
+                )),
+            ];
+            f.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }), inner);
+        }
+    }
+}
+
+/// The read-only progress overlay shown while a transfer runs.
+fn render_transfer_running(f: &mut Frame, area: Rect, app: &mut App) {
+    let Some(w) = app.transfer.as_ref() else {
+        return;
+    };
+    if area.width < 12 || area.height < 5 {
+        return;
+    }
+    let src = fix_double_encoding(&qualified_display(&w.src_schema, &w.src_table));
+    let table = w.name_values[2].clone();
+    let box_w = if area.width > 76 {
+        72
+    } else {
+        area.width.saturating_sub(2).max(10)
+    };
+    let h = 7.min(area.height.saturating_sub(2).max(4));
+    let box_area = centered_overlay(area, box_w, h);
+    f.render_widget(Clear, box_area);
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_set(border::ROUNDED)
+        .border_style(Style::default().fg(Color::Cyan))
+        .title(t(" 数据搬运中… · Esc 中止（已提交批次保留） "));
+    let inner = block.inner(box_area);
+    f.render_widget(block, box_area);
+    let (rows, chunks, elapsed, total) = app.transfer_progress.unwrap_or((0, 0, 0, None));
+    let rate = (rows as u128 * 1000).checked_div(elapsed).unwrap_or(rows as u128) as u64;
+    let mut lines = vec![
+        Line::from(Span::styled(
+            tf("{} → {}", &[&src, &fix_double_encoding(&table)]),
+            Style::default().fg(Color::White),
+        )),
+        Line::from(""),
+        Line::from(Span::styled(
+            tf(
+                "已搬 {} 行 / 已完成 {} 块 ({} 行/秒)",
+                &[&rows, &chunks, &rate],
+            ),
+            Style::default().fg(Color::Green),
+        )),
+    ];
+    if let Some(t) = total.filter(|t| *t > 0) {
+        lines.push(Line::from(Span::styled(
+            tf("源预估 {} 行", &[&t]),
+            Style::default().fg(Color::DarkGray),
+        )));
+    }
+    lines.push(Line::from(""));
+    lines.push(Line::from(Span::styled(
+        t("Esc 中止并保留已提交批次；完成前请勿关闭终端"),
+        Style::default().fg(Color::DarkGray),
+    )));
+    f.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }), inner);
+}
+
+/// The `WHERE` / `LIMIT` input for the transfer wizard's options step.
+fn render_transfer_prompt(f: &mut Frame, area: Rect, app: &mut App) {
+    let Some(w) = app.transfer.as_ref() else {
+        return;
+    };
+    let Some(p) = w.prompt.as_ref() else {
+        return;
+    };
+    let field = p.field;
+    let label = match field {
+        TransferField::Where => t("数据搬运 WHERE（只搬子集）"),
+        TransferField::Limit => t("数据搬运 LIMIT 上限"),
+    };
+    let box_w = if area.width.saturating_sub(4) < 24 {
+        area.width
+    } else {
+        (area.width - 4).min(74)
+    };
+    let h = 7.min(area.height);
+    let box_area = centered_overlay(area, box_w, h);
+    f.render_widget(Clear, box_area);
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_set(border::ROUNDED)
+        .border_style(Style::default().fg(Color::Yellow))
+        .title(tf(" {} · Enter 确定 · Esc 取消 ", &[&label]));
+    let inner = block.inner(box_area);
+    f.render_widget(block, box_area);
+    let hint_h = 2u16.min(inner.height.saturating_sub(1));
+    let ta_h = inner.height.saturating_sub(hint_h).max(1);
+    let ta_area = Rect {
+        x: inner.x,
+        y: inner.y,
+        width: inner.width,
+        height: ta_h,
+    };
+    let hint_area = Rect {
+        x: inner.x,
+        y: inner.y + ta_h,
+        width: inner.width,
+        height: hint_h,
+    };
+    if let Some(w) = app.transfer.as_mut() {
+        if let Some(p) = w.prompt.as_mut() {
+            p.input.set_block(Block::default());
+            f.render_widget(&p.input, ta_area);
+        }
+    }
+    if hint_h > 0 {
+        let hint = match field {
+            TransferField::Where => t("例: id > 100 AND status = 'ok'（留空 = 全表）"),
+            TransferField::Limit => t("例: 5000（留空 = 不限；顶层上限）"),
+        };
+        f.render_widget(
+            Paragraph::new(Line::from(Span::styled(
+                hint,
+                Style::default().fg(Color::DarkGray),
+            ))),
+            hint_area,
+        );
+    }
+}
+
+/// The transfer completion summary (`Alt-T`).
+fn render_transfer_report(f: &mut Frame, area: Rect, app: &mut App) {
+    let Some(rep) = app.transfer_report.as_ref() else {
+        return;
+    };
+    if area.width < 12 || area.height < 5 {
+        return;
+    }
+    let box_w = if area.width > 88 {
+        84
+    } else {
+        area.width.saturating_sub(2).max(10)
+    };
+    let h = 16.min(area.height.saturating_sub(2).max(5));
+    let box_area = centered_overlay(area, box_w, h);
+    f.render_widget(Clear, box_area);
+    let color = if rep.ok() {
+        Color::Green
+    } else if rep.cancelled {
+        Color::Yellow
+    } else {
+        Color::Red
+    };
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_set(border::ROUNDED)
+        .border_style(Style::default().fg(color))
+        .title(t(" 数据搬运汇总 · g 复制摘要 · b 浏览目标表 · Esc 关闭 "));
+    let inner = block.inner(box_area);
+    f.render_widget(block, box_area);
+
+    let mut lines: Vec<Line> = Vec::new();
+    let kv = |k: &str, v: String| {
+        Line::from(vec![
+            Span::styled(format!("{k}: "), Style::default().fg(Color::DarkGray)),
+            Span::raw(v),
+        ])
+    };
+    lines.push(kv(
+        t("源"),
+        format!("{} ({})", rep.src_label, rep.src_db_type.as_str()),
+    ));
+    let conflict = if rep.mode == TransferMode::Append {
+        String::new()
+    } else {
+        format!(" · {}", t(rep.conflict.label()))
+    };
+    lines.push(kv(
+        t("目标"),
+        format!(
+            "{} ({}) · {}{} · {}",
+            rep.tgt_label,
+            rep.tgt_db_type.as_str(),
+            t(rep.mode.label()),
+            conflict,
+            t(rep.on_error.label())
+        ),
+    ));
+    let src_rows = rep.src_rows;
+    lines.push(kv(
+        t("已搬运"),
+        tf(
+            "{} 行 · 跳过 {} 行 · 源读取 {} 行 · {} 块",
+            &[&rep.moved, &rep.skipped.len(), &src_rows, &rep.chunks_done],
+        ),
+    ));
+    lines.push(kv(
+        t("耗时/速率"),
+        format!("{}ms · {} {}", rep.elapsed_ms, rep.rate(), t("行/秒")),
+    ));
+    lines.push(kv(
+        t("源预估"),
+        rep.estimated
+            .map(|n| n.to_string())
+            .unwrap_or_else(|| "?".to_string()),
+    ));
+    if rep.created {
+        lines.push(kv(t("建表"), t("已在目标创建").to_string()));
+    }
+    if let Some(bp) = &rep.breakpoint {
+        lines.push(kv(t("断点主键"), bp.clone()));
+    }
+    if rep.cancelled {
+        lines.push(Line::from(Span::styled(
+            t("⚠ 已中止（已提交批次保留，可按断点续搬）"),
+            Style::default().fg(Color::Yellow),
+        )));
+    }
+    if let Some((row, err)) = &rep.aborted {
+        lines.push(Line::from(Span::styled(
+            tf("✗ 中止于源行 {}: {}", &[&row, &err]),
+            Style::default().fg(Color::Red),
+        )));
+    }
+    for (row, err) in rep.skipped.iter().take(3) {
+        lines.push(Line::from(Span::styled(
+            tf("跳过源行 {}: {}", &[&row, &err]),
+            Style::default().fg(Color::Yellow),
+        )));
+    }
+    for warn in rep.warnings.iter().take(2) {
+        lines.push(Line::from(Span::styled(
+            tf("⚠ {}", &[&warn]),
+            Style::default().fg(Color::Yellow),
+        )));
+    }
+    f.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }), inner);
+}
+
 /// The `Alt-L` file-path input, drawn as a one-line box at the bottom.
 fn render_file_load_prompt(f: &mut Frame, area: Rect, app: &mut App) {
     if area.height < 3 || area.width < 12 {
@@ -23846,6 +26330,20 @@ const HELP_ROWS: &[(&str, &str)] = &[
     ("y", "复制差异摘要（纯文本）"),
     ("g", "生成同步 INSERT/UPDATE/DELETE（方向：源 → 目标，只生成不执行）"),
     ("Esc", "关闭；对比进行中按一下中止（保留已比结果）"),
+    ("— 数据搬运（Alt-T）—", ""),
+    (
+        "Alt-T",
+        "跨库搬数据：源 = 当前表，目标可同连接或跨连接/跨方言（MySQL↔PG 双向）",
+    ),
+    ("① 选目标连接", "Enter 下一步；默认当前连接（同方言）"),
+    ("② 目标库/表", "Tab 切换 库/Schema/表名；改名 = 表复制；默认同名"),
+    ("③ 模式", "建表+搬数据（默认）/ 仅建表 / 插入已有表（append）"),
+    ("表已存在（o）", "报错停下（默认）或 覆盖 = 先 DROP（红色确认层）"),
+    ("选项", "w WHERE 子集 · l LIMIT 上限 · i 带索引 · a 自增值 · s 停止/跳过"),
+    ("搬运引擎", "源 keyset 分块（1000 行）→ 目标事务批量 INSERT（500/批）"),
+    ("进度 / 中止", "状态栏显示 行数/块数/速率；Esc 中止（已提交批次保留）"),
+    ("大表防护", "源预估 ≥100 万行需再按 Enter 确认；单批失败重试 1 次"),
+    ("完成汇总", "g 复制摘要 · b 浏览目标表（同连接/库时）· Esc 关闭"),
     ("补全上下文", "表名. 后只补该表列名；FROM/JOIN 后优先表名；WHERE/ON 后优先列名"),
     ("↑ ↓", "历史（首行 / 末行）"),
     ("Esc", "回到侧栏"),
@@ -30869,5 +33367,342 @@ mod tests {
         assert_ne!(ui_text::t_lang("差异", Lang::En), "差异");
         assert_ne!(ui_text::t_lang("数据一致", Lang::En), "数据一致");
         assert_ne!(ui_text::t_lang("同步 SQL", Lang::En), "同步 SQL");
+    }
+
+    // ── data transfer (Alt-T) ──
+
+    fn transfer_wizard_fixture() -> TransferWizard {
+        let conn = test_conn("mysql");
+        let mut name_input = TextArea::from(vec!["orders".to_string()]);
+        name_input.move_cursor(CursorMove::End);
+        let mut conn_list = ListState::default();
+        conn_list.select(Some(0));
+        let mut opt_list = ListState::default();
+        opt_list.select(Some(0));
+        TransferWizard {
+            step: TransferStep::Options,
+            conn_list,
+            conns: vec![conn.clone()],
+            target_conn: conn.clone(),
+            name_focus: NameFocus::Table,
+            name_values: ["shop".into(), String::new(), "orders".into()],
+            name_input,
+            opt_list,
+            mode: TransferMode::CreateAndCopy,
+            conflict: TransferConflict::Stop,
+            on_error: TransferOnError::Stop,
+            where_input: String::new(),
+            limit_input: String::new(),
+            with_indexes: true,
+            with_auto_increment: true,
+            large_warn: None,
+            error: None,
+            prompt: None,
+            submitted: false,
+            src_conn: conn,
+            src_db: "shop".into(),
+            src_schema: String::new(),
+            src_table: "orders".into(),
+        }
+    }
+
+    fn transfer_src_cols() -> Vec<ColumnInfo> {
+        vec![
+            col_full("id", "int", false, None, None, true),
+            col_full("name", "varchar(50)", false, None, Some("名称"), false),
+            col_full("price", "decimal(10,2)", true, None, None, false),
+            ColumnInfo {
+                extra: Some("auto_increment".into()),
+                ..col_full("seq", "bigint", false, None, None, false)
+            },
+            col_full("payload", "blob", true, None, None, false),
+            col_full("created_at", "timestamp", true, None, None, false),
+        ]
+    }
+
+    fn transfer_report_fixture() -> TransferReport {
+        let mysql = parse_database_type("mysql").unwrap();
+        TransferReport {
+            src_label: "shop.orders".into(),
+            tgt_label: "warehouse.orders".into(),
+            src_db_type: mysql,
+            tgt_db_type: mysql,
+            mode: TransferMode::CreateAndCopy,
+            conflict: TransferConflict::Stop,
+            on_error: TransferOnError::Stop,
+            tgt_db: "warehouse".into(),
+            tgt_schema: String::new(),
+            tgt_table: "orders".into(),
+            tgt_conn_id: "id-mysql".into(),
+            src_rows: 5000,
+            moved: 5000,
+            skipped: Vec::new(),
+            aborted: None,
+            cancelled: true,
+            estimated: Some(5000),
+            created: true,
+            breakpoint: Some("4999".into()),
+            warnings: Vec::new(),
+            elapsed_ms: 2500,
+            chunks_done: 5,
+        }
+    }
+
+    #[test]
+    fn transfer_create_table_is_dialect_correct() {
+        let cols = transfer_src_cols();
+        let idx = vec![
+            idx_info("PRIMARY", &["id"], true, true),
+            idx_info("idx_name", &["name"], false, false),
+        ];
+        let pk = vec!["id".to_string()];
+        let mysql = parse_database_type("mysql").unwrap();
+        let pg = parse_database_type("postgres").unwrap();
+        // MySQL → MySQL keeps the dialect verbatim (inline COMMENT + AUTO_INCREMENT).
+        let (script, warns) = generate_transfer_create(
+            &cols, &idx, &pk, mysql, mysql, "", "orders_copy", true, true,
+        )
+        .unwrap();
+        assert!(warns.is_empty(), "{warns:?}");
+        assert!(script.contains("CREATE TABLE `orders_copy` ("));
+        assert!(script.contains("`seq` bigint NOT NULL AUTO_INCREMENT"));
+        assert!(script.contains("PRIMARY KEY (`id`)"));
+        assert!(script.contains("`name` varchar(50) NOT NULL COMMENT '名称'"));
+        assert!(script.contains("CREATE INDEX `idx_name` ON `orders_copy` (`name`);"));
+        // MySQL → PostgreSQL maps types, serial and COMMENT ON.
+        let (script, _) = generate_transfer_create(
+            &cols, &idx, &pk, mysql, pg, "", "orders_copy", true, true,
+        )
+        .unwrap();
+        assert!(script.contains("CREATE TABLE \"orders_copy\" ("));
+        // Cross-dialect auto-increment stays a plain integer (no stale sequence).
+        assert!(script.contains("\"seq\" bigint NOT NULL"));
+        assert!(!script.contains("bigserial"));
+        assert!(script.contains("\"payload\" bytea"));
+        assert!(script.contains("\"name\" character varying(50) NOT NULL"));
+        assert!(script.contains("COMMENT ON COLUMN \"orders_copy\".\"name\" IS '名称';"));
+        assert!(script.contains("PRIMARY KEY (\"id\")"));
+        assert!(!script.contains("AUTO_INCREMENT"));
+        assert!(script.contains("CREATE INDEX \"idx_name\" ON \"orders_copy\" (\"name\");"));
+    }
+
+    #[test]
+    fn transfer_without_auto_increment_keeps_a_plain_type() {
+        let cols = transfer_src_cols();
+        let idx = vec![idx_info("PRIMARY", &["id"], true, true)];
+        let pk = vec!["id".to_string()];
+        let mysql = parse_database_type("mysql").unwrap();
+        let pg = parse_database_type("postgres").unwrap();
+        let (script, _) = generate_transfer_create(
+            &cols, &idx, &pk, mysql, pg, "", "t", false, false,
+        )
+        .unwrap();
+        assert!(script.contains("\"seq\" bigint"));
+        assert!(!script.contains("bigserial"));
+        assert!(!script.contains("AUTO_INCREMENT"));
+        assert!(!script.contains("CREATE INDEX"));
+    }
+
+    #[test]
+    fn transfer_warns_when_the_source_has_no_primary_key() {
+        let cols = vec![col_full("a", "int", true, None, None, false)];
+        let mysql = parse_database_type("mysql").unwrap();
+        let (script, warns) =
+            generate_transfer_create(&cols, &[], &[], mysql, mysql, "", "t", true, true).unwrap();
+        assert!(!script.contains("PRIMARY KEY"));
+        assert_eq!(warns.len(), 1);
+    }
+
+    #[test]
+    fn transfer_type_mapping_and_tz_normalisation() {
+        let mysql = parse_database_type("mysql").unwrap();
+        let pg = parse_database_type("postgres").unwrap();
+        let c = |ty: &str| col_full("c", ty, true, None, None, false);
+        assert_eq!(transfer_target_type(&c("blob"), pg, true, true), "bytea");
+        assert_eq!(
+            transfer_target_type(&c("varchar(20)"), pg, true, true),
+            "character varying(20)"
+        );
+        assert_eq!(transfer_target_type(&c("tinyint(1)"), pg, true, true), "smallint");
+        assert_eq!(transfer_target_type(&c("int"), pg, true, true), "integer");
+        // Same-dialect PostgreSQL keeps the auto-increment counter as `serial`.
+        let auto = ColumnInfo {
+            extra: Some("auto_increment".into()),
+            ..col_full("id", "int", false, None, None, true)
+        };
+        assert_eq!(transfer_target_type(&auto, pg, false, true), "serial");
+        // Same dialect is verbatim.
+        assert_eq!(
+            transfer_target_type(&c("varchar(20)"), mysql, false, true),
+            "varchar(20)"
+        );
+        // temporal literal normalisation for a MySQL target
+        assert_eq!(
+            strip_tz_suffix("2024-01-01 12:00:00+00").as_deref(),
+            Some("2024-01-01 12:00:00")
+        );
+        assert_eq!(
+            strip_tz_suffix("2024-01-01T12:00:00Z").as_deref(),
+            Some("2024-01-01 12:00:00")
+        );
+        assert_eq!(strip_tz_suffix("2024-01-01 12:00:00"), None);
+    }
+
+    #[test]
+    fn transfer_append_aligns_by_name_and_keeps_the_pk_cursor() {
+        let mysql = parse_database_type("mysql").unwrap();
+        let src = vec![
+            col_full("id", "int", false, None, None, true),
+            col_full("a", "int", true, None, None, false),
+            col_full("b", "int", true, None, None, false),
+        ];
+        let tgt = vec![
+            col_full("id", "bigint", false, None, None, true),
+            col_full("b", "int", true, None, None, false),
+            col_full("c", "text", true, None, None, false),
+        ];
+        let pk = vec!["id".to_string()];
+        let align = build_transfer_align(&src, &tgt, &pk, mysql, mysql, false).unwrap();
+        assert_eq!(align.cols.len(), 2);
+        assert_eq!(align.cols[0].src_name, "id");
+        assert_eq!(align.cols[1].src_name, "b");
+        assert_eq!(align.pk_idx, vec![0]);
+        assert!(align.keyset());
+        assert_eq!(
+            align.pk_of(&[Val::Text("7".into()), Val::Text("x".into())]).unwrap(),
+            vec![Val::Text("7".into())]
+        );
+        // A key column missing on the target disables the keyset path.
+        let tgt_no_id = vec![col_full("b", "int", true, None, None, false)];
+        let align = build_transfer_align(&src, &tgt_no_id, &pk, mysql, mysql, false).unwrap();
+        assert!(!align.keyset());
+    }
+
+    #[test]
+    fn transfer_count_probe_is_bounded_and_honours_the_limit() {
+        let mysql = parse_database_type("mysql").unwrap();
+        let sql = build_transfer_count_sql(mysql, "", "orders", "id > 10", None);
+        assert!(sql.contains("LIMIT 1000001"), "{sql}");
+        assert!(sql.contains("WHERE (id > 10)"));
+        let sql = build_transfer_count_sql(mysql, "", "orders", "", Some(50));
+        assert!(sql.contains("LIMIT 50"), "{sql}");
+        // The offset fallback orders by the first column.
+        let sql = build_transfer_offset_select(
+            mysql,
+            "",
+            "orders",
+            &["id".to_string(), "name".to_string()],
+            "",
+            1000,
+            2000,
+        );
+        assert!(sql.contains("ORDER BY `id`"));
+        assert!(sql.contains("LIMIT 1000 OFFSET 2000"));
+    }
+
+    #[test]
+    fn transfer_overwrite_flows_through_a_red_confirmation() {
+        assert_eq!(TransferMode::CreateAndCopy.next(), TransferMode::CreateOnly);
+        assert_eq!(TransferMode::CreateOnly.next(), TransferMode::Append);
+        assert_eq!(TransferMode::Append.next(), TransferMode::CreateAndCopy);
+        let mut app = test_app();
+        app.transfer = Some(Box::new(transfer_wizard_fixture()));
+        assert_eq!(app.transfer.as_ref().unwrap().conflict, TransferConflict::Stop);
+        transfer_cycle_conflict(&mut app);
+        assert_eq!(app.transfer.as_ref().unwrap().conflict, TransferConflict::Drop);
+        assert_eq!(app.transfer.as_ref().unwrap().step, TransferStep::Confirm);
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        transfer_confirm_key(&mut app, &tx, KeyEvent::from(KeyCode::Esc));
+        assert_eq!(app.transfer.as_ref().unwrap().conflict, TransferConflict::Stop);
+        assert_eq!(app.transfer.as_ref().unwrap().step, TransferStep::Options);
+    }
+
+    #[test]
+    fn transfer_breakpoint_report_summarises_the_run() {
+        let rep = transfer_report_fixture();
+        assert_eq!(rep.rate(), 2000);
+        assert!(!rep.ok());
+        let text = transfer_summary_text(&rep);
+        assert!(text.contains("断点主键: 4999"), "{text}");
+        assert!(text.contains("已中止"), "{text}");
+        assert!(text.contains("已完成块: 5"), "{text}");
+    }
+
+    #[test]
+    fn transfer_overlays_render_at_extreme_sizes() {
+        let mut app = test_app();
+        app.selected = Some(test_conn("mysql"));
+        app.transfer = Some(Box::new(transfer_wizard_fixture()));
+        let sizes = [(42u16, 22u16), (120, 40), (20, 6), (1, 1)];
+        for step in [
+            TransferStep::Connection,
+            TransferStep::Name,
+            TransferStep::Options,
+            TransferStep::Confirm,
+        ] {
+            if let Some(w) = app.transfer.as_mut() {
+                w.step = step;
+            }
+            for (w, h) in sizes {
+                draw(&mut app, w, h);
+            }
+        }
+        // The WHERE / LIMIT prompt on top of the wizard.
+        app.transfer.as_mut().unwrap().step = TransferStep::Options;
+        transfer_open_prompt(&mut app, TransferField::Where);
+        for (w, h) in sizes {
+            draw(&mut app, w, h);
+        }
+        // The in-flight progress overlay.
+        if let Some(w) = app.transfer.as_mut() {
+            w.prompt = None;
+            w.submitted = true;
+        }
+        app.transfer_progress = Some((1234, 2, 900, Some(100000)));
+        for (w, h) in sizes {
+            draw(&mut app, w, h);
+        }
+        // The completion summary.
+        app.transfer = None;
+        app.transfer_report = Some(Box::new(transfer_report_fixture()));
+        for (w, h) in sizes {
+            draw(&mut app, w, h);
+        }
+    }
+
+    #[test]
+    fn transfer_running_esc_requests_an_abort() {
+        let mut app = test_app();
+        let mut w = transfer_wizard_fixture();
+        w.submitted = true;
+        app.transfer = Some(Box::new(w));
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        transfer_key(&mut app, &tx, KeyEvent::from(KeyCode::Esc));
+        assert!(app.transfer_cancel.load(Ordering::Relaxed));
+        // Other keys are ignored while the job runs.
+        app.transfer_cancel.store(false, Ordering::Relaxed);
+        transfer_key(&mut app, &tx, KeyEvent::from(KeyCode::Char('x')));
+        assert!(!app.transfer_cancel.load(Ordering::Relaxed));
+    }
+
+    #[test]
+    fn transfer_strings_have_english_translations() {
+        use ui_text::Lang;
+        for s in [
+            "数据搬运仅支持 SQL 连接",
+            "开始搬运",
+            "断点主键",
+            "已搬运",
+            "⚠ 覆盖会先 DROP 目标表（数据不可恢复）· Enter 确认 · Esc 返回",
+            "DROP TABLE 会永久删除目标表的全部数据，且无法恢复。",
+            // Labels rendered through `t()` indirectly (the enum `label()`s).
+            "建表+搬数据",
+            "插入已有表",
+            "报错停下",
+            "停止报行号",
+            "跳过继续",
+        ] {
+            assert_ne!(ui_text::t_lang(s, Lang::En), s, "{s}");
+        }
     }
 }
