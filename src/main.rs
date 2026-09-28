@@ -23407,45 +23407,72 @@ const HELP_ROWS: &[(&str, &str)] = &[
     ("/", "按语句内容过滤（大小写不敏感子串）"),
 ];
 
-fn render_help(f: &mut Frame, area: Rect, app: &mut App) {
-    let w = {
-        let avail = area.width.saturating_sub(4);
-        if avail < 30 {
-            area.width
+/// Width of the `?` help overlay. The cheat-sheet has grown a lot (R15–R33),
+/// so on a wide terminal it takes almost the whole screen — capped at 96
+/// columns instead of the old 64. Narrow terminals keep the previous fallback:
+/// all but 4 columns, or the whole area when even that is too small.
+fn help_overlay_width(area_width: u16) -> u16 {
+    let avail = area_width.saturating_sub(4);
+    if avail < 30 {
+        area_width
+    } else {
+        avail.min(96)
+    }
+}
+
+/// Width of the help key column. Wide layouts get 24 columns so long chords and
+/// descriptive labels stay on one line; narrow layouts keep the old 16 (and
+/// shrink further rather than overflow the box).
+fn help_key_width(w: u16) -> usize {
+    let base = if w >= 72 { 24 } else { 16 };
+    base.min(w.saturating_sub(6) as usize)
+}
+
+fn help_overlay_lines(key_w: usize) -> Vec<Line<'static>> {
+    // Group sections are marked by a row with an empty description. A blank
+    // spacer before every section after the first makes the long list scannable
+    // without touching the data table itself.
+    let mut lines: Vec<Line<'static>> = Vec::with_capacity(HELP_ROWS.len() + 16);
+    let mut first_group = true;
+    for (k, d) in HELP_ROWS {
+        if d.is_empty() {
+            if !first_group {
+                lines.push(Line::from(""));
+            }
+            first_group = false;
+            lines.push(Line::from(Span::styled(
+                t(k),
+                Style::default()
+                    .fg(Color::Cyan)
+                    .add_modifier(Modifier::BOLD),
+            )));
         } else {
-            avail.min(64)
+            lines.push(Line::from(vec![
+                Span::styled(
+                    format!("{:<key_w$}", t(k)),
+                    Style::default().fg(Color::Yellow),
+                ),
+                Span::raw(t(d)),
+            ]));
         }
-    };
+    }
+    lines
+}
+
+fn render_help(f: &mut Frame, area: Rect, app: &mut App) {
+    let w = help_overlay_width(area.width);
+    // Build the lines first: the group spacers mean the rendered row count is
+    // not simply `HELP_ROWS.len()`, and the box should grow to fit when the
+    // terminal is tall enough.
+    let lines = help_overlay_lines(help_key_width(w));
+    let total = lines.len();
     let max_h = area.height.saturating_sub(2).max(3);
-    let h = (HELP_ROWS.len() as u16 + 2).min(max_h);
+    let h = (total as u16 + 2).min(max_h);
     let box_area = centered_overlay(area, w, h);
     let inner_h = box_area.height.saturating_sub(2) as usize;
     f.render_widget(Clear, box_area);
-    let total = HELP_ROWS.len();
     let max_scroll = total.saturating_sub(inner_h) as u16;
     let scroll = app.help_scroll.min(max_scroll);
-    let key_w = 16usize.min(w.saturating_sub(6) as usize);
-    let lines: Vec<Line> = HELP_ROWS
-        .iter()
-        .map(|(k, d)| {
-            if d.is_empty() {
-                Line::from(Span::styled(
-                    t(k),
-                    Style::default()
-                        .fg(Color::Cyan)
-                        .add_modifier(Modifier::BOLD),
-                ))
-            } else {
-                Line::from(vec![
-                    Span::styled(
-                        format!("{:<key_w$}", t(k)),
-                        Style::default().fg(Color::Yellow),
-                    ),
-                    Span::raw(t(d)),
-                ])
-            }
-        })
-        .collect();
     let title = tf(" 快捷键 · {}/{} · ↑↓ 滚动 · Esc 关闭 ", &[&((scroll as usize + inner_h).min(total)), &(total)]);
     f.render_widget(
         Paragraph::new(lines).scroll((scroll, 0)).block(
@@ -26166,6 +26193,47 @@ mod tests {
         );
         assert_eq!(q.watchdog(), OP_WATCHDOG_SQL);
         assert!(OP_WATCHDOG_FALLBACK < OP_WATCHDOG_SQL);
+    }
+
+    #[test]
+    fn help_overlay_widens_on_large_screens_and_falls_back_on_narrow_ones() {
+        // Wide: cap raised from 64 to 96, leaving a 2-column gutter on each side.
+        assert_eq!(help_overlay_width(200), 96);
+        assert_eq!(help_overlay_width(100), 96);
+        assert_eq!(help_overlay_width(80), 76);
+        assert_eq!(help_overlay_width(64), 60);
+        // Narrow: under 34 columns the old whole-area fallback still applies.
+        assert_eq!(help_overlay_width(33), 33);
+        assert_eq!(help_overlay_width(30), 30);
+        assert_eq!(help_overlay_width(24), 24);
+        assert_eq!(help_overlay_width(10), 10);
+        // Just past the fallback the gutter applies again.
+        assert_eq!(help_overlay_width(34), 30);
+        // The key column grows only where there is room for it.
+        assert_eq!(help_key_width(96), 24);
+        assert_eq!(help_key_width(72), 24);
+        assert_eq!(help_key_width(71), 16);
+        assert_eq!(help_key_width(60), 16);
+        // ...and never overflows a tiny box.
+        assert_eq!(help_key_width(20), 14);
+        assert_eq!(help_key_width(8), 2);
+    }
+
+    #[test]
+    fn help_overlay_has_a_section_spacer_for_every_group_after_the_first() {
+        // Rendering inserts a blank line before each group header (empty
+        // description) except the very first, so the long list stays scannable.
+        let groups = HELP_ROWS.iter().filter(|(_, d)| d.is_empty()).count();
+        assert!(groups > 5, "expected several help sections, found {groups}");
+        let lines = help_overlay_lines(24);
+        assert_eq!(
+            lines.len(),
+            HELP_ROWS.len() + (groups - 1),
+            "help line count should be the rows plus one spacer per extra group"
+        );
+        // Exactly one blank spacer line per group beyond the first.
+        let blank = lines.iter().filter(|l| l.spans.is_empty()).count();
+        assert_eq!(blank, groups - 1);
     }
 
     #[test]
