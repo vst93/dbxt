@@ -4899,6 +4899,11 @@ fn detect_danger(statement: &str) -> Option<String> {
     match first {
         "drop" => Some(t("DROP 会永久删除对象").to_string()),
         "truncate" => Some(t("TRUNCATE 会清空整张表且不可回滚").to_string()),
+        // `ALTER TABLE … DROP COLUMN` / `DROP CONSTRAINT` destroy data or
+        // constraints even though the leading keyword is ALTER.
+        "alter" if has_keyword(&lower, "drop") => {
+            Some(t("ALTER … DROP 会删除列 / 约束及其数据").to_string())
+        }
         "update" | "delete" => {
             if !has_keyword(&lower, "where") {
                 Some(tf("{} 没有 WHERE 子句，会作用于整张表", &[&(first.to_ascii_uppercase())]))
@@ -4912,6 +4917,304 @@ fn detect_danger(statement: &str) -> Option<String> {
             Some(t("DELETE 没有 WHERE 子句，会作用于整张表").to_string())
         }
         _ => None,
+    }
+}
+
+// ─── read-only connection guard ──────────────────────────────────────────────
+
+/// The first SQL word, lowercased, skipping leading whitespace, `;` and `(`.
+/// Returns the word plus the byte offset just past it.
+fn first_sql_word(sql: &str) -> (String, usize) {
+    let trimmed = sql.trim_start_matches(|c: char| c.is_whitespace() || c == ';' || c == '(');
+    let off = sql.len() - trimmed.len();
+    let end = trimmed
+        .find(|c: char| !(c.is_alphanumeric() || c == '_'))
+        .unwrap_or(trimmed.len());
+    (trimmed[..end].to_ascii_lowercase(), off + end)
+}
+
+/// Unwrap `EXPLAIN [ANALYZE] [VERBOSE] [(opts)] …` to the statement it wraps, so
+/// `EXPLAIN ANALYZE DELETE` is classified as the DELETE it really runs.
+fn explain_inner(rest: &str) -> String {
+    let mut rest = rest;
+    loop {
+        rest = rest.trim_start_matches(|c: char| c.is_whitespace() || c == ';');
+        // Skip a whole `(ANALYZE, FORMAT JSON, …)` option group in one step.
+        if rest.starts_with('(') {
+            let mut depth = 0i32;
+            let mut end = None;
+            for (i, c) in rest.char_indices() {
+                match c {
+                    '(' => depth += 1,
+                    ')' => {
+                        depth -= 1;
+                        if depth == 0 {
+                            end = Some(i + 1);
+                            break;
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            match end {
+                Some(e) => {
+                    rest = &rest[e..];
+                    continue;
+                }
+                None => return String::new(),
+            }
+        }
+        let (w, after) = first_sql_word(rest);
+        if w.is_empty() {
+            return String::new();
+        }
+        match w.as_str() {
+            "analyze" | "analyse" | "verbose" => rest = &rest[after..],
+            _ => return rest.to_string(),
+        }
+    }
+}
+
+/// The main verb of a `WITH …` statement: scan at paren depth 0 (CTE bodies are
+/// inside parentheses, so their `SELECT` is skipped) and return the first
+/// statement verb. `None` when nothing recognisable follows the CTE list.
+fn with_main_verb(rest: &str) -> Option<String> {
+    let mut rest = rest.trim_start();
+    let (w, after) = first_sql_word(rest);
+    if w == "recursive" {
+        rest = &rest[after..];
+    }
+    let chars: Vec<char> = rest.chars().collect();
+    let mut i = 0usize;
+    let mut depth = 0i32;
+    while i < chars.len() {
+        let c = chars[i];
+        if c == '(' {
+            depth += 1;
+            i += 1;
+            continue;
+        }
+        if c == ')' {
+            depth -= 1;
+            i += 1;
+            continue;
+        }
+        if depth == 0 && (c.is_alphanumeric() || c == '_') {
+            let start = i;
+            while i < chars.len() && (chars[i].is_alphanumeric() || chars[i] == '_') {
+                i += 1;
+            }
+            let word: String = chars[start..i].iter().collect::<String>().to_ascii_lowercase();
+            match word.as_str() {
+                "select" | "values" | "table" | "insert" | "update" | "delete" | "merge"
+                | "replace" | "call" | "execute" => return Some(word),
+                _ => {}
+            }
+            continue;
+        }
+        i += 1;
+    }
+    None
+}
+
+/// The statement's main verb, lowercased. `WITH …` is reduced to its top-level
+/// verb and `EXPLAIN` unwrapped; an empty string means undetermined.
+fn statement_main_verb(statement: &str) -> String {
+    let cleaned = strip_sql_noise(statement);
+    let lower = cleaned.trim().to_ascii_lowercase();
+    if lower.is_empty() {
+        return String::new();
+    }
+    let (first, after) = first_sql_word(&lower);
+    match first.as_str() {
+        "explain" => statement_main_verb(&explain_inner(&lower[after..])),
+        "with" => with_main_verb(&lower[after..]).unwrap_or_default(),
+        other => other.to_string(),
+    }
+}
+
+/// A statement is read-only only when its verb is unambiguously a read. Every
+/// other verb — DML, DDL, transaction control, session `SET`, an unrecognised
+/// word — counts as a write, so a read-only connection fails closed.
+fn statement_is_read_only(statement: &str) -> bool {
+    matches!(
+        statement_main_verb(statement).as_str(),
+        "select" | "show" | "values" | "table" | "describe" | "desc"
+    )
+}
+
+/// The first write verb in `sql` for a read-only connection, or `None` when the
+/// whole batch is read-only. `?` marks a statement whose verb could not be
+/// determined (which still counts as a violation).
+fn readonly_violation(cfg: &ConnectionConfig, sql: &str) -> Option<String> {
+    if !cfg.read_only {
+        return None;
+    }
+    let statements = dbx_core::sql::split_sql_statements_for_database(sql, cfg.db_type);
+    for st in &statements {
+        if !statement_is_read_only(st) {
+            let verb = statement_main_verb(st);
+            return Some(if verb.is_empty() {
+                "?".to_string()
+            } else {
+                verb.to_ascii_uppercase()
+            });
+        }
+    }
+    None
+}
+
+/// Hard-block a write on a read-only connection (zero extra queries: the check
+/// is pure text). Returns true when the statement was refused.
+fn readonly_block(app: &mut App, sql: &str) -> bool {
+    let Some(cfg) = app.selected.clone() else {
+        return false;
+    };
+    if !cfg.read_only {
+        return false;
+    }
+    match readonly_violation(&cfg, sql) {
+        Some(verb) => {
+            app.status = tf("✗ 只读连接：拒绝写语句（{}）", &[&verb]);
+            true
+        }
+        None => false,
+    }
+}
+
+/// Refuse a row-level write gesture (edit / insert / delete) on a read-only
+/// connection before any SQL is generated.
+fn readonly_conn_block(app: &mut App) -> bool {
+    if app.selected.as_ref().is_some_and(|c| c.read_only) {
+        app.status = t("✗ 只读连接：拒绝写语句").into();
+        return true;
+    }
+    false
+}
+
+/// Find a top-level (paren depth 0) keyword, ignoring string literals, quoted
+/// identifiers and comments. Returns the byte offset just past the keyword.
+fn find_top_level_keyword(sql: &str, keyword: &str) -> Option<usize> {
+    let chars: Vec<char> = sql.chars().collect();
+    let mut i = 0usize;
+    let mut depth = 0i32;
+    while i < chars.len() {
+        let c = chars[i];
+        if c == '\'' || c == '"' || c == '`' {
+            let quote = c;
+            i += 1;
+            while i < chars.len() {
+                if chars[i] == '\\' && quote == '\'' && i + 1 < chars.len() {
+                    i += 2;
+                    continue;
+                }
+                if chars[i] == quote {
+                    i += 1;
+                    break;
+                }
+                i += 1;
+            }
+            continue;
+        }
+        if c == '-' && chars.get(i + 1) == Some(&'-') {
+            while i < chars.len() && chars[i] != '\n' {
+                i += 1;
+            }
+            continue;
+        }
+        if c == '/' && chars.get(i + 1) == Some(&'*') {
+            i += 2;
+            while i + 1 < chars.len() && !(chars[i] == '*' && chars[i + 1] == '/') {
+                i += 1;
+            }
+            i = (i + 2).min(chars.len());
+            continue;
+        }
+        if c == '(' {
+            depth += 1;
+            i += 1;
+            continue;
+        }
+        if c == ')' {
+            depth -= 1;
+            i += 1;
+            continue;
+        }
+        if depth == 0 && (c.is_alphanumeric() || c == '_') {
+            let start = i;
+            while i < chars.len() && (chars[i].is_alphanumeric() || chars[i] == '_') {
+                i += 1;
+            }
+            let word: String = chars[start..i].iter().collect::<String>().to_ascii_lowercase();
+            if word == keyword {
+                let byte_off: usize = chars[..i].iter().map(|c| c.len_utf8()).sum();
+                return Some(byte_off);
+            }
+            continue;
+        }
+        i += 1;
+    }
+    None
+}
+
+/// The `WHERE` predicate text of every UPDATE / DELETE in `sql`, collapsed to
+/// one line and truncated to 80 display columns. Purely textual — no query is
+/// sent, the statement the user already sees is just parsed back.
+fn where_predicates(sql: &str) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    for st in dbx_core::sql::split_sql_statements(sql) {
+        let verb = statement_main_verb(&st);
+        if !matches!(verb.as_str(), "update" | "delete") {
+            continue;
+        }
+        if let Some(off) = find_top_level_keyword(&st, "where") {
+            let pred = one_line(st[off..].trim().trim_end_matches(';'));
+            if !pred.is_empty() {
+                out.push(truncate_disp(&pred, 80));
+            }
+        }
+    }
+    out
+}
+
+/// The largest `LIMIT n` (n > 10000) in a read statement, for the non-blocking
+/// "large result set" heads-up. MySQL's `LIMIT off, n` counts the second number.
+fn large_limit_hint(sql: &str) -> Option<u64> {
+    let mut best: Option<u64> = None;
+    for st in dbx_core::sql::split_sql_statements(sql) {
+        let verb = statement_main_verb(&st);
+        if verb != "select" && verb != "values" {
+            continue;
+        }
+        if let Some(n) = top_level_limit(&st) {
+            if n > 10_000 {
+                best = Some(best.map_or(n, |b| b.max(n)));
+            }
+        }
+    }
+    best
+}
+
+/// The `LIMIT` value of one statement (paren-depth 0 only), if any.
+fn top_level_limit(statement: &str) -> Option<u64> {
+    let mut rest = statement;
+    loop {
+        let off = find_top_level_keyword(rest, "limit")?;
+        let after = &rest[off..];
+        let s = after.trim_start();
+        let first_len = s.find(|c: char| !c.is_ascii_digit()).unwrap_or(s.len());
+        if first_len == 0 {
+            rest = after;
+            continue;
+        }
+        let first: u64 = s[..first_len].parse().unwrap_or(0);
+        let tail = s[first_len..].trim_start();
+        if let Some(comma) = tail.strip_prefix(',') {
+            let r = comma.trim_start();
+            let l = r.find(|c: char| !c.is_ascii_digit()).unwrap_or(r.len());
+            return Some(r[..l].parse().unwrap_or(first));
+        }
+        return Some(first);
     }
 }
 
@@ -8365,6 +8668,8 @@ enum FormRow {
     Password,
     Database,
     Ssl,
+    /// Hard-block every write statement on this connection (safety valve).
+    ReadOnly,
     Color,
     SshEnabled,
     SshHost,
@@ -8388,6 +8693,8 @@ struct ConnForm {
     password: String,
     database: String,
     ssl: bool,
+    /// Read-only connection flag (kernel `ConnectionConfig::read_only`).
+    read_only: bool,
     /// Connection colour as `#rrggbb` (empty = no colour, family default).
     color: String,
     /// Index into the `Space`-cycled colour stops (none / presets / custom).
@@ -8423,6 +8730,7 @@ impl Default for ConnForm {
             password: String::new(),
             database: String::new(),
             ssl: false,
+            read_only: false,
             color: String::new(),
             color_sel: 0,
             ssh_enabled: false,
@@ -8631,6 +8939,7 @@ fn form_rows(f: &ConnForm) -> Vec<(FormRow, &'static str)> {
         (FormRow::Password, "password"),
         (FormRow::Database, "database"),
         (FormRow::Ssl, "ssl"),
+        (FormRow::ReadOnly, "read_only"),
         (FormRow::Color, "color"),
         (FormRow::SshEnabled, "ssh_tunnel"),
     ];
@@ -8670,6 +8979,7 @@ fn form_label_short(label: &'static str) -> &'static str {
         "ssh_key" => "ssh.key",
         "ssh_passphrase" => "ssh.pass",
         "ssh_agent" => "ssh.agent",
+        "read_only" => "ro",
         other => other,
     }
 }
@@ -8692,7 +9002,7 @@ fn form_text_mut(f: &mut ConnForm, row: FormRow) -> Option<&mut String> {
         FormRow::SshKeyPath => Some(&mut f.ssh_key_path),
         FormRow::SshKeyPassphrase => Some(&mut f.ssh_key_passphrase),
         FormRow::SshAgentSock => Some(&mut f.ssh_agent_sock),
-        FormRow::Ssl | FormRow::SshEnabled | FormRow::SshAuth | FormRow::Save => None,
+        FormRow::Ssl | FormRow::ReadOnly | FormRow::SshEnabled | FormRow::SshAuth | FormRow::Save => None,
     }
 }
 
@@ -8721,6 +9031,7 @@ fn form_from_connection(cfg: &ConnectionConfig, name: String, edit_id: Option<St
         password: cfg.password.clone(),
         database: cfg.database.clone().unwrap_or_default(),
         ssl: cfg.ssl,
+        read_only: cfg.read_only,
         color: cfg.color.clone().unwrap_or_default(),
         color_sel: color_sel_for(cfg.color.as_deref().unwrap_or("")),
         edit_id,
@@ -9515,6 +9826,12 @@ struct App {
     col_jump: Option<TextArea<'static>>,
     /// Last SQL sent to the backend, used to guess a table for `y`.
     last_sql: Option<String>,
+    /// Last SQL actually executed (set by [`execute_sql`]), so the quit guard
+    /// can tell unrun editor text from an already-executed statement.
+    last_executed: Option<String>,
+    /// Two-stage quit: the first quit key press arms this (when there is unrun
+    /// editor text / an active filter); a second press quits.
+    quit_armed: bool,
 
     // ── global database search (Alt-G) ──
     /// The modal search-term input.
@@ -10176,6 +10493,8 @@ impl App {
             locate_col: None,
             col_jump: None,
             last_sql: None,
+            last_executed: None,
+            quit_armed: false,
             search_input: None,
             search_query: String::new(),
             search_open: false,
@@ -10941,13 +11260,19 @@ fn apply_op_result(app: &mut App, res: OpResult, tx: &Tx) {
             let note = note_of(&r);
             let truncated = r.truncated;
             let grid = Grid::from_query(r.columns.clone(), &r.rows, note.clone());
-            app.status = if direct {
+            let base = if direct {
                 tf(
                     "直跑历史 · {} · {} 行 · {}",
                     &[&app.selected_name(), &(grid.rows.len()), &note],
                 )
             } else {
                 format!("{} · {} · {}",  app.selected_name(),  grid.rows.len(),  note)
+            };
+            // A large `LIMIT` (> 10000) is only a heads-up: the run is never
+            // blocked, the yellow `⚠` prefix just makes a slow result expected.
+            app.status = match large_limit_hint(&sql) {
+                Some(n) => format!("{} {}", tf("⚠ 大结果集 · LIMIT {} · 可能较慢", &[&n]), base),
+                None => base,
             };
             // Keep every query result as a tab so consecutive SELECTs can be flipped
             // with `[` / `]` instead of overwriting each other. A `Ctrl-N` "load more"
@@ -12101,6 +12426,34 @@ fn reset_overlays_for_backend_switch(app: &mut App) {
     app.error_popup = None;
 }
 
+/// True when quitting would discard unrun work: the editor holds SQL that was
+/// never executed, or a sidebar / result filter is active.
+fn quit_has_unsaved(app: &App) -> bool {
+    let sql = app.editor_sql();
+    let sql = sql.trim();
+    let last = app.last_executed.as_deref().unwrap_or("").trim();
+    let editor_dirty = !sql.is_empty() && sql != last;
+    let filter_dirty =
+        !app.table_filter.trim().is_empty() || !app.result_needle.trim().is_empty();
+    editor_dirty || filter_dirty
+}
+
+/// The single quit entry point. With unrun work the first press only arms the
+/// quit (a status hint, no overlay); a second press quits. Esc / any other key
+/// disarms it in [`key`].
+fn request_quit(app: &mut App) {
+    if app.quit_armed {
+        app.quit = true;
+        return;
+    }
+    if quit_has_unsaved(app) {
+        app.quit_armed = true;
+        app.status = t("⚠ 编辑器有未执行语句 · 再按 q / Ctrl-C 退出 · Esc 留下").into();
+        return;
+    }
+    app.quit = true;
+}
+
 fn key(app: &mut App, tx: &Tx, k: KeyEvent) {
     // The back/forward landing hint is transient: it survives until the next
     // key press (the history keys themselves refresh it).
@@ -12113,13 +12466,19 @@ fn key(app: &mut App, tx: &Tx, k: KeyEvent) {
     if app.row_hint_until.take().is_some() && app.status == row_hint_text() {
         app.status.clear();
     }
+    // Two-stage quit: any key other than a quit key disarms the pending quit
+    // (so `Esc` — or simply carrying on — leaves the app running).
+    let ctrl_c = k.modifiers.contains(KeyModifiers::CONTROL)
+        && !k.modifiers.contains(KeyModifiers::SHIFT)
+        && k.code == KeyCode::Char('c');
+    let bare_q = k.modifiers.is_empty() && k.code == KeyCode::Char('q');
+    if app.quit_armed && !(ctrl_c || bare_q) {
+        app.quit_armed = false;
+    }
     // global: quit. Ctrl-Shift-C is a *view* toggle (compact columns), so the
     // quit must not swallow it on terminals that report Shift as a modifier.
-    if k.modifiers.contains(KeyModifiers::CONTROL)
-        && !k.modifiers.contains(KeyModifiers::SHIFT)
-        && k.code == KeyCode::Char('c')
-    {
-        app.quit = true;
+    if ctrl_c {
+        request_quit(app);
         return;
     }
 
@@ -12189,6 +12548,11 @@ fn confirm_key(app: &mut App, tx: &Tx, k: KeyEvent) {
     match k.code {
         KeyCode::Enter | KeyCode::Char('y') | KeyCode::Char('Y') => {
             if let Some(c) = app.confirm.take() {
+                // A read-only connection refuses Redis / MongoDB writes too, so
+                // the red layer's Enter cannot slip a mutation past the guard.
+                if (c.redis.is_some() || c.mongo.is_some()) && readonly_conn_block(app) {
+                    return;
+                }
                 if let Some(cc) = c.conn {
                     app.status = tf("删除连接 {}…", &[&cc.name]);
                     app.spawn(tx, Op::DeleteConn { id: cc.id, name: cc.name });
@@ -12813,6 +13177,19 @@ fn browse_key(app: &mut App, tx: &Tx, k: KeyEvent) {
             }
             _ => {}
         }
+    }
+
+    // Bare `q` quits (two-stage when unrun work exists), but only with an
+    // active connection and no text surface focused: in the editor / command
+    // line `q` stays a literal character, and every overlay above already owns
+    // `q` to close itself.
+    if k.modifiers.is_empty()
+        && k.code == KeyCode::Char('q')
+        && app.selected.is_some()
+        && !matches!(app.focus, Focus::Editor | Focus::CmdInput)
+    {
+        request_quit(app);
+        return;
     }
 
     match app.focus {
@@ -20360,6 +20737,18 @@ fn transfer_confirm_key(app: &mut App, tx: &Tx, k: KeyEvent) {
 /// Build the job from the wizard and dispatch it in the background. A >1M source
 /// must pass the wizard's `large_warn` gate first.
 fn start_transfer(app: &mut App, tx: &Tx) {
+    // A read-only target connection is a hard stop: the wizard writes to it.
+    if app
+        .transfer
+        .as_ref()
+        .is_some_and(|w| w.target_conn.read_only)
+    {
+        if let Some(w) = app.transfer.as_mut() {
+            w.error = Some(t("目标连接为只读，拒绝写入").to_string());
+        }
+        app.status = t("✗ 只读连接：拒绝写语句").into();
+        return;
+    }
     app.transfer_gen += 1;
     let gen = app.transfer_gen;
     let Some(w) = app.transfer.as_mut() else {
@@ -20943,6 +21332,12 @@ fn file_load_plan_key(app: &mut App, tx: &Tx, k: KeyEvent) {
             let Some(plan) = app.file_load_plan.take() else {
                 return;
             };
+            // Read-only connections refuse a file script that contains any write;
+            // the preview stays open so it can still be loaded into the editor.
+            if readonly_block(app, &plan.sql) {
+                app.file_load_plan = Some(plan);
+                return;
+            }
             if !plan.danger.is_empty() {
                 app.pending_run_origin = "script";
                 app.confirm = Some(Confirm {
@@ -22683,6 +23078,9 @@ fn delete_row(app: &mut App) {
         app.status = t("仅表格浏览支持删除行").into();
         return;
     }
+    if readonly_conn_block(app) {
+        return;
+    }
     let Some(grid) = active_grid(app) else {
         return;
     };
@@ -22709,7 +23107,7 @@ fn delete_row(app: &mut App) {
         reasons.push(tf("将删除 1 行（主键 {}）", &[&(keys.join(", "))]));
     }
     reasons.push(t("DELETE 不可撤销，Enter 后立即执行").into());
-    reasons.push(format!("WHERE {where_clause}"));
+    // The WHERE predicate itself is shown by the confirm layer's impact line.
     app.confirm = Some(Confirm {
         sql,
         reasons,
@@ -22729,6 +23127,9 @@ fn delete_row(app: &mut App) {
 fn edit_cell(app: &mut App) {
     if !in_table_data_view(app) {
         app.focus = Focus::Editor;
+        return;
+    }
+    if readonly_conn_block(app) {
         return;
     }
     let Some(grid) = active_grid(app) else {
@@ -22785,6 +23186,9 @@ fn edit_cell(app: &mut App) {
 fn quick_insert(app: &mut App) {
     if !in_table_data_view(app) {
         app.status = t("仅表格浏览支持快速插入").into();
+        return;
+    }
+    if readonly_conn_block(app) {
         return;
     }
     let Some(ps) = app.page_state.clone() else {
@@ -22880,6 +23284,9 @@ fn edit_dialog_key(app: &mut App, tx: &Tx, k: KeyEvent) {
 /// Send a generated write. It still passes the dangerous-statement gate so a
 /// write that somehow lacks a bound WHERE gets a second confirmation.
 fn submit_edit_sql(app: &mut App, tx: &Tx, sql: String) {
+    if readonly_block(app, &sql) {
+        return;
+    }
     let mut reason = detect_danger(&sql);
     if reason.is_none() && one_line(&sql).to_ascii_lowercase().contains("where 1 = 1") {
         reason = Some(t("WHERE 恒真（1 = 1），会作用于整张表").into());
@@ -22918,6 +23325,9 @@ fn commit_batch(app: &mut App) {
         script.push_str(";\n");
     }
     script.push_str("COMMIT;");
+    if readonly_block(app, &script) {
+        return;
+    }
     app.confirm = Some(Confirm {
         sql: script,
         reasons: vec![
@@ -23165,6 +23575,11 @@ fn run_sql(app: &mut App, tx: &Tx, scope: RunScope) {
         app.status = t("✗ 未选择连接").into();
         return;
     };
+    // Read-only connections refuse every write before the danger layer, so a
+    // blocked statement never even reaches the red confirmation.
+    if readonly_block(app, &sql) {
+        return;
+    }
     // Danger check runs per statement so `UPDATE a; DELETE FROM b;` is caught too.
     let statements = dbx_core::sql::split_sql_statements_for_database(&sql, cfg.db_type);
     let mut reasons: Vec<String> = Vec::new();
@@ -23197,6 +23612,13 @@ fn execute_sql(app: &mut App, tx: &Tx, sql: String, origin: &'static str) {
         app.status = t("✗ 未选择连接").into();
         return;
     };
+    // The single write choke point: every path (editor, file script, history
+    // direct run, row edit, batch commit, red-confirm accept) lands here, so a
+    // read-only connection is enforced even if a caller forgot its own check.
+    if readonly_block(app, &sql) {
+        return;
+    }
+    app.last_executed = Some(sql.trim().to_string());
     app.loading = true;
     // A history direct run gets a distinct landing status that names its elapsed
     // time once the result arrives (R45).
@@ -23347,6 +23769,7 @@ fn form_key(app: &mut App, tx: &Tx, k: KeyEvent) {
         KeyCode::Down | KeyCode::Tab => app.form.field = (app.form.field + 1) % len,
         KeyCode::Enter => match cur {
             FormRow::Ssl => app.form.ssl = !app.form.ssl,
+            FormRow::ReadOnly => app.form.read_only = !app.form.read_only,
             FormRow::SshEnabled => app.form.ssh_enabled = !app.form.ssh_enabled,
             FormRow::SshAuth => app.form.ssh_auth = app.form.ssh_auth.next(),
             FormRow::Save => save_form(app, tx),
@@ -23354,6 +23777,7 @@ fn form_key(app: &mut App, tx: &Tx, k: KeyEvent) {
         },
         KeyCode::Char(' ') => match cur {
             FormRow::Ssl => app.form.ssl = !app.form.ssl,
+            FormRow::ReadOnly => app.form.read_only = !app.form.read_only,
             FormRow::SshEnabled => app.form.ssh_enabled = !app.form.ssh_enabled,
             FormRow::SshAuth => app.form.ssh_auth = app.form.ssh_auth.next(),
             // Space cycles the colour palette; the custom stop opens the hex editor.
@@ -23526,6 +23950,7 @@ fn save_form(app: &mut App, tx: &Tx) {
         Some(f.database.trim().to_string())
     };
     cfg.ssl = f.ssl;
+    cfg.read_only = f.read_only;
     cfg.color = color;
     cfg.transport_layers = ssh_layer
         .into_iter()
@@ -25218,6 +25643,9 @@ fn open_import_prompt(app: &mut App) {
         app.status = t("仅 SQL 连接支持 CSV 导入").into();
         return;
     }
+    if readonly_conn_block(app) {
+        return;
+    }
     let Some((schema, table)) = import_target_table(app) else {
         app.status = t("先选中一张表再按 I 导入").into();
         return;
@@ -25315,6 +25743,10 @@ fn import_plan_key(app: &mut App, tx: &Tx, k: KeyEvent) {
         KeyCode::Enter => {
             if let Some(err) = plan.error.clone() {
                 app.status = format!("✗ {err}");
+                app.import_plan = Some(plan);
+                return;
+            }
+            if readonly_conn_block(app) {
                 app.import_plan = Some(plan);
                 return;
             }
@@ -25459,6 +25891,8 @@ struct ImportConn {
     password: Option<String>,
     database: Option<String>,
     ssl: bool,
+    /// Read-only flag carried by a dbxt bundle (kernel `ConnectionConfig::read_only`).
+    read_only: bool,
     color: Option<String>,
     ssh: Option<ImportSsh>,
     /// True for DBeaver / Navicat, whose passwords are encrypted upstream.
@@ -25642,6 +26076,9 @@ fn connection_export_value(cfg: &ConnectionConfig, include_passwords: bool) -> s
         m.insert("database".into(), serde_json::json!(db));
     }
     m.insert("ssl".into(), serde_json::json!(cfg.ssl));
+    if cfg.read_only {
+        m.insert("read_only".into(), serde_json::json!(true));
+    }
     if let Some(color) = &cfg.color {
         if !color.is_empty() {
             m.insert("color".into(), serde_json::json!(color));
@@ -25705,6 +26142,7 @@ fn parse_dbxt_bundle(arr: &[serde_json::Value]) -> Result<Vec<ImportConn>, Strin
         c.password = json_str(obj.get("password"));
         c.database = cfg_str(obj, &["database"]);
         c.ssl = value_truthy(obj.get("ssl"));
+        c.read_only = value_truthy(obj.get("read_only"));
         c.color = cfg_str(obj, &["color"]);
         if let Some(ssh) = obj.get("ssh").and_then(|v| v.as_object()) {
             c.ssh = Some(parse_ssh_value(ssh));
@@ -26083,6 +26521,7 @@ fn import_conn_to_config(c: &ImportConn, name: String, id: String) -> Result<Con
             cfg.color = Some(color.clone());
         }
     }
+    cfg.read_only = c.read_only;
     if let Some(ssh) = &c.ssh {
         cfg.transport_layers = vec![TransportLayerConfig::Ssh(import_ssh_to_layer(&name, ssh))];
     }
@@ -26903,8 +27342,8 @@ fn fit_status(msg: &str, width: usize) -> String {
     if width == 0 {
         return String::new();
     }
-    if msg.starts_with('✗') || msg.starts_with('✓') {
-        // 错误 / 成功确认：关键信息在前，保留头部，尾部截断
+    if msg.starts_with('✗') || msg.starts_with('✓') || msg.starts_with('⚠') {
+        // 错误 / 成功确认 / 警告：关键信息在前，保留头部，尾部截断
         truncate_disp(msg, width)
     } else {
         // 普通消息：进度类根因常在尾部，保留尾部。
@@ -29158,17 +29597,26 @@ fn side_row_line(
     let mut spans: Vec<Span> = vec![Span::styled(indent, mk(Style::default()))];
     match row {
         SideRow::Conn { idx } => {
-            let (name, color, open) = match side_root_cfg(app, *idx) {
-                Some(c) => (c.name.clone(), connection_color(c), side_conn_open(app, *idx)),
-                None => (String::new(), Color::Gray, false),
+            let (name, color, open, ro) = match side_root_cfg(app, *idx) {
+                Some(c) => (
+                    c.name.clone(),
+                    connection_color(c),
+                    side_conn_open(app, *idx),
+                    c.read_only,
+                ),
+                None => (String::new(), Color::Gray, false, false),
             };
             spans.push(Span::styled(
                 if open { "▾ " } else { "▸ " }.to_string(),
                 mk(Style::default().fg(Color::DarkGray)),
             ));
             spans.push(Span::styled("● ".to_string(), mk(Style::default().fg(color))));
+            if ro {
+                spans.push(Span::styled("🔒 ".to_string(), mk(Style::default().fg(color))));
+            }
+            let name_w = inner.saturating_sub(if ro { 2 } else { 0 });
             spans.push(Span::styled(
-                truncate_disp(&name, inner),
+                truncate_disp(&name, name_w),
                 mk(Style::default().fg(color).add_modifier(Modifier::BOLD)),
             ));
         }
@@ -29442,6 +29890,13 @@ fn form_row_value(f: &ConnForm, row: FormRow) -> String {
         FormRow::Password => "*".repeat(f.password.chars().count()),
         FormRow::Database => f.database.clone(),
         FormRow::Ssl => if f.ssl { "y" } else { "n" }.to_string(),
+        FormRow::ReadOnly => {
+            if f.read_only {
+                format!("y  {}", t("拒绝写语句"))
+            } else {
+                "n".to_string()
+            }
+        }
         FormRow::Color => {
             if f.color.trim().is_empty() {
                 t("无（按类型）").to_string()
@@ -32655,7 +33110,7 @@ fn render_filter_prompt(f: &mut Frame, area: Rect, app: &mut App) {
 /// mirrors.
 const HELP_ROWS: &[(&str, &str)] = &[
     ("— 全局 —", ""),
-    ("Ctrl-C", "退出"),
+    ("q / Ctrl-C", "退出（编辑器有未执行语句时两段确认：再按一次退出，Esc 留下）"),
     ("Ctrl-L", "切换命令模式 SQL → Redis → MongoDB"),
     ("F5 / Ctrl-J", "执行 SQL（有选区只跑选区，否则整段）"),
     ("Alt-Enter", "只执行光标处语句（有选区则执行选区；分号分隔，字面量/注释里的分号不算）"),
@@ -32693,9 +33148,10 @@ const HELP_ROWS: &[(&str, &str)] = &[
     ("— 连接表单 —", ""),
     ("↑ ↓ / Tab", "切换字段（开启 ssh_tunnel 后自动展开 SSH 段）"),
     ("Enter", "编辑字段 / 切换开关 / 保存连接"),
-    ("Space", "切换 ssh_tunnel / ssl / 登录方式"),
+    ("Space", "切换 ssh_tunnel / ssl / read_only / 登录方式"),
     ("color", "Space 循环预设颜色（无色→10 色→自定义），Enter 输入 #RRGGBB；色块为只读预览"),
     ("ssh_tunnel", "开启 SSH 跳板隧道（ssh_host / ssh_port / ssh_user / 登录方式）"),
+    ("read_only", "只读连接：拒绝 INSERT/UPDATE/DELETE/DDL（SELECT/SHOW/EXPLAIN 照常；树中显 🔒）"),
     ("登录方式", "password / key（密钥路径 + 口令）/ agent（SSH_AUTH_SOCK）"),
     ("远端目标", "隧道转发目标 = 连接的 host:port（改 host / port 即改目标）"),
     ("~/.ssh/config", "ssh_host 可填别名；ProxyJump 自动展开为多跳"),
@@ -33141,9 +33597,12 @@ fn render_confirm(f: &mut Frame, area: Rect, confirm: &Confirm) -> (Rect, Rect) 
     // Keep the statement's own line structure so a multi-line UPDATE / DELETE /
     // BEGIN … COMMIT stays readable; nothing is run from a summary alone.
     let sql_lines = wrap_sql_lines(&confirm.sql, inner_w);
+    // Impact estimate: the WHERE predicate of every UPDATE / DELETE in the
+    // statement(s), echoed back verbatim (truncated) with no extra query.
+    let impact = where_predicates(&confirm.sql);
     let max_h = area.height.saturating_sub(2) as usize;
-    // reasons + blank + SQL + blank + hint, plus the two border rows
-    let needed = confirm.reasons.len() + sql_lines.len() + 5;
+    // reasons + impact + blank + SQL + blank + hint, plus the two border rows
+    let needed = confirm.reasons.len() + impact.len() + sql_lines.len() + 5;
     let h = needed.min(max_h).max(3) as u16;
     let box_area = centered_overlay(area, w, h);
     f.render_widget(Clear, box_area);
@@ -33157,8 +33616,15 @@ fn render_confirm(f: &mut Frame, area: Rect, confirm: &Confirm) -> (Rect, Rect) 
                 .add_modifier(Modifier::BOLD),
         )));
     }
+    for p in &impact {
+        lines.push(Line::from(Span::styled(
+            tf("WHERE 谓词：{}", &[&p]),
+            Style::default().fg(Color::Yellow),
+        )));
+    }
     lines.push(Line::from(""));
-    let sql_room = (box_area.height as usize).saturating_sub(confirm.reasons.len() + 5);
+    let sql_room = (box_area.height as usize)
+        .saturating_sub(confirm.reasons.len() + impact.len() + 5);
     let truncated = sql_lines.len() > sql_room;
     let shown_sql = if truncated {
         sql_room.saturating_sub(1)
@@ -35664,6 +36130,17 @@ mod tests {
     }
 
     #[test]
+    fn warning_keeps_head() {
+        // A ⚠ heads-up (e.g. the large-result hint) must stay readable on a
+        // narrow status line; its tail is only the connection / row count.
+        let msg = "⚠ 大结果集 · LIMIT 20000 · 可能较慢 · rw-sqlite · 3 行 · 1ms";
+        let out = fit_status(msg, 24);
+        assert!(out.starts_with('⚠'));
+        assert!(out.contains("大结果集"));
+        assert_eq!(disp_width(&out), 24);
+    }
+
+    #[test]
     fn error_keeps_head() {
         let msg = "✗ query: Server error: `ERROR 1146 (42S02): Table 'mysql.users' doesn't exist` SQL text omitted from user-facing error; enable debug SQL diagnostics to inspect the original statement.";
         let out = fit_status(msg, 30);
@@ -35738,6 +36215,178 @@ mod tests {
     fn danger_detection_sees_cte_delete() {
         assert!(detect_danger("WITH x AS (SELECT id FROM t) DELETE FROM t").is_some());
         assert!(detect_danger("WITH x AS (SELECT id FROM t) DELETE FROM t WHERE id IN (SELECT id FROM x)").is_none());
+    }
+
+    #[test]
+    fn danger_detection_flags_alter_drop_column() {
+        assert!(detect_danger("ALTER TABLE users DROP COLUMN email").is_some());
+        assert!(detect_danger("ALTER TABLE users DROP CONSTRAINT ck").is_some());
+        // A non-destructive ALTER stays clear.
+        assert!(detect_danger("ALTER TABLE users ADD COLUMN email text").is_none());
+        assert!(detect_danger("ALTER TABLE users RENAME TO people").is_none());
+    }
+
+    #[test]
+    fn read_only_classifies_reads_and_writes() {
+        for read in [
+            "SELECT * FROM t",
+            "SHOW TABLES",
+            "EXPLAIN SELECT * FROM t",
+            "EXPLAIN ANALYZE SELECT * FROM t",
+            "EXPLAIN (ANALYZE, FORMAT JSON) SELECT * FROM t",
+            "(SELECT 1)",
+            "VALUES (1), (2)",
+            "TABLE t",
+            "DESCRIBE t",
+        ] {
+            assert!(statement_is_read_only(read), "should be read-only: {read}");
+        }
+        // Everything ambiguous or destructive fails closed.
+        for write in [
+            "INSERT INTO t VALUES (1)",
+            "UPDATE t SET a = 1 WHERE id = 1",
+            "DELETE FROM t WHERE id = 1",
+            "CREATE TABLE t (id int)",
+            "ALTER TABLE t ADD COLUMN a int",
+            "DROP TABLE t",
+            "TRUNCATE TABLE t",
+            "EXPLAIN ANALYZE DELETE FROM t",
+            "EXPLAIN (ANALYZE) DELETE FROM t",
+            "BEGIN",
+            "COMMIT",
+            "SET search_path = x",
+            "CALL p()",
+            "SELEC 1",
+        ] {
+            assert!(!statement_is_read_only(write), "should be blocked: {write}");
+        }
+    }
+
+    #[test]
+    fn read_only_handles_cte_and_multi_statement_boundaries() {
+        // A CTE whose body reads but whose main verb writes must block.
+        assert!(statement_is_read_only(
+            "WITH x AS (SELECT id FROM t) SELECT * FROM x"
+        ));
+        assert!(!statement_is_read_only(
+            "WITH x AS (SELECT id FROM t) DELETE FROM t WHERE id IN (SELECT id FROM x)"
+        ));
+        assert!(!statement_is_read_only(
+            "WITH x AS (SELECT id FROM t) INSERT INTO t SELECT * FROM x"
+        ));
+        // An undetermined WITH has no recognised verb → block (fail closed).
+        assert!(!statement_is_read_only("WITH x AS (SELECT 1)"));
+        // A read-only connection blocks a mixed batch as a whole.
+        let mut cfg = test_conn("mysql");
+        cfg.read_only = true;
+        assert!(readonly_violation(&cfg, "SELECT 1; SELECT 2").is_none());
+        assert_eq!(
+            readonly_violation(&cfg, "SELECT 1; INSERT INTO t VALUES (1);").as_deref(),
+            Some("INSERT")
+        );
+        // The guard only applies to read-only connections.
+        cfg.read_only = false;
+        assert!(readonly_violation(&cfg, "DROP TABLE t").is_none());
+    }
+
+    #[test]
+    fn readonly_block_refuses_and_reports_a_red_status() {
+        let mut app = test_app();
+        let mut cfg = test_conn("mysql");
+        cfg.read_only = true;
+        app.selected = Some(cfg);
+        assert!(readonly_block(&mut app, "INSERT INTO t VALUES (1)"));
+        assert!(app.status.starts_with('✗'), "red status: {}", app.status);
+        assert!(app.status.contains("只读连接"));
+        assert!(!readonly_block(&mut app, "SELECT * FROM t"));
+        // The row-gesture guard (edit / insert / delete / CSV import) refuses
+        // without needing the SQL text yet.
+        assert!(readonly_conn_block(&mut app));
+        assert!(app.status.starts_with('✗'));
+        app.selected.as_mut().unwrap().read_only = false;
+        assert!(!readonly_conn_block(&mut app));
+    }
+
+    #[test]
+    fn where_predicates_are_extracted_and_truncated() {
+        assert_eq!(
+            where_predicates("UPDATE t SET a = 1 WHERE id = 7"),
+            vec!["id = 7".to_string()]
+        );
+        // One predicate per UPDATE / DELETE; literals with commas are kept whole.
+        assert_eq!(
+            where_predicates(
+                "DELETE FROM t WHERE a = 1 AND b = 'x, y';\nUPDATE t SET a = 2 WHERE id IN (1,2,3);"
+            ),
+            vec!["a = 1 AND b = 'x, y'".to_string(), "id IN (1,2,3)".to_string()]
+        );
+        // A SELECT's WHERE is not an impact line.
+        assert!(where_predicates("SELECT * FROM t WHERE id = 1").is_empty());
+        // The top-level WHERE wins, not a subquery's.
+        assert_eq!(
+            where_predicates("DELETE FROM t WHERE id IN (SELECT id FROM u WHERE x = 1)"),
+            vec!["id IN (SELECT id FROM u WHERE x = 1)".to_string()]
+        );
+        // Truncated to 80 display columns with an ellipsis.
+        let long = format!("UPDATE t SET a = 1 WHERE {}", "x".repeat(200));
+        let got = where_predicates(&long);
+        assert_eq!(got.len(), 1);
+        assert_eq!(disp_width(&got[0]), 80);
+        assert!(got[0].ends_with('…'));
+    }
+
+    #[test]
+    fn large_limit_hint_only_fires_over_ten_thousand() {
+        assert_eq!(large_limit_hint("SELECT * FROM t LIMIT 20000"), Some(20000));
+        assert_eq!(large_limit_hint("SELECT * FROM t LIMIT 500"), None);
+        // Not a read statement, so no heads-up.
+        assert_eq!(large_limit_hint("UPDATE t SET a = 1 WHERE id = 1 LIMIT 20000"), None);
+        // MySQL `LIMIT offset, count` counts the second number.
+        assert_eq!(large_limit_hint("SELECT * FROM t LIMIT 10, 20000"), Some(20000));
+        assert_eq!(large_limit_hint("SELECT * FROM t"), None);
+    }
+
+    #[test]
+    fn quit_is_two_stage_when_the_editor_is_dirty() {
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel::<OpResult>();
+        let mut app = test_app();
+        app.selected = Some(test_conn("mysql"));
+        app.set_editor_text("SELECT 1;");
+        // The first q only arms the quit.
+        key(&mut app, &tx, KeyEvent::new(KeyCode::Char('q'), KeyModifiers::NONE));
+        assert!(app.quit_armed);
+        assert!(!app.quit);
+        // Esc leaves without quitting and disarms.
+        key(&mut app, &tx, KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+        assert!(!app.quit_armed);
+        assert!(!app.quit);
+        // Two presses quit.
+        key(&mut app, &tx, KeyEvent::new(KeyCode::Char('q'), KeyModifiers::NONE));
+        assert!(app.quit_armed);
+        key(&mut app, &tx, KeyEvent::new(KeyCode::Char('q'), KeyModifiers::NONE));
+        assert!(app.quit);
+    }
+
+    #[test]
+    fn quit_is_immediate_when_the_editor_matches_the_last_run() {
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel::<OpResult>();
+        let mut app = test_app();
+        app.selected = Some(test_conn("mysql"));
+        app.set_editor_text("SELECT 1;");
+        app.last_executed = Some("SELECT 1;".into());
+        key(&mut app, &tx, KeyEvent::new(KeyCode::Char('q'), KeyModifiers::NONE));
+        assert!(app.quit, "a clean editor quits on the first q");
+        // Ctrl-C shares the same guard: an unrun statement arms instead of quitting.
+        let mut app = test_app();
+        app.selected = Some(test_conn("mysql"));
+        app.set_editor_text("SELECT 1;");
+        key(
+            &mut app,
+            &tx,
+            KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL),
+        );
+        assert!(app.quit_armed);
+        assert!(!app.quit);
     }
 
     #[test]

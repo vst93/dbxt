@@ -14,6 +14,11 @@
 - `d` 弹出切换层 —— MySQL 库、PostgreSQL（及其他支持 schema 的引擎）先 schema 后库、MongoDB 库、Redis 逻辑 db 同一套手势。
 - `o` 返回连接选择，`r` 原地刷新列表。
 
+**安全阀** —— 为“一直开着生产连接”的场景准备
+- **只读连接。** 表单新增 `read_only` 行（`Space` / `Enter` 切换）。开启后该连接**一切写语句硬拦截** —— `INSERT` / `UPDATE` / `DELETE` / DDL 全部拒绝，红色状态 `✗ 只读连接：拒绝写语句（INSERT）`；`SELECT` / `SHOW` / `EXPLAIN` / `DESCRIBE` / `VALUES` / `TABLE` 照常。判定是**语句级纯文本分析，零额外查询**：看首个关键字，`WITH …` 归约到顶层动词、`EXPLAIN` 剥掉外层（因此 `EXPLAIN ANALYZE DELETE` 仍算写）；拿不准的一律拦截（未知关键字、裸 `BEGIN`、会话 `SET` 都当写）。多语句批次（`SELECT 1; INSERT …`）整体拒绝。所有写路径共用一个收口（编辑器、`.sql` 文件脚本、历史直跑、行编辑/插入/删除、批量提交、红色确认层放行），并覆盖非 SQL 写入（CSV 导入、`Alt-T` 搬运的只读目标、Redis / MongoDB 写入）；侧栏连接根前缀 `🔒`（沿用连接色）。标记存于 DBX 自己的 `ConnectionConfig::read_only`，与桌面端互通。
+- **两段式退出。** 编辑器里有未执行语句（或侧栏/结果过滤生效）时，第一次 `q`（或 `Ctrl-C`）只提示 —— `编辑器有未执行语句 · 再按 q / Ctrl-C 退出 · Esc 留下` —— 再按一次才退；`Esc`（或任意其他键）留下。编辑器为空/已执行时照旧一次退出。
+- **危险语句影响面。** 红色确认层现在回显语句里每条 `UPDATE` / `DELETE` 的 `WHERE` 谓词原文（截断 80 列，如 `WHERE 谓词：id = 4821`），让“看着有边界”的写操作也能看清真正会作用的范围。`TRUNCATE`、`ALTER … DROP COLUMN` / `DROP CONSTRAINT` 加入 `DROP`、无 `WHERE` 的 `UPDATE` / `DELETE` 危险清单。`LIMIT > 10000` 的 `SELECT` **不拦截**，只落一条黄色 `⚠ 大结果集 · LIMIT 20000 · 可能较慢` 提醒。
+
 **连接导入 / 导出 / 迁移（`Alt-E` / `Alt-I`）**
 - `Alt-E` 把**全部**已保存连接导出为自描述 JSON 包（`format` / `version` / `connections[]`，默认 `~/dbxt-connections.json`）。**默认不含密码**；`p` 显式开启（红色明文警告确认），`y` 则复制 JSON 到剪贴板而不写文件。状态栏报告目标路径与条数。
 - `Alt-I` 从文件路径导入，自动识别格式 —— dbxt 自有 JSON 包、DBeaver `data-sources.json`（标准路径 `~/.local/share/DBeaverData/workspace6/General/.dbeaver/data-sources.json`）、Navicat `.ncx` XML 导出。预览清单逐条列出（名称 / 引擎 / 主机 / SSH / 颜色 / 需补密码），标出同名冲突，并列出无法映射的驱动（跳过）。
@@ -148,10 +153,10 @@ cargo install --git https://github.com/vst93/dbxt
 
 | 场景 | 按键 |
 | --- | --- |
-| 全局 | `?` 当前上下文迷你速查（再按一次进全量帮助） · `Tab`/`Shift-Tab` 切栏 · `Alt-Shift-1/2/3` 聚焦（终端可能报成 `Alt-!` `Alt-@` `Alt-#`） · `Alt-←`/`Alt-→` 表 / 集合 / Redis key 后退前进（浏览器语义，最多 50 个） · `F5`/`Ctrl-J` 执行（有选区只跑选区） · `Alt-Enter` 只执行光标处语句 · `Alt-O` 脚本输出分隔+耗时 · `Ctrl-C` 退出 |
+| 全局 | `?` 当前上下文迷你速查（再按一次进全量帮助） · `Tab`/`Shift-Tab` 切栏 · `Alt-Shift-1/2/3` 聚焦（终端可能报成 `Alt-!` `Alt-@` `Alt-#`） · `Alt-←`/`Alt-→` 表 / 集合 / Redis key 后退前进（浏览器语义，最多 50 个） · `F5`/`Ctrl-J` 执行（有选区只跑选区） · `Alt-Enter` 只执行光标处语句 · `Alt-O` 脚本输出分隔+耗时 · `q` / `Ctrl-C` 退出（编辑器有未执行语句时两段确认：再按一次退出，`Esc` 留下） |
 | 连接 | `↑` `↓` 移动 · `Enter` 连接 · `Alt-1..9` 直切第 N 个连接（智能恢复上次库/表） · `Alt-Tab`/`` Alt-` `` 与上一个连接对切 · `c` 新建 · `e` 编辑 · `p` 复制 · `s` 排序（名称/类型/颜色） · `x` 删除 · `d` 数据库/schema 切换 · `o` 返回选择 |
 | 导入 / 导出 | `Alt-E` 导出全部连接为 JSON（`p` 含密码需红色确认 · `y` 复制到剪贴板） · `Alt-I` 导入 dbxt / DBeaver / Navicat 文件（`s` 跳过 · `r` 覆盖需红色确认 · `b` 都存 · `Space` 勾选 · `d` 逐条） |
-| 连接表单 | `↑` `↓`/`Tab` 切换字段 · `Enter` 编辑/切换/保存 · `Space` 切换 `ssh_tunnel`/`ssl`/`ssh_auth`、循环 `color` 调色板 · `Esc` 返回 |
+| 连接表单 | `↑` `↓`/`Tab` 切换字段 · `Enter` 编辑/切换/保存 · `Space` 切换 `ssh_tunnel`/`ssl`/`read_only`/`ssh_auth`、循环 `color` 调色板 · `Esc` 返回 |
 | SSH 主机密钥 | `y`/`Enter` 接受并记住 · `s` 仅本次会话 · `n`/`Esc` 拒绝 |
 | 侧栏 | `↑` `↓`/`j` `k` 在 连接→库→表 树上移动 · `h`/`l`（`←`/`→`）折叠/展开 · `Enter` 打开（连接=切换展开 / 库=切库 / 表=浏览） · 直接输入字母即过滤（`/` 也可，命中表名或库名，父节点保留） · `Alt`+字母 加 `;`/`,` 首字母循环跳 · `s` 排序（名称/类型）；在库行则惰性拉取该库尺寸 + 各表行数估计 · `Y` 复制连接为 `xxx-copy` · `1-9` 直跳第 N 个连接/表 · `Alt-1..9` 直切连接 · `3j`/`3k` 计数前缀（移动 3 项） · `[`/`]` 切库 · `Ctrl-U` 清除过滤 · `r` 表结构 · `I` 导入 CSV · `t` 最近表 |
 | 编辑器 | `Alt-H` 历史面板（`Enter` 回填 · `Ctrl-Enter`/`p` 直跑） · `Alt-G` 全库搜索 · `Alt-L` 执行 `.sql` 文件 · `Alt-F` 格式化/压缩 · `Ctrl-U` 撤销格式化 · `Alt-/` 补全 · `Alt-Enter` 执行光标处语句（分号边界，字面量/注释里的分号不算） · `Alt-P` 片段插到光标 · `%` 跳配对括号（光标在 `()[]{}` 上或旁；否则照常输入 `%`） · `Ctrl-A`/`Ctrl-E` 行首/行尾（`Home`/`End` 同） · `Ctrl-K`/`Ctrl-Shift-K` 删至行尾 · `Ctrl-W` 删前一个词 · `F5`/`Ctrl-J` 执行（有选区只跑选区） · `↑` `↓` 历史 |

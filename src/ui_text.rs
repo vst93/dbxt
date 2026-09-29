@@ -139,6 +139,19 @@ fn render(tmpl: &str, args: &[&dyn fmt::Display]) -> String {
 /// [`en_of`] (a test asserts each entry resolves to a distinct English string).
 #[allow(dead_code)]
 pub static ALL_KEYS: &[&str] = &[
+    "退出（编辑器有未执行语句时两段确认：再按一次退出，Esc 留下）",
+    "只读连接：拒绝 INSERT/UPDATE/DELETE/DDL（SELECT/SHOW/EXPLAIN 照常；树中显 🔒）",
+    "切换 ssh_tunnel / ssl / read_only / 登录方式",
+    "拒绝写语句",
+    "✗ 只读连接：拒绝写语句（{}）",
+    "✗ 只读连接：拒绝写语句",
+    "⚠ 编辑器有未执行语句 · 再按 q / Ctrl-C 退出 · Esc 留下",
+    "ALTER … DROP 会删除列 / 约束及其数据",
+    "WHERE 谓词：{}",
+    "⚠ 大结果集 · LIMIT {} · 可能较慢",
+    "只读连接：写语句被拦截（只允许 SELECT / SHOW / EXPLAIN）",
+    "目标连接为只读，拒绝写入",
+    "退出确认",
     " Redis db · ↑↓ Enter · Esc 关 ",
     " SQL 片段 · {} 个 · Enter 插入 · r 刷新 · Esc 关 ",
     " WHERE 过滤 · Enter 应用 · Esc 取消 · 留空清除 ",
@@ -1057,6 +1070,29 @@ pub static ALL_KEYS: &[&str] = &[
 /// The Chinese → English table. Keys must match the source literals exactly.
 fn en_of(zh: &'static str) -> Option<&'static str> {
     match zh {
+        // ── R47 safety valves (read-only / quit guard / danger impact) ──
+        "拒绝写语句" => Some("refuses write statements"),
+        "✗ 只读连接：拒绝写语句（{}）" => {
+            Some("✗ Read-only connection: write statement refused ({})")
+        }
+        "✗ 只读连接：拒绝写语句" => Some("✗ Read-only connection: write statement refused"),
+        "⚠ 编辑器有未执行语句 · 再按 q / Ctrl-C 退出 · Esc 留下" => {
+            Some("⚠ Unrun editor SQL · press q / Ctrl-C again to quit · Esc to stay")
+        }
+        "ALTER … DROP 会删除列 / 约束及其数据" => {
+            Some("ALTER … DROP removes columns / constraints and their data")
+        }
+        "WHERE 谓词：{}" => Some("WHERE predicate: {}"),
+        "⚠ 大结果集 · LIMIT {} · 可能较慢" => {
+            Some("⚠ Large result set · LIMIT {} · may be slow")
+        }
+        "只读连接：写语句被拦截（只允许 SELECT / SHOW / EXPLAIN）" => {
+            Some("read-only connection: writes blocked (only SELECT / SHOW / EXPLAIN allowed)")
+        }
+        "目标连接为只读，拒绝写入" => {
+            Some("target connection is read-only; write refused")
+        }
+        "退出确认" => Some("quit guard"),
         // ── R46 mouse / touch ──
         "Enter/y 执行" => Some("Enter/y execute"),
         "Esc/n 取消" => Some("Esc/n cancel"),
@@ -2324,7 +2360,15 @@ fn en_of(zh: &'static str) -> Option<&'static str> {
             Some("Move between fields (enabling ssh_tunnel expands the SSH section)")
         }
         "编辑字段 / 切换开关 / 保存连接" => Some("Edit field / toggle switch / save connection"),
-        "切换 ssh_tunnel / ssl / 登录方式" => Some("Toggle ssh_tunnel / ssl / login method"),
+        "切换 ssh_tunnel / ssl / read_only / 登录方式" => {
+            Some("Toggle ssh_tunnel / ssl / read_only / login method")
+        },
+        "退出（编辑器有未执行语句时两段确认：再按一次退出，Esc 留下）" => {
+            Some("Quit (two-stage when the editor holds unrun SQL: press again to quit, Esc to stay)")
+        },
+        "只读连接：拒绝 INSERT/UPDATE/DELETE/DDL（SELECT/SHOW/EXPLAIN 照常；树中显 🔒）" => {
+            Some("Read-only connection: refuse INSERT/UPDATE/DELETE/DDL (SELECT/SHOW/EXPLAIN still run; shown with 🔒 in the tree)")
+        },
         "开启 SSH 跳板隧道（ssh_host / ssh_port / ssh_user / 登录方式）" => {
             Some("Enable an SSH jump-host tunnel (ssh_host / ssh_port / ssh_user / login method)")
         }
