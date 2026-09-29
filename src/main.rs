@@ -3020,6 +3020,33 @@ fn redis_value_view(v: RedisValue) -> RedisValueView {
             }
             (vec![t("value").into()], vec![vec![Val::Text(redis_blob_text(content))]], note)
         }
+        RedisValueData::Bitmap {
+            content,
+            total_bytes,
+            truncated,
+            set_bits,
+        } => {
+            row_keys.push(String::new());
+            let size = total_bytes.unwrap_or(content.raw_base64.len() as u64);
+            let mut note = tf("{} 字节", &[&(size)]);
+            if let Some(bits) = set_bits {
+                note.push_str(&tf(" · {} 位置位", &[&(bits)]));
+            }
+            if *truncated {
+                note.push_str(t(" · 已截断"));
+            }
+            (vec![t("value").into()], vec![vec![Val::Text(redis_blob_text(content))]], note)
+        }
+        // kvrocks-style HyperLogLog: the raw bytes are unreadable, so only the
+        // PFCOUNT cardinality estimate is shown.
+        RedisValueData::HyperLogLog { count } => {
+            row_keys.push(String::new());
+            let text = match count {
+                Some(c) => tf("基数估计 {}", &[&(c)]),
+                None => t("（不可读）").to_string(),
+            };
+            (vec![t("value").into()], vec![vec![Val::Text(text)]], String::new())
+        }
         RedisValueData::Json { value } => {
             row_keys.push(String::new());
             (vec![t("value").into()], vec![vec![Val::Text(sanitize_cell(value))]], String::new())
@@ -3113,9 +3140,11 @@ fn redis_value_view(v: RedisValue) -> RedisValueView {
             }
             (vec![t("id").into(), t("fields").into()], rows, note)
         }
-        RedisValueData::Unknown => (
+        RedisValueData::Unknown { redis_type } => (
             vec![t("value").into()],
-            vec![vec![Val::Text(t("（暂不支持的类型）").to_string())]],
+            vec![vec![Val::Text(
+                tf("（暂不支持的类型：{}）", &[&(redis_type)]),
+            )]],
             String::new(),
         ),
     };
@@ -5616,6 +5645,13 @@ async fn record_history(
         affected_rows: None,
         rollback_sql: None,
         details_json: None,
+        // dbxt is a local TUI client, not the MCP server: mark the entry as a
+        // plain SQL run so it shares the desktop/CLI retention bucket.
+        source: "sql".to_string(),
+        mcp_tool_name: None,
+        mcp_request_json: None,
+        mcp_response_json: None,
+        mcp_session_id: None,
     };
     let _ = backend.state().storage.save_history_entry(&entry).await;
 }
@@ -9569,7 +9605,8 @@ async fn run_async() -> Result<()> {
         }
     }
     let backend = Arc::new(LocalBackend::open(&db_path).await.map_err(|e| {
-        anyhow::anyhow!("{}", tf("打开 DBX 存储文件失败 ({}): {}\n(可用 DBX_DATA_DIR 指定目录，或把 dbx.db 文件路径作为第一个位置参数传入)", &[&format!("{:?}", db_path), &(e)]))
+        let detail = humanize_backend_error(&e);
+        anyhow::anyhow!("{}", tf("打开 DBX 存储文件失败 ({}): {}\n(可用 DBX_DATA_DIR 指定目录，或把 dbx.db 文件路径作为第一个位置参数传入)", &[&format!("{:?}", db_path), &(detail)]))
     })?);
 
     let terminal = ratatui::init();
@@ -9991,16 +10028,20 @@ fn apply_op_result(app: &mut App, res: OpResult, tx: &Tx) {
             }
             OpResult::SshPrompt(env) => {
                 let kind = env.request.kind;
+                // A generic user-input prompt may ship a suggested default;
+                // prefill it so the user can accept with one Enter.
+                let input = env.request.default_value.clone().unwrap_or_default();
                 app.ssh_prompt = Some(SshPromptState {
                     request: env.request,
                     responder: Some(env.responder),
-                    input: String::new(),
+                    input,
                 });
                 app.status = match kind {
                     SshPromptKind::HostKeyVerify => t("SSH 主机密钥待确认（y 接受 / n 拒绝）").into(),
                     SshPromptKind::HostKeyChanged => t("SSH 主机密钥已变化，请确认").into(),
                     SshPromptKind::SecretInput => t("SSH 服务器要求额外验证").into(),
                     SshPromptKind::WorkerUploadConsent => t("SSH 请求确认").into(),
+                    SshPromptKind::UserInput => t("需要用户输入").into(),
                 };
             }
             OpResult::SshNotice(notice) => {
@@ -11184,6 +11225,9 @@ fn apply_op_result(app: &mut App, res: OpResult, tx: &Tx) {
         | OpResult::SearchProgress { .. }
         | OpResult::DataDiffProgress { .. } => {}
         OpResult::Error(e) => {
+            // v0.6.27+ secret-store failures get a human hint (key missing /
+            // migration pending); every other error passes through unchanged.
+            let e = humanize_backend_error(&e);
             app.import_progress = None;
             app.page_pending = false;
             app.pending_sel = None;
@@ -14200,6 +14244,45 @@ fn ssh_connect_error_message(cfg: &ConnectionConfig, error: &str) -> String {
     tf("SSH 隧道连接失败（{}）：{}", &[&(hop), &(error)])
 }
 
+/// Translate the DBX kernel's secret-store failure codes (v0.6.27+) into an
+/// actionable hint. From v0.6.27 the kernel encrypts connection / plugin / AI /
+/// tunnel secrets with a key that lives *outside* the database (OS keychain, or
+/// `DBX_SECRET_KEY_FILE` / `DBX_SECRET_KEY`); a headless CLI can only read it
+/// when that provider is reachable, and it never provisions a key itself. dbxt
+/// passes the key resolution straight through to the kernel — this only turns
+/// the raw code into something a TUI user can act on.
+fn secret_store_error_hint(error: &str) -> Option<&'static str> {
+    if error.contains("DATA_MIGRATION_REQUIRED") {
+        return Some(t(
+            "DBX 数据安全升级未完成：请先打开 DBX 桌面端并完成「数据安全升级向导」（dbxt 不会迁移数据）；无桌面环境可用 DBX_SECRET_KEY_FILE 提供密钥",
+        ));
+    }
+    if error.contains("SECRET_KEY_UNAVAILABLE") || error.contains("KEY_PROVIDER_UNAVAILABLE") {
+        return Some(t(
+            "读不到 DBX 数据加密密钥：桌面端把密钥存放在系统钥匙串，本进程无法访问；请改用带系统钥匙串支持的构建，或用 DBX_SECRET_KEY_FILE / DBX_SECRET_KEY 提供密钥",
+        ));
+    }
+    if error.contains("ENCRYPTED_DATA_KEY_MISSING")
+        || error.contains("SECRET_KEY_MISMATCH")
+        || error.contains("SECRET_KEY_INVALID")
+        || error.contains("MISSING_EXTERNAL_KEY")
+        || error.contains("KEY_FILE_UNAVAILABLE")
+    {
+        return Some(t(
+            "DBX 数据加密密钥缺失或不匹配：请提供创建该库时所用的密钥（DBX_SECRET_KEY_FILE / DBX_SECRET_KEY），或重新运行桌面端升级向导",
+        ));
+    }
+    None
+}
+
+/// Replace a raw kernel secret-store error with its hint, leaving every other
+/// error untouched.
+fn humanize_backend_error(error: &str) -> String {
+    secret_store_error_hint(error)
+        .map(str::to_string)
+        .unwrap_or_else(|| error.to_string())
+}
+
 /// Human-readable text for a best-effort host-key notice.
 fn ssh_notice_text(notice: &SshHostKeyNotice) -> String {
     match notice.kind {
@@ -14239,6 +14322,31 @@ fn ssh_prompt_key(app: &mut App, k: KeyEvent) {
             KeyCode::Backspace => {
                 state.input.pop();
                 None
+            }
+            KeyCode::Char(c) => {
+                state.input.push(c);
+                None
+            }
+            _ => None,
+        },
+        // A generic user-input prompt (e.g. a plugin bastion MFA code). With
+        // fixed options a digit picks one; otherwise it is free-form text.
+        SshPromptKind::UserInput => match k.code {
+            KeyCode::Enter => Some(SshPromptAnswer::Secret(state.input.clone())),
+            KeyCode::Esc => Some(SshPromptAnswer::Reject),
+            KeyCode::Backspace => {
+                state.input.pop();
+                None
+            }
+            KeyCode::Char(c) if !state.request.options.is_empty() => {
+                match c.to_digit(10).and_then(|n| n.checked_sub(1)).and_then(|i| state.request.options.get(i as usize))
+                {
+                    Some(option) => Some(SshPromptAnswer::Secret(option.value.clone())),
+                    None => {
+                        state.input.push(c);
+                        None
+                    }
+                }
             }
             KeyCode::Char(c) => {
                 state.input.push(c);
@@ -31926,6 +32034,7 @@ fn render_ssh_prompt(f: &mut Frame, area: Rect, app: &mut App) {
         SshPromptKind::HostKeyChanged => (t(" ⚠ SSH 主机密钥已变化 "), Color::Red),
         SshPromptKind::SecretInput => (t(" SSH 需要验证 "), Color::Cyan),
         SshPromptKind::WorkerUploadConsent => (t(" SSH 请求确认 "), Color::Cyan),
+        SshPromptKind::UserInput => (t(" 需要输入 "), Color::Cyan),
     };
     lines.push(Line::from(Span::styled(
         tf("主机 {}:{}", &[&(req.host), &(req.port)]),
@@ -31987,6 +32096,39 @@ fn render_ssh_prompt(f: &mut Frame, area: Rect, app: &mut App) {
             ));
             lines.push(Line::from(Span::styled(
                 t("Enter/y 允许 · Esc/n 取消"),
+                Style::default().fg(Color::Yellow),
+            )));
+        }
+        SshPromptKind::UserInput => {
+            if let Some(source) = req.source.as_deref() {
+                lines.push(Line::from(Span::styled(
+                    tf("来自 {}", &[&(source)]),
+                    Style::default().fg(Color::DarkGray),
+                )));
+            }
+            if let Some(title) = req.title.as_deref() {
+                lines.push(Line::from(Span::styled(
+                    title.to_string(),
+                    Style::default().add_modifier(Modifier::BOLD),
+                )));
+            }
+            if let Some(prompt) = req.prompt.as_deref() {
+                for l in prompt.lines() {
+                    lines.push(Line::from(l.to_string()));
+                }
+            }
+            for (i, option) in req.options.iter().enumerate() {
+                lines.push(Line::from(format!("{}. {}", i + 1, option.label)));
+            }
+            lines.push(Line::from(""));
+            lines.push(Line::from(Span::styled(
+                format!("> {}▏", state.input),
+                Style::default()
+                    .fg(Color::Green)
+                    .add_modifier(Modifier::BOLD),
+            )));
+            lines.push(Line::from(Span::styled(
+                t("Enter 提交 · Esc 取消"),
                 Style::default().fg(Color::Yellow),
             )));
         }
@@ -36821,6 +36963,7 @@ mod tests {
         let table = || TableInfo {
             name: "users".into(),
             table_type: "TABLE".into(),
+            valid: None,
             comment: None,
             parent_schema: None,
             parent_name: None,
@@ -37618,6 +37761,7 @@ mod tests {
         let table = |name: &str| TableInfo {
             name: name.into(),
             table_type: "TABLE".into(),
+            valid: None,
             comment: None,
             parent_schema: None,
             parent_name: None,
@@ -37656,6 +37800,7 @@ mod tests {
         let table = |name: &str| TableInfo {
             name: name.into(),
             table_type: "TABLE".into(),
+            valid: None,
             comment: None,
             parent_schema: None,
             parent_name: None,
@@ -37684,6 +37829,7 @@ mod tests {
         TableInfo {
             name: name.into(),
             table_type: kind.into(),
+            valid: None,
             comment: None,
             parent_schema: None,
             parent_name: None,
@@ -38304,6 +38450,7 @@ mod tests {
             .map(|i| TableInfo {
                 name: format!("t{i}"),
                 table_type: "TABLE".into(),
+                valid: None,
                 comment: None,
                 parent_schema: None,
                 parent_name: None,
@@ -38348,6 +38495,7 @@ mod tests {
         app.tables = vec![TableInfo {
             name: "t1".into(),
             table_type: "TABLE".into(),
+            valid: None,
             comment: None,
             parent_schema: None,
             parent_name: None,
@@ -38870,6 +39018,31 @@ mod tests {
         assert_eq!(detect_lang_from(Some("zh"), Some("en_US.UTF-8")), Lang::Zh);
         // Nothing set → built-in default is Chinese.
         assert_eq!(detect_lang_from(None, None), Lang::Zh);
+    }
+
+    /// R44: the kernel's v0.6.27 secret-store codes must become an actionable
+    /// hint, while every other error passes through untouched.
+    #[test]
+    fn secret_store_errors_get_actionable_hints() {
+        let migration = humanize_backend_error(
+            "DATA_MIGRATION_REQUIRED: open DBX Desktop or Web to complete the data security upgrade",
+        );
+        assert!(migration.contains("桌面端"), "{migration}");
+        assert!(migration.contains("DBX_SECRET_KEY_FILE"), "{migration}");
+
+        let unavailable = humanize_backend_error(
+            "SECRET_KEY_UNAVAILABLE: this process cannot read the DBX data encryption key",
+        );
+        assert!(unavailable.contains("DBX_SECRET_KEY_FILE"), "{unavailable}");
+
+        let write = humanize_backend_error("KEY_PROVIDER_UNAVAILABLE");
+        assert!(write.contains("钥匙串"), "{write}");
+
+        // A non-secret error is returned verbatim (prefix and all).
+        assert_eq!(
+            humanize_backend_error("query: syntax error near FROM"),
+            "query: syntax error near FROM"
+        );
     }
 
     #[test]

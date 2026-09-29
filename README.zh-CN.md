@@ -168,7 +168,28 @@ cargo install --git https://github.com/vst93/dbxt
 
 按表偏好（列宽压缩、隐藏列、排序）写入 `~/.config/dbxt/tui.json`，以 `库.表` 为键；`DBXT_CONFIG` 可覆盖路径，`DBXT_NO_PERSIST=1` 可关闭。`DBXT_LANG=en|zh` 选择界面语言（未设置时由 locale 决定），`DBX_DATA_DIR` 指定其他 DBX 存储，`DBXT_INSTALL_DIR` 是安装脚本的目标目录。
 
-SSH 隧道的单测（序列化形状、表单映射、认证/错误分类、主机密钥提示）随 `cargo test` 运行。另有两个端到端测试会驱动真实隧道（dbxt → 本机 `sshd` → MySQL），默认跳过，需 `DBXT_SSH_TEST=1` 开启；它们读取 `DBXT_SSH_TEST_USER` / `_PASSWORD` / `_KEY`、`DBXT_SSH_TEST_MYSQL_PORT`（默认 13306）与 `DBXT_SSH_TEST_MYSQL_USER` / `_PASSWORD`。
+SSH 隧道的单测（序列化形状、表单映射、认证/错误分类、主机密钥提示）随 `cargo test` 运行。另有两个端到端测试会驱动真实隧道（dbxt → 本机 `sshd` → MySQL），默认跳过，需 `DBXT_SSH_TEST=1` 开启；它们读取 `DBXT_SSH_TEST_USER` / `_PASSWORD` / `_KEY`、`DBXT_SSH_TEST_MYSQL_PORT`（默认 13306）与 `DBXT_SSH_TEST_MYSQL_USER` / `_PASSWORD`。`tests/secret_store.rs` 也随 `cargo test` 运行：它临时生成一个 `DBX_SECRET_KEY_FILE`，写入加密连接再读回密码（密钥不提交）。
+
+## DBX Secret Store 兼容
+
+dbxt 基于 **DBX v0.6.27** 构建。自 v0.6.27 起，内核会对连接 / 插件 / AI / 隧道等敏感字段强制加密落库（`dbxenc1` envelope，AES-256-GCM），密钥存放在**数据库之外**。dbxt 不做任何密钥管理 —— 密钥解析完全透传内核 —— 因此能打开哪类库取决于密钥提供者是否可达。
+
+| 库状态 | dbxt 行为 |
+| --- | --- |
+| 明文（旧版，尚未迁移） | 拒绝打开，报 `DATA_MIGRATION_REQUIRED` 并提示：请先在 DBX 桌面端（或 Web）完成「**数据安全升级**向导」。dbxt 不迁移数据，也不绕过这道门。 |
+| 密文，密钥可达 | 透明打开；密码与隧道凭据照常解密。 |
+| 密文，密钥不可达 | 拒绝打开，报 `SECRET_KEY_UNAVAILABLE` 并提示下方密钥来源。 |
+
+**密钥来源**（内核解析顺序）：
+
+1. `DBX_SECRET_KEY_FILE` —— 密钥文件路径（64 位十六进制、base64url 32 字节，或经 Argon2id 哈希的密码短语）。无桌面 / 容器环境首选。
+2. `DBX_SECRET_KEY` —— 直接把密钥材料放进环境变量。
+3. 系统钥匙串 —— macOS Keychain、Windows 凭据管理器、Linux Secret Service（由 `os-keyring` feature 编译进内核）。DBX 桌面端把密钥存在这里。
+4. `<data-dir>/.dbx/secret.key` —— 内核管理的用户级兜底密钥。
+
+CLI/MCP 进程只**读取**密钥：不创建、不迁移旧凭据。若没有桌面端，请导出密钥（`DBX_SECRET_KEY_FILE`）供 dbxt 解密。
+
+版本对应：基于明文时代内核（v0.6.9 及更早）构建的 dbxt 无法读取桌面端已升级的库 —— 升级 dbxt 与桌面端同步。反之亦然：v0.6.27 内核不会静默读取明文库，请先完成向导。
 
 ## 状态与路线图
 

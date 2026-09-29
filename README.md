@@ -168,7 +168,28 @@ The TUI's `?` overlay and `dbxt --help` carry the complete list; this is the sho
 
 Per-table choices (compact widths, hidden columns, sort) are written to `~/.config/dbxt/tui.json`, keyed by `database.table`; `DBXT_CONFIG` overrides the path and `DBXT_NO_PERSIST=1` disables it. `DBXT_LANG=en|zh` selects the UI language (the locale decides when unset), `DBX_DATA_DIR` points dbxt at a different DBX store, and `DBXT_INSTALL_DIR` is the install script's target directory.
 
-The SSH-tunnel unit tests (serialization shape, form mapping, auth/error classification, host-key prompt) run with the normal `cargo test`. Two extra end-to-end tests drive a real tunnel (dbxt → local `sshd` → MySQL) and are skipped unless `DBXT_SSH_TEST=1`; they read `DBXT_SSH_TEST_USER` / `_PASSWORD` / `_KEY`, `DBXT_SSH_TEST_MYSQL_PORT` (default 13306) and `DBXT_SSH_TEST_MYSQL_USER` / `_PASSWORD`.
+The SSH-tunnel unit tests (serialization shape, form mapping, auth/error classification, host-key prompt) run with the normal `cargo test`. Two extra end-to-end tests drive a real tunnel (dbxt → local `sshd` → MySQL) and are skipped unless `DBXT_SSH_TEST=1`; they read `DBXT_SSH_TEST_USER` / `_PASSWORD` / `_KEY`, `DBXT_SSH_TEST_MYSQL_PORT` (default 13306) and `DBXT_SSH_TEST_MYSQL_USER` / `_PASSWORD`. `tests/secret_store.rs` also runs with `cargo test`: it generates a throwaway `DBX_SECRET_KEY_FILE`, saves an encrypted connection and reads its password back (the key is never committed).
+
+## DBX Secret Store compatibility
+
+dbxt builds against **DBX v0.6.27**. From v0.6.27 the kernel encrypts connection / plugin / AI / tunnel secrets at rest (`dbxenc1` envelopes, AES-256-GCM) with a key that lives **outside** the database. dbxt does not manage that key — it passes the kernel's resolution straight through — so which store it can open depends on the key provider being reachable.
+
+| Store state | What dbxt does |
+| --- | --- |
+| Plaintext (legacy, not yet upgraded) | Refuses to open with `DATA_MIGRATION_REQUIRED` and prints a hint: finish the **Data Security Upgrade** wizard in DBX Desktop (or Web) first. dbxt never migrates data and never bypasses the gate. |
+| Encrypted, key reachable | Opens transparently; passwords and tunnel credentials decrypt as usual. |
+| Encrypted, key unreachable | Refuses to open with `SECRET_KEY_UNAVAILABLE` and prints a hint pointing at the key sources below. |
+
+**Key sources**, in the order the kernel resolves them:
+
+1. `DBX_SECRET_KEY_FILE` — path to a key file (a 64-char hex or base64url 32-byte key, or a passphrase hashed with Argon2id). Best for headless / container hosts.
+2. `DBX_SECRET_KEY` — the key material directly in the environment.
+3. OS keychain — macOS Keychain, Windows Credential Manager, Linux Secret Service (compiled in via the `os-keyring` feature). This is where DBX Desktop stores the key.
+4. `<data-dir>/.dbx/secret.key` — the managed per-user fallback.
+
+A CLI/MCP process only *reads* the key: it never provisions one and never migrates legacy credentials. If you run dbxt without DBX Desktop, export the key (`DBX_SECRET_KEY_FILE`) so it can decrypt the store.
+
+Version note: a dbxt built against the plaintext-era kernel (v0.6.9 and earlier) cannot read a store that DBX Desktop has already upgraded — upgrade dbxt alongside Desktop. The reverse also holds: the v0.6.27 kernel will not silently read a plaintext store; complete the wizard first.
 
 ## Status & roadmap
 

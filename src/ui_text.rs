@@ -586,6 +586,7 @@ pub static ALL_KEYS: &[&str] = &[
     " · 已截断",
     " · 更多",
     "（暂不支持的类型）",
+    "（暂不支持的类型：{}）",
     "永不过期",
     "不存在",
     "重新扫描 keys…",
@@ -622,6 +623,9 @@ pub static ALL_KEYS: &[&str] = &[
     " MongoDB 过滤 (JSON) · Enter 应用 · Esc 取消 · 留空清除 ",
     "运算符: $eq $gt $lt $in $regex $exists · 留空 = 全部",
     "{} 字节",
+    " · {} 位置位",
+    "基数估计 {}",
+    "（不可读）",
     "{} 个元素",
     "{} 个成员",
     "{} 个字段",
@@ -850,12 +854,19 @@ pub static ALL_KEYS: &[&str] = &[
     "SSH 主机密钥已变化，请确认",
     "SSH 服务器要求额外验证",
     "SSH 请求确认",
+    "需要用户输入",
+    " 需要输入 ",
+    "来自 {}",
     "SSH 连接 {}@{}:{} → {}…",
     "无法列举数据库（{}）",
     "SSH 认证失败（{}）：凭据被拒绝或不可用，请检查密码 / 密钥 / agent",
     "SSH 主机不可达（{}）：无法建立连接，请检查地址 / 端口 / 网络",
     "隧道已建立但远端数据库不可达（{} → {}:{}）：请确认跳板机能访问该地址",
     "SSH 隧道连接失败（{}）：{}",
+    // ── R44: DBX Secret Store (v0.6.27+) ──
+    "DBX 数据安全升级未完成：请先打开 DBX 桌面端并完成「数据安全升级向导」（dbxt 不会迁移数据）；无桌面环境可用 DBX_SECRET_KEY_FILE 提供密钥",
+    "读不到 DBX 数据加密密钥：桌面端把密钥存放在系统钥匙串，本进程无法访问；请改用带系统钥匙串支持的构建，或用 DBX_SECRET_KEY_FILE / DBX_SECRET_KEY 提供密钥",
+    "DBX 数据加密密钥缺失或不匹配：请提供创建该库时所用的密钥（DBX_SECRET_KEY_FILE / DBX_SECRET_KEY），或重新运行桌面端升级向导",
     "⚠ SSH 主机密钥已变化（{}:{}），可能被中间人攻击",
     "SSH 主机密钥被拒绝（{}:{}）",
     "SSH 主机密钥已接受但无法保存（{}:{}）：仅本次会话信任",
@@ -1874,6 +1885,7 @@ fn en_of(zh: &'static str) -> Option<&'static str> {
         " · 已截断" => Some(" · truncated"),
         " · 更多" => Some(" · more"),
         "（暂不支持的类型）" => Some("(unsupported type)"),
+        "（暂不支持的类型：{}）" => Some("(unsupported type: {})"),
         "永不过期" => Some("no expiry"),
         "不存在" => Some("missing"),
         "重新扫描 keys…" => Some("rescanning keys…"),
@@ -1910,6 +1922,9 @@ fn en_of(zh: &'static str) -> Option<&'static str> {
         " MongoDB 过滤 (JSON) · Enter 应用 · Esc 取消 · 留空清除 " => Some(" MongoDB filter (JSON) · Enter apply · Esc cancel · blank clears "),
         "运算符: $eq $gt $lt $in $regex $exists · 留空 = 全部" => Some("operators: $eq $gt $lt $in $regex $exists · blank = all"),
         "{} 字节" => Some("{} bytes"),
+        " · {} 位置位" => Some(" · {} bits set"),
+        "基数估计 {}" => Some("Cardinality estimate {}"),
+        "（不可读）" => Some("(unreadable)"),
         "{} 个元素" => Some("{} elements"),
         "{} 个成员" => Some("{} members"),
         "{} 个字段" => Some("{} fields"),
@@ -2144,6 +2159,9 @@ fn en_of(zh: &'static str) -> Option<&'static str> {
         "SSH 主机密钥已变化，请确认" => Some("SSH host key changed — please confirm"),
         "SSH 服务器要求额外验证" => Some("The SSH server requires additional verification"),
         "SSH 请求确认" => Some("SSH requests confirmation"),
+        "需要用户输入" => Some("User input required"),
+        " 需要输入 " => Some(" Input required "),
+        "来自 {}" => Some("From {}"),
         "SSH 连接 {}@{}:{} → {}…" => Some("SSH connect {}@{}:{} → {}…"),
         "无法列举数据库（{}）" => Some("Cannot list databases ({})"),
         "SSH 认证失败（{}）：凭据被拒绝或不可用，请检查密码 / 密钥 / agent" => {
@@ -2156,6 +2174,22 @@ fn en_of(zh: &'static str) -> Option<&'static str> {
             Some("Tunnel is up but the remote database is unreachable ({} → {}:{}): make sure the jump host can reach it")
         }
         "SSH 隧道连接失败（{}）：{}" => Some("SSH tunnel connection failed ({}): {}"),
+        // ── R44: DBX Secret Store (v0.6.27+) ──
+        "DBX 数据安全升级未完成：请先打开 DBX 桌面端并完成「数据安全升级向导」（dbxt 不会迁移数据）；无桌面环境可用 DBX_SECRET_KEY_FILE 提供密钥" => {
+            Some(
+                "DBX data security upgrade not finished: open DBX Desktop and complete the Data Security Upgrade wizard first (dbxt never migrates data); on a headless host supply a key via DBX_SECRET_KEY_FILE",
+            )
+        }
+        "读不到 DBX 数据加密密钥：桌面端把密钥存放在系统钥匙串，本进程无法访问；请改用带系统钥匙串支持的构建，或用 DBX_SECRET_KEY_FILE / DBX_SECRET_KEY 提供密钥" => {
+            Some(
+                "Cannot read the DBX data encryption key: Desktop keeps it in the OS keychain, which this process cannot reach. Use a build with OS keychain support, or supply a key via DBX_SECRET_KEY_FILE / DBX_SECRET_KEY",
+            )
+        }
+        "DBX 数据加密密钥缺失或不匹配：请提供创建该库时所用的密钥（DBX_SECRET_KEY_FILE / DBX_SECRET_KEY），或重新运行桌面端升级向导" => {
+            Some(
+                "The DBX data encryption key is missing or does not match: supply the key that created this store (DBX_SECRET_KEY_FILE / DBX_SECRET_KEY), or re-run the Desktop upgrade wizard",
+            )
+        }
         "⚠ SSH 主机密钥已变化（{}:{}），可能被中间人攻击" => {
             Some("⚠ SSH host key changed for {}:{} — possible man-in-the-middle")
         }

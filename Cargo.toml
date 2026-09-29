@@ -6,11 +6,13 @@ description = "Terminal UI client for DBX — reuse dbx connections and drivers 
 license = "Apache-2.0"
 
 [dependencies]
-dbx-core = { git = "https://github.com/t8y2/dbx", tag = "v0.6.9", default-features = false, features = [
+dbx-core = { git = "https://github.com/t8y2/dbx", tag = "v0.6.27", default-features = false, features = [
     "sqlite-bundled",
+    "os-keyring",
 ] }
-dbx-mcp = { git = "https://github.com/t8y2/dbx", tag = "v0.6.9", default-features = false, features = [
+dbx-mcp = { git = "https://github.com/t8y2/dbx", tag = "v0.6.27", default-features = false, features = [
     "sqlite-bundled",
+    "duckdb-sidecar",
 ] }
 ratatui = "0.29"
 crossterm = { version = "0.28", features = ["event-stream"] }
