@@ -5124,6 +5124,10 @@ enum Op {
     /// every switch so a slow reply for the connection the user just left is
     /// dropped instead of overwriting the new one's list.
     Databases(Box<ConnectionConfig>, u64),
+    /// R43: enumerate a non-active connection's databases for the sidebar tree.
+    /// `gen` is that connection's own request id, so only the newest reply for
+    /// that root is kept.
+    TreeDatabases(Box<ConnectionConfig>, u64),
     /// Enumerate the schemas of one database (PostgreSQL and other
     /// schema-aware engines).
     ListSchemas(Box<ConnectionConfig>, String),
@@ -5357,6 +5361,14 @@ enum OpResult {
         /// failure is never silent.
         warning: Option<String>,
         /// [`App::conn_gen`] at request time; a stale reply is dropped.
+        gen: u64,
+    },
+    /// R43: a non-active connection's database list for the sidebar tree, or the
+    /// error that prevented it (shown as an error row, never a broken tree).
+    TreeDatabases {
+        conn_id: String,
+        databases: Vec<String>,
+        error: Option<String>,
         gen: u64,
     },
     /// A table list plus the request id it answers, so a slow reply for a
@@ -5953,6 +5965,34 @@ async fn run_op(backend: &LocalBackend, op: Op, tx: &Tx) -> OpResult {
                 }
             }
         },
+        Op::TreeDatabases(cfg, gen) => {
+            let conn_id = cfg.id.clone();
+            match backend.list_databases(&cfg).await {
+                Ok(dbs) => OpResult::TreeDatabases {
+                    conn_id,
+                    databases: if dbs.is_empty() {
+                        vec![cfg.database.clone().unwrap_or_default()]
+                    } else {
+                        dbs
+                    },
+                    error: None,
+                    gen,
+                },
+                Err(e) => {
+                    let msg = if cfg.has_effective_ssh_tunnels() {
+                        ssh_connect_error_message(&cfg, &e)
+                    } else {
+                        tf("无法列举数据库（{}）", &[&(e)])
+                    };
+                    OpResult::TreeDatabases {
+                        conn_id,
+                        databases: Vec::new(),
+                        error: Some(msg),
+                        gen,
+                    }
+                }
+            }
+        }
         Op::ListSchemas(cfg, db) => {
             // `list_schemas_core` is the kernel's schema enumerator; it hides
             // system schemas unless the connection opts in (`show_system_schemas`).
@@ -8784,6 +8824,32 @@ enum NavEntry {
     },
 }
 
+/// One visible row of the sidebar connection tree (R43). The sidebar used to be
+/// a flat connection header + database row + table list; it is now a real tree:
+/// connection → database → table, with the same rows navigable by one cursor.
+#[derive(Clone, PartialEq, Debug)]
+enum SideRow {
+    /// A connection root (every saved connection is a root).
+    Conn { idx: usize },
+    /// A non-current connection's database list is being fetched.
+    ConnLoading { idx: usize },
+    /// A non-current connection's database list could not be fetched.
+    ConnError { idx: usize, msg: String },
+    /// A database under a connection. `idx` is the connection's index.
+    Db { idx: usize, db: String },
+    /// A table / collection under the current connection's current database.
+    /// `table` indexes `App::tables`; `depth` is 2 with a database layer, 1 when
+    /// tables hang directly under the connection (SQLite and friends).
+    Table { idx: usize, table: usize, depth: usize },
+}
+
+/// Per-connection state of the sidebar tree's lazy database fetch.
+#[derive(Clone, PartialEq, Debug)]
+enum TreeDbState {
+    Loading,
+    Error(String),
+}
+
 struct App {
     backend: Arc<LocalBackend>,
     page: Page,
@@ -8837,6 +8903,31 @@ struct App {
     table_sort: TableSort,
     /// Last first-letter jump (R39): `;` / `,` repeat it forward / backward.
     table_jump_letter: Option<char>,
+
+    // ── sidebar connection tree (R43) ──
+    /// Connection roots the user expanded (session memory). The active
+    /// connection is inserted on every switch so it starts open.
+    tree_conn_open: std::collections::HashSet<String>,
+    /// Connection roots the user explicitly collapsed. The active root is open
+    /// unless it is listed here (so it starts open without being un-collapsible).
+    tree_conn_closed: std::collections::HashSet<String>,
+    /// Database nodes of the *current* connection the user explicitly collapsed,
+    /// so the active database's tables can be hidden (session memory).
+    tree_db_closed: std::collections::HashSet<String>,
+    /// Lazily fetched database lists for connections other than the active one,
+    /// keyed by connection id. Filled when a root is expanded.
+    tree_dbs: std::collections::HashMap<String, Vec<String>>,
+    /// Per-connection state of that lazy fetch (`None` = idle / loaded).
+    tree_db_state: std::collections::HashMap<String, TreeDbState>,
+    /// Monotonic request id per connection, so a stale reply is dropped.
+    tree_gen: std::collections::HashMap<String, u64>,
+    /// The flattened visible tree rows, rebuilt whenever the tree can change.
+    side_rows: Vec<SideRow>,
+    /// Cursor into `side_rows` (the sidebar's single selection).
+    side_sel: usize,
+    /// Last `table_list` selection mirrored into `side_sel`; a change means an
+    /// external caller moved the table cursor, so the tree follows it.
+    side_table_seen: Option<usize>,
 
     /// Client-side substring filter over the loaded Redis keys (R42 one-step
     /// type-to-filter, mirrors the sidebar table filter). `redis_scan.keys` is
@@ -9534,6 +9625,15 @@ impl App {
             table_prompt: None,
             table_sort: TableSort::Name,
             table_jump_letter: None,
+            tree_conn_open: std::collections::HashSet::new(),
+            tree_conn_closed: std::collections::HashSet::new(),
+            tree_db_closed: std::collections::HashSet::new(),
+            tree_dbs: std::collections::HashMap::new(),
+            tree_db_state: std::collections::HashMap::new(),
+            tree_gen: std::collections::HashMap::new(),
+            side_rows: Vec::new(),
+            side_sel: 0,
+            side_table_seen: None,
             redis_filter: String::new(),
             redis_filter_prompt: None,
             redis_jump_letter: None,
@@ -9954,6 +10054,13 @@ fn apply_op_result(app: &mut App, res: OpResult, tx: &Tx) {
             }
             let configured = app.selected.as_ref().and_then(|c| c.database.clone());
             app.databases = dbs;
+            // Keep the tree's per-connection cache in step with the active
+            // connection's list, so collapsing and re-expanding it is instant.
+            if let Some(cfg) = app.selected.clone() {
+                app.tree_dbs.insert(cfg.id.clone(), app.databases.clone());
+                app.tree_db_state.remove(&cfg.id);
+                app.tree_conn_open.insert(cfg.id);
+            }
             app.db_index = configured
                 .as_deref()
                 .and_then(|db| app.databases.iter().position(|d| d == db))
@@ -10007,6 +10114,27 @@ fn apply_op_result(app: &mut App, res: OpResult, tx: &Tx) {
             if let Some(w) = warning {
                 app.status = format!("⚠ {w}");
             }
+        }
+        OpResult::TreeDatabases {
+            conn_id,
+            databases,
+            error,
+            gen,
+        } => {
+            // Only the newest request for this root may land.
+            if app.tree_gen.get(&conn_id).copied() != Some(gen) {
+                return;
+            }
+            match error {
+                Some(msg) => {
+                    app.tree_db_state.insert(conn_id, TreeDbState::Error(msg));
+                }
+                None => {
+                    app.tree_dbs.insert(conn_id.clone(), databases);
+                    app.tree_db_state.remove(&conn_id);
+                }
+            }
+            rebuild_side_rows(app);
         }
         OpResult::Schemas { db, schemas, warning } => {
             // A reply for a database the user already left must not resurrect a
@@ -12428,6 +12556,8 @@ fn flush_count(app: &mut App, tx: &Tx) {
             app.redis_list.select(Some(i));
         } else {
             app.table_list.select(Some(i));
+            // R43: the tree cursor follows the table jump.
+            rebuild_side_rows(app);
         }
         app.status = tf("跳转 {}/{}", &[&(i + 1), &(len)]);
     }
@@ -12727,7 +12857,9 @@ fn sidebar_key(app: &mut App, tx: &Tx, k: KeyEvent) {
         return;
     }
 
-    // connection selected → table browser
+    // connection selected → connection tree (R43): connection → database → table
+    // under a single cursor.
+    rebuild_side_rows(app);
     // R39 first-letter jump: Alt+<letter> cycles to the next table whose name
     // starts with that letter (vim `f`-style). Plain letters are reserved for
     // the one-step type-to-filter below, so the jump takes the modifier; `;` /
@@ -12742,6 +12874,7 @@ fn sidebar_key(app: &mut App, tx: &Tx, k: KeyEvent) {
                             "首字母跳「{}」→ {} · Alt+字母 循环 · ; , 前后跳",
                             &[&c, &name],
                         );
+                        rebuild_side_rows(app);
                     }
                     None => {
                         app.status = tf("没有以「{}」开头的表", &[&c]);
@@ -12764,50 +12897,60 @@ fn sidebar_key(app: &mut App, tx: &Tx, k: KeyEvent) {
         // `s` — cycle the sidebar order: name → type (TABLE/VIEW).
         KeyCode::Char('s') => app.cycle_table_sort(),
         // `;` / `,` repeat the last Alt+letter jump forward / backward.
-        KeyCode::Char(';') => repeat_table_jump(app, 1),
-        KeyCode::Char(',') => repeat_table_jump(app, -1),
-        // `/` — filter-as-you-type over the table list (vim-style), the fast way
-        // to reach a table when the sidebar is long.
+        KeyCode::Char(';') => {
+            repeat_table_jump(app, 1);
+            rebuild_side_rows(app);
+        }
+        KeyCode::Char(',') => {
+            repeat_table_jump(app, -1);
+            rebuild_side_rows(app);
+        }
+        // `/` — filter-as-you-type over the tree's visible nodes (vim-style),
+        // the fast way to reach a table when the sidebar is long.
         KeyCode::Char('/') => open_table_filter(app),
         // `t` — jump straight to one of the last five browsed tables.
         KeyCode::Char('t') => open_recent_tables(app),
+        // Tree navigation: `j`/`k` walk the whole tree (connections, databases,
+        // tables) with one cursor; a vim count prefix repeats the step.
         KeyCode::Up | KeyCode::Char('k') => {
-            let n = app.tables.len();
             let step = take_count(app) as usize;
-            list_step(&mut app.table_list, n, step, false);
+            side_step(app, step, false);
         }
         KeyCode::Down | KeyCode::Char('j') => {
-            let n = app.tables.len();
             let step = take_count(app) as usize;
-            list_step(&mut app.table_list, n, step, true);
+            side_step(app, step, true);
         }
         KeyCode::Home => {
             take_count(app);
-            if !app.tables.is_empty() {
-                app.table_list.select(Some(0));
+            if !app.side_rows.is_empty() {
+                app.side_sel = 0;
+                side_mirror_table(app);
             }
         }
         KeyCode::End => {
             take_count(app);
-            let n = app.tables.len();
+            let n = app.side_rows.len();
             if n > 0 {
-                app.table_list.select(Some(n - 1));
+                app.side_sel = n - 1;
+                side_mirror_table(app);
             }
         }
         KeyCode::PageUp => {
-            let n = app.tables.len();
             let step = 10 * take_count(app) as usize;
-            list_step(&mut app.table_list, n, step, false);
+            side_step(app, step, false);
         }
         KeyCode::PageDown => {
-            let n = app.tables.len();
             let step = 10 * take_count(app) as usize;
-            list_step(&mut app.table_list, n, step, true);
+            side_step(app, step, true);
         }
-        KeyCode::Enter => open_table_data(app, tx),
-        // ←/→ (and h/l) stay as a fast shortcut; `d` is the discoverable list.
-        KeyCode::Left | KeyCode::Char('h') => cycle_db(app, tx, false),
-        KeyCode::Right | KeyCode::Char('l') => cycle_db(app, tx, true),
+        KeyCode::Enter => side_activate(app, tx),
+        // vim tree: `l`/`→` expands, `h`/`←` collapses (or steps to the parent).
+        KeyCode::Left | KeyCode::Char('h') => side_collapse(app),
+        KeyCode::Right | KeyCode::Char('l') => side_expand(app, tx),
+        // `[` / `]` keep the old fast database cycle now that `h`/`l` belong to
+        // the tree; `d` is still the discoverable database list.
+        KeyCode::Char('[') => cycle_db(app, tx, false),
+        KeyCode::Char(']') => cycle_db(app, tx, true),
         // One-step type-to-filter (R39): any printable character that is not a
         // bound shortcut starts the filter with that character already typed,
         // so a lookup is a single keystroke instead of `/` then type.
@@ -13271,6 +13414,12 @@ fn reload_tables(app: &mut App, tx: &Tx) {
         app.page_pending = false;
         app.loading = true;
         let db = app.current_db();
+        // R43: a newly selected database opens in the tree (it may have been
+        // collapsed on an earlier visit).
+        if let Some(cfg) = app.selected.clone() {
+            app.tree_conn_open.insert(cfg.id.clone());
+            app.tree_db_closed.remove(&db_node_key(&cfg.id, &db));
+        }
         app.status = tf("切换到 {} …", &[&(fix_double_encoding(&db))]);
         app.set_placeholder();
         spawn_table_list(app, tx);
@@ -13371,6 +13520,21 @@ fn sidebar_longest_name(tables: &[TableInfo], schema: &str) -> usize {
         .map(|t| disp_width(&fix_double_encoding(&qualified_display(schema, &t.name))))
         .max()
         .unwrap_or(0)
+}
+
+/// Widest row the connection tree can draw: a table name plus its indent (two
+/// levels when the engine has a database layer, one otherwise) and any
+/// connection name, so the mid layout can size the sidebar to its content.
+fn sidebar_tree_longest_name(app: &App) -> usize {
+    let indent = if app.databases.is_empty() { 2 } else { 4 };
+    let tables = sidebar_longest_name(&app.tables, &app.schema) + indent;
+    let conns = app
+        .connections
+        .iter()
+        .map(|c| disp_width(&c.name))
+        .max()
+        .unwrap_or(0);
+    tables.max(conns)
 }
 
 /// Truncate a table name to `max` display cells, marking the cut with a trailing
@@ -13857,6 +14021,11 @@ fn activate_connection(
     app.conn_gen = app.conn_gen.wrapping_add(1);
     let gen = app.conn_gen;
     app.selected = Some(cfg.clone());
+    // R43: the active connection's tree root starts expanded so its databases
+    // (or, without a database layer, its tables) are visible immediately.
+    app.tree_conn_open.insert(cfg.id.clone());
+    app.tree_conn_closed.remove(&cfg.id);
+    app.tree_db_closed.clear();
     app.picker_open = false;
     app.backend_kind = backend_for_connection(&cfg);
     // The pointer is only meaningful for the engines whose browse state is a
@@ -13870,6 +14039,13 @@ fn activate_connection(
     app.schemas.clear();
     app.schema.clear();
     app.schemas_db.clear();
+    // R43: drop the previous connection's databases / tables so the tree never
+    // shows them under the new root during the async reload.
+    app.databases.clear();
+    app.db_index = 0;
+    app.tables.clear();
+    app.tables_all.clear();
+    app.table_list = ListState::default();
     app.clear_grid();
     app.script = None;
     app.ddl = None;
@@ -13907,6 +14083,17 @@ fn activate_connection(
         app.spawn(tx, Op::History(Box::new(cfg)));
     } else {
         app.spawn(tx, Op::Databases(Box::new(cfg), gen));
+    }
+    // R43: land the sidebar tree cursor on the newly active root so a switch is
+    // reflected immediately, before the database list arrives.
+    rebuild_side_rows(app);
+    if let Some(pos) = app
+        .side_rows
+        .iter()
+        .position(|r| matches!(r, SideRow::Conn { idx } if side_is_active(app, *idx)))
+    {
+        app.side_sel = pos;
+        side_mirror_table(app);
     }
 }
 
@@ -14419,12 +14606,8 @@ fn scroll(app: &mut App, tx: &Tx, delta: i32) {
                     app.conn_list.select(Some(next as usize));
                 }
             } else {
-                let n = app.tables.len();
-                if n > 0 {
-                    let cur = app.table_list.selected().unwrap_or(0) as i32;
-                    let next = (cur + delta).clamp(0, n as i32 - 1);
-                    app.table_list.select(Some(next as usize));
-                }
+                rebuild_side_rows(app);
+                side_step(app, delta.unsigned_abs() as usize, delta > 0);
             }
         }
         Focus::Preview => {
@@ -14811,40 +14994,34 @@ fn sidebar_click(app: &mut App, tx: &Tx, x: u16, y: u16) {
         }
         return;
     }
-    // row 0 = connection header, then optional database selector row and the
-    // table-filter row (both only when the connection is open).
-    let header = 1
-        + if sidebar_db_row(app) { 1 } else { 0 }
-        + if app.tables_all.is_empty() { 0 } else { 1 };
-    if rel == 1 && sidebar_db_row(app) {
-        // clicking the database row opens the switcher
-        open_db_picker(app);
-        return;
-    }
-    let table_row = rel - header;
-    if table_row < 0 {
+    // SQL / MongoDB: the connection tree. Row 0 is the `/` filter row when the
+    // connection has tables; the tree rows follow.
+    rebuild_side_rows(app);
+    let filter_rows: usize = if app.tables_all.is_empty() { 0 } else { 1 };
+    let tree_row = rel - filter_rows as i32;
+    if tree_row < 0 {
         return;
     }
     let _ = x;
     let cap = (area.height as usize)
-        .saturating_sub(
-            2 + if sidebar_db_row(app) { 1 } else { 0 }
-                + if app.tables_all.is_empty() { 0 } else { 1 },
-        )
+        .saturating_sub(2 + filter_rows)
         .max(1);
-    let sel = app.table_list.selected();
-    let start = sel
-        .unwrap_or(0)
-        .saturating_sub(cap / 2)
-        .min(app.tables.len().saturating_sub(cap.min(app.tables.len())));
-    let idx = start + table_row as usize;
-    if idx >= app.tables.len() {
+    let n = app.side_rows.len();
+    let sel = if n == 0 { 0 } else { app.side_sel.min(n - 1) };
+    let start = if n <= cap {
+        0
+    } else {
+        sel.saturating_sub(cap / 2).min(n - cap)
+    };
+    let idx = start + tree_row as usize;
+    if idx >= n {
         return;
     }
-    if app.table_list.selected() == Some(idx) {
-        open_table_data(app, tx);
+    if app.side_sel == idx {
+        side_activate(app, tx);
     } else {
-        app.table_list.select(Some(idx));
+        app.side_sel = idx;
+        side_mirror_table(app);
     }
 }
 
@@ -14866,6 +15043,417 @@ fn sidebar_db_label(app: &App) -> String {
         )
     } else {
         tf("{} · d 切换", &[&(fix_double_encoding(&app.current_db()))])
+    }
+}
+
+// ── sidebar connection tree (R43) ──
+
+/// Index of the active connection in `app.connections` (matched by id, so a
+/// re-sorted picker does not confuse the tree).
+fn current_conn_index(app: &App) -> Option<usize> {
+    let id = app.selected.as_ref()?.id.as_str();
+    app.connections.iter().position(|c| c.id == id)
+}
+
+/// The connection a tree root index refers to. Indices `0..connections.len()`
+/// are the saved list; one extra index past the end stands for the active
+/// connection when it is not in that list (a test fixture, or a connection that
+/// has just been created and not yet reloaded).
+fn side_root_cfg(app: &App, idx: usize) -> Option<&ConnectionConfig> {
+    if let Some(c) = app.connections.get(idx) {
+        return Some(c);
+    }
+    if idx == app.connections.len() {
+        return app.selected.as_ref();
+    }
+    None
+}
+
+/// Whether tree root `idx` is the active connection.
+fn side_is_active(app: &App, idx: usize) -> bool {
+    match current_conn_index(app) {
+        Some(i) => i == idx,
+        None => idx == app.connections.len() && app.selected.is_some(),
+    }
+}
+
+/// Number of tree roots: the saved connections plus, when the active connection
+/// is missing from that list, one synthetic root for it.
+fn side_root_count(app: &App) -> usize {
+    app.connections.len() + usize::from(current_conn_index(app).is_none() && app.selected.is_some())
+}
+
+/// Whether a connection root is expanded. The active root defaults open (the
+/// user has to collapse it explicitly); a non-active root opens on demand.
+fn side_conn_open(app: &App, idx: usize) -> bool {
+    let Some(c) = side_root_cfg(app, idx) else {
+        return false;
+    };
+    if side_is_active(app, idx) {
+        !app.tree_conn_closed.contains(&c.id)
+    } else {
+        app.tree_conn_open.contains(&c.id)
+    }
+}
+
+/// Stable key for one database node of one connection (session collapse memory).
+fn db_node_key(conn_id: &str, db: &str) -> String {
+    format!("{conn_id}\u{0}{db}")
+}
+
+/// Depth of a tree row: connections at 0, databases at 1, tables at 2. Used by
+/// `h` (collapse / step to parent) and the indent.
+fn side_row_depth(r: &SideRow) -> usize {
+    match r {
+        SideRow::Conn { .. } => 0,
+        SideRow::ConnLoading { .. } | SideRow::ConnError { .. } | SideRow::Db { .. } => 1,
+        SideRow::Table { depth, .. } => *depth,
+    }
+}
+
+/// Build the visible sidebar tree rows. Pure over `app`, so navigation, click
+/// hit-testing and rendering all agree on what is on screen.
+///
+/// Every saved connection is a root. The active connection is expanded on
+/// switch, so its databases (or, for engines without a database layer, its
+/// tables) show immediately; its active database reveals the tables. Other
+/// connections expand on demand and lazily load their database list, so a
+/// failure shows an error row instead of breaking the tree.
+fn compute_side_rows(app: &App) -> Vec<SideRow> {
+    let mut rows = Vec::new();
+    if app.selected.is_none() {
+        return rows;
+    }
+    let needle = app.table_filter.trim().to_lowercase();
+    for idx in 0..side_root_count(app) {
+        let Some(c) = side_root_cfg(app, idx) else {
+            continue;
+        };
+        let is_active = side_is_active(app, idx);
+        // The root is always visible: the tree keeps its anchors even when a
+        // filter hides everything below them.
+        rows.push(SideRow::Conn { idx });
+        if !side_conn_open(app, idx) {
+            continue;
+        }
+        if is_active {
+            if app.databases.is_empty() {
+                // No database layer (SQLite / a test fixture): tables hang
+                // directly under the connection.
+                for ti in 0..app.tables.len() {
+                    rows.push(SideRow::Table {
+                        idx,
+                        table: ti,
+                        depth: 1,
+                    });
+                }
+            } else {
+                let cur_db = app.current_db();
+                for db in &app.databases {
+                    let is_cur_db = *db == cur_db;
+                    // A filter keeps a database row when its name matches or it
+                    // is the active one with visible tables; ancestors of a
+                    // match survive, which is the whole point of a tree filter.
+                    if !needle.is_empty()
+                        && !db.to_lowercase().contains(&needle)
+                        && !(is_cur_db && !app.tables.is_empty())
+                    {
+                        continue;
+                    }
+                    rows.push(SideRow::Db {
+                        idx,
+                        db: db.clone(),
+                    });
+                    if is_cur_db && !app.tree_db_closed.contains(&db_node_key(&c.id, db)) {
+                        for ti in 0..app.tables.len() {
+                            rows.push(SideRow::Table {
+                                idx,
+                                table: ti,
+                                depth: 2,
+                            });
+                        }
+                    }
+                }
+            }
+        } else {
+            match app.tree_db_state.get(&c.id) {
+                Some(TreeDbState::Loading) => rows.push(SideRow::ConnLoading { idx }),
+                Some(TreeDbState::Error(msg)) => rows.push(SideRow::ConnError {
+                    idx,
+                    msg: msg.clone(),
+                }),
+                _ => match app.tree_dbs.get(&c.id) {
+                    Some(dbs) => {
+                        for db in dbs {
+                            if !needle.is_empty() && !db.to_lowercase().contains(&needle) {
+                                continue;
+                            }
+                            rows.push(SideRow::Db {
+                                idx,
+                                db: db.clone(),
+                            });
+                        }
+                    }
+                    // Not fetched yet (or a synthetic root): a loading row stands
+                    // in until the lazy list arrives.
+                    None => rows.push(SideRow::ConnLoading { idx }),
+                },
+            }
+        }
+    }
+    rows
+}
+
+/// Rebuild the flattened tree and keep the cursor in sync. An external move of
+/// `table_list` (first-letter jump, recent tables, filter Enter, count jump, a
+/// global-search hit) drags the tree cursor onto that table; a tree move drags
+/// `table_list` with it, so `selected_table()` stays authoritative for the rest
+/// of the app.
+fn rebuild_side_rows(app: &mut App) {
+    let rows = compute_side_rows(app);
+    let cur_table = app.table_list.selected();
+    if cur_table != app.side_table_seen {
+        if let Some(pos) = rows.iter().position(
+            |r| matches!(r, SideRow::Table { table, .. } if Some(*table) == cur_table),
+        ) {
+            app.side_sel = pos;
+        }
+        app.side_table_seen = cur_table;
+    }
+    app.side_rows = rows;
+    let n = app.side_rows.len();
+    if n == 0 {
+        app.side_sel = 0;
+    } else {
+        app.side_sel = app.side_sel.min(n - 1);
+    }
+    side_mirror_table(app);
+}
+
+/// Mirror the tree cursor onto `table_list` when it sits on a table row.
+fn side_mirror_table(app: &mut App) {
+    if let Some(SideRow::Table { table, .. }) = app.side_rows.get(app.side_sel) {
+        if app.table_list.selected() != Some(*table) {
+            app.table_list.select(Some(*table));
+        }
+        app.side_table_seen = Some(*table);
+    }
+}
+
+/// Move the tree cursor by `step` rows, clamped to the visible tree.
+fn side_step(app: &mut App, step: usize, forward: bool) {
+    let n = app.side_rows.len();
+    if n == 0 {
+        return;
+    }
+    let cur = app.side_sel.min(n - 1);
+    app.side_sel = if forward {
+        (cur + step).min(n - 1)
+    } else {
+        cur.saturating_sub(step)
+    };
+    side_mirror_table(app);
+    // Name the position so a count move (`3j`) replaces the `3·` prefix readout
+    // with something useful instead of leaving it on screen.
+    app.status = tf("树 {}/{}", &[&(app.side_sel + 1), &(n)]);
+}
+
+/// Move the tree cursor up to the nearest row shallower than the current one
+/// (a table's database, a database's connection).
+fn side_focus_parent(app: &mut App) {
+    let Some(cur) = app.side_rows.get(app.side_sel) else {
+        return;
+    };
+    let d = side_row_depth(cur);
+    let mut i = app.side_sel;
+    while i > 0 {
+        i -= 1;
+        if side_row_depth(&app.side_rows[i]) < d {
+            app.side_sel = i;
+            side_mirror_table(app);
+            return;
+        }
+    }
+}
+
+/// `l` / `→`: expand the tree row under the cursor (a connection loads its
+/// databases; a database reveals its tables). On an already-expanded node it
+/// steps into the first child, vim-tree style.
+fn side_expand(app: &mut App, tx: &Tx) {
+    let Some(row) = app.side_rows.get(app.side_sel).cloned() else {
+        return;
+    };
+    match row {
+        SideRow::Conn { idx } => {
+            if side_conn_open(app, idx) {
+                side_step(app, 1, true);
+            } else {
+                expand_conn(app, tx, idx);
+            }
+        }
+        SideRow::Db { idx, db } => {
+            // Only the active connection's *current* database can reveal tables;
+            // any other database node selects it (switching connection when
+            // needed).
+            if side_is_active(app, idx) && db == app.current_db() {
+                let id = side_root_cfg(app, idx).map(|c| c.id.clone()).unwrap_or_default();
+                let key = db_node_key(&id, &db);
+                if app.tree_db_closed.remove(&key) {
+                    rebuild_side_rows(app);
+                } else {
+                    side_step(app, 1, true);
+                }
+            } else {
+                switch_to_db(app, tx, idx, &db);
+            }
+        }
+        _ => {}
+    }
+}
+
+/// `h` / `←`: collapse the tree row under the cursor, or step up to its parent
+/// when it is already collapsed / a leaf.
+fn side_collapse(app: &mut App) {
+    let Some(row) = app.side_rows.get(app.side_sel).cloned() else {
+        return;
+    };
+    match row {
+        SideRow::Conn { idx } => {
+            let id = side_root_cfg(app, idx).map(|c| c.id.clone()).unwrap_or_default();
+            if side_conn_open(app, idx) {
+                if side_is_active(app, idx) {
+                    app.tree_conn_closed.insert(id);
+                } else {
+                    app.tree_conn_open.remove(&id);
+                }
+                rebuild_side_rows(app);
+            }
+        }
+        SideRow::Db { idx, db } => {
+            if side_is_active(app, idx) && db == app.current_db() {
+                let id = side_root_cfg(app, idx).map(|c| c.id.clone()).unwrap_or_default();
+                let key = db_node_key(&id, &db);
+                if !app.tree_db_closed.contains(&key) {
+                    app.tree_db_closed.insert(key);
+                    rebuild_side_rows(app);
+                } else {
+                    side_focus_parent(app);
+                }
+            } else {
+                side_focus_parent(app);
+            }
+        }
+        _ => side_focus_parent(app),
+    }
+}
+
+/// Expand a connection root, lazily loading its database list when it is not the
+/// active connection. A failure is remembered and drawn as an error row.
+fn expand_conn(app: &mut App, tx: &Tx, idx: usize) {
+    let Some(c) = side_root_cfg(app, idx).cloned() else {
+        return;
+    };
+    let id = c.id.clone();
+    if side_is_active(app, idx) {
+        app.tree_conn_closed.remove(&id);
+        rebuild_side_rows(app);
+        return;
+    }
+    app.tree_conn_open.insert(id.clone());
+    // A synthetic root (not in the saved list) cannot be lazily connected.
+    if idx >= app.connections.len() {
+        rebuild_side_rows(app);
+        return;
+    }
+    let already = app.tree_dbs.contains_key(&id)
+        || matches!(app.tree_db_state.get(&id), Some(TreeDbState::Loading));
+    if already {
+        rebuild_side_rows(app);
+        return;
+    }
+    let gen = {
+        let g = app.tree_gen.entry(id.clone()).or_insert(0);
+        *g = g.wrapping_add(1);
+        *g
+    };
+    app.tree_db_state.insert(id.clone(), TreeDbState::Loading);
+    rebuild_side_rows(app);
+    app.spawn(tx, Op::TreeDatabases(Box::new(c), gen));
+}
+
+/// Switch to the connection at `idx` and land on `db` once its database list
+/// arrives (used when drilling into a non-active connection's database).
+fn switch_to_db(app: &mut App, tx: &Tx, idx: usize, db: &str) {
+    let target_id = side_root_cfg(app, idx).map(|c| c.id.clone());
+    if side_is_active(app, idx) {
+        // Already active: just move to the database.
+        if let Some(pos) = app.databases.iter().position(|d| d == db) {
+            app.db_index = pos;
+            reload_tables(app, tx);
+        }
+        return;
+    }
+    switch_connection(app, tx, idx);
+    if app.selected.as_ref().map(|c| c.id.clone()) == target_id {
+        match app.pending_restore.as_mut() {
+            Some(p) => p.db = db.to_string(),
+            None => {
+                app.pending_restore = Some(ConnPointer {
+                    db: db.to_string(),
+                    ..Default::default()
+                })
+            }
+        }
+    }
+}
+
+/// `Enter` / `Space` on the tree: activate the row under the cursor.
+fn side_activate(app: &mut App, tx: &Tx) {
+    let Some(row) = app.side_rows.get(app.side_sel).cloned() else {
+        return;
+    };
+    match row {
+        SideRow::Conn { idx } => {
+            let id = side_root_cfg(app, idx).map(|c| c.id.clone()).unwrap_or_default();
+            if side_is_active(app, idx) {
+                if side_conn_open(app, idx) {
+                    app.tree_conn_closed.insert(id);
+                } else {
+                    app.tree_conn_closed.remove(&id);
+                }
+                rebuild_side_rows(app);
+            } else {
+                if idx < app.connections.len() {
+                    switch_connection(app, tx, idx);
+                }
+                app.tree_conn_open.insert(id);
+            }
+        }
+        SideRow::Db { idx, db } => {
+            if side_is_active(app, idx) {
+                let id = side_root_cfg(app, idx).map(|c| c.id.clone()).unwrap_or_default();
+                app.tree_db_closed.remove(&db_node_key(&id, &db));
+                if let Some(pos) = app.databases.iter().position(|d| d == &db) {
+                    if app.db_index != pos {
+                        app.db_index = pos;
+                        reload_tables(app, tx);
+                    } else {
+                        rebuild_side_rows(app);
+                    }
+                }
+            } else {
+                switch_to_db(app, tx, idx, &db);
+            }
+        }
+        SideRow::Table { .. } => open_table_data(app, tx),
+        SideRow::ConnError { idx, .. } => {
+            // Retry the lazy fetch.
+            if let Some(id) = side_root_cfg(app, idx).map(|c| c.id.clone()) {
+                app.tree_db_state.remove(&id);
+            }
+            expand_conn(app, tx, idx);
+        }
+        SideRow::ConnLoading { .. } => {}
     }
 }
 
@@ -19451,6 +20039,7 @@ fn apply_table_filter(app: &mut App) {
     let n = app.tables.len();
     if n == 0 {
         app.table_list.select(None);
+        rebuild_side_rows(app);
         return;
     }
     let sel = prev
@@ -19458,6 +20047,7 @@ fn apply_table_filter(app: &mut App) {
         .unwrap_or(0)
         .min(n - 1);
     app.table_list.select(Some(sel));
+    rebuild_side_rows(app);
 }
 
 // ── Redis key list: client-side type-to-filter + first-letter jump (R42) ──
@@ -25417,17 +26007,25 @@ fn context_info(app: &App) -> String {
     if !app.col_hidden.is_empty() {
         parts.push(tf("隐藏列 {}", &[&(app.col_hidden.len())]));
     }
-    // Narrow screens clip the grid columns, so the focused column's name goes
-    // here (early in the line, before the width cap can truncate it): after a
-    // header click or a pan the user still knows which column the cursor is on.
-    if app.term_w > 0 && app.term_w < 56 && app.grid_kind != GridKind::Columns {
+    // When the grid columns are clipped, name the focused column and give its
+    // absolute position (`列 1|column_3 4/8`). This is the single column readout:
+    // it used to be split between a narrow-only name line and an always-on
+    // scroll-window line, which duplicated `列 …` on a narrow screen. The pin
+    // prefix (`1|`) is kept so a frozen prefix stays visible.
+    if app.grid_kind != GridKind::Columns {
         if let Some(grid) = &app.grid {
             let ncols = grid.columns.len();
             if ncols > 0 && app.grid_frozen + app.vis_cols.max(1) < ncols {
                 if let Some(name) = grid.columns.get(app.col_cursor) {
+                    let pin = match app.grid_frozen {
+                        0 => String::new(),
+                        1 => "1|".to_string(),
+                        f => format!("1-{f}|"),
+                    };
                     parts.push(tf(
-                        "列 {} {}/{}",
+                        "列 {}{} {}/{}",
                         &[
+                            &pin,
                             &truncate_disp(&fix_double_encoding(name), 12),
                             &(app.col_cursor + 1),
                             &ncols,
@@ -25491,27 +26089,8 @@ fn context_info(app: &App) -> String {
             .unwrap_or(n);
         parts.push(tf("行 {}/{}", &[&(cur), &(total_abs)]));
     }
-    // Horizontal position is always visible for data grids so the user can tell
-    // at a glance that more columns exist off-screen. With a pinned prefix the
-    // label reads `列 1|3-8/21` (pinned | scrolled).
-    if let Some(grid) = &app.grid {
-        if app.grid_kind != GridKind::Columns && !grid.columns.is_empty() {
-            let ncols = grid.columns.len();
-            let off = app.col_offset.min(ncols - 1);
-            let vis = app.vis_cols.clamp(1, ncols - off);
-            let pin = match app.grid_frozen {
-                0 => String::new(),
-                1 => "1|".to_string(),
-                f => format!("1-{f}|"),
-            };
-            // When every column is on screen the user needs to know there is
-            // nothing left to scroll to — the whole point of compact mode. That
-            // marker was already pushed at the front of the list.
-            if app.grid_frozen + vis < ncols {
-                parts.push(tf("列 {}{}-{}/{}", &[&(pin), &(off + 1), &(off + vis), &(ncols)]));
-            }
-        }
-    }
+    // Horizontal position used to be a separate `列 1|3-8/21` readout here; it
+    // is now folded into the single focused-column line above (R43).
     if !app.batch.is_empty() {
         parts.push(tf("批量 {} 待提交", &[&(app.batch.len())]));
     }
@@ -26029,7 +26608,8 @@ fn footer_hints_ctx(ctx: FooterCtx) -> Vec<Hint> {
                 ("q", t("显隐")),
             ],
             Focus::Sidebar => vec![
-                ("↑↓", t("表")),
+                ("↑↓", t("树")),
+                ("h l", t("折叠/展开")),
                 ("a-z", t("过滤")),
                 ("Enter", t("浏览")),
                 ("r", t("结构")),
@@ -26218,7 +26798,7 @@ fn render_browse(f: &mut Frame, area: Rect, app: &mut App) {
         let sidebar_w = sidebar_width(
             app.term_w,
             mode,
-            sidebar_longest_name(&app.tables, &app.schema),
+            sidebar_tree_longest_name(app),
         );
         let hz =
             Layout::horizontal([Constraint::Length(sidebar_w), Constraint::Min(20)]).split(area);
@@ -27411,124 +27991,8 @@ fn render_console(f: &mut Frame, area: Rect, app: &App) {
 
 fn render_sidebar(f: &mut Frame, area: Rect, app: &mut App) {
     let focused = app.focus == Focus::Sidebar;
-    let mut lines: Vec<Line> = Vec::new();
 
-    if let Some(c) = &app.selected {
-        let conn_color = connection_color(c);
-        lines.push(Line::from(vec![
-            Span::styled("● ", Style::default().fg(conn_color)),
-            Span::styled(
-                c.name.clone(),
-                Style::default()
-                    .fg(conn_color)
-                    .add_modifier(Modifier::BOLD),
-            ),
-        ]));
-        // database row: always visible when known, opens the `d` switcher on click
-        if sidebar_db_row(app) {
-            let label = sidebar_db_label(app);
-            let w = (area.width as usize).saturating_sub(4).max(6);
-            lines.push(Line::from(vec![
-                Span::styled("▤ ", Style::default().fg(Color::Cyan)),
-                Span::styled(
-                    truncate_disp(&label, w),
-                    Style::default()
-                        .fg(Color::Cyan)
-                        .add_modifier(Modifier::BOLD),
-                ),
-            ]));
-        }
-
-        // Redis connections browse keys, not tables.
-        if app.backend_kind == Backend::Redis {
-            render_redis_sidebar(f, area, app, &mut lines);
-            return;
-        }
-
-        // table-name filter row: shows the active `/` filter, or the hint.
-        let filter_rows = if app.tables_all.is_empty() {
-            0
-        } else {
-            1
-        };
-        if filter_rows > 0 {
-            let w = (area.width as usize).saturating_sub(4).max(6);
-            let (mark, text, style) = if app.table_filter.is_empty() {
-                (
-                    "/ ",
-                    t("/ 过滤表名").to_string(),
-                    Style::default().fg(Color::DarkGray),
-                )
-            } else {
-                (
-                    "▸ ",
-                    format!("/{} · {}/{}",  app.table_filter,  app.tables.len(),  app.tables_all.len()),
-                    Style::default().fg(Color::Yellow),
-                )
-            };
-            lines.push(Line::from(vec![
-                Span::styled(mark, Style::default().fg(Color::Yellow)),
-                Span::styled(truncate_disp(&text, w), style),
-            ]));
-        }
-
-        let cap = (area.height as usize)
-            .saturating_sub(2 + if sidebar_db_row(app) { 1 } else { 0 } + filter_rows)
-            .max(1);
-        let sel = app.table_list.selected();
-        let start = sel
-            .unwrap_or(0)
-            .saturating_sub(cap / 2)
-            .min(app.tables.len().saturating_sub(cap.min(app.tables.len())));
-        let needle = app.table_filter.trim().to_ascii_lowercase();
-        for (i, t) in app.tables.iter().enumerate().skip(start).take(cap) {
-            let marker = if sel == Some(i) { "▸ " } else { "  " };
-            let view = if t.table_type.eq_ignore_ascii_case("VIEW") {
-                "~"
-            } else {
-                ""
-            };
-            let style = if sel == Some(i) {
-                Style::default()
-                    .fg(Color::Green)
-                    .add_modifier(Modifier::BOLD)
-            } else if view == "~" {
-                Style::default().fg(Color::Blue)
-            } else {
-                Style::default()
-            };
-            let disp_full = fix_double_encoding(&qualified_display(&app.schema, &t.name));
-            // The sidebar border (2) and the `▸ ` marker (2) are not available to
-            // the name; the VIEW badge takes one more cell.
-            let name_w = (area.width as usize)
-                .saturating_sub(4)
-                .saturating_sub(view.len());
-            let disp = truncate_table_name(&disp_full, name_w);
-            let hit = style.add_modifier(Modifier::UNDERLINED);
-            let mut spans = vec![Span::styled(marker.to_string(), style)];
-            spans.extend(highlight_match_spans(&disp, &needle, style, hit));
-            if !view.is_empty() {
-                spans.push(Span::styled(view.to_string(), style));
-            }
-            lines.push(Line::from(spans));
-        }
-
-        let title = if app.table_filter.is_empty() {
-            format!(" {} ({}) ",  c.name,  app.tables_all.len())
-        } else {
-            tf(" {} 表 {}/{} ", &[&(c.name), &(app.tables.len()), &(app.tables_all.len())])
-        };
-        f.render_widget(
-            Paragraph::new(lines).block(
-                Block::default()
-                    .borders(Borders::ALL)
-                    .title(title)
-                    .border_set(border::ROUNDED)
-                    .border_style(border_style(focused)),
-            ),
-            area,
-        );
-    } else {
+    let Some(c) = app.selected.clone() else {
         // no connection selected: sidebar is just a placeholder (picker overlay does the job)
         let hint = if app.picker_open {
             ""
@@ -27547,7 +28011,195 @@ fn render_sidebar(f: &mut Frame, area: Rect, app: &mut App) {
                 ),
             area,
         );
+        return;
+    };
+
+    // Redis connections browse keys, not databases/tables: keep the flat key
+    // browser (the tree only makes sense for SQL / Mongo).
+    if app.backend_kind == Backend::Redis {
+        let conn_color = connection_color(&c);
+        let mut lines: Vec<Line> = Vec::new();
+        lines.push(Line::from(vec![
+            Span::styled("● ", Style::default().fg(conn_color)),
+            Span::styled(
+                c.name.clone(),
+                Style::default()
+                    .fg(conn_color)
+                    .add_modifier(Modifier::BOLD),
+            ),
+        ]));
+        if sidebar_db_row(app) {
+            let label = sidebar_db_label(app);
+            let w = (area.width as usize).saturating_sub(4).max(6);
+            lines.push(Line::from(vec![
+                Span::styled("▤ ", Style::default().fg(Color::Cyan)),
+                Span::styled(
+                    truncate_disp(&label, w),
+                    Style::default()
+                        .fg(Color::Cyan)
+                        .add_modifier(Modifier::BOLD),
+                ),
+            ]));
+        }
+        render_redis_sidebar(f, area, app, &mut lines);
+        return;
     }
+
+    // SQL / MongoDB: the connection → database → table tree (R43).
+    rebuild_side_rows(app);
+    let mut lines: Vec<Line> = Vec::new();
+
+    // table-name filter row: shows the active `/` filter, or the hint.
+    let filter_rows = if app.tables_all.is_empty() { 0 } else { 1 };
+    if filter_rows > 0 {
+        let w = (area.width as usize).saturating_sub(4).max(6);
+        let (mark, text, style) = if app.table_filter.is_empty() {
+            (
+                "/ ",
+                t("/ 过滤表名").to_string(),
+                Style::default().fg(Color::DarkGray),
+            )
+        } else {
+            (
+                "▸ ",
+                format!("/{} · {}/{}",  app.table_filter,  app.tables.len(),  app.tables_all.len()),
+                Style::default().fg(Color::Yellow),
+            )
+        };
+        lines.push(Line::from(vec![
+            Span::styled(mark, Style::default().fg(Color::Yellow)),
+            Span::styled(truncate_disp(&text, w), style),
+        ]));
+    }
+
+    let cap = (area.height as usize)
+        .saturating_sub(2 + filter_rows)
+        .max(1);
+    let n = app.side_rows.len();
+    let sel = if n == 0 { 0 } else { app.side_sel.min(n - 1) };
+    let start = if n <= cap {
+        0
+    } else {
+        sel.saturating_sub(cap / 2).min(n - cap)
+    };
+    let needle = app.table_filter.trim().to_ascii_lowercase();
+    for i in start..(start + cap).min(n) {
+        let row = app.side_rows[i].clone();
+        lines.push(side_row_line(app, &row, i == sel, &needle, area.width));
+    }
+
+    let title = if app.table_filter.is_empty() {
+        format!(" {} ({}) ",  c.name,  app.tables_all.len())
+    } else {
+        tf(" {} 表 {}/{} ", &[&(c.name), &(app.tables.len()), &(app.tables_all.len())])
+    };
+    f.render_widget(
+        Paragraph::new(lines).block(
+            Block::default()
+                .borders(Borders::ALL)
+                .title(title)
+                .border_set(border::ROUNDED)
+                .border_style(border_style(focused)),
+        ),
+        area,
+    );
+}
+
+/// Render one row of the sidebar connection tree: an expand triangle, a
+/// connection / database symbol and the name, indented two cells per level. The
+/// selected row is filled so the single tree cursor is unmistakable.
+fn side_row_line(
+    app: &App,
+    row: &SideRow,
+    selected: bool,
+    needle: &str,
+    area_w: u16,
+) -> Line<'static> {
+    let depth = side_row_depth(row);
+    let indent = "  ".repeat(depth);
+    let mk = |s: Style| -> Style {
+        if selected {
+            s.bg(Color::DarkGray).add_modifier(Modifier::BOLD)
+        } else {
+            s
+        }
+    };
+    let inner = (area_w as usize).saturating_sub(2 + indent.len()).max(4);
+    let mut spans: Vec<Span> = vec![Span::styled(indent, mk(Style::default()))];
+    match row {
+        SideRow::Conn { idx } => {
+            let (name, color, open) = match side_root_cfg(app, *idx) {
+                Some(c) => (c.name.clone(), connection_color(c), side_conn_open(app, *idx)),
+                None => (String::new(), Color::Gray, false),
+            };
+            spans.push(Span::styled(
+                if open { "▾ " } else { "▸ " }.to_string(),
+                mk(Style::default().fg(Color::DarkGray)),
+            ));
+            spans.push(Span::styled("● ".to_string(), mk(Style::default().fg(color))));
+            spans.push(Span::styled(
+                truncate_disp(&name, inner),
+                mk(Style::default().fg(color).add_modifier(Modifier::BOLD)),
+            ));
+        }
+        SideRow::ConnLoading { .. } => {
+            spans.push(Span::styled(
+                truncate_disp(t("… 加载库列表"), inner + 2),
+                mk(Style::default().fg(Color::DarkGray)),
+            ));
+        }
+        SideRow::ConnError { msg, .. } => {
+            spans.push(Span::styled(
+                format!("✗ {}",  truncate_disp(msg, inner)),
+                mk(Style::default().fg(Color::Red)),
+            ));
+        }
+        SideRow::Db { idx, db } => {
+            let is_cur = side_is_active(app, *idx);
+            let is_cur_db = is_cur && *db == app.current_db();
+            let open = is_cur_db
+                && side_root_cfg(app, *idx)
+                    .is_some_and(|c| !app.tree_db_closed.contains(&db_node_key(&c.id, db)));
+            let tri = if is_cur_db && open { "▾ " } else { "▸ " };
+            spans.push(Span::styled(tri.to_string(), mk(Style::default().fg(Color::DarkGray))));
+            spans.push(Span::styled("▤ ".to_string(), mk(Style::default().fg(Color::Cyan))));
+            let disp = fix_double_encoding(db);
+            let style = mk(Style::default()
+                .fg(if is_cur { Color::Cyan } else { Color::Gray })
+                .add_modifier(Modifier::BOLD));
+            let hit = style.add_modifier(Modifier::UNDERLINED);
+            spans.extend(highlight_match_spans(
+                &truncate_disp(&disp, inner),
+                needle,
+                style,
+                hit,
+            ));
+        }
+        SideRow::Table { table, .. } => {
+            let view = app
+                .tables
+                .get(*table)
+                .is_some_and(|t| t.table_type.eq_ignore_ascii_case("VIEW"));
+            let name = app
+                .tables
+                .get(*table)
+                .map(|t| fix_double_encoding(&qualified_display(&app.schema, &t.name)))
+                .unwrap_or_default();
+            let w = inner.saturating_sub(usize::from(view));
+            let disp = truncate_table_name(&name, w);
+            let style = mk(if view {
+                Style::default().fg(Color::Blue)
+            } else {
+                Style::default()
+            });
+            let hit = style.add_modifier(Modifier::UNDERLINED);
+            spans.extend(highlight_match_spans(&disp, needle, style, hit));
+            if view {
+                spans.push(Span::styled("~".to_string(), mk(Style::default().fg(Color::Blue))));
+            }
+        }
+    }
+    Line::from(spans)
 }
 
 /// Single-letter type badge shown next to a key in the sidebar.
@@ -30861,20 +31513,21 @@ const HELP_ROWS: &[(&str, &str)] = &[
     ("预览 s/r/b", "同名策略：s 跳过 · r 覆盖（红色确认，按 name 匹配） · b 都存（名加 -imported）"),
     ("预览 Space / d", "Space 勾选/取消该条 · d 逐条循环 跳过/覆盖/都存 · Enter 导入"),
     ("密码", "导出默认不含密码（p 显式开启）；DBeaver / Navicat 密码加密，不解析，导入后标「需补密码」"),
-    ("— 侧栏 —", ""),
-    ("↑ ↓", "移动表列表"),
-    ("1-9", "直跳第 N 个连接 / 表"),
+    ("— 侧栏（连接树）—", ""),
+    ("↑ ↓ / j k", "在 连接 → 库 → 表 树上移动（可计数：3 j 下移 3 项）"),
+    ("h l / ← →", "折叠 / 展开当前节点（连接节点列出库，库节点列出表）"),
+    ("Enter", "打开：连接=切换并展开 · 库=切到该库 · 表=浏览数据"),
+    ("1-9", "直跳第 N 个连接 / 表（树光标跟随）"),
     ("3 j / 3 k", "计数前缀：下 / 上移动 3 项（侧栏 / 结果 / 历史通用）"),
-    ("a-z / /", "过滤表名：任意字符一步直达过滤，Enter 打开第一个命中，Esc 清除"),
+    ("a-z / /", "过滤：命中表名 / 库名，父节点保留（Enter 打开首个命中，Esc 清除）"),
     ("Ctrl-U / Alt-⌫", "清除表过滤（过滤提示框内）"),
     ("s", "表排序：名称 / 类型（TABLE / VIEW）"),
     ("Alt+a-z · ; ,", "首字母跳：跳到以该字母开头的下一张表；; , 前后循环（与过滤互斥）"),
     ("t", "最近表浮层（Enter 直达）"),
-    ("Enter", "浏览表数据"),
     ("r", "表结构（字段 + DDL）"),
     ("I", "导入 CSV 到当前表（预览 + 追加/覆盖确认）"),
     ("d", "数据库 / 模式列表（PG 等支持 schema 的连接；浮层内 r 刷新）"),
-    ("← →", "切换数据库（快捷）"),
+    ("[ ]", "切换数据库（快捷）"),
     ("o", "返回连接选择"),
     ("c", "新建连接"),
     ("p", "复制连接（预填表单）"),
@@ -35179,9 +35832,180 @@ mod tests {
         let info = context_info(&app);
         assert!(info.contains("column_3"), "{info}");
         assert!(info.contains("4/8"), "{info}");
-        // A wide terminal keeps its richer context and skips the name.
+        // The pin prefix survives the merge, and there is exactly one column
+        // readout (R43 removed the duplicate scroll-window line).
+        assert!(info.contains("1|"), "{info}");
+        assert_eq!(info.matches("列 ").count(), 1, "{info}");
+        // A wide terminal shows the same single readout instead of a bare
+        // `列 1|1-2/8` scroll window.
         app.term_w = 120;
-        assert!(!context_info(&app).contains("column_3"));
+        let wide = context_info(&app);
+        assert!(wide.contains("column_3"), "{wide}");
+        assert_eq!(wide.matches("列 ").count(), 1, "{wide}");
+        assert!(!wide.contains("1-2/"), "no scroll window: {wide}");
+    }
+
+    /// R43: a clipped grid shows exactly one column readout — the focused
+    /// column's name and its absolute position — instead of the old narrow name
+    /// line plus a separate scroll-window line.
+    #[test]
+    fn status_bar_column_readout_is_single_without_a_scroll_window() {
+        let mut app = test_app();
+        app.term_w = 42;
+        app.grid_kind = GridKind::TableData;
+        app.set_grid(sample_grid());
+        app.grid_frozen = 0;
+        app.vis_cols = 2;
+        app.col_cursor = 5;
+        app.focus = Focus::Preview;
+        let info = context_info(&app);
+        assert!(info.contains("column_5"), "{info}");
+        assert!(info.contains("6/8"), "{info}");
+        assert_eq!(info.matches("列 ").count(), 1, "{info}");
+        assert!(!info.contains("-"), "no a-b scroll window: {info}");
+    }
+
+    /// Build the shared fixture for the tree tests: two connections, the first
+    /// active with two databases and two tables in the current one.
+    fn tree_app() -> App {
+        let mut app = test_app();
+        let c1 = test_conn("mysql");
+        let c2 = test_conn("postgres");
+        app.connections = vec![c1.clone(), c2];
+        app.selected = Some(c1);
+        app.backend_kind = Backend::Sql;
+        app.schema = String::new();
+        app.databases = vec!["shop".into(), "logs".into()];
+        app.db_index = 0;
+        app.tables = vec![table_info("orders", "TABLE"), table_info("users", "TABLE")];
+        app.tables_all = app.tables.clone();
+        app.table_list.select(Some(0));
+        app
+    }
+
+    /// R43: the sidebar is a connection → database → table tree; the active
+    /// connection and its current database start expanded, siblings stay
+    /// collapsed.
+    #[test]
+    fn sidebar_tree_nests_database_and_table_levels() {
+        let app = tree_app();
+        let rows = compute_side_rows(&app);
+        assert_eq!(rows[0], SideRow::Conn { idx: 0 });
+        assert!(matches!(&rows[1], SideRow::Db { idx: 0, db } if db == "shop"));
+        assert!(matches!(&rows[2], SideRow::Table { table: 0, depth: 2, .. }));
+        assert!(matches!(&rows[3], SideRow::Table { table: 1, depth: 2, .. }));
+        assert!(matches!(&rows[4], SideRow::Db { idx: 0, db } if db == "logs"));
+        // The second connection is a collapsed root.
+        assert_eq!(rows[5], SideRow::Conn { idx: 1 });
+        assert_eq!(rows.len(), 6);
+    }
+
+    /// R43: the tree cursor walks tables, `h` collapses the active database
+    /// (hiding its tables) and remembers it, and `l` expands it again.
+    #[test]
+    fn sidebar_tree_collapse_memory_and_cursor_walk() {
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel::<OpResult>();
+        let mut app = tree_app();
+        rebuild_side_rows(&mut app);
+        // The cursor follows the externally selected table.
+        assert!(matches!(app.side_rows[app.side_sel], SideRow::Table { table: 0, .. }));
+        side_step(&mut app, 1, true);
+        assert_eq!(app.table_list.selected(), Some(1));
+        side_step(&mut app, 1, false);
+        assert_eq!(app.table_list.selected(), Some(0));
+        // `h` on a table steps up to its database, then collapses it.
+        side_collapse(&mut app);
+        assert!(matches!(app.side_rows[app.side_sel], SideRow::Db { .. }));
+        side_collapse(&mut app);
+        assert!(
+            app.side_rows.iter().all(|r| !matches!(r, SideRow::Table { .. })),
+            "collapsed database hides its tables"
+        );
+        assert!(matches!(app.side_rows[app.side_sel], SideRow::Db { .. }));
+        // `l` re-expands the database; the collapse is remembered per (conn, db).
+        side_expand(&mut app, &tx);
+        assert!(app.side_rows.iter().any(|r| matches!(r, SideRow::Table { .. })));
+    }
+
+    /// R43: the `/` filter keeps a node when it or a descendant matches, so the
+    /// database / connection ancestors of a table hit survive.
+    #[test]
+    fn sidebar_tree_filter_scopes_to_visible_nodes() {
+        let mut app = tree_app();
+        app.table_filter = "ord".into();
+        apply_table_filter(&mut app);
+        assert_eq!(app.tables.len(), 1);
+        let rows = compute_side_rows(&app);
+        assert!(rows.iter().any(|r| matches!(r, SideRow::Conn { .. })));
+        assert!(rows
+            .iter()
+            .any(|r| matches!(r, SideRow::Db { db, .. } if db == "shop")));
+        assert!(
+            !rows
+                .iter()
+                .any(|r| matches!(r, SideRow::Db { db, .. } if db == "logs")),
+            "a non-matching sibling database is hidden"
+        );
+        assert_eq!(
+            rows.iter()
+                .filter(|r| matches!(r, SideRow::Table { .. }))
+                .count(),
+            1
+        );
+    }
+
+    /// R43: a failed lazy database fetch draws an error row under the connection
+    /// and never breaks the rest of the tree.
+    #[test]
+    fn sidebar_tree_shows_error_row_for_a_failed_lazy_load() {
+        let mut app = tree_app();
+        let c2 = app.connections[1].clone();
+        app.tree_conn_open.insert(c2.id.clone());
+        app.tree_db_state
+            .insert(c2.id, TreeDbState::Error("boom".into()));
+        let rows = compute_side_rows(&app);
+        assert!(rows
+            .iter()
+            .any(|r| matches!(r, SideRow::ConnError { msg, .. } if msg == "boom")));
+        // The active subtree is untouched.
+        assert!(rows.iter().any(|r| matches!(r, SideRow::Table { .. })));
+    }
+
+    /// R43: expanding a non-active connection reads its cached database list
+    /// (no switch), and a cached list is shown as database rows.
+    #[test]
+    fn sidebar_tree_shows_cached_databases_for_a_sibling() {
+        let mut app = tree_app();
+        let c2 = app.connections[1].clone();
+        app.tree_conn_open.insert(c2.id.clone());
+        app.tree_dbs
+            .insert(c2.id.clone(), vec!["analytics".into(), "staging".into()]);
+        let rows = compute_side_rows(&app);
+        let dbs: Vec<&str> = rows
+            .iter()
+            .filter_map(|r| match r {
+                SideRow::Db { idx: 1, db } => Some(db.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(dbs, vec!["analytics", "staging"]);
+    }
+
+    /// R43: a sibling whose cached databases are all excluded by the filter
+    /// shows nothing, not a misleading "loading" row.
+    #[test]
+    fn sidebar_tree_filter_does_not_fake_a_loading_row() {
+        let mut app = tree_app();
+        let c2 = app.connections[1].clone();
+        app.tree_conn_open.insert(c2.id.clone());
+        app.tree_dbs.insert(c2.id.clone(), vec!["analytics".into()]);
+        app.table_filter = "ord".into();
+        apply_table_filter(&mut app);
+        let rows = compute_side_rows(&app);
+        assert!(!rows.iter().any(|r| matches!(r, SideRow::ConnLoading { .. })));
+        assert!(rows
+            .iter()
+            .any(|r| matches!(r, SideRow::Db { db, .. } if db == "shop")));
     }
 
     fn history_row(id: &str, sql: &str) -> HistoryRow {

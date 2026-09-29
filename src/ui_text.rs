@@ -296,6 +296,7 @@ pub static ALL_KEYS: &[&str] = &[
     "列",
     "列   ",
     "列 {}{}-{}/{}",
+    "列 {}{} {}/{}",
     "列显隐浮层（空格勾选 / a 全选 / x 仅首列，按 库.表 记住）",
     "列显隐：空格勾选显示的列（按 库.表 记住，跨会话）",
     "列窗口横滚一列（任意区域，按住连滚）",
@@ -483,6 +484,12 @@ pub static ALL_KEYS: &[&str] = &[
     "直达",
     "真正的 SQL NULL：灰色斜体（终端不支持斜体时仅灰色）",
     "移动表列表",
+    "— 侧栏（连接树）—",
+    "在 连接 → 库 → 表 树上移动（可计数：3 j 下移 3 项）",
+    "折叠 / 展开当前节点（连接节点列出库，库节点列出表）",
+    "打开：连接=切换并展开 · 库=切到该库 · 表=浏览数据",
+    "直跳第 N 个连接 / 表（树光标跟随）",
+    "过滤：命中表名 / 库名，父节点保留（Enter 打开首个命中，Esc 清除）",
     "空字符串：灰色，带引号的空串，不会与 NULL 混淆",
     "第 {} 行 · {} 列",
     "第 {}/{} 页",
@@ -524,6 +531,9 @@ pub static ALL_KEYS: &[&str] = &[
     "补全",
     "补全上下文",
     "表",
+    "树",
+    "树 {}/{}",
+    "折叠/展开",
     "表名. 后只补该表列名；FROM/JOIN 后优先表名；WHERE/ON 后优先列名",
     "表结构尚未加载，稍后重试",
     "表结构视图不支持搜索",
@@ -679,6 +689,7 @@ pub static ALL_KEYS: &[&str] = &[
     "批量删除 {} 个 key",
     "将批量删除 {} 个 key（模式 {}）",
     "… 其余 {} 条命令",
+    "… 加载库列表",
     "共 {} 个 key · {} 条命令",
     "批量设置 TTL · {} 个 key",
     "批量设置 TTL={}s · {} 个 key",
@@ -1546,6 +1557,7 @@ fn en_of(zh: &'static str) -> Option<&'static str> {
         "列" => Some("column"),
         "列   " => Some("col   "),
         "列 {}{}-{}/{}" => Some("cols {}{}-{}/{}"),
+        "列 {}{} {}/{}" => Some("col {}{} {}/{}"),
         "列显隐浮层（空格勾选 / a 全选 / x 仅首列，按 库.表 记住）" => Some("Column visibility (Space toggle / a all / x first only, remembered per db.table)"),
         "列显隐：空格勾选显示的列（按 库.表 记住，跨会话）" => Some("Column visibility: Space toggles shown columns (remembered per db.table, across sessions)"),
         "列窗口横滚一列（任意区域，按住连滚）" => Some("Scroll the column window by one (any pane, hold to repeat)"),
@@ -1751,6 +1763,22 @@ fn en_of(zh: &'static str) -> Option<&'static str> {
         "直达" => Some("jump"),
         "真正的 SQL NULL：灰色斜体（终端不支持斜体时仅灰色）" => Some("A real SQL NULL: grey italic (grey only when the terminal lacks italics)"),
         "移动表列表" => Some("Move the table list"),
+        "— 侧栏（连接树）—" => Some("— Sidebar (connection tree) —"),
+        "在 连接 → 库 → 表 树上移动（可计数：3 j 下移 3 项）" => {
+            Some("Walk the connection → database → table tree (count prefix: 3 j moves down 3)")
+        }
+        "折叠 / 展开当前节点（连接节点列出库，库节点列出表）" => {
+            Some("Collapse / expand the current node (a connection lists databases, a database lists tables)")
+        }
+        "打开：连接=切换并展开 · 库=切到该库 · 表=浏览数据" => {
+            Some("Open: connection = switch and expand · database = switch to it · table = browse data")
+        }
+        "直跳第 N 个连接 / 表（树光标跟随）" => {
+            Some("jump straight to the Nth connection / table (the tree cursor follows)")
+        }
+        "过滤：命中表名 / 库名，父节点保留（Enter 打开首个命中，Esc 清除）" => {
+            Some("Filter: matches table / database names, ancestors kept (Enter opens the first hit, Esc clears)")
+        }
         "空字符串：灰色，带引号的空串，不会与 NULL 混淆" => Some("Empty string: grey, a quoted empty string, never confused with NULL"),
         "第 {} 行 · {} 列" => Some("row {} · col {}"),
         "第 {}/{} 页" => Some("page {}/{}"),
@@ -1792,6 +1820,9 @@ fn en_of(zh: &'static str) -> Option<&'static str> {
         "补全" => Some("complete"),
         "补全上下文" => Some("Completion context"),
         "表" => Some("table"),
+        "树" => Some("tree"),
+        "树 {}/{}" => Some("tree {}/{}"),
+        "折叠/展开" => Some("collapse/expand"),
         "表名. 后只补该表列名；FROM/JOIN 后优先表名；WHERE/ON 后优先列名" => Some("After table.: only that table's columns; after FROM/JOIN: tables first; after WHERE/ON: columns first"),
         "表结构尚未加载，稍后重试" => Some("Table structure not loaded yet, try again later"),
         "表结构视图不支持搜索" => Some("Structure view does not support search"),
@@ -1946,6 +1977,7 @@ fn en_of(zh: &'static str) -> Option<&'static str> {
         "批量删除 {} 个 key" => Some("batch delete {} keys"),
         "将批量删除 {} 个 key（模式 {}）" => Some("will batch delete {} keys (pattern {})"),
         "… 其余 {} 条命令" => Some("… {} more commands"),
+        "… 加载库列表" => Some("… loading databases"),
         "共 {} 个 key · {} 条命令" => Some("{} keys · {} commands total"),
         "批量设置 TTL · {} 个 key" => Some("Batch set TTL · {} keys"),
         "批量设置 TTL={}s · {} 个 key" => Some("batch set TTL={}s · {} keys"),
