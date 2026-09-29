@@ -3952,13 +3952,26 @@ struct RowPopup {
     scroll: u16,
 }
 
+/// Memoised wrap of the modal text popups (R42). A 100 KB cell would otherwise
+/// be re-wrapped on every frame while scrolling; the cache is invalidated when a
+/// popup opens and recomputed only when the inner width changes.
+struct PopupCache {
+    width: usize,
+    lines: Vec<Line<'static>>,
+}
+
 // ─── Redis key browser ───────────────────────────────────────────────────────
 
 /// Server-side SCAN state for the Redis key browser. Keys are appended page by
 /// page (never a full `KEYS *`), and `cursor == 0` marks the end of the keyspace.
 #[derive(Clone)]
 struct RedisScanState {
+    /// The filtered view the sidebar renders / navigates (R42 client-side
+    /// type-to-filter). Equal to `all` when no filter is active.
     keys: Vec<RedisKeyInfo>,
+    /// Every key loaded so far, before the client-side filter is applied. A
+    /// SCAN page appends here and the filter is re-applied.
+    all: Vec<RedisKeyInfo>,
     /// Cursor to resume from; 0 means the scan is exhausted.
     cursor: u64,
     exhausted: bool,
@@ -3979,6 +3992,7 @@ impl Default for RedisScanState {
     fn default() -> Self {
         Self {
             keys: Vec::new(),
+            all: Vec::new(),
             cursor: 0,
             exhausted: false,
             pattern: "*".to_string(),
@@ -8713,6 +8727,25 @@ struct ErrorPopup {
     scroll: u16,
 }
 
+/// One stop on the `Alt-←` / `Alt-→` round-trip stack (R42). Tables, Mongo
+/// collections and Redis keys are all first-class navigation nodes; a value /
+/// document *detail* view is deliberately not a node, so a back step lands on
+/// the list entry that opened it. Mongo collections are stored as [`Self::Table`]
+/// because they live in the same sidebar list as SQL tables.
+#[derive(Clone, PartialEq, Eq, Debug)]
+enum NavEntry {
+    Table {
+        db: String,
+        schema: String,
+        table: String,
+    },
+    RedisKey {
+        db: u32,
+        key_raw: String,
+        key_display: String,
+    },
+}
+
 struct App {
     backend: Arc<LocalBackend>,
     page: Page,
@@ -8766,6 +8799,18 @@ struct App {
     table_sort: TableSort,
     /// Last first-letter jump (R39): `;` / `,` repeat it forward / backward.
     table_jump_letter: Option<char>,
+
+    /// Client-side substring filter over the loaded Redis keys (R42 one-step
+    /// type-to-filter, mirrors the sidebar table filter). `redis_scan.keys` is
+    /// the filtered view; `redis_scan.all` keeps the full loaded window.
+    redis_filter: String,
+    redis_filter_prompt: Option<TextArea<'static>>,
+    /// Last Redis first-letter jump, so `;` / `,` repeat it forward / backward.
+    redis_jump_letter: Option<char>,
+
+    /// R42: the results pane shows a statement separator line plus a `12.3ms`
+    /// prefix per statement (console feel). Off by default; `Alt-O` toggles it.
+    show_stmt_timing: bool,
 
     // table structure
     columns: Vec<ColumnInfo>,
@@ -8832,15 +8877,20 @@ struct App {
     recent_tables: Vec<(String, String, String)>,
     recent_open: bool,
     recent_list: ListState,
-    /// Browser-style back/forward history of browsed tables (`Alt-←` / `Alt-→`).
-    /// `nav_pos` is the cursor into it; opening a table truncates the forward
-    /// branch and appends, exactly like a browser.
-    nav_history: Vec<(String, String, String)>,
+    /// Browser-style back/forward history of browsed tables / collections /
+    /// Redis keys (`Alt-←` / `Alt-→`). `nav_pos` is the cursor into it; opening
+    /// a node truncates the forward branch and appends, exactly like a browser.
+    nav_history: Vec<NavEntry>,
     nav_pos: usize,
+    /// A Redis key a history step wants to open once its key list has loaded
+    /// (the db switch rescans asynchronously).
+    pending_open_redis_key: Option<String>,
     /// The transient `← table` / `→ table` landing hint from the last history
     /// step. Shown at the head of the status bar's context block (where a narrow
     /// screen cannot truncate it) and cleared by the next key press.
     nav_landing: Option<String>,
+    /// Memoised wrap for the cell / row / error text popups (R42).
+    popup_cache: Option<PopupCache>,
     /// A `(schema, table)` to open as soon as the (new) table list arrives.
     pending_open_table: Option<(String, String)>,
     /// A `WHERE` predicate to apply when the next table opens (a search-hit
@@ -9441,6 +9491,10 @@ impl App {
             table_prompt: None,
             table_sort: TableSort::Name,
             table_jump_letter: None,
+            redis_filter: String::new(),
+            redis_filter_prompt: None,
+            redis_jump_letter: None,
+            show_stmt_timing: false,
             columns: Vec::new(),
             ddl: None,
             struct_view: StructView::Fields,
@@ -9481,7 +9535,9 @@ impl App {
             recent_list: ListState::default(),
             nav_history: Vec::new(),
             nav_pos: 0,
+            pending_open_redis_key: None,
             nav_landing: None,
+            popup_cache: None,
             pending_open_table: None,
             pending_table_filter: None,
             completion: None,
@@ -10243,9 +10299,9 @@ fn apply_op_result(app: &mut App, res: OpResult, tx: &Tx) {
             }
             app.redis_scan.pending = false;
             if append {
-                app.redis_scan.keys.extend(keys);
+                app.redis_scan.all.extend(keys);
             } else {
-                app.redis_scan.keys = keys;
+                app.redis_scan.all = keys;
             }
             app.redis_scan.cursor = cursor;
             app.redis_scan.total = total;
@@ -10254,16 +10310,30 @@ fn apply_op_result(app: &mut App, res: OpResult, tx: &Tx) {
             // rescan can remove keys); keep them across a load-more append.
             if !app.redis_selected.is_empty() {
                 let present: HashSet<String> =
-                    app.redis_scan.keys.iter().map(|k| k.key_raw.clone()).collect();
+                    app.redis_scan.all.iter().map(|k| k.key_raw.clone()).collect();
                 app.redis_selected.retain(|k| present.contains(k));
                 if app.redis_selected.is_empty() {
                     app.redis_anchor = None;
                 }
             }
+            // Re-apply the client-side filter over the freshly loaded window.
+            apply_redis_filter(app);
+            // A history step (`Alt-←` / `Alt-→`) may be waiting for its key to
+            // appear in the reloaded list; open it now.
+            if let Some(raw) = app.pending_open_redis_key.take() {
+                if let Some(i) = app.redis_scan.keys.iter().position(|k| k.key_raw == raw) {
+                    app.redis_list.select(Some(i));
+                    open_redis_value(app, tx);
+                    return;
+                }
+            }
             let n = app.redis_scan.keys.len();
+            let all = app.redis_scan.all.len();
             let sel = app.redis_list.selected().unwrap_or(0).min(n.saturating_sub(1));
             app.redis_list.select((n > 0).then_some(sel));
-            app.status = if app.redis_scan.exhausted {
+            app.status = if !app.redis_filter.is_empty() {
+                tf("过滤「{}」· {} 命中 / {} 个 key", &[&(app.redis_filter), &(n), &(all)])
+            } else if app.redis_scan.exhausted {
                 tf("{} 个 key · 已全部加载", &[&(n)])
             } else {
                 tf("{} 个 key · 已加载 {} · n 加载更多", &[&(total), &(n)])
@@ -11573,6 +11643,12 @@ fn browse_key(app: &mut App, tx: &Tx, k: KeyEvent) {
         return;
     }
 
+    // Redis key filter (client-side type-to-filter) is modal while typing.
+    if app.redis_filter_prompt.is_some() {
+        redis_filter_key(app, tx, k);
+        return;
+    }
+
     // Redis input dialogs (pattern / TTL / rename / value / batch) are modal.
     if app.redis_prompt.is_some() {
         redis_prompt_key(app, tx, k);
@@ -11687,7 +11763,14 @@ fn browse_key(app: &mut App, tx: &Tx, k: KeyEvent) {
     // picker, and any other key clears a stale pending `g`.
     if app.pending_g {
         match k.code {
-            KeyCode::Char('d') | KeyCode::Char('t') | KeyCode::Char('v') if k.modifiers.is_empty() => {
+            // `gg` (go to top, R42) is resolved in the results pane too, so the
+            // chord must reach `preview_key` instead of being cleared here.
+            KeyCode::Char('d')
+            | KeyCode::Char('t')
+            | KeyCode::Char('v')
+            | KeyCode::Char('g')
+                if k.modifiers.is_empty() =>
+            {
                 preview_key(app, tx, k);
                 return;
             }
@@ -11885,6 +11968,19 @@ fn browse_key(app: &mut App, tx: &Tx, k: KeyEvent) {
             // one-step version of the Ctrl-O panel (which appends to the end).
             KeyCode::Char('p') | KeyCode::Char('P') => {
                 open_snippets_at_cursor(app, tx);
+                return;
+            }
+            // Alt-O: toggle the script-output console feel — a separator line
+            // and a `12.3ms` prefix per statement (off by default). Alt-T is
+            // already the data-transfer wizard, so the timing toggle takes the
+            // free Alt-O mnemonic.
+            KeyCode::Char('o') | KeyCode::Char('O') => {
+                app.show_stmt_timing = !app.show_stmt_timing;
+                app.status = if app.show_stmt_timing {
+                    t("语句分隔 + 耗时 开（Alt-O 关）").into()
+                } else {
+                    t("语句分隔 + 耗时 关（Alt-O 开）").into()
+                };
                 return;
             }
             // Alt-← / Alt-→: browser-style back / forward through the tables you
@@ -12105,6 +12201,9 @@ fn db_picker_apply(app: &mut App, tx: &Tx, idx: usize) {
         app.redis_value = None;
         app.clear_grid();
         app.set_placeholder();
+        app.redis_filter.clear();
+        app.redis_filter_prompt = None;
+        app.redis_jump_letter = None;
         app.status = format!("redis db → {idx}");
         start_redis_scan(app, tx, true);
         return;
@@ -12220,16 +12319,21 @@ fn flush_count(app: &mut App, tx: &Tx) {
         return;
     }
     let picker = app.selected.is_none();
+    // Redis keys, SQL tables and Mongo collections all accept a direct numeric
+    // jump; the KV / document lists are the R42 additions.
+    let redis = !picker && app.backend_kind == Backend::Redis;
     let len = if picker {
         app.connections.len()
-    } else if app.backend_kind == Backend::Sql {
-        app.tables.len()
+    } else if redis {
+        app.redis_scan.keys.len()
     } else {
-        return;
+        app.tables.len()
     };
     if let Some(i) = count_jump_index(n, len) {
         if picker {
             app.conn_list.select(Some(i));
+        } else if redis {
+            app.redis_list.select(Some(i));
         } else {
             app.table_list.select(Some(i));
         }
@@ -12394,6 +12498,27 @@ fn sidebar_key(app: &mut App, tx: &Tx, k: KeyEvent) {
             redis_batch_delete(app);
             return;
         }
+        // R42 first-letter jump: Alt+<letter> cycles to the next loaded key
+        // starting with that letter (the KV twin of the sidebar table jump).
+        if k.modifiers.contains(KeyModifiers::ALT) {
+            if let KeyCode::Char(c) = k.code {
+                if c.is_alphabetic() {
+                    match redis_jump_by_letter(app, c, 1) {
+                        Some(i) => {
+                            let name = fix_double_encoding(&app.redis_scan.keys[i].key_display);
+                            app.status = tf(
+                                "首字母跳「{}」→ {} · Alt+字母 循环 · ; , 前后跳",
+                                &[&c, &name],
+                            );
+                        }
+                        None => {
+                            app.status = tf("没有以「{}」开头的 key", &[&c]);
+                        }
+                    }
+                    return;
+                }
+            }
+        }
         match k.code {
             KeyCode::Tab => app.focus = Focus::Editor,
             KeyCode::Char('c') => {
@@ -12409,6 +12534,12 @@ fn sidebar_key(app: &mut App, tx: &Tx, k: KeyEvent) {
             }
             // `/` edits the server-side MATCH pattern.
             KeyCode::Char('/') => open_redis_pattern_prompt(app),
+            // `f` filters the *loaded* keys client-side (substring, live); any
+            // printable character does the same in one step below.
+            KeyCode::Char('f') => open_redis_filter(app),
+            // `;` / `,` repeat the last first-letter jump forward / backward.
+            KeyCode::Char(';') => repeat_redis_jump(app, 1),
+            KeyCode::Char(',') => repeat_redis_jump(app, -1),
             // `n` fetches the next SCAN page.
             KeyCode::Char('n') => start_redis_scan(app, tx, false),
             // Space toggles one key; `a` selects every loaded key.
@@ -12428,9 +12559,12 @@ fn sidebar_key(app: &mut App, tx: &Tx, k: KeyEvent) {
             KeyCode::Delete => redis_batch_delete(app),
             KeyCode::Char('x') => open_redis_batch_ttl_prompt(app),
             KeyCode::Char('m') => open_redis_batch_rename_prompt(app),
-            // Esc clears the selection when there is one.
+            // Esc clears the client-side filter first, then the selection.
             KeyCode::Esc => {
-                if !app.redis_selected.is_empty() {
+                if !app.redis_filter.is_empty() {
+                    clear_redis_filter(app);
+                    app.status = tf("已清除 key 过滤 · {} 个 key", &[&(app.redis_scan.all.len())]);
+                } else if !app.redis_selected.is_empty() {
                     app.redis_selected.clear();
                     app.redis_anchor = None;
                     app.status = t("已清除选择").into();
@@ -12478,6 +12612,24 @@ fn sidebar_key(app: &mut App, tx: &Tx, k: KeyEvent) {
             KeyCode::Enter => open_redis_value(app, tx),
             KeyCode::Left | KeyCode::Char('h') => cycle_redis_db(app, tx, false),
             KeyCode::Right | KeyCode::Char('l') => cycle_redis_db(app, tx, true),
+            // One-step type-to-filter (R42): any printable character that is not
+            // a bound shortcut starts the client-side filter with that character
+            // already typed, so a key lookup is a single keystroke.
+            KeyCode::Char(c)
+                if !k.modifiers.contains(KeyModifiers::CONTROL)
+                    && !k.modifiers.contains(KeyModifiers::ALT)
+                    && !c.is_ascii_control() =>
+            {
+                if app.redis_scan.all.is_empty() {
+                    app.status = t("还没有 key 可过滤").into();
+                } else {
+                    open_redis_filter_with(app, Some(c));
+                    app.status = tf(
+                        "过滤「{}」· {} 个命中 · Enter 查看首位",
+                        &[&(app.redis_filter), &(app.redis_scan.keys.len())],
+                    );
+                }
+            }
             _ => {}
         }
         return;
@@ -13639,6 +13791,9 @@ fn activate_connection(
     app.redis_prompt = None;
     app.redis_scan = RedisScanState::default();
     app.redis_list = ListState::default();
+    app.redis_filter.clear();
+    app.redis_filter_prompt = None;
+    app.redis_jump_letter = None;
     app.mongo_filter.clear();
     app.mongo_page = 0;
     app.set_placeholder();
@@ -13845,6 +14000,7 @@ fn start_redis_scan(app: &mut App, tx: &Tx, reset: bool) {
     };
     if reset {
         app.redis_scan.keys.clear();
+        app.redis_scan.all.clear();
         app.redis_scan.cursor = 0;
         app.redis_scan.exhausted = false;
         app.redis_scan.gen = app.redis_scan.gen.wrapping_add(1);
@@ -13886,6 +14042,8 @@ fn open_redis_value(app: &mut App, tx: &Tx) {
         app.status = t("先选中一个 key").into();
         return;
     };
+    // R42: the key value view is a round-trip node (the detail is not).
+    remember_redis_key(app, app.redis_db, &key.0, &key.1);
     app.loading = true;
     app.status = tf("加载 key {}…", &[&(fix_double_encoding(&key.1))]);
     app.spawn(
@@ -13991,6 +14149,9 @@ fn back_to_picker(app: &mut App) {
     app.redis_selected.clear();
     app.redis_anchor = None;
     app.redis_pending_batch = None;
+    app.redis_filter.clear();
+    app.redis_filter_prompt = None;
+    app.redis_jump_letter = None;
     app.picker_open = true;
 }
 
@@ -14006,6 +14167,9 @@ fn cycle_redis_db(app: &mut App, tx: &Tx, forward: bool) {
     app.set_placeholder();
     app.redis_selected.clear();
     app.redis_anchor = None;
+    app.redis_filter.clear();
+    app.redis_filter_prompt = None;
+    app.redis_jump_letter = None;
     app.status = tf("redis db → {}", &[&(app.redis_db)]);
     start_redis_scan(app, tx, true);
 }
@@ -15458,7 +15622,9 @@ fn mongo_docs_key(app: &mut App, tx: &Tx, k: KeyEvent) {
         KeyCode::Char('e') => open_mongo_edit(app),
         KeyCode::Char('i') => open_mongo_insert(app),
         KeyCode::Delete => mongo_confirm_delete(app),
-        KeyCode::Char('y') => copy_redis_row(app),
+        // R42: `y` copies the focused document's full JSON (the natural unit for
+        // a document store), not the flattened grid row.
+        KeyCode::Char('y') => copy_mongo_doc_json(app),
         KeyCode::Char('o') => open_row_popup(app),
         KeyCode::Char('v') => open_cell_popup(app),
         KeyCode::Char('/') => open_result_filter(app),
@@ -15494,6 +15660,20 @@ fn open_mongo_filter_prompt(app: &mut App) {
     ta.set_placeholder_text(t("JSON 过滤，例: {\"age\": {\"$gt\": 30}}（留空 = 全部）"));
     ta.move_cursor(CursorMove::End);
     app.filter_prompt = Some(ta);
+}
+
+/// `y` in a MongoDB document grid: copy the focused document as pretty JSON.
+fn copy_mongo_doc_json(app: &mut App) {
+    let Some((_idx, doc)) = mongo_focused_doc(app) else {
+        app.status = t("没有可复制的文档").into();
+        return;
+    };
+    let json = serde_json::to_string_pretty(&doc).unwrap_or_else(|_| doc.to_string());
+    let n = json.chars().count();
+    match clipboard_copy(&json) {
+        Some(p) => app.status = tf("✓ 已复制文档 JSON（{} 字符）· 兜底 {}", &[&n, &(p.display())]),
+        None => app.status = tf("✓ 已复制文档 JSON（{} 字符）", &[&n]),
+    }
 }
 
 /// The focused document from the retained page, plus its index in that page.
@@ -15920,6 +16100,13 @@ fn preview_key(app: &mut App, tx: &Tx, k: KeyEvent) {
                 open_locate(app);
                 return;
             }
+            // `gg` — vim's "go to top" (R42): a real console motion for the
+            // result / statement list.
+            KeyCode::Char('g') if k.modifiers.is_empty() => {
+                app.pending_g = false;
+                preview_home(app);
+                return;
+            }
             KeyCode::Esc => {
                 app.pending_g = false;
                 return;
@@ -15998,8 +16185,16 @@ fn preview_key(app: &mut App, tx: &Tx, k: KeyEvent) {
         KeyCode::Char('/') => open_result_filter(app),
         // `|` jumps straight to a column by number or name prefix (wide tables).
         KeyCode::Char('|') => open_col_jump(app),
-        // `y` copies the focused row as an INSERT statement (OSC 52 + file).
-        KeyCode::Char('y') => copy_row_sql(app),
+        // `y` in the script *list* copies the focused statement's whole result
+        // as CSV (the same format Ctrl-Y export leads with, R22); in a grid it
+        // keeps copying the focused row as an INSERT statement.
+        KeyCode::Char('y') => {
+            if app.script.as_ref().is_some_and(|s| s.drilled.is_none()) {
+                copy_stmt_result(app);
+            } else {
+                copy_row_sql(app);
+            }
+        }
         // Bare-key aliases for the two view commands (mobile reachability).
         KeyCode::Char('w') => toggle_compact(app),
         KeyCode::Char('c') => open_col_picker(app),
@@ -16066,19 +16261,14 @@ fn preview_key(app: &mut App, tx: &Tx, k: KeyEvent) {
         }
         KeyCode::Home => {
             take_count(app);
-            if !ddl {
-                app.sel = 0;
-            }
+            preview_home(app);
         }
         KeyCode::End => {
             take_count(app);
-            if !ddl {
-                let n = result_row_count(app);
-                if n > 0 {
-                    app.sel = n - 1;
-                }
-            }
+            preview_end(app);
         }
+        // `G` — vim's "go to bottom" (R42), for the grid and the statement list.
+        KeyCode::Char('G') => preview_end(app),
         KeyCode::Char('n') => {
             let times = take_count(app);
             if !app.result_needle.trim().is_empty() {
@@ -16138,6 +16328,73 @@ fn preview_key(app: &mut App, tx: &Tx, k: KeyEvent) {
     }
 }
 
+/// `Home` / `gg` in the results pane: top of the DDL, the statement list or the
+/// grid, whichever owns the pane (R42).
+fn preview_home(app: &mut App) {
+    if app.struct_view == StructView::Ddl && app.ddl.is_some() {
+        app.ddl_scroll = 0;
+        return;
+    }
+    if let Some(s) = &mut app.script {
+        if s.drilled.is_none() {
+            s.sel = 0;
+            return;
+        }
+    }
+    app.sel = 0;
+}
+
+/// `End` / `G` in the results pane: bottom of the DDL, the statement list or the
+/// grid (R42).
+fn preview_end(app: &mut App) {
+    if app.struct_view == StructView::Ddl && app.ddl.is_some() {
+        app.ddl_scroll = u16::MAX;
+        return;
+    }
+    if let Some(s) = &mut app.script {
+        if s.drilled.is_none() {
+            s.sel = s.outcomes.len().saturating_sub(1);
+            return;
+        }
+    }
+    let n = result_row_count(app);
+    if n > 0 {
+        app.sel = n - 1;
+    }
+}
+
+/// `y` in the script list: copy the focused statement's result grid as CSV (the
+/// R22 export default), so a multi-statement run can be pasted into a ticket or
+/// a spreadsheet straight from the console.
+fn copy_stmt_result(app: &mut App) {
+    let (idx, grid) = match app.script.as_ref().and_then(|s| {
+        s.outcomes
+            .get(s.sel)
+            .map(|o| (s.sel, o.grid.clone()))
+    }) {
+        Some(v) => v,
+        None => {
+            app.status = t("没有可复制的结果").into();
+            return;
+        }
+    };
+    if grid.columns.is_empty() && grid.rows.is_empty() {
+        app.status = tf("第 {} 条语句没有结果集", &[&(idx + 1)]);
+        return;
+    }
+    let csv = grid_to_csv(&grid);
+    let n = csv.chars().count();
+    match clipboard_copy(&csv) {
+        Some(p) => {
+            app.status = tf(
+                "✓ 已复制第 {} 条结果 CSV（{} 字符）· 兜底 {}",
+                &[&(idx + 1), &n, &(p.display())],
+            )
+        }
+        None => app.status = tf("✓ 已复制第 {} 条结果 CSV（{} 字符）", &[&(idx + 1), &n]),
+    }
+}
+
 #[derive(Clone, Copy)]
 enum PopupTarget {
     Cell,
@@ -16186,6 +16443,7 @@ fn open_error_popup(app: &mut App, err: &str) {
     } else {
         lines
     };
+    app.popup_cache = None;
     app.error_popup = Some(ErrorPopup {
         lines,
         expanded: false,
@@ -16842,17 +17100,39 @@ fn remember_recent_table(app: &mut App, db: &str, schema: &str, table: &str) {
     app.recent_tables.retain(|e| e != &entry);
     app.recent_tables.insert(0, entry.clone());
     app.recent_tables.truncate(5);
-    record_nav(app, entry);
+    record_nav(
+        app,
+        NavEntry::Table {
+            db: db.to_string(),
+            schema: schema.to_string(),
+            table: table.to_string(),
+        },
+    );
 }
 
-/// How deep the `Alt-←` / `Alt-→` history goes. Fifty tables is far more than a
+/// R42: push a browsed Redis key value view onto the round-trip stack. Only the
+/// list entry (db + key) is a node — a value *detail* view is not, so `Alt-←`
+/// from a value lands on the key list, not a second value.
+fn remember_redis_key(app: &mut App, db: u32, key_raw: &str, key_display: &str) {
+    record_nav(
+        app,
+        NavEntry::RedisKey {
+            db,
+            key_raw: key_raw.to_string(),
+            key_display: key_display.to_string(),
+        },
+    );
+}
+
+/// How deep the `Alt-←` / `Alt-→` history goes. Fifty nodes is far more than a
 /// session ever walks back through, and bounds the memory.
 const NAV_DEPTH: usize = 50;
 
-/// Push a browsed table onto the back/forward history with browser semantics:
-/// re-opening the entry the cursor already points at is a no-op; anything else
-/// drops the forward branch and appends, moving the cursor to the new tail.
-fn record_nav(app: &mut App, entry: (String, String, String)) {
+/// Push a browsed table / collection / key onto the back/forward history with
+/// browser semantics: re-opening the entry the cursor already points at is a
+/// no-op; anything else drops the forward branch and appends, moving the cursor
+/// to the new tail.
+fn record_nav(app: &mut App, entry: NavEntry) {
     if app.nav_history.get(app.nav_pos).is_some_and(|e| *e == entry) {
         return;
     }
@@ -16865,21 +17145,21 @@ fn record_nav(app: &mut App, entry: (String, String, String)) {
     app.nav_pos = app.nav_history.len().saturating_sub(1);
 }
 
-/// `Alt-←` — step back to the previously browsed table. The cursor moves first,
-/// then the table is opened; the re-open does not push a second history entry
+/// `Alt-←` — step back to the previously browsed node. The cursor moves first,
+/// then the node is opened; the re-open does not push a second history entry
 /// because [`record_nav`] sees the entry it already points at.
 fn nav_back(app: &mut App, tx: &Tx) {
     if app.nav_pos == 0 {
         app.status = if app.nav_history.is_empty() {
-            t("还没有浏览过表").into()
+            t("还没有浏览过表 / key").into()
         } else {
-            t("已经是最早的表").into()
+            t("已经是最早的表 / key").into()
         };
         return;
     }
     app.nav_pos -= 1;
-    let (db, schema, table) = app.nav_history[app.nav_pos].clone();
-    open_nav_entry(app, tx, &db, &schema, &table, "←");
+    let entry = app.nav_history[app.nav_pos].clone();
+    open_nav_entry(app, tx, &entry, "←");
 }
 
 /// `Alt-→` — step forward again after a back. Disabled once the cursor is at the
@@ -16887,15 +17167,15 @@ fn nav_back(app: &mut App, tx: &Tx) {
 fn nav_forward(app: &mut App, tx: &Tx) {
     if app.nav_history.is_empty() || app.nav_pos + 1 >= app.nav_history.len() {
         app.status = if app.nav_history.is_empty() {
-            t("还没有浏览过表").into()
+            t("还没有浏览过表 / key").into()
         } else {
-            t("已经是最新的表").into()
+            t("已经是最新的表 / key").into()
         };
         return;
     }
     app.nav_pos += 1;
-    let (db, schema, table) = app.nav_history[app.nav_pos].clone();
-    open_nav_entry(app, tx, &db, &schema, &table, "→");
+    let entry = app.nav_history[app.nav_pos].clone();
+    open_nav_entry(app, tx, &entry, "→");
 }
 
 /// The transient status that confirms where a history step landed. The same
@@ -16914,13 +17194,86 @@ fn open_recent(app: &mut App, tx: &Tx, idx: usize) {
         return;
     };
     app.recent_open = false;
-    open_nav_entry(app, tx, &db, &schema, &table, "");
+    open_nav_entry(
+        app,
+        tx,
+        &NavEntry::Table {
+            db,
+            schema,
+            table,
+        },
+        "",
+    );
 }
 
-/// Jump to a `(database, schema, table)` triple, switching database / schema
-/// first when needed. `arrow` (`←` / `→` / empty) prefixes the status hint so a
-/// history step confirms its landing; the recent-table overlay passes empty.
-fn open_nav_entry(app: &mut App, tx: &Tx, db: &str, schema: &str, table: &str, arrow: &str) {
+/// Jump to a history node, switching backend context first when needed.
+/// `arrow` (`←` / `→` / empty) prefixes the status hint so a history step
+/// confirms its landing; the recent-table overlay passes empty.
+fn open_nav_entry(app: &mut App, tx: &Tx, entry: &NavEntry, arrow: &str) {
+    match entry {
+        NavEntry::Table { db, schema, table } => {
+            open_nav_table(app, tx, db, schema, table, arrow)
+        }
+        NavEntry::RedisKey {
+            db,
+            key_raw,
+            key_display,
+        } => open_nav_redis_key(app, tx, *db, key_raw, key_display, arrow),
+    }
+}
+
+/// Open a Redis key from the round-trip stack. Switches logical db first when
+/// needed (the rescan is async, so the key is stashed in
+/// `pending_open_redis_key`), then selects and loads it.
+fn open_nav_redis_key(
+    app: &mut App,
+    tx: &Tx,
+    db: u32,
+    key_raw: &str,
+    key_display: &str,
+    arrow: &str,
+) {
+    if app.backend_kind != Backend::Redis {
+        app.status = t("✗ 该记录属于 Redis 连接").into();
+        return;
+    }
+    let qualified = fix_double_encoding(key_display);
+    if db != app.redis_db {
+        app.redis_db = db;
+        app.redis_value = None;
+        app.clear_grid();
+        app.redis_filter.clear();
+        app.redis_filter_prompt = None;
+        app.pending_open_redis_key = Some(key_raw.to_string());
+        start_redis_scan(app, tx, true);
+        set_nav_status(app, arrow, &qualified);
+        return;
+    }
+    if let Some(i) = app.redis_scan.keys.iter().position(|k| k.key_raw == key_raw) {
+        app.redis_list.select(Some(i));
+        open_redis_value(app, tx);
+        set_nav_status(app, arrow, &qualified);
+    } else {
+        // Not in the loaded window: rescan and open it when it appears.
+        app.pending_open_redis_key = Some(key_raw.to_string());
+        start_redis_scan(app, tx, true);
+        set_nav_status(app, arrow, &qualified);
+    }
+}
+
+/// Open a `(database, schema, table)` triple from the round-trip stack.
+fn open_nav_table(
+    app: &mut App,
+    tx: &Tx,
+    db: &str,
+    schema: &str,
+    table: &str,
+    arrow: &str,
+) {
+    if app.backend_kind == Backend::Redis {
+        app.status = t("✗ 该记录属于表 / 集合").into();
+        return;
+    }
     let db_changed = db != app.current_db();
     let qualified = qualified_display(&fix_double_encoding(schema), &fix_double_encoding(table));
     // Same database and schema: the table is already listed, jump straight to it.
@@ -19040,6 +19393,175 @@ fn apply_table_filter(app: &mut App) {
     app.table_list.select(Some(sel));
 }
 
+// ── Redis key list: client-side type-to-filter + first-letter jump (R42) ──
+
+/// Recompute the visible Redis key list (`redis_scan.keys`) from the full loaded
+/// window (`redis_scan.all`) and the active `redis_filter`, keeping the
+/// previously selected key when it still matches. This is the KV twin of
+/// [`apply_table_filter`].
+fn apply_redis_filter(app: &mut App) {
+    let prev = app
+        .redis_list
+        .selected()
+        .and_then(|i| app.redis_scan.keys.get(i))
+        .map(|k| k.key_raw.clone());
+    let needle = app.redis_filter.trim().to_lowercase();
+    app.redis_scan.keys = if needle.is_empty() {
+        app.redis_scan.all.clone()
+    } else {
+        app.redis_scan
+            .all
+            .iter()
+            .filter(|k| {
+                fix_double_encoding(&k.key_display)
+                    .to_lowercase()
+                    .contains(&needle)
+            })
+            .cloned()
+            .collect()
+    };
+    let n = app.redis_scan.keys.len();
+    if n == 0 {
+        app.redis_list.select(None);
+        return;
+    }
+    let sel = prev
+        .and_then(|p| app.redis_scan.keys.iter().position(|k| k.key_raw == p))
+        .unwrap_or(0)
+        .min(n - 1);
+    app.redis_list.select(Some(sel));
+}
+
+/// Open the Redis key filter, optionally seeded with the character that started
+/// it (R42 one-step type-to-filter).
+fn open_redis_filter_with(app: &mut App, seed: Option<char>) {
+    if app.redis_scan.all.is_empty() {
+        app.status = t("还没有 key 可过滤").into();
+        return;
+    }
+    let mut text = app.redis_filter.clone();
+    if let Some(c) = seed {
+        text.push(c);
+    }
+    let mut ta = TextArea::from([text.clone()]);
+    ta.move_cursor(CursorMove::End);
+    app.redis_filter_prompt = Some(ta);
+    app.redis_filter = text;
+    apply_redis_filter(app);
+}
+
+/// Open the Redis key filter with the current needle (the `f` binding).
+fn open_redis_filter(app: &mut App) {
+    if app.redis_scan.all.is_empty() {
+        app.status = t("还没有 key 可过滤").into();
+        return;
+    }
+    let mut ta = TextArea::from([app.redis_filter.clone()]);
+    ta.move_cursor(CursorMove::End);
+    app.redis_filter_prompt = Some(ta);
+}
+
+/// Clear the Redis key filter and its prompt in one gesture.
+fn clear_redis_filter(app: &mut App) {
+    app.redis_filter_prompt = None;
+    app.redis_filter.clear();
+    apply_redis_filter(app);
+}
+
+/// Keys while the Redis key filter prompt owns the keyboard: every keystroke
+/// refilters live; Enter keeps the filter and opens the first hit; Esc clears.
+fn redis_filter_key(app: &mut App, tx: &Tx, k: KeyEvent) {
+    if (k.modifiers.contains(KeyModifiers::CONTROL) && k.code == KeyCode::Char('u'))
+        || (k.modifiers.contains(KeyModifiers::ALT) && k.code == KeyCode::Backspace)
+    {
+        clear_redis_filter(app);
+        app.status = tf("已清除 key 过滤 · {} 个 key", &[&(app.redis_scan.all.len())]);
+        return;
+    }
+    match k.code {
+        KeyCode::Enter => {
+            app.redis_filter = app
+                .redis_filter_prompt
+                .as_ref()
+                .map(|t| t.lines().join(" ").trim().to_string())
+                .unwrap_or_default();
+            app.redis_filter_prompt = None;
+            apply_redis_filter(app);
+            let (n, total) = (app.redis_scan.keys.len(), app.redis_scan.all.len());
+            if n == 0 {
+                app.status = tf("过滤「{}」· 0 个 key 命中", &[&app.redis_filter]);
+                return;
+            }
+            app.redis_list.select(Some(0));
+            app.status = if app.redis_filter.is_empty() {
+                tf("{} 个 key", &[&(total)])
+            } else {
+                tf("过滤「{}」· 查看第 1 个命中 · Esc 清除", &[&(app.redis_filter)])
+            };
+            open_redis_value(app, tx);
+        }
+        KeyCode::Esc => {
+            clear_redis_filter(app);
+            app.status = tf("已清除 key 过滤 · {} 个 key", &[&(app.redis_scan.all.len())]);
+        }
+        _ => {
+            if let Some(t) = app.redis_filter_prompt.as_mut() {
+                t.input(k);
+            }
+            app.redis_filter = app
+                .redis_filter_prompt
+                .as_ref()
+                .map(|t| t.lines().join(" ").trim().to_string())
+                .unwrap_or_default();
+            apply_redis_filter(app);
+            app.status = tf("过滤「{}」· {} 个命中", &[&(app.redis_filter), &(app.redis_scan.keys.len())]);
+        }
+    }
+}
+
+/// R42: cycle to the next loaded Redis key whose name starts with `letter`
+/// (case-insensitive, wrapping). Mirrors [`table_jump_by_letter`].
+fn redis_jump_by_letter(app: &mut App, letter: char, dir: i32) -> Option<usize> {
+    if app.redis_scan.keys.is_empty() {
+        return None;
+    }
+    let n = app.redis_scan.keys.len();
+    let cur = app.redis_list.selected().unwrap_or(0);
+    let lower = letter.to_ascii_lowercase();
+    let matches = |i: usize| {
+        app.redis_scan.keys[i]
+            .key_display
+            .chars()
+            .next()
+            .is_some_and(|c| c.to_ascii_lowercase() == lower)
+    };
+    let step = if dir >= 0 { 1 } else { n - 1 };
+    for k in 1..=n {
+        let i = (cur + k * step) % n;
+        if matches(i) {
+            app.redis_list.select(Some(i));
+            app.redis_jump_letter = Some(lower);
+            return Some(i);
+        }
+    }
+    None
+}
+
+/// `;` / `,` in the Redis sidebar: repeat the last first-letter jump.
+fn repeat_redis_jump(app: &mut App, dir: i32) {
+    let Some(letter) = app.redis_jump_letter else {
+        app.status = t("先用 Alt+字母 做首字母跳，再用 ; , 循环").into();
+        return;
+    };
+    match redis_jump_by_letter(app, letter, dir) {
+        Some(i) => {
+            let name = fix_double_encoding(&app.redis_scan.keys[i].key_display);
+            app.status = tf("首字母跳「{}」→ {}", &[&letter, &name]);
+        }
+        None => app.status = tf("没有以「{}」开头的 key", &[&letter]),
+    }
+}
+
 /// R39: cycle to the next table whose name starts with `letter` (case-
 /// insensitive), wrapping around. `dir` is +1 for the forward cycle (`g`-less
 /// first-letter press / `;`) and -1 for backward (`,`). The unqualified name is
@@ -19536,6 +20058,7 @@ fn open_cell_popup(app: &mut App) {
     let col = grid.columns.get(app.col_cursor).cloned().unwrap_or_default();
     let (text, style) = value_display(v);
     let title = tf("{} · 第 {} 行 · {} 字符", &[&(fix_double_encoding(&col)), &(cursor_abs_row(app)), &(text.chars().count())]);
+    app.popup_cache = None;
     app.cell_popup = Some(CellPopup {
         title,
         lines: vec![PopupLine { text, style }],
@@ -19566,6 +20089,7 @@ fn open_row_popup(app: &mut App) {
         });
     }
     let title = tf("第 {} 行 · {} 列", &[&(cursor_abs_row(app)), &(grid.columns.len())]);
+    app.popup_cache = None;
     app.row_popup = Some(RowPopup {
         title,
         lines,
@@ -24356,11 +24880,13 @@ fn ui(f: &mut Frame, app: &mut App) {
             t(" 跳列 · Enter/Esc "),
         );
     }
-    if let Some(popup) = app.cell_popup.clone() {
-        render_text_popup(f, f.area(), &popup.title, &popup.lines, popup.scroll);
+    if let Some(popup) = app.cell_popup.as_ref() {
+        let cache = &mut app.popup_cache;
+        render_text_popup(f, f.area(), &popup.title, &popup.lines, popup.scroll, cache);
     }
-    if let Some(popup) = app.row_popup.clone() {
-        render_text_popup(f, f.area(), &popup.title, &popup.lines, popup.scroll);
+    if let Some(popup) = app.row_popup.as_ref() {
+        let cache = &mut app.popup_cache;
+        render_text_popup(f, f.area(), &popup.title, &popup.lines, popup.scroll, cache);
     }
     if app.error_popup.is_some() {
         render_error_popup(f, f.area(), app);
@@ -24866,6 +25392,8 @@ fn footer_ctx_inner(app: &App, include_help: bool) -> FooterCtx {
         FooterView::Snippets
     } else if app.db_picker_open {
         FooterView::DbPicker
+    } else if app.redis_filter_prompt.is_some() {
+        FooterView::TablePrompt
     } else if app.redis_prompt.is_some() {
         FooterView::RedisPrompt
     } else if app.mongo_dialog.is_some() {
@@ -24912,7 +25440,10 @@ fn footer_ctx_inner(app: &App, include_help: bool) -> FooterCtx {
         FooterView::RedisKeys
     } else if app.backend_kind == Backend::Redis && app.grid_kind == GridKind::RedisValue {
         FooterView::RedisValue
-    } else if app.backend_kind == Backend::Mongo && app.grid_kind == GridKind::MongoDocs {
+    } else if app.backend_kind == Backend::Mongo
+        && app.grid_kind == GridKind::MongoDocs
+        && app.focus == Focus::Preview
+    {
         FooterView::MongoDocs
     } else {
         FooterView::Browse
@@ -25126,6 +25657,8 @@ fn footer_hints_ctx(ctx: FooterCtx) -> Vec<Hint> {
         ],
         FooterView::RedisKeys => vec![
             ("↑↓", t("key")),
+            ("a-z", t("过滤")),
+            ("Alt+a-z", t("首字母跳")),
             ("Space", t("勾选")),
             ("a", t("全选")),
             ("Enter", t("查看值")),
@@ -25136,29 +25669,34 @@ fn footer_hints_ctx(ctx: FooterCtx) -> Vec<Hint> {
             ("n", t("更多")),
             ("r", t("重扫")),
             ("d", t("逻辑库")),
+            ("1-9", t("直跳")),
             ("Tab", t("命令台")),
         ],
         FooterView::RedisValue => vec![
             ("↑↓", t("行")),
             ("←→", t("列")),
             ("Enter", t("详情")),
+            ("y", t("复制值")),
             ("e", t("编辑")),
             ("x", t("TTL")),
             ("m", t("重命名")),
             ("n", t("更多")),
             ("Del", t("删 key")),
             ("/", t("搜索")),
+            ("Esc", t("返回列表")),
         ],
         FooterView::MongoDocs => vec![
             ("↑↓", t("行")),
             ("←→", t("列")),
             ("Enter", t("详情")),
+            ("y", t("复制 JSON")),
             ("e", t("编辑")),
             ("i", t("插入")),
             ("Del", t("删文档")),
             ("n/p", t("翻页")),
             ("f", t("JSON 过滤")),
             ("/", t("搜索")),
+            ("Esc", t("返回列表")),
         ],
         FooterView::Browse => match ctx.focus {
             Focus::Sidebar if !ctx.has_connection => vec![
@@ -25211,6 +25749,7 @@ fn footer_hints_ctx(ctx: FooterCtx) -> Vec<Hint> {
                 ("gv", t("定位值")),
                 ("|", t("跳列")),
                 ("gd/gt", t("结构/数据")),
+                ("Alt-O", t("语句耗时")),
             ],
         },
     };
@@ -25547,6 +26086,10 @@ fn render_results_pane(f: &mut Frame, area: Rect, app: &mut App) {
             if let Some(grid) = active_grid(app) {
                 render_grid(f, area, app, &grid, GridKind::Query, &title, false);
             }
+        } else if app.show_stmt_timing {
+            // R42 console feel: statement separators + a `12.3ms` prefix per
+            // statement (Alt-O).
+            render_script_stream(f, area, app, &s);
         } else {
             render_script_list(f, area, app, &s);
         }
@@ -26367,6 +26910,90 @@ fn render_script_list(f: &mut Frame, area: Rect, app: &mut App, script: &ScriptV
     f.render_widget(table, area);
 }
 
+/// Compact elapsed-time label for the script console: `12ms`, `1.23s`, `2.0m`.
+fn format_elapsed_ms(ms: u128) -> String {
+    if ms < 1_000 {
+        format!("{ms}ms")
+    } else if ms < 60_000 {
+        format!("{:.2}s", ms as f64 / 1000.0)
+    } else {
+        format!("{:.1}m", ms as f64 / 60_000.0)
+    }
+}
+
+/// R42 console-style script output: a separator line per statement carrying the
+/// statement number and elapsed time, then the statement and its result. Shown
+/// only when `show_stmt_timing` is on (`Alt-O`); the plain table is the default.
+fn render_script_stream(f: &mut Frame, area: Rect, app: &mut App, script: &ScriptView) {
+    let focused = app.focus == Focus::Preview;
+    let errors = script.outcomes.iter().filter(|o| o.error.is_some()).count();
+    let affected: u64 = script.outcomes.iter().map(|o| o.affected).sum();
+    let title = tf(
+        " 脚本输出 · {} 条 · 影响 {} 行 · {} 错误 · Alt-O 关分隔 ",
+        &[&(script.outcomes.len()), &(affected), &(errors)],
+    );
+    let inner_w = area.width.saturating_sub(2).max(1) as usize;
+    let inner_h = area.height.saturating_sub(2).max(1) as usize;
+    // Three lines per statement: separator, statement, result.
+    let mut lines: Vec<Line> = Vec::with_capacity(script.outcomes.len() * 3);
+    for (i, o) in script.outcomes.iter().enumerate() {
+        let head = format!(
+            "── #{} · {} ",
+            i + 1,
+            format_elapsed_ms(o.ms)
+        );
+        let pad = inner_w.saturating_sub(disp_width(&head));
+        let sep_style = Style::default().fg(Color::DarkGray);
+        lines.push(Line::from(Span::styled(
+            format!("{head}{}", "─".repeat(pad)),
+            if i == script.sel {
+                Style::default()
+                    .fg(Color::Cyan)
+                    .add_modifier(Modifier::BOLD)
+            } else {
+                sep_style
+            },
+        )));
+        let sql_style = if i == script.sel {
+            highlight_style()
+        } else {
+            Style::default()
+        };
+        lines.push(Line::from(Span::styled(
+            truncate_disp(&one_line(&o.sql), inner_w),
+            sql_style,
+        )));
+        let (status, status_style) = match &o.error {
+            Some(e) => (
+                format!("  ✗ {}", truncate_disp(&one_line(e), inner_w.saturating_sub(4))),
+                Style::default().fg(Color::Red),
+            ),
+            None if !o.grid.columns.is_empty() => (
+                format!("  ✓ {}", tf("{} 行", &[&o.grid.rows.len()])),
+                Style::default().fg(Color::Green),
+            ),
+            None => (
+                format!("  ✓ {}", tf("影响 {} 行", &[&o.affected])),
+                Style::default().fg(Color::Green),
+            ),
+        };
+        lines.push(Line::from(Span::styled(status, status_style)));
+    }
+    // Keep the selected statement visible: 3 lines per entry.
+    let sel_line = script.sel * 3;
+    let scroll = sel_line.saturating_sub(inner_h.saturating_sub(3)) as u16;
+    f.render_widget(
+        Paragraph::new(lines).scroll((scroll, 0)).block(
+            Block::default()
+                .borders(Borders::ALL)
+                .title(title)
+                .border_set(border::ROUNDED)
+                .border_style(border_style(focused)),
+        ),
+        area,
+    );
+}
+
 fn render_ddl(f: &mut Frame, area: Rect, app: &mut App, ddl: &str) {
     let focused = app.focus == Focus::Preview;
     let inner_w = area.width.saturating_sub(2).max(1) as usize;
@@ -26615,12 +27242,23 @@ fn redis_type_badge(t: &str) -> (&'static str, Color) {
     }
 }
 
+/// The type badge shown for one key. On a narrow screen the TTL fuses into the
+/// badge (`S·12s`) so the key name keeps its width and the row never wraps
+/// (R42).
+fn redis_badge_token(narrow: bool, badge: &str, ttl: Option<i64>) -> String {
+    match (narrow, ttl) {
+        (true, Some(t)) => format!("{badge}·{t}s"),
+        _ => badge.to_string(),
+    }
+}
+
 /// Sidebar body for a Redis connection: a `/` pattern row followed by the SCAN
 /// key list with type + TTL badges.
 fn render_redis_sidebar(f: &mut Frame, area: Rect, app: &App, lines: &mut Vec<Line>) {
     let focused = app.focus == Focus::Sidebar;
     let w = (area.width as usize).saturating_sub(4).max(6);
-    // pattern row
+    let needle = app.redis_filter.trim().to_lowercase();
+    // pattern row (server-side SCAN MATCH) + client-side filter row (R42).
     let (mark, text, style) = if app.redis_scan.pattern == "*" {
         (
             "/ ",
@@ -26638,21 +27276,46 @@ fn render_redis_sidebar(f: &mut Frame, area: Rect, app: &App, lines: &mut Vec<Li
         Span::styled(mark, Style::default().fg(Color::Yellow)),
         Span::styled(truncate_disp(&text, w), style),
     ]));
+    if !app.redis_filter.is_empty() {
+        lines.push(Line::from(vec![
+            Span::styled("f ", Style::default().fg(Color::Yellow)),
+            Span::styled(
+                truncate_disp(
+                    &tf(
+                        "{} · {} 命中",
+                        &[&app.redis_filter, &(app.redis_scan.keys.len())],
+                    ),
+                    w,
+                ),
+                Style::default().fg(Color::Yellow),
+            ),
+        ]));
+    }
 
-    // Header rows: connection + db row + pattern row.
-    let cap = (area.height as usize).saturating_sub(5).max(1);
+    // Header rows: connection + db row + pattern row (+ filter row).
+    let extra = if app.redis_filter.is_empty() { 0 } else { 1 };
+    let cap = (area.height as usize)
+        .saturating_sub(5 + extra)
+        .max(1);
     let n = app.redis_scan.keys.len();
     let sel = app.redis_list.selected();
     let start = sel
         .unwrap_or(0)
         .saturating_sub(cap / 2)
         .min(n.saturating_sub(cap.min(n)));
+    // On a narrow screen the type badge and TTL fuse into one `S·12s` token so a
+    // key row always stays on a single line (R42). 42-column terminals (the
+    // small-screen acceptance size) give the sidebar ~28 columns, so the
+    // threshold sits just above that.
+    let narrow = area.width < 30;
     for (i, key) in app.redis_scan.keys.iter().enumerate().skip(start).take(cap) {
         let (badge, color) = redis_type_badge(&key.key_type);
-        let ttl = if key.ttl >= 0 {
-            format!(" {}s",  key.ttl)
-        } else {
+        let ttl_num = (key.ttl >= 0).then_some(key.ttl);
+        let badge_token = redis_badge_token(narrow, badge, ttl_num);
+        let ttl = if narrow {
             String::new()
+        } else {
+            ttl_num.map(|t| format!(" {t}s")).unwrap_or_default()
         };
         let picked = app.redis_selected.contains(&key.key_raw);
         let marker = if sel == Some(i) { "▸" } else { " " };
@@ -26662,20 +27325,33 @@ fn render_redis_sidebar(f: &mut Frame, area: Rect, app: &App, lines: &mut Vec<Li
         } else {
             Style::default().fg(Color::DarkGray)
         };
-        let name_w = w.saturating_sub(8 + ttl.len());
-        let name = truncate_disp(&fix_double_encoding(&key.key_display), name_w.max(4));
+        let prefix_w = 2 + badge_token.chars().count() + 1 + ttl.len();
+        let name_w = w.saturating_sub(prefix_w).max(4);
+        let name = truncate_disp(&fix_double_encoding(&key.key_display), name_w);
         let row_style = if sel == Some(i) {
             Style::default().fg(Color::Green).add_modifier(Modifier::BOLD)
         } else {
             Style::default()
         };
-        lines.push(Line::from(vec![
+        let mut spans = vec![
             Span::styled(marker, row_style),
             Span::styled(check, check_style),
-            Span::styled(badge, Style::default().fg(color).add_modifier(Modifier::BOLD)),
-            Span::styled(format!(" {name}"), row_style),
-            Span::styled(ttl, Style::default().fg(Color::DarkGray)),
-        ]));
+            Span::styled(
+                badge_token,
+                Style::default().fg(color).add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(" ", row_style),
+        ];
+        spans.extend(highlight_match_spans(
+            &name,
+            &needle,
+            row_style,
+            search_hit_style(),
+        ));
+        if !ttl.is_empty() {
+            spans.push(Span::styled(ttl, Style::default().fg(Color::DarkGray)));
+        }
+        lines.push(Line::from(spans));
     }
     if !app.redis_scan.exhausted {
         lines.push(Line::from(Span::styled(
@@ -26684,7 +27360,11 @@ fn render_redis_sidebar(f: &mut Frame, area: Rect, app: &App, lines: &mut Vec<Li
         )));
     } else if n == 0 {
         lines.push(Line::from(Span::styled(
-            t("  （无匹配 key）"),
+            if app.redis_filter.is_empty() {
+                t("  （无匹配 key）").to_string()
+            } else {
+                tf("  （无「{}」命中）", &[&app.redis_filter])
+            },
             Style::default().fg(Color::DarkGray),
         )));
     }
@@ -29188,20 +29868,35 @@ fn render_snippet_name(f: &mut Frame, area: Rect, app: &mut App) {
 }
 
 /// Shared scrollable text popup used for both cell values and row details.
-fn render_text_popup(f: &mut Frame, area: Rect, title: &str, lines: &[PopupLine], scroll: u16) {
+fn render_text_popup(
+    f: &mut Frame,
+    area: Rect,
+    title: &str,
+    lines: &[PopupLine],
+    scroll: u16,
+    cache: &mut Option<PopupCache>,
+) {
     let w = overlay_width(area.width, 88, 24);
     let inner_w = w.saturating_sub(4).max(1) as usize;
     // Wrap each logical line on its own so the style that marks NULL / ''
-    // survives across physical rows.
-    let body: Vec<Line> = lines
-        .iter()
-        .flat_map(|pl| {
-            let style = pl.style;
-            wrap_text(&pl.text, inner_w)
-                .into_iter()
-                .map(move |t| Line::from(Span::styled(t, style)))
-        })
-        .collect();
+    // survives across physical rows. The result is memoised: re-wrapping a
+    // 100 KB value on every scroll frame would stall the TUI (R42).
+    if cache.as_ref().is_none_or(|c| c.width != inner_w) {
+        let body: Vec<Line> = lines
+            .iter()
+            .flat_map(|pl| {
+                let style = pl.style;
+                wrap_text(&pl.text, inner_w)
+                    .into_iter()
+                    .map(move |t| Line::from(Span::styled(t, style)))
+            })
+            .collect();
+        *cache = Some(PopupCache {
+            width: inner_w,
+            lines: body,
+        });
+    }
+    let body = &cache.as_ref().expect("popup cache filled above").lines;
     let total = body.len();
     let max_h = area.height.saturating_sub(4).max(3);
     let h = ((total as u16) + 2).min(max_h);
@@ -29212,7 +29907,7 @@ fn render_text_popup(f: &mut Frame, area: Rect, title: &str, lines: &[PopupLine]
     let scroll = scroll.min(max_scroll);
     let title = tf(" {} · {}/{} · Esc 关闭 ", &[&(title), &((scroll as usize + inner_h).min(total)), &(total)]);
     f.render_widget(
-        Paragraph::new(body).scroll((scroll, 0)).block(
+        Paragraph::new(body.clone()).scroll((scroll, 0)).block(
             Block::default()
                 .borders(Borders::ALL)
                 .title(title)
@@ -29240,7 +29935,8 @@ fn render_error_popup(f: &mut Frame, area: Rect, app: &mut App) {
                 style: Style::default().fg(Color::Red),
             })
             .collect();
-        render_text_popup(f, area, t("执行错误"), &lines, popup.scroll);
+        let cache = &mut app.popup_cache;
+        render_text_popup(f, area, t("执行错误"), &lines, popup.scroll, cache);
         return;
     }
     let w = overlay_width(area.width, 72, 24);
@@ -29690,7 +30386,8 @@ const HELP_ROWS: &[(&str, &str)] = &[
     ("Alt-C / w", "紧凑列宽：窄屏自动共享列宽，宽表尽量一屏放下"),
     ("Alt-V / c", "列显隐：空格勾选显示的列（按 库.表 记住，跨会话）"),
     ("Alt-R / t", "最近浏览的 5 张表，Enter 直达（侧栏 t）"),
-    ("Alt-← →", "最近表后退 / 前进（浏览器语义，最多 50 张，跨库可用）"),
+    ("Alt-← →", "最近表 / 集合 / Redis key 后退 / 前进（浏览器语义，最多 50 个，跨库可用）"),
+    ("Alt-O", "脚本输出：语句分隔线 + 每条耗时前缀（默认关；Alt-T 已被数据搬运占用）"),
     ("Shift+← →", "列窗口横滚一列（任意区域，按住连滚）"),
     ("Ctrl-O", "SQL 片段收藏（DBX saved_sql_files）"),
     ("Ctrl-P", "EXPLAIN 当前 SQL（SQL 后端）"),
@@ -29752,7 +30449,8 @@ const HELP_ROWS: &[(&str, &str)] = &[
     ("大表翻页", "有主键时按主键续读（keyset），翻页耗时与页深无关"),
     ("行数上限", "50 万行以上的表显示 >50万，不再每页 COUNT"),
     ("← → / h l", "单元格光标（列窗口跟随）"),
-    ("Home / End", "首行 / 末行"),
+    ("Home / End · g g / G", "首行 / 末行（脚本语句列表同样适用）"),
+    ("y（脚本列表）", "复制当前语句结果为 CSV（与 Ctrl-Y 导出的首选格式一致）"),
     ("Ctrl-E", "聚焦 SQL 编辑器"),
     (
         "Shift/Alt/Ctrl+滚轮 · 横滑",
@@ -29850,20 +30548,27 @@ const HELP_ROWS: &[(&str, &str)] = &[
     ("use <db>", "MongoDB 切库"),
     ("— Redis key 浏览器 —", ""),
     ("↑ ↓ / Enter", "选择 key / 查看 value"),
+    ("a-z / f", "按已加载 key 子串过滤（一步直达，命中高亮；Enter 查看首位，Esc 清除）"),
+    ("Alt+a-z · ; ,", "首字母跳：跳到以该字母开头的下一个 key；; , 前后循环"),
+    ("1-9", "直跳第 N 个已加载 key"),
     ("Space / Shift+↑↓", "勾选 key / 范围选（a 全选已加载）"),
-    ("/", "编辑 SCAN MATCH 模式（留空 = 全部）"),
+    ("/", "编辑 SCAN MATCH 模式（服务端，留空 = 全部）"),
     ("n / End", "加载下一 SCAN 页"),
     ("r", "以当前模式重扫"),
     ("[ ]", "切换逻辑 db"),
     ("Del / x / m", "批量删除 / 设 TTL / 前缀重命名选中 key（均确认）"),
     ("y", "复制选中的 key 名（每行一个）"),
     ("value: e x m Del", "编辑 string·hash 字段 / TTL / 重命名 / 删除 key（均确认）"),
+    ("value: y / Esc", "复制值（string）/ 返回 key 列表"),
     ("value: n", "大集合继续加载 200 项"),
+    ("窄屏徽章", "类型与 TTL 融合为单行 `S·12s`，key 名不换行"),
     ("— MongoDB 文档浏览器 —", ""),
     ("Enter", "浏览 collection 文档（JSON 网格）"),
     ("n / p", "文档翻页"),
     ("f", "JSON 过滤（如 {\"age\": {\"$gt\": 30}}，留空清除）"),
     ("e / i / Del", "编辑 / 插入 / 删除文档（均确认，_id 不可改）"),
+    ("y / Esc", "复制当前文档 JSON / 返回集合列表"),
+    ("a-z / Alt+a-z / 1-9", "集合列表：子串过滤 / 首字母跳 / 直跳（同表列表）"),
     ("r", "查看 collection 索引"),
     ("— 危险操作 / 删除确认 —", ""),
     ("Enter / y", "执行（SQL 全文可见）"),
@@ -31195,6 +31900,221 @@ mod tests {
         for (w, h) in sizes {
             draw(&mut app, w, h);
         }
+    }
+
+    fn mk_redis_key(name: &str) -> RedisKeyInfo {
+        RedisKeyInfo {
+            key_display: name.to_string(),
+            key_raw: base64_encode(name.as_bytes()),
+            key_type: "string".into(),
+            ttl: -1,
+            size: 1,
+            value_preview: String::new(),
+        }
+    }
+
+    /// R42: the KV list filter narrows `keys` without touching the loaded window
+    /// (`all`), keeps a still-matching selection, and restores on clear.
+    #[test]
+    fn redis_filter_state_machine_narrows_and_restores() {
+        let mut app = test_app();
+        app.redis_scan.all = vec![
+            mk_redis_key("app:a"),
+            mk_redis_key("app:b"),
+            mk_redis_key("user:x"),
+        ];
+        apply_redis_filter(&mut app);
+        assert_eq!(app.redis_scan.keys.len(), 3);
+        app.redis_list.select(Some(1));
+        // Substring filter keeps the selected `app:b` selected.
+        app.redis_filter = "app:".into();
+        apply_redis_filter(&mut app);
+        assert_eq!(app.redis_scan.keys.len(), 2);
+        assert_eq!(app.redis_list.selected(), Some(1));
+        // A filter that excludes the selection falls back to the first hit.
+        app.redis_filter = "user".into();
+        apply_redis_filter(&mut app);
+        assert_eq!(app.redis_scan.keys.len(), 1);
+        assert_eq!(app.redis_list.selected(), Some(0));
+        // No hit empties the view, never the loaded window.
+        app.redis_filter = "zzz".into();
+        apply_redis_filter(&mut app);
+        assert!(app.redis_scan.keys.is_empty());
+        assert_eq!(app.redis_list.selected(), None);
+        assert_eq!(app.redis_scan.all.len(), 3);
+        // Clearing restores the full window.
+        clear_redis_filter(&mut app);
+        assert_eq!(app.redis_scan.keys.len(), 3);
+    }
+
+    /// R42: `Alt+<letter>` cycles through the loaded keys by first letter and
+    /// wraps, and the repeat key remembers the letter.
+    #[test]
+    fn redis_first_letter_jump_cycles_by_letter() {
+        let mut app = test_app();
+        app.redis_scan.all = vec![
+            mk_redis_key("alpha"),
+            mk_redis_key("beta"),
+            mk_redis_key("apex"),
+        ];
+        apply_redis_filter(&mut app);
+        app.redis_list.select(Some(0));
+        assert_eq!(redis_jump_by_letter(&mut app, 'a', 1), Some(2));
+        assert_eq!(app.redis_jump_letter, Some('a'));
+        // Forward from the last `a` wraps to the first.
+        assert_eq!(redis_jump_by_letter(&mut app, 'a', 1), Some(0));
+        // Backward from index 0 wraps to the last `a`.
+        assert_eq!(redis_jump_by_letter(&mut app, 'a', -1), Some(2));
+        assert_eq!(redis_jump_by_letter(&mut app, 'z', 1), None);
+    }
+
+    /// R42: the script console timing prefix stays compact across magnitudes.
+    #[test]
+    fn elapsed_prefix_format_is_compact() {
+        assert_eq!(format_elapsed_ms(0), "0ms");
+        assert_eq!(format_elapsed_ms(12), "12ms");
+        assert_eq!(format_elapsed_ms(999), "999ms");
+        assert_eq!(format_elapsed_ms(1_234), "1.23s");
+        assert_eq!(format_elapsed_ms(120_000), "2.0m");
+    }
+
+    /// R42: the narrow Redis badge fuses type and TTL into one token.
+    #[test]
+    fn redis_badge_fuses_type_and_ttl_when_narrow() {
+        assert_eq!(redis_badge_token(true, "S", Some(12)), "S·12s");
+        assert_eq!(redis_badge_token(true, "H", None), "H");
+        assert_eq!(redis_badge_token(false, "S", Some(12)), "S");
+    }
+
+    fn sample_script(n: usize) -> ScriptView {
+        let outcomes = (0..n)
+            .map(|i| StmtOutcome {
+                sql: format!("SELECT {i}"),
+                grid: Grid {
+                    columns: vec!["x".into()],
+                    rows: vec![vec![Val::Text(format!("{i}"))]],
+                    note: String::new(),
+                },
+                error: None,
+                affected: 0,
+                ms: 12,
+            })
+            .collect();
+        ScriptView {
+            outcomes,
+            sel: 1,
+            drilled: None,
+        }
+    }
+
+    /// R42: `Home` / `End` / `gg` / `G` route to the statement list or the grid,
+    /// whichever owns the results pane.
+    #[test]
+    fn preview_home_end_routes_to_script_list_and_grid() {
+        let mut app = test_app();
+        app.script = Some(sample_script(4));
+        preview_end(&mut app);
+        assert_eq!(app.script.as_ref().unwrap().sel, 3);
+        preview_home(&mut app);
+        assert_eq!(app.script.as_ref().unwrap().sel, 0);
+        // Drilled into a statement: the grid cursor moves instead.
+        app.script.as_mut().unwrap().drilled = Some(0);
+        app.script.as_mut().unwrap().outcomes[0].grid = sample_grid();
+        app.set_grid(sample_grid());
+        app.sel = 2;
+        preview_home(&mut app);
+        assert_eq!(app.sel, 0);
+        preview_end(&mut app);
+        assert_eq!(app.sel, 3);
+    }
+
+    /// R42: the `gg` / `G` / `Home` / `End` chord actually reaches the script
+    /// list through the global key dispatch (the `g` chord is resolved in
+    /// `browse_key` before the pane handler).
+    #[test]
+    fn script_list_gg_and_g_move_to_top_and_bottom() {
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel::<OpResult>();
+        let mut app = test_app();
+        app.picker_open = false;
+        app.selected = Some(test_conn("mysql"));
+        app.backend_kind = Backend::Sql;
+        app.focus = Focus::Preview;
+        app.script = Some(sample_script(5));
+        key(&mut app, &tx, KeyEvent::new(KeyCode::Char('G'), KeyModifiers::NONE));
+        assert_eq!(app.script.as_ref().unwrap().sel, 4);
+        key(&mut app, &tx, KeyEvent::new(KeyCode::Char('g'), KeyModifiers::NONE));
+        key(&mut app, &tx, KeyEvent::new(KeyCode::Char('g'), KeyModifiers::NONE));
+        assert_eq!(app.script.as_ref().unwrap().sel, 0, "gg goes to the top");
+        key(&mut app, &tx, KeyEvent::new(KeyCode::End, KeyModifiers::NONE));
+        assert_eq!(app.script.as_ref().unwrap().sel, 4);
+        key(&mut app, &tx, KeyEvent::new(KeyCode::Home, KeyModifiers::NONE));
+        assert_eq!(app.script.as_ref().unwrap().sel, 0);
+    }
+
+    /// R42: `Alt-O` swaps the plain script table for the separator stream.
+    #[test]
+    fn script_timing_toggle_renders_separator_stream() {
+        let mut app = test_app();
+        app.picker_open = false;
+        app.selected = Some(test_conn("mysql"));
+        app.backend_kind = Backend::Sql;
+        app.focus = Focus::Preview;
+        app.script = Some(sample_script(3));
+        let plain = draw(&mut app, 80, 20);
+        assert!(
+            plain.iter().any(|l| l.contains("SELECT 0")),
+            "plain script list missing: {plain:?}"
+        );
+        assert!(
+            !plain.iter().any(|l| l.contains("#1")),
+            "separators must be off by default"
+        );
+        app.show_stmt_timing = true;
+        let stream = draw(&mut app, 80, 20);
+        assert!(
+            stream.iter().any(|l| l.contains("#1")),
+            "separator stream missing: {stream:?}"
+        );
+        assert!(
+            stream.iter().any(|l| l.contains("12ms")),
+            "timing prefix missing: {stream:?}"
+        );
+    }
+
+    /// R42: a 100 KB cell is wrapped once and the wrap is reused across frames
+    /// and scrolls; only a width change rebuilds it.
+    #[test]
+    fn large_cell_popup_wraps_once_and_reuses_cache() {
+        let mut app = test_app();
+        app.picker_open = false;
+        app.selected = Some(test_conn("mysql"));
+        app.backend_kind = Backend::Sql;
+        app.grid_kind = GridKind::Query;
+        let big = "x".repeat(100_000);
+        app.set_grid(Grid {
+            columns: vec!["v".into()],
+            rows: vec![vec![Val::Text(big)]],
+            note: String::new(),
+        });
+        app.focus = Focus::Preview;
+        app.sel = 0;
+        app.col_cursor = 0;
+        open_cell_popup(&mut app);
+        assert!(app.popup_cache.is_none(), "cache is cleared on open");
+        draw(&mut app, 42, 22);
+        let cache = app.popup_cache.as_ref().expect("cache filled on first draw");
+        let width = cache.width;
+        let ptr = cache.lines.as_ptr();
+        // Same width: the wrap is reused (same allocation), even when scrolled.
+        draw(&mut app, 42, 22);
+        app.cell_popup.as_mut().unwrap().scroll = 20;
+        draw(&mut app, 42, 22);
+        let cache = app.popup_cache.as_ref().unwrap();
+        assert_eq!(cache.lines.as_ptr(), ptr, "wrap reused across frames");
+        // A width change rebuilds it.
+        draw(&mut app, 70, 22);
+        let cache = app.popup_cache.as_ref().unwrap();
+        assert_ne!(cache.width, width, "resize recomputes the wrap");
     }
 
     /// One overlay fixture for [`overlays_render_at_extreme_sizes`].
@@ -33475,10 +34395,17 @@ mod tests {
     /// The back/forward history is browser-shaped: re-opening the entry the
     /// cursor points at is a no-op, a fresh table truncates the forward branch,
     /// and the depth is capped.
+    /// The back/forward history is browser-shaped: re-opening the entry the
+    /// cursor points at is a no-op, a fresh node truncates the forward branch,
+    /// and the depth is capped.
     #[test]
     fn nav_history_is_browser_style() {
         let mut app = test_app();
-        let e = |t: &str| ("db".to_string(), "public".to_string(), t.to_string());
+        let e = |t: &str| NavEntry::Table {
+            db: "db".to_string(),
+            schema: "public".to_string(),
+            table: t.to_string(),
+        };
         record_nav(&mut app, e("a"));
         record_nav(&mut app, e("b"));
         record_nav(&mut app, e("c"));
@@ -33497,14 +34424,48 @@ mod tests {
         record_nav(&mut app, e("d"));
         assert_eq!(app.nav_history.len(), 3);
         assert_eq!(app.nav_pos, 2);
-        let names: Vec<&str> = app.nav_history.iter().map(|e| e.2.as_str()).collect();
+        let names: Vec<&str> = app
+            .nav_history
+            .iter()
+            .map(|e| match e {
+                NavEntry::Table { table, .. } => table.as_str(),
+                NavEntry::RedisKey { .. } => "?",
+            })
+            .collect();
         assert_eq!(names, vec!["a", "b", "d"]);
         // The stack is bounded; the oldest steps fall off the front.
         for i in 0..NAV_DEPTH * 2 {
-            record_nav(&mut app, ("db".into(), "public".into(), format!("t{i}")));
+            record_nav(
+                &mut app,
+                NavEntry::Table {
+                    db: "db".into(),
+                    schema: "public".into(),
+                    table: format!("t{i}"),
+                },
+            );
         }
         assert_eq!(app.nav_history.len(), NAV_DEPTH);
         assert_eq!(app.nav_pos, NAV_DEPTH - 1);
+    }
+
+    /// R42: a Redis key is a first-class round-trip node next to a table, so a
+    /// table → key → table walk is replayable, while the value detail itself is
+    /// not a second node.
+    #[test]
+    fn nav_history_records_redis_keys_beside_tables() {
+        let mut app = test_app();
+        remember_recent_table(&mut app, "shop", "public", "orders");
+        remember_redis_key(&mut app, 3, "raw:app:1", "app:1");
+        // Re-recording the key the cursor already points at is a no-op.
+        remember_redis_key(&mut app, 3, "raw:app:1", "app:1");
+        assert_eq!(app.nav_history.len(), 2);
+        remember_recent_table(&mut app, "shop", "public", "items");
+        assert_eq!(app.nav_history.len(), 3);
+        assert_eq!(app.nav_pos, 2);
+        assert!(matches!(
+            &app.nav_history[1],
+            NavEntry::RedisKey { db: 3, key_display, .. } if key_display == "app:1"
+        ));
     }
 
     #[test]
@@ -33905,15 +34866,14 @@ mod tests {
     fn help_has_no_bare_uppercase_shortcuts() {
         // Regression guard for the R8 keymap: every shortcut must be lowercase,
         // a named key, or a Ctrl/Alt/Shift/F-key combination — never a lone
-        // uppercase letter the user has to reach with Shift. `I` is the single
-        // deliberate exception: CSV import is rare and deliberate, and lowercase
-        // `i` is already quick-insert in the results pane.
+        // uppercase letter the user has to reach with Shift. `I` (CSV import)
+        // and `G` (vim's go-to-bottom, R42) are the two deliberate exceptions.
         for (key, _) in HELP_ROWS {
             if key.starts_with('—') {
                 continue;
             }
             for tok in key.split(['/', ' ', '+']).filter(|t| !t.is_empty()) {
-                if tok == "I" {
+                if tok == "I" || tok == "G" {
                     continue;
                 }
                 assert!(

@@ -972,7 +972,7 @@ pub static ALL_KEYS: &[&str] = &[
     "例: status = 'active'（留空回车 = 无过滤）",
     "数据对比 WHERE 过滤（两边同时生效）· Enter 开始 · Esc 返回",
     "配对括号",
-    "最近表后退 / 前进（浏览器语义，最多 50 张，跨库可用）",
+    "最近表 / 集合 / Redis key 后退 / 前进（浏览器语义，最多 50 个，跨库可用）",
     "跳到配对括号（光标在 ()[]{} 上或旁；否则照常输入 %）",
     "行首 / 行尾（Home / End 同）",
     "删至行尾（kill line）",
@@ -982,6 +982,84 @@ pub static ALL_KEYS: &[&str] = &[
 /// The Chinese → English table. Keys must match the source literals exactly.
 fn en_of(zh: &'static str) -> Option<&'static str> {
     match zh {
+        // ── R42 Redis / Mongo key alignment + script console ──
+        "语句分隔 + 耗时 开（Alt-O 关）" => {
+            Some("statement separators + timing ON (Alt-O to turn off)")
+        }
+        "语句分隔 + 耗时 关（Alt-O 开）" => {
+            Some("statement separators + timing OFF (Alt-O to turn on)")
+        }
+        "语句耗时" => Some("stmt timing"),
+        "还没有浏览过表 / key" => Some("no table / key browsed yet"),
+        "已经是最早的表 / key" => Some("already at the oldest table / key"),
+        "已经是最新的表 / key" => Some("already at the newest table / key"),
+        "✗ 该记录属于 Redis 连接" => Some("✗ that entry belongs to a Redis connection"),
+        "✗ 该记录属于表 / 集合" => Some("✗ that entry belongs to a table / collection"),
+        "还没有 key 可过滤" => Some("no keys to filter yet"),
+        "已清除 key 过滤 · {} 个 key" => Some("key filter cleared · {} keys"),
+        "过滤「{}」· 0 个 key 命中" => Some("filter `{}` · 0 keys match"),
+        "{} 个 key" => Some("{} keys"),
+        "{} · {} 命中" => Some("{} · {} hits"),
+        "过滤「{}」· 查看第 1 个命中 · Esc 清除" => {
+            Some("filter `{}` · viewing first hit · Esc clears")
+        }
+        "过滤「{}」· {} 个命中" => Some("filter `{}` · {} hits"),
+        "过滤「{}」· {} 个命中 · Enter 查看首位" => {
+            Some("filter `{}` · {} hits · Enter views the first")
+        }
+        "过滤「{}」· {} 命中 / {} 个 key" => Some("filter `{}` · {} hits / {} keys"),
+        "  （无「{}」命中）" => Some("  (no `{}` match)"),
+        "没有以「{}」开头的 key" => Some("no key starts with `{}`"),
+        "没有可复制的结果" => Some("no result to copy"),
+        "第 {} 条语句没有结果集" => Some("statement #{} has no result set"),
+        "✓ 已复制第 {} 条结果 CSV（{} 字符）· 兜底 {}" => {
+            Some("✓ copied statement #{} result as CSV ({} chars) · fallback {}")
+        }
+        "✓ 已复制第 {} 条结果 CSV（{} 字符）" => {
+            Some("✓ copied statement #{} result as CSV ({} chars)")
+        }
+        "没有可复制的文档" => Some("no document to copy"),
+        "✓ 已复制文档 JSON（{} 字符）· 兜底 {}" => {
+            Some("✓ copied document JSON ({} chars) · fallback {}")
+        }
+        "✓ 已复制文档 JSON（{} 字符）" => Some("✓ copied document JSON ({} chars)"),
+        " 脚本输出 · {} 条 · 影响 {} 行 · {} 错误 · Alt-O 关分隔 " => {
+            Some(" script output · {} stmts · {} rows · {} errors · Alt-O hides separators ")
+        }
+        "复制值" => Some("copy value"),
+        "返回列表" => Some("back to list"),
+        "key" => Some("key"),
+        "脚本输出：语句分隔线 + 每条耗时前缀（默认关；Alt-T 已被数据搬运占用）" => {
+            Some("script output: statement separator + per-statement timing prefix (off by default; Alt-T is the data-transfer wizard)")
+        }
+        "首行 / 末行（脚本语句列表同样适用）" => {
+            Some("first / last row (also applies to the script statement list)")
+        }
+        "复制当前语句结果为 CSV（与 Ctrl-Y 导出的首选格式一致）" => {
+            Some("copy the focused statement's result as CSV (matches Ctrl-Y export's leading format)")
+        }
+        "按已加载 key 子串过滤（一步直达，命中高亮；Enter 查看首位，Esc 清除）" => {
+            Some("substring-filter the loaded keys (one-step; hits highlighted; Enter views the first, Esc clears)")
+        }
+        "首字母跳：跳到以该字母开头的下一个 key；; , 前后循环" => {
+            Some("first-letter jump: next key starting with the letter; ; , cycles")
+        }
+        "直跳第 N 个已加载 key" => Some("jump to the Nth loaded key"),
+        "编辑 SCAN MATCH 模式（服务端，留空 = 全部）" => {
+            Some("edit the server-side SCAN MATCH pattern (blank = all)")
+        }
+        "复制值（string）/ 返回 key 列表" => Some("copy value (string) / back to the key list"),
+        "窄屏徽章" => Some("narrow badge"),
+        "y（脚本列表）" => Some("y (script list)"),
+        "类型与 TTL 融合为单行 `S·12s`，key 名不换行" => {
+            Some("type and TTL fuse into one `S·12s` token so a key stays on one line")
+        }
+        "复制当前文档 JSON / 返回集合列表" => {
+            Some("copy the current document JSON / back to the collection list")
+        }
+        "集合列表：子串过滤 / 首字母跳 / 直跳（同表列表）" => {
+            Some("collection list: substring filter / first-letter jump / direct jump (same as the table list)")
+        }
         // ── R41 connection quick-switch / run scope / small-screen wrap-up ──
         "→ {} 首屏（无 {}）" => Some("→ {} first screen (no {})"),
         "已在连接 {} · 无需切换" => Some("already on connection {} · no switch needed"),
@@ -2465,8 +2543,8 @@ fn en_of(zh: &'static str) -> Option<&'static str> {
         "直跳第 N 个连接 / 表" => Some("jump straight to the Nth connection / table"),
         "直跳" => Some("jump"),
         "配对括号" => Some("brackets"),
-        "最近表后退 / 前进（浏览器语义，最多 50 张，跨库可用）" => {
-            Some("recent-table back / forward (browser semantics, up to 50, across databases)")
+        "最近表 / 集合 / Redis key 后退 / 前进（浏览器语义，最多 50 个，跨库可用）" => {
+            Some("back / forward over tables / collections / Redis keys (browser semantics, up to 50)")
         }
         "跳到配对括号（光标在 ()[]{} 上或旁；否则照常输入 %）" => {
             Some("jump to the matching bracket (cursor on or beside ()[]{}; otherwise types %)")

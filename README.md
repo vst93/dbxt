@@ -69,13 +69,15 @@ A keyboard-first terminal UI for databases, built on the [DBX](https://github.co
 
 **Redis**
 - Connecting to Redis opens a paginated `SCAN` key browser (never `KEYS *`) with type + TTL badges, a server-side `MATCH` pattern (`/`) and logical-DB switching.
-- `Enter` renders the value by type — string, hash, list, set, sorted set, stream, RedisJSON — with load-more for large collections.
+- The key list shares the SQL sidebar's quick-locate feel: any printable character starts a **one-step substring filter** over the loaded keys (hits highlighted, `Enter` opens the first, `Esc` clears), `Alt`+letter does a **first-letter cycle jump** (`;`/`,` repeat it), `1-9` jumps to the Nth key and `3j`/`3k` repeat a move.
+- `Enter` renders the value by type — string, hash, list, set, sorted set, stream, RedisJSON — with load-more for large collections; `y` copies the focused value and `Esc` returns to the list.
+- On a narrow screen the type badge and TTL fuse into one token (`S·12s`) so a key row never wraps.
 - `e` / `x` / `m` / `Del` edit, set TTL, rename and delete; `Space` multi-selects and drives batch delete / TTL / prefix-rename behind the red confirmation layer.
 - The raw `redis-cli` console (`Ctrl-L`) remains for anything else.
 
 **MongoDB**
-- Connecting to MongoDB lists collections; `Enter` browses documents as a grid over the union of top-level keys (`_id` first).
-- `n`/`p` page, `f` applies a JSON filter, `r` shows the collection's indexes.
+- Connecting to MongoDB lists collections; `Enter` browses documents as a grid over the union of top-level keys (`_id` first). The collection list uses the same filter / first-letter-jump / direct-jump keys as the SQL table list.
+- `n`/`p` page, `f` applies a JSON filter, `r` shows the collection's indexes; `y` copies the focused document as pretty JSON and `Esc` returns to the collection list.
 - `e` edits a document in a JSON editor (`_id` immutable, field-level diff), `i` inserts, `Del` deletes by `_id` — every write confirmed, page reloaded in place.
 
 **Efficiency & experience**
@@ -85,7 +87,8 @@ A keyboard-first terminal UI for databases, built on the [DBX](https://github.co
 - With text selected (`Shift`+arrows) `F5`/`Ctrl-J` runs only the selection; with no selection `Alt-Enter` picks out the statement under the cursor by semicolon (a `;` inside a literal or comment does not split — the same lexer as the `%` bracket matcher), and a selection wins over both. `Alt-P` opens saved snippets and pastes the pick at the cursor in one step (`Ctrl-O` still appends to the end).
 - `Ctrl-A` auto-collapses unfocused panes and `Ctrl-W` pins one; below 50 columns the panes stack vertically. In the side-by-side layout the sidebar sizes itself to the widest `schema.table` name (never below a readable floor, and 28 columns are kept on a wide screen), so the data area keeps the freed columns; a name too long for the sidebar is cut and marked with `~`.
 - `Alt-C` compacts column widths, `Alt-V` hides columns, `Alt-R` jumps to a recent table, `Alt-H` opens the query history — choices persist per `database.table`.
-- `Alt-←` / `Alt-→` walk the last 50 browsed tables like a browser's back/forward buttons (the forward branch is dropped when you open a new table, and cross-database jumps work too); the status line confirms the landing with `← table`. The sidebar `t` overlay still lists the last five for a direct jump.
+- `Alt-←` / `Alt-→` walk the last 50 browsed nodes — SQL tables, MongoDB collections and Redis keys are all first-class stops (a value/document *detail* view is not, so a back step lands on the list entry that opened it); like a browser, the forward branch is dropped when you open a new node, and cross-database jumps work too. The status line confirms the landing with `← table`. The sidebar `t` overlay still lists the last five for a direct jump.
+- Multi-statement output doubles as a console: `Home`/`End` and `gg`/`G` jump to the top / bottom of the statement list, `Enter` on an errored row opens the error box, `y` copies the focused statement's result as CSV (the format `Ctrl-Y` export leads with), and `Alt-O` toggles a separator line plus a compact per-statement timing prefix (`12ms`, `1.23s`) — off by default. (`Alt-T` is the data-transfer wizard, hence `Alt-O`.)
 - Mouse and touch work: click to select, click again to confirm; the wheel scrolls, `Shift`/`Alt`/`Ctrl`+wheel pans columns.
 - Failures are visible: a watchdog turns a dead backend into an error, a spinner with elapsed seconds shows work in flight, and server errors echo verbatim.
 - Large results stay smooth: a 20,000×12 grid scrolls at ~0.6 ms/frame (column widths are cached and only the visible window is sliced out, instead of re-scanning every row each frame), and file export runs on a background worker that streams straight to disk — 20,000 rows × 12 columns in well under a second, with peak memory near a single row (~36 MB whole-process, versus ~96 MB when the document was built in memory).
@@ -144,7 +147,7 @@ The TUI's `?` overlay and `dbxt --help` carry the complete list; this is the sho
 
 | Context | Keys |
 | --- | --- |
-| Global | `?` context mini cheat-sheet (a second `?` opens the full help) · `Tab`/`Shift-Tab` panes · `Alt-Shift-1/2/3` focus (terminals may report `Alt-!` `Alt-@` `Alt-#`) · `Alt-←`/`Alt-→` recent-table back/forward (browser semantics, up to 50, across databases) · `F5`/`Ctrl-J` run (selection only when highlighted) · `Alt-Enter` run only the statement at the cursor · `Ctrl-C` quit |
+| Global | `?` context mini cheat-sheet (a second `?` opens the full help) · `Tab`/`Shift-Tab` panes · `Alt-Shift-1/2/3` focus (terminals may report `Alt-!` `Alt-@` `Alt-#`) · `Alt-←`/`Alt-→` back/forward over tables / collections / Redis keys (browser semantics, up to 50) · `F5`/`Ctrl-J` run (selection only when highlighted) · `Alt-Enter` run only the statement at the cursor · `Alt-O` script-output separators + timing · `Ctrl-C` quit |
 | Connections | `↑` `↓` move · `Enter` connect · `Alt-1..9` jump to the Nth connection (smart db/table restore) · `Alt-Tab`/`` Alt-` `` toggle with the previous connection · `c` new · `e` edit · `p` duplicate · `s` sort (name/type/colour) · `x` delete · `d` database/schema switcher · `o` picker |
 | Import / export | `Alt-E` export every connection as JSON (`p` include passwords w/ red confirm · `y` copy to clipboard) · `Alt-I` import a dbxt / DBeaver / Navicat file (`s` skip · `r` overwrite w/ red confirm · `b` keep both · `Space` toggle · `d` per row) |
 | Connection form | `↑` `↓`/`Tab` fields · `Enter` edit/toggle/save · `Space` toggle `ssh_tunnel`/`ssl`/`ssh_auth`, cycle the `color` palette · `Esc` back |
@@ -156,8 +159,8 @@ The TUI's `?` overlay and `dbxt --help` carry the complete list; this is the sho
 | Data transfer | `Alt-T` copy structure/rows to another connection (`o` overwrite w/ red confirm · `m` mode · `w`/`l` WHERE/LIMIT · `i` indexes · `a` auto-increment · `s` stop/skip) · step ① connection · step ② db/schema/table · step ③ options · `g` summary · `b` browse target · `Esc` abort |
 | Results | `↑` `↓` rows · `←` `→` columns · `n`/`p` pages (`5n` = 5 pages) · `gd`/`gt` structure/data · `gv` locate a value (n/N cycles hits) · `|` jump to a column by number/name · `Enter`/`v` cell · `e` edit · `i` insert · `Delete` delete |
 | Results (more) | `f` filter · `s` sort · `Ctrl-K` extra sort · `Ctrl-R` clear · `y` copy row · `/` search (hides non-matches) · `Ctrl-Y` export · `[` `]` tabs |
-| Redis | `Space` select · `a` all · `Del`/`x`/`m` batch delete/TTL/rename · `/` MATCH · `n` more · `e` edit · `Enter` value |
-| MongoDB | `e` edit · `i` insert · `Del` delete · `f` filter · `n`/`p` pages · `r` indexes |
+| Redis | `Space` select · `a` all · `Del`/`x`/`m` batch delete/TTL/rename · `/` MATCH · `f`/`a-z` filter · `Alt+a-z` jump · `n` more · `e` edit · `Enter` value |
+| MongoDB | `e` edit · `i` insert · `Del` delete · `f` filter · `y` copy JSON · `n`/`p` pages · `r` indexes |
 | Overlays | `Enter`/`y` confirm · `Esc`/`n` cancel · `↑` `↓` scroll |
 
 ## Persistence & configuration
