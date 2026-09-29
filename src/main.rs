@@ -7399,16 +7399,16 @@ async fn run_op(backend: &LocalBackend, op: Op, tx: &Tx) -> OpResult {
                 .await
             {
                 Ok(entries) => {
-                    // Newest first (DBX returns descending order); unique SQL so
-                    // one statement run repeatedly does not flood the list.
-                    let mut rows: Vec<HistoryRow> = Vec::new();
-                    let mut seen: HashSet<String> = HashSet::new();
+                    // Newest first (DBX returns descending order). Repeated
+                    // statements are merged by `merge_history_rows` below, which
+                    // keeps one row per statement and counts the repeats (`×n`).
+                    let mut raw: Vec<HistoryRow> = Vec::new();
                     for e in entries {
                         let sql = e.sql.trim().to_string();
-                        if sql.is_empty() || !seen.insert(sql.clone()) {
+                        if sql.is_empty() {
                             continue;
                         }
-                        rows.push(HistoryRow {
+                        raw.push(HistoryRow {
                             id: e.id,
                             sql,
                             executed_at: e.executed_at,
@@ -7420,11 +7420,13 @@ async fn run_op(backend: &LocalBackend, op: Op, tx: &Tx) -> OpResult {
                                 0
                             },
                             origin: history_origin_from_details(e.details_json.as_deref()),
+                            count: 1,
                         });
-                        if rows.len() >= 300 {
+                        if raw.len() >= 300 {
                             break;
                         }
                     }
+                    let rows = merge_history_rows(raw);
                     let favorites = match backend.state().storage.load_saved_sql_library().await {
                         Ok(lib) => lib
                             .files
@@ -9181,6 +9183,9 @@ struct ConnForm {
     db_type: String,
     host: String,
     port: String,
+    /// True once the user has typed a port themselves: the default-port
+    /// auto-fill must never clobber a hand-entered value (R51).
+    port_touched: bool,
     username: String,
     password: String,
     database: String,
@@ -9217,7 +9222,11 @@ impl Default for ConnForm {
             name: String::new(),
             db_type: "mysql".into(),
             host: String::new(),
-            port: String::new(),
+            // R51: the form opens with the default port for the preselected
+            // `mysql` type already filled in; changing the type re-derives it
+            // until the user types a port of their own.
+            port: "3306".into(),
+            port_touched: false,
             username: String::new(),
             password: String::new(),
             database: String::new(),
@@ -9434,8 +9443,10 @@ fn sort_table_list(list: &mut [TableInfo], mode: TableSort) {
 /// technical keycaps kept identical in both languages (like the base fields).
 fn form_rows(f: &ConnForm) -> Vec<(FormRow, &'static str)> {
     let mut rows = vec![
-        (FormRow::Name, "name"),
+        // R51: field order follows the real creation flow — pick the type first
+        // (which fills the default port), then name, host, credentials, database.
         (FormRow::DbType, "db_type"),
+        (FormRow::Name, "name"),
         (FormRow::Host, "host"),
         (FormRow::Port, "port"),
         (FormRow::Username, "username"),
@@ -9513,6 +9524,36 @@ fn form_text_mut(f: &mut ConnForm, row: FormRow) -> Option<&mut String> {
     }
 }
 
+/// The default port for a fresh connection of `db_type`, as an editable string.
+/// `0` (local-file drivers like SQLite / DuckDB) and unknown types both render
+/// as an empty field rather than a bogus `0`.
+fn default_form_port(db_type: &str) -> String {
+    parse_database_type(db_type.trim())
+        .ok()
+        .and_then(|dt| dbx_core::database_manifest::default_port(&dt))
+        .filter(|p| *p > 0)
+        .map(|p| p.to_string())
+        .unwrap_or_default()
+}
+
+/// R51: keep the `port` field in sync with the selected `db_type` while the user
+/// has not typed a port of their own. Called after every `db_type` change, so
+/// picking MySQL / PostgreSQL / Redis / MongoDB fills 3306 / 5432 / 6379 / 27017
+/// instantly; once `port_touched` is set the user's value is never overwritten.
+fn apply_default_port(f: &mut ConnForm) {
+    if f.port_touched {
+        return;
+    }
+    f.port = default_form_port(&f.db_type);
+}
+
+/// R51: connection name generated when the user leaves `name` blank, shaped
+/// `host-db_type` (e.g. `localhost-postgres`) so the picker stays scannable
+/// without a manual name.
+fn auto_conn_name(host: &str, db_type: &str) -> String {
+    format!("{}-{}", host.trim(), db_type.trim())
+}
+
 /// The first SSH transport layer of a saved connection, if any. Used to prefill
 /// the form when editing / duplicating a tunneled connection.
 fn first_ssh_layer(cfg: &ConnectionConfig) -> Option<&SshTunnelConfig> {
@@ -9534,6 +9575,9 @@ fn form_from_connection(cfg: &ConnectionConfig, name: String, edit_id: Option<St
         } else {
             cfg.port.to_string()
         },
+        // A saved connection's port is authoritative: changing the type while
+        // editing must not silently re-derive it (R51).
+        port_touched: true,
         username: cfg.username.clone(),
         password: cfg.password.clone(),
         database: cfg.database.clone().unwrap_or_default(),
@@ -9902,6 +9946,31 @@ struct HistoryRow {
     /// Where dbxt ran it from: `editor` / `script` / `direct`. Empty for
     /// entries another client wrote (no origin to show).
     origin: String,
+    /// R51: how many times this statement appears in the loaded history window.
+    /// The panel keeps one row per statement (newest first) and shows `×n` when
+    /// it ran more than once, so a re-run loop does not flood the list.
+    count: usize,
+}
+
+/// R51: collapse repeated statements in a newest-first history window into a
+/// single row per statement, counting the repeats (`×n`). The newest occurrence
+/// wins, so its timestamp / duration are what the row shows, and the survivors
+/// keep their original order. This is the adjacency merge the panel needs: a
+/// statement re-run back-to-back lands as consecutive entries, and the count
+/// also folds in non-adjacent repeats.
+fn merge_history_rows(rows: Vec<HistoryRow>) -> Vec<HistoryRow> {
+    let mut out: Vec<HistoryRow> = Vec::new();
+    let mut index_of: HashMap<String, usize> = HashMap::new();
+    for mut r in rows {
+        if let Some(&i) = index_of.get(&r.sql) {
+            out[i].count += 1;
+        } else {
+            r.count = 1;
+            index_of.insert(r.sql.clone(), out.len());
+            out.push(r);
+        }
+    }
+    out
 }
 
 /// Short badge for a [`HistoryRow::origin`] value, or `None` when unknown.
@@ -19690,6 +19759,10 @@ fn preview_home(app: &mut App) {
         }
     }
     app.sel = 0;
+    // R51: jumping to the first row also parks the cell cursor back on the
+    // first column, so a Home/End sweep starts from a known corner.
+    app.col_cursor = 0;
+    app.col_offset = 0;
 }
 
 /// `End` / `G` in the results pane: bottom of the DDL, the statement list or the
@@ -19708,6 +19781,9 @@ fn preview_end(app: &mut App) {
     let n = result_row_count(app);
     if n > 0 {
         app.sel = n - 1;
+        // R51: the last row also resets the cell cursor to the first column.
+        app.col_cursor = 0;
+        app.col_offset = 0;
     }
 }
 
@@ -20724,7 +20800,15 @@ fn open_history(app: &mut App, tx: &Tx) {
 /// then the rest in time order (R45).
 fn recompute_history_view(app: &mut App) {
     let needle = app.history_needle.trim().to_lowercase();
-    let matches = |r: &HistoryRow| needle.is_empty() || r.sql.to_lowercase().contains(&needle);
+    // R51: the `/` filter matches the statement text, the source connection name
+    // and the run-origin badge (`编` / `脚` / `直`), so `编` narrows to
+    // editor-run statements and a host name narrows to its connection.
+    let matches = |r: &HistoryRow| {
+        needle.is_empty()
+            || r.sql.to_lowercase().contains(&needle)
+            || r.connection_name.to_lowercase().contains(&needle)
+            || history_origin_badge(&r.origin).is_some_and(|b| b.to_lowercase().contains(&needle))
+    };
     let mut favs: Vec<usize> = Vec::new();
     let mut rest: Vec<usize> = Vec::new();
     for (i, r) in app.history_rows.iter().enumerate() {
@@ -21000,7 +21084,11 @@ fn history_filter_key(app: &mut App, k: KeyEvent) {
                 .and_then(|ta| ta.lines().first().cloned())
                 .unwrap_or_default();
             recompute_history_view(app);
-            app.history_list.select(Some(0));
+            // The list is the filter view, so the cursor is only valid when
+            // something matched (an empty view keeps it unset).
+            if !app.history_view.is_empty() {
+                app.history_list.select(Some(0));
+            }
         }
     }
 }
@@ -25352,10 +25440,20 @@ fn form_key(app: &mut App, tx: &Tx, k: KeyEvent) {
                 if cur == FormRow::Color {
                     app.form.color_sel = color_sel_for(&app.form.color);
                 }
+                // R51: leaving the type field re-derives the default port.
+                if cur == FormRow::DbType {
+                    apply_default_port(&mut app.form);
+                }
             }
             KeyCode::Backspace => {
                 if let Some(s) = form_text_mut(&mut app.form, cur) {
                     s.pop();
+                }
+                if cur == FormRow::Port {
+                    app.form.port_touched = true;
+                }
+                if cur == FormRow::DbType {
+                    apply_default_port(&mut app.form);
                 }
             }
             KeyCode::Char(c) => {
@@ -25367,6 +25465,13 @@ fn form_key(app: &mut App, tx: &Tx, k: KeyEvent) {
                         FormRow::Color if !(c.is_ascii_hexdigit() || c == '#') => {}
                         _ => s.push(c),
                     }
+                }
+                // R51: the type drives the port until the user edits the port.
+                if cur == FormRow::Port {
+                    app.form.port_touched = true;
+                }
+                if cur == FormRow::DbType {
+                    apply_default_port(&mut app.form);
                 }
             }
             _ => {}
@@ -25495,8 +25600,8 @@ fn build_ssh_layer(f: &ConnForm) -> Result<Option<SshTunnelConfig>, String> {
 
 fn save_form(app: &mut App, tx: &Tx) {
     let f = app.form.clone();
-    if f.name.trim().is_empty() || f.host.trim().is_empty() {
-        app.form.err = t("name / host 必填").into();
+    if f.host.trim().is_empty() {
+        app.form.err = t("host 必填").into();
         return;
     }
     let Ok(db_type) = parse_database_type(&f.db_type) else {
@@ -25505,6 +25610,13 @@ fn save_form(app: &mut App, tx: &Tx) {
             &[&(f.db_type)],
         );
         return;
+    };
+    // R51: a blank connection name is generated as `host-db_type` instead of
+    // being rejected, so the picker stays readable without a manual name.
+    let name = if f.name.trim().is_empty() {
+        auto_conn_name(f.host.trim(), &f.db_type)
+    } else {
+        f.name.trim().to_string()
     };
     let port = f
         .port
@@ -25539,7 +25651,7 @@ fn save_form(app: &mut App, tx: &Tx) {
         Some(existing) => existing,
         None => match new_connection_config(
             Uuid::new_v4().to_string(),
-            f.name.trim().to_string(),
+            name.clone(),
             db_type,
             f.host.trim().to_string(),
             port,
@@ -25560,7 +25672,7 @@ fn save_form(app: &mut App, tx: &Tx) {
             }
         },
     };
-    cfg.name = f.name.trim().to_string();
+    cfg.name = name;
     cfg.db_type = db_type;
     cfg.host = f.host.trim().to_string();
     cfg.port = port;
@@ -32580,8 +32692,18 @@ fn history_list_item(app: &App, ri: usize, list_w: usize) -> ListItem<'static> {
     } else {
         String::new()
     };
-    let reserved =
-        disp_width(&time) + 4 + disp_width(&src) + 2 + disp_width(&duration) + disp_width(&origin);
+    let count = if r.count > 1 {
+        format!("×{}", r.count)
+    } else {
+        String::new()
+    };
+    let reserved = disp_width(&time)
+        + 4
+        + disp_width(&src)
+        + 2
+        + disp_width(&duration)
+        + disp_width(&origin)
+        + disp_width(&count);
     let summary = truncate_disp(
         &history_summary(&r.sql),
         list_w.saturating_sub(reserved).max(8),
@@ -32601,6 +32723,14 @@ fn history_list_item(app: &App, ri: usize, list_w: usize) -> ListItem<'static> {
         Span::raw(" "),
         Span::styled(summary, sum_style),
     ];
+    if !count.is_empty() {
+        spans.push(Span::styled(
+            format!(" {count}"),
+            Style::default()
+                .fg(Color::Yellow)
+                .add_modifier(Modifier::BOLD),
+        ));
+    }
     if !duration.is_empty() {
         spans.push(Span::styled(
             format!("  {duration}"),
@@ -35325,8 +35455,10 @@ const HELP_ROWS: &[(&str, &str)] = &[
     ),
     ("q", "折叠 / 展开连接列表"),
     ("— 连接表单 —", ""),
-    ("↑ ↓ / Tab", "切换字段（开启 ssh_tunnel 后自动展开 SSH 段）"),
+    ("↑ ↓ / Tab", "切换字段：db_type → name → host → port → user → password → database（开启 ssh_tunnel 后自动展开 SSH 段）"),
     ("Enter", "编辑字段 / 切换开关 / 保存连接"),
+    ("默认端口", "选定 db_type 即带出 MySQL 3306 / PG 5432 / Redis 6379 / Mongo 27017；手动改过 port 则不覆盖"),
+    ("name 留空", "保存时按 host-db_type 自动生成连接名（如 localhost-postgres）"),
     ("Space", "切换 ssh_tunnel / ssl / read_only / 登录方式"),
     (
         "color",
@@ -35455,7 +35587,7 @@ const HELP_ROWS: &[(&str, &str)] = &[
     ("← → / h l", "单元格光标（列窗口跟随）"),
     (
         "Home / End · g g / G",
-        "首行 / 末行（脚本语句列表同样适用）",
+        "首行 / 末行（列光标同时回第一列；脚本语句列表同样适用）",
     ),
     (
         "y（脚本列表）",
@@ -35719,7 +35851,11 @@ const HELP_ROWS: &[(&str, &str)] = &[
     ("f", "收藏 / 取消收藏该条（同一 DBX saved_sql_files 存储）"),
     ("y", "复制整条语句"),
     ("Del", "删除单条历史（红色确认，不影响数据库数据）"),
-    ("/", "按语句内容过滤（大小写不敏感子串）"),
+    (
+        "/",
+        "过滤历史：匹配语句文本 / 来源连接 / 来源标（大小写不敏感子串）",
+    ),
+    ("×n", "同一语句多次执行合并为一行并计数（Ctrl-↵ / p 仍直跑该条）"),
     ("— 鼠标 / 触屏 —", ""),
     (
         "点击（结果区）",
@@ -37380,6 +37516,29 @@ mod tests {
         assert_eq!(app.sel, 3);
     }
 
+    /// R51: `Home` / `End` in a grid also park the cell cursor back on the first
+    /// column, so a row sweep never leaves a stale column highlight.
+    #[test]
+    fn preview_home_end_reset_the_cell_cursor_column() {
+        let mut app = test_app();
+        app.grid_kind = GridKind::Query;
+        app.set_grid(sample_grid());
+        app.focus = Focus::Preview;
+        app.sel = 2;
+        app.col_cursor = 5;
+        app.col_offset = 3;
+        preview_home(&mut app);
+        assert_eq!(app.sel, 0);
+        assert_eq!(app.col_cursor, 0);
+        assert_eq!(app.col_offset, 0);
+        app.col_cursor = 7;
+        app.col_offset = 4;
+        preview_end(&mut app);
+        assert_eq!(app.sel, 3);
+        assert_eq!(app.col_cursor, 0);
+        assert_eq!(app.col_offset, 0);
+    }
+
     /// R42: the `gg` / `G` / `Home` / `End` chord actually reaches the script
     /// list through the global key dispatch (the `g` chord is resolved in
     /// `browse_key` before the pane handler).
@@ -37991,6 +38150,7 @@ mod tests {
                             success: i % 5 != 0,
                             duration_ms: if i % 3 == 0 { 12 } else { 0 },
                             origin: if i % 2 == 0 { "editor".into() } else { String::new() },
+                            count: 1,
                         })
                         .collect();
                     a.history_view = (0..a.history_rows.len()).collect();
@@ -38009,6 +38169,7 @@ mod tests {
                         success: true,
                         duration_ms: 0,
                         origin: String::new(),
+                        count: 1,
                     }];
                     a.history_view = vec![0];
                     a.history_list.select(Some(0));
@@ -42209,6 +42370,7 @@ mod tests {
             success: true,
             duration_ms: 0,
             origin: String::new(),
+            count: 1,
         }
     }
 
@@ -42233,6 +42395,99 @@ mod tests {
         app.history_needle.clear();
         recompute_history_view(&mut app);
         assert_eq!(app.history_view, vec![0, 1]);
+    }
+
+    /// R51: the `/` filter also matches the source connection and the run-origin
+    /// badge, not just the statement text.
+    #[test]
+    fn history_filter_matches_origin_badge_and_source() {
+        let mut app = test_app();
+        let mut a = history_row("1", "SELECT 1");
+        a.origin = "editor".into();
+        a.connection_name = "prod".into();
+        let mut b = history_row("2", "SELECT 2");
+        b.origin = "direct".into();
+        b.connection_name = "analytics".into();
+        app.history_rows = vec![a, b];
+        app.history_needle = t("编").into();
+        recompute_history_view(&mut app);
+        assert_eq!(app.history_view, vec![0], "editor badge narrows to row 1");
+        app.history_needle = "analytics".into();
+        recompute_history_view(&mut app);
+        assert_eq!(
+            app.history_view,
+            vec![1],
+            "source connection narrows the view"
+        );
+    }
+
+    /// R51: the `/` filter state machine — `/` opens the input, typing narrows
+    /// the view and pins the cursor, Esc clears the needle, Enter keeps it, and
+    /// a no-match state leaves the cursor unset.
+    #[test]
+    fn history_filter_state_machine_keeps_a_valid_cursor() {
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel::<OpResult>();
+        let mut app = test_app();
+        app.history_rows = vec![
+            history_row("1", "SELECT alpha"),
+            history_row("2", "SELECT beta"),
+        ];
+        app.history_open = true;
+        let press = |app: &mut App, code: KeyCode| {
+            history_key(app, &tx, KeyEvent::new(code, KeyModifiers::NONE));
+        };
+        press(&mut app, KeyCode::Char('/'));
+        assert!(app.history_filter.is_some());
+        for c in "beta".chars() {
+            press(&mut app, KeyCode::Char(c));
+        }
+        assert_eq!(app.history_needle, "beta");
+        assert_eq!(app.history_view, vec![1]);
+        assert_eq!(app.history_list.selected(), Some(0));
+        // Esc clears the needle and restores the full list.
+        press(&mut app, KeyCode::Esc);
+        assert!(app.history_filter.is_none());
+        assert_eq!(app.history_needle, "");
+        assert_eq!(app.history_view, vec![0, 1]);
+        // A non-matching needle leaves the cursor unset (no bogus row 0).
+        press(&mut app, KeyCode::Char('/'));
+        for c in "zzz".chars() {
+            press(&mut app, KeyCode::Char(c));
+        }
+        assert!(app.history_view.is_empty());
+        assert_eq!(app.history_list.selected(), None);
+        press(&mut app, KeyCode::Esc);
+        // Enter keeps the needle (the panel stays filtered).
+        press(&mut app, KeyCode::Char('/'));
+        for c in "alpha".chars() {
+            press(&mut app, KeyCode::Char(c));
+        }
+        press(&mut app, KeyCode::Enter);
+        assert!(app.history_filter.is_none());
+        assert_eq!(app.history_needle, "alpha");
+        assert_eq!(app.history_view, vec![0]);
+    }
+
+    /// R51: repeated statements collapse into one row that counts the repeats,
+    /// keeping the newest occurrence's metadata and the original order.
+    #[test]
+    fn history_merge_counts_repeats_keeping_the_newest() {
+        let mut second = history_row("2", "SELECT 2");
+        second.connection_name = "other".into();
+        let rows = vec![
+            history_row("1", "SELECT 1"),
+            second,
+            history_row("3", "SELECT 1"),
+            history_row("4", "SELECT 1"),
+            history_row("5", "SELECT 3"),
+        ];
+        let merged = merge_history_rows(rows);
+        let sqls: Vec<&str> = merged.iter().map(|r| r.sql.as_str()).collect();
+        assert_eq!(sqls, vec!["SELECT 1", "SELECT 2", "SELECT 3"]);
+        assert_eq!(merged[0].count, 3);
+        assert_eq!(merged[0].id, "1", "the newest occurrence wins the row");
+        assert_eq!(merged[1].count, 1);
+        assert_eq!(merged[2].count, 1);
     }
 
     #[test]
@@ -46375,6 +46630,133 @@ mod tests {
         let agent = form_rows(&f);
         assert!(agent.iter().any(|(r, _)| *r == FormRow::SshAgentSock));
         assert_eq!(agent.last().map(|(r, _)| *r), Some(FormRow::Save));
+    }
+
+    /// R51: the form fields follow the real creation flow — type first (so its
+    /// default port lands before the cursor reaches `port`), then name, host,
+    /// port, credentials, database.
+    #[test]
+    fn form_field_order_matches_the_creation_flow() {
+        let f = ConnForm::default();
+        let order: Vec<FormRow> = form_rows(&f).into_iter().map(|(r, _)| r).collect();
+        assert_eq!(
+            &order[..7],
+            &[
+                FormRow::DbType,
+                FormRow::Name,
+                FormRow::Host,
+                FormRow::Port,
+                FormRow::Username,
+                FormRow::Password,
+                FormRow::Database,
+            ]
+        );
+        // The SSH rows sit after the base fields, before the save row.
+        assert!(
+            order.iter().position(|r| *r == FormRow::SshEnabled)
+                > order.iter().position(|r| *r == FormRow::Color)
+        );
+    }
+
+    /// R51: the port field is derived from the selected database type, and a
+    /// hand-entered port is never overwritten by a later type change.
+    #[test]
+    fn default_port_tracks_type_until_the_user_edits_it() {
+        let mut f = ConnForm::default();
+        // A fresh form opens on mysql with its default port already shown.
+        assert_eq!(f.port, "3306");
+        for (ty, port) in [
+            ("postgres", "5432"),
+            ("redis", "6379"),
+            ("mongodb", "27017"),
+            ("mysql", "3306"),
+        ] {
+            f.db_type = ty.into();
+            apply_default_port(&mut f);
+            assert_eq!(f.port, port, "default port for {ty}");
+        }
+        // Local-file drivers have no port: the field stays blank.
+        f.db_type = "sqlite".into();
+        apply_default_port(&mut f);
+        assert_eq!(f.port, "");
+        // Once the user types a port, it is pinned across type changes.
+        f.port = "15432".into();
+        f.port_touched = true;
+        f.db_type = "mysql".into();
+        apply_default_port(&mut f);
+        assert_eq!(f.port, "15432");
+    }
+
+    /// R51: driving the real form keys, choosing a type refills the default
+    /// port while the field is untouched, and typing a port marks it pinned.
+    #[test]
+    fn form_keys_fill_default_port_and_pin_a_typed_one() {
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel::<OpResult>();
+        let mut app = test_app();
+        app.page = Page::NewConn;
+        app.form = ConnForm::default();
+        let idx = |app: &App, r: FormRow| {
+            form_rows(&app.form)
+                .iter()
+                .position(|(x, _)| *x == r)
+                .unwrap()
+        };
+        let press = |app: &mut App, code: KeyCode| {
+            form_key(app, &tx, KeyEvent::new(code, KeyModifiers::NONE));
+        };
+        // Retype `db_type` to postgres: its port follows.
+        let dbtype_row = idx(&app, FormRow::DbType);
+        app.form.field = dbtype_row;
+        press(&mut app, KeyCode::Enter);
+        for _ in 0..5 {
+            press(&mut app, KeyCode::Backspace);
+        }
+        for c in "postgres".chars() {
+            press(&mut app, KeyCode::Char(c));
+        }
+        press(&mut app, KeyCode::Enter);
+        assert_eq!(app.form.db_type, "postgres");
+        assert_eq!(app.form.port, "5432");
+        // Edit the port: it becomes the user's own value.
+        let port_row = idx(&app, FormRow::Port);
+        app.form.field = port_row;
+        press(&mut app, KeyCode::Enter);
+        for _ in 0..4 {
+            press(&mut app, KeyCode::Backspace);
+        }
+        for c in "15432".chars() {
+            press(&mut app, KeyCode::Char(c));
+        }
+        press(&mut app, KeyCode::Enter);
+        assert_eq!(app.form.port, "15432");
+        assert!(app.form.port_touched);
+        // Changing the type now must not clobber the typed port.
+        let dbtype_row = idx(&app, FormRow::DbType);
+        app.form.field = dbtype_row;
+        press(&mut app, KeyCode::Enter);
+        for _ in 0..8 {
+            press(&mut app, KeyCode::Backspace);
+        }
+        for c in "mysql".chars() {
+            press(&mut app, KeyCode::Char(c));
+        }
+        press(&mut app, KeyCode::Enter);
+        assert_eq!(app.form.db_type, "mysql");
+        assert_eq!(app.form.port, "15432");
+    }
+
+    /// R51: a blank connection name is generated as `host-db_type`.
+    #[test]
+    fn blank_name_generates_host_and_type() {
+        assert_eq!(
+            auto_conn_name("localhost", "postgres"),
+            "localhost-postgres"
+        );
+        assert_eq!(auto_conn_name(" 10.0.0.1 ", "mysql"), "10.0.0.1-mysql");
+        assert_eq!(
+            auto_conn_name("db.internal", "mongodb"),
+            "db.internal-mongodb"
+        );
     }
 
     #[test]

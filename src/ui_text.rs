@@ -213,6 +213,7 @@ pub static ALL_KEYS: &[&str] = &[
     "mongo parse: {} (例: db.col.find({{}}))",
     "mongo shell… (db={}) · Ctrl-L 切换",
     "name / host 必填",
+    "host 必填",
     "q 显示\n连接列表",
     "q 显示连接列表",
     "redis db {} · d 切换",
@@ -1073,6 +1074,15 @@ pub static ALL_KEYS: &[&str] = &[
     "无可显示的列（先打开一张表或执行查询）",
     " 列结构 · {} · {} 列 · j/k 滚动 · Esc 关 ",
     " 列结构 · j/k · Esc ",
+    // R51: connection-form defaults / history counts / grid Home-End column reset
+    "切换字段：db_type → name → host → port → user → password → database（开启 ssh_tunnel 后自动展开 SSH 段）",
+    "选定 db_type 即带出 MySQL 3306 / PG 5432 / Redis 6379 / Mongo 27017；手动改过 port 则不覆盖",
+    "保存时按 host-db_type 自动生成连接名（如 localhost-postgres）",
+    "默认端口",
+    "name 留空",
+    "首行 / 末行（列光标同时回第一列；脚本语句列表同样适用）",
+    "过滤历史：匹配语句文本 / 来源连接 / 来源标（大小写不敏感子串）",
+    "同一语句多次执行合并为一行并计数（Ctrl-↵ / p 仍直跑该条）",
 ];
 
 /// The Chinese → English table. Keys must match the source literals exactly.
@@ -1303,8 +1313,8 @@ fn en_of(zh: &'static str) -> Option<&'static str> {
         "脚本输出：语句分隔线 + 每条耗时前缀（默认关；Alt-T 已被数据搬运占用）" => {
             Some("script output: statement separator + per-statement timing prefix (off by default; Alt-T is the data-transfer wizard)")
         }
-        "首行 / 末行（脚本语句列表同样适用）" => {
-            Some("first / last row (also applies to the script statement list)")
+        "首行 / 末行（列光标同时回第一列；脚本语句列表同样适用）" => {
+            Some("first / last row (also resets the cell cursor to the first column; applies to the script statement list too)")
         }
         "复制当前语句结果为 CSV（与 Ctrl-Y 导出的首选格式一致）" => {
             Some("copy the focused statement's result as CSV (matches Ctrl-Y export's leading format)")
@@ -1684,6 +1694,7 @@ fn en_of(zh: &'static str) -> Option<&'static str> {
         "mongo parse: {} (例: db.col.find({{}}))" => Some("mongo parse: {} (e.g. db.col.find({{}}))"),
         "mongo shell… (db={}) · Ctrl-L 切换" => Some("mongo shell… (db={}) · Ctrl-L switch"),
         "name / host 必填" => Some("name / host required"),
+        "host 必填" => Some("host is required"),
         "q 显示\n连接列表" => Some("q show\nconnection list"),
         "q 显示连接列表" => Some("q show connection list"),
         "redis db {} · d 切换" => Some("redis db {} · d switch"),
@@ -2441,6 +2452,17 @@ fn en_of(zh: &'static str) -> Option<&'static str> {
         "切换字段（开启 ssh_tunnel 后自动展开 SSH 段）" => {
             Some("Move between fields (enabling ssh_tunnel expands the SSH section)")
         }
+        "切换字段：db_type → name → host → port → user → password → database（开启 ssh_tunnel 后自动展开 SSH 段）" => {
+            Some("Move between fields: db_type → name → host → port → user → password → database (enabling ssh_tunnel expands the SSH section)")
+        }
+        "选定 db_type 即带出 MySQL 3306 / PG 5432 / Redis 6379 / Mongo 27017；手动改过 port 则不覆盖" => {
+            Some("Picking db_type fills MySQL 3306 / PG 5432 / Redis 6379 / Mongo 27017; a hand-edited port is never overwritten")
+        }
+        "保存时按 host-db_type 自动生成连接名（如 localhost-postgres）" => {
+            Some("A blank name is generated on save as host-db_type (e.g. localhost-postgres)")
+        }
+        "默认端口" => Some("default port"),
+        "name 留空" => Some("blank name"),
         "编辑字段 / 切换开关 / 保存连接" => Some("Edit field / toggle switch / save connection"),
         "切换 ssh_tunnel / ssl / read_only / 登录方式" => {
             Some("Toggle ssh_tunnel / ssl / read_only / login method")
@@ -2518,6 +2540,12 @@ fn en_of(zh: &'static str) -> Option<&'static str> {
         "复制整条语句" => Some("Copy the whole statement"),
         "删除单条历史（红色确认，不影响数据库数据）" => Some("Delete one history entry (red confirmation; database data untouched)"),
         "按语句内容过滤（大小写不敏感子串）" => Some("Filter by statement text (case-insensitive substring)"),
+        "过滤历史：匹配语句文本 / 来源连接 / 来源标（大小写不敏感子串）" => {
+            Some("Filter history: matches statement text / source connection / origin badge (case-insensitive substring)")
+        }
+        "同一语句多次执行合并为一行并计数（Ctrl-↵ / p 仍直跑该条）" => {
+            Some("A repeatedly run statement merges into one row with a count (Ctrl-↵ / p still runs it directly)")
+        }
         // ── global database search (Alt-G) ──
         "全库搜索仅支持 SQL（MySQL / PostgreSQL）" => Some("Global search is SQL-only (MySQL / PostgreSQL)"),
         "全库搜索仅支持 MySQL / PostgreSQL 连接" => Some("Global search supports MySQL / PostgreSQL connections only"),
