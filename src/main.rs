@@ -49,7 +49,7 @@ use ratatui::widgets::{
     Block, Borders, Cell, Clear, List, ListItem, ListState, Paragraph, Row, Table, Wrap,
 };
 use ratatui::Frame;
-use tui_textarea::{CursorMove, TextArea};
+use tui_textarea::{CursorMove, Scrolling, TextArea};
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 use uuid::Uuid;
 
@@ -10352,6 +10352,19 @@ impl EditorViewport {
         };
     }
 
+    /// R62: a half-page scroll moves the origin by half the viewport height,
+    /// mirroring tui-textarea's `Scrolling::HalfPageDown` / `HalfPageUp`
+    /// (`height / 2`, truncating). The widget then pulls the cursor back into the
+    /// new viewport; the next render's `follow` lands the mirror on the same top.
+    fn half_page(&mut self, down: bool) {
+        let delta = self.h / 2;
+        self.row = if down {
+            self.row.saturating_add(delta)
+        } else {
+            self.row.saturating_sub(delta)
+        };
+    }
+
     /// Replay the viewport delta of the page-scroll keys that reach the widget
     /// (`PageUp` / `PageDown`, plus tui-textarea's built-in `Ctrl-V` = page down).
     fn note_key(&mut self, k: &KeyEvent) {
@@ -16102,6 +16115,40 @@ fn viewport_rows(app: &App) -> usize {
     app.rects.results.height.saturating_sub(3).max(1) as usize
 }
 
+/// R62: half a results viewport, at least one row (so even a two-row pane still
+/// moves rather than turning the motion into a no-op).
+fn half_rows(app: &App) -> usize {
+    (viewport_rows(app) / 2).max(1)
+}
+
+/// R62 half-page scroll direction.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum HalfPage {
+    Down,
+    Up,
+}
+
+/// R62: which half-page motion a `Ctrl-D` / `Ctrl-U` press means in a pane, or
+/// `None` when the pane already owns the key so the motion yields there.
+///
+/// The rule is "fire only where the key is otherwise free", so the two
+/// documented bindings win and the result is deliberately asymmetric: the
+/// results pane keeps `Ctrl-D` for delete-row and takes `Ctrl-U` for half-page
+/// up, while the editor keeps `Ctrl-U` for undo (R51 / R57 / R58) and takes
+/// `Ctrl-D` for half-page down (its forward-delete alias also lives on `Del`).
+/// Redis / Mongo value grids route through the results rule, and `Ctrl-D` there
+/// still reaches each grid's own delete. The status line is untouched.
+fn half_page_key(focus: Focus, ctrl: bool, code: KeyCode) -> Option<HalfPage> {
+    if !ctrl {
+        return None;
+    }
+    match (focus, code) {
+        (Focus::Editor, KeyCode::Char('d')) => Some(HalfPage::Down),
+        (Focus::Preview, KeyCode::Char('u')) => Some(HalfPage::Up),
+        _ => None,
+    }
+}
+
 /// One-row cursor move, flipping the page when the cursor runs off an edge so
 /// browsing is continuous (no "turn page, then hunt for the row").
 fn cursor_step(app: &mut App, tx: &Tx, dir: i32) -> bool {
@@ -16161,10 +16208,32 @@ fn move_cursor(app: &mut App, tx: &Tx, delta: i32) {
 
 /// Screen-at-a-time scroll that carries over the page boundary.
 fn screen_move(app: &mut App, tx: &Tx, dir: i32) {
+    scroll_rows(app, tx, dir, viewport_rows(app));
+}
+
+/// R62: half-page scroll in the results pane, reusing the full-page arithmetic
+/// with half a viewport as the step. The DDL view scrolls its own preview buffer
+/// (`ddl_scroll`), matching how `PageUp` / `PageDown` treat it.
+fn half_screen_move(app: &mut App, tx: &Tx, dir: i32) {
+    let step = half_rows(app);
+    if app.struct_view == StructView::Ddl && app.ddl.is_some() {
+        if dir > 0 {
+            app.ddl_scroll = app.ddl_scroll.saturating_add(step as u16);
+        } else {
+            app.ddl_scroll = app.ddl_scroll.saturating_sub(step as u16);
+        }
+        return;
+    }
+    scroll_rows(app, tx, dir, step);
+}
+
+/// Screen-at-a-time scroll that carries over the page boundary. `screen` is the
+/// row step, so the same code backs the full-page (`PageUp` / `PageDown`) and
+/// half-page (`Ctrl-D` / `Ctrl-U`) motions and both clamp / page-flip alike.
+fn scroll_rows(app: &mut App, tx: &Tx, dir: i32, screen: usize) {
     if app.struct_view == StructView::Ddl && app.ddl.is_some() {
         return;
     }
-    let screen = viewport_rows(app);
     if let Some(s) = &mut app.script {
         if s.drilled.is_none() {
             let n = s.outcomes.len();
@@ -20562,6 +20631,24 @@ fn editor_key_inner(app: &mut App, tx: &Tx, k: KeyEvent) {
         completion_key(app, k);
         return;
     }
+    // R62: half-page scroll in the editor. `Ctrl-D` is free in dbxt (its
+    // forward-delete alias also lives on the `Del` key), so it scrolls down half
+    // a screen and the widget pulls the cursor into the new viewport; `Ctrl-U`
+    // keeps its R51 undo role and yields here — see `half_page_key`.
+    if let Some(dir) = half_page_key(
+        Focus::Editor,
+        k.modifiers.contains(KeyModifiers::CONTROL),
+        k.code,
+    ) {
+        let down = dir == HalfPage::Down;
+        app.editor_vp.half_page(down);
+        app.editor.scroll(if down {
+            Scrolling::HalfPageDown
+        } else {
+            Scrolling::HalfPageUp
+        });
+        return;
+    }
     match (k.modifiers, k.code) {
         (m, KeyCode::Char('j')) if m.contains(KeyModifiers::CONTROL) => run_current(app, tx),
         // R61 Ctrl-F: find inside the editor buffer (client-side, no query).
@@ -21671,6 +21758,18 @@ fn redis_prompt_key(app: &mut App, tx: &Tx, k: KeyEvent) {
 }
 
 fn preview_key(app: &mut App, tx: &Tx, k: KeyEvent) {
+    // R62: half-page scroll in the results pane. `Ctrl-D` yields to the
+    // delete-row key, so only `Ctrl-U` fires here (see `half_page_key`). Handled
+    // before the per-grid keymaps so the SQL / Redis / Mongo grids share the one
+    // rule, and `Ctrl-D` still reaches each grid's own delete untouched.
+    if let Some(dir) = half_page_key(
+        Focus::Preview,
+        k.modifiers.contains(KeyModifiers::CONTROL),
+        k.code,
+    ) {
+        half_screen_move(app, tx, if dir == HalfPage::Down { 1 } else { -1 });
+        return;
+    }
     // A Redis value / Mongo document grid has its own keymap (edit, delete, TTL,
     // rename, JSON filter) that must not fall through to the SQL row actions.
     if app.backend_kind == Backend::Redis && app.grid_kind == GridKind::RedisValue {
@@ -39655,6 +39754,10 @@ const HELP_ROWS: &[(&str, &str)] = &[
     ("— 结果（表格浏览）—", ""),
     ("↑ ↓ / j k", "行光标（到边自动翻页）"),
     ("PgUp / PgDn", "整屏滚动，跨页衔接"),
+    (
+        "Ctrl-U",
+        "半屏向上滚动（Ctrl-D 让位给「删除当前行」；编辑器内为撤销）",
+    ),
     ("n / p", "下一页 / 上一页（可计数：5 n = 翻 5 页）"),
     ("Ctrl-F / Ctrl-B", "下一页 / 上一页"),
     (
@@ -39793,6 +39896,10 @@ const HELP_ROWS: &[(&str, &str)] = &[
     (
         "Ctrl-Z / Ctrl-U",
         "撤销（Alt-F 格式化或编辑历史；状态栏提示已撤销 / 没有可撤销的）",
+    ),
+    (
+        "Ctrl-D",
+        "半屏向下滚动（Ctrl-U 让位给撤销；Del 键仍删后一个字符）",
     ),
     (
         "Ctrl-Y / Ctrl-R",
@@ -46166,6 +46273,236 @@ mod tests {
             KeyEvent::new(KeyCode::PageUp, KeyModifiers::NONE),
         );
         assert_eq!(app.sel, 0, "PageUp at the top is a no-op");
+    }
+
+    /// R62: the half-page keys yield where the pane already owns them — the
+    /// editor keeps `Ctrl-U` for undo, the results pane keeps `Ctrl-D` for
+    /// delete-row — and the free key carries the half-page motion. The decision
+    /// is a pure function so the yield rule is pinned here.
+    #[test]
+    fn half_page_key_yields_to_documented_bindings() {
+        // Editor: Ctrl-D is free → half-page down; Ctrl-U is undo → yields.
+        assert_eq!(
+            half_page_key(Focus::Editor, true, KeyCode::Char('d')),
+            Some(HalfPage::Down)
+        );
+        assert_eq!(half_page_key(Focus::Editor, true, KeyCode::Char('u')), None);
+        // Results: Ctrl-D is delete-row → yields; Ctrl-U is free → half-page up.
+        assert_eq!(
+            half_page_key(Focus::Preview, true, KeyCode::Char('d')),
+            None
+        );
+        assert_eq!(
+            half_page_key(Focus::Preview, true, KeyCode::Char('u')),
+            Some(HalfPage::Up)
+        );
+        // Without Ctrl the letters keep their literal meaning, and the sidebar /
+        // command line never half-page.
+        assert_eq!(
+            half_page_key(Focus::Editor, false, KeyCode::Char('d')),
+            None
+        );
+        assert_eq!(
+            half_page_key(Focus::Preview, false, KeyCode::Char('u')),
+            None
+        );
+        assert_eq!(
+            half_page_key(Focus::Sidebar, true, KeyCode::Char('d')),
+            None
+        );
+        assert_eq!(
+            half_page_key(Focus::CmdInput, true, KeyCode::Char('u')),
+            None
+        );
+    }
+
+    /// R62: the half-page step is half the viewport and never zero, even when the
+    /// results pane is squeezed to nothing (`viewport_rows` floors at one).
+    #[test]
+    fn half_page_step_is_never_zero() {
+        let app = test_app();
+        assert_eq!(viewport_rows(&app), 1);
+        assert_eq!(half_rows(&app), 1, "a degenerate pane still steps one row");
+    }
+
+    /// R62: `EditorViewport::half_page` mirrors tui-textarea's `height / 2` step
+    /// (truncating an odd height) and clamps at the top of the buffer.
+    #[test]
+    fn editor_viewport_half_page_steps_and_clamps() {
+        let mut vp = EditorViewport {
+            w: 40,
+            h: 10,
+            ..Default::default()
+        };
+        vp.half_page(true);
+        assert_eq!(vp.row, 5);
+        vp.half_page(true);
+        assert_eq!(vp.row, 10);
+        vp.half_page(false);
+        assert_eq!(vp.row, 5);
+        vp.half_page(false);
+        vp.half_page(false);
+        assert_eq!(vp.row, 0, "clamps at the first line");
+        // An odd height truncates, matching `(height as i16) / 2`.
+        let mut vp = EditorViewport {
+            w: 40,
+            h: 7,
+            ..Default::default()
+        };
+        vp.half_page(true);
+        assert_eq!(vp.row, 3);
+    }
+
+    /// R62: in the editor `Ctrl-D` scrolls half a screen and the cursor follows
+    /// the new viewport; `Ctrl-U` keeps its R51 undo role and does not scroll.
+    #[test]
+    fn editor_ctrl_d_half_pages_and_ctrl_u_still_undoes() {
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel::<OpResult>();
+        let mut app = test_app();
+        app.focus = Focus::Editor;
+        let long: String = (0..200).map(|i| format!("SELECT {i};\n")).collect();
+        app.set_editor_text(&long);
+        app.editor.move_cursor(CursorMove::Jump(0, 0));
+        // Draw a frame so the widget's viewport (and the mirror) have a size.
+        draw(&mut app, 110, 30);
+        let h = app.editor_vp.h as usize;
+        assert!(h >= 2, "editor viewport should be a few rows, got {h}");
+        assert_eq!(app.editor.cursor(), (0, 0));
+        assert_eq!(app.editor_vp.row, 0);
+
+        key(
+            &mut app,
+            &tx,
+            KeyEvent::new(KeyCode::Char('d'), KeyModifiers::CONTROL),
+        );
+        assert_eq!(
+            app.editor_vp.row,
+            (h / 2) as u16,
+            "mirror steps half a page"
+        );
+        assert_eq!(
+            app.editor.cursor().0,
+            h / 2,
+            "the cursor follows the scrolled viewport"
+        );
+
+        // Ctrl-U is the documented undo, so it must NOT scroll: the viewport
+        // stays put (nothing to undo still reports a status).
+        let before = app.editor_vp.row;
+        key(
+            &mut app,
+            &tx,
+            KeyEvent::new(KeyCode::Char('u'), KeyModifiers::CONTROL),
+        );
+        assert_eq!(
+            app.editor_vp.row, before,
+            "Ctrl-U does not half-page in the editor"
+        );
+    }
+
+    /// R62: in the results grid `Ctrl-U` scrolls up half a screen (reusing the
+    /// full-page arithmetic) and clamps at the first row, while `Ctrl-D` yields to
+    /// delete-row and never scrolls.
+    #[test]
+    fn results_ctrl_u_half_pages_up_and_ctrl_d_still_deletes() {
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel::<OpResult>();
+        let mut app = test_app();
+        app.picker_open = false;
+        app.selected = Some(test_conn("mysql"));
+        app.backend_kind = Backend::Sql;
+        app.grid_kind = GridKind::Query;
+        app.set_grid(Grid {
+            columns: vec!["c".into()],
+            rows: (0..40).map(|i| vec![Val::Text(i.to_string())]).collect(),
+            note: String::new(),
+        });
+        app.focus = Focus::Preview;
+        app.sel = 20;
+        draw(&mut app, 110, 30);
+        let half = half_rows(&app);
+        assert!(half >= 1 && half < viewport_rows(&app));
+
+        key(
+            &mut app,
+            &tx,
+            KeyEvent::new(KeyCode::Char('u'), KeyModifiers::CONTROL),
+        );
+        assert_eq!(app.sel, 20 - half, "Ctrl-U moves up half a screen");
+
+        // Repeated Ctrl-U walks up to the first row and clamps there.
+        for _ in 0..6 {
+            key(
+                &mut app,
+                &tx,
+                KeyEvent::new(KeyCode::Char('u'), KeyModifiers::CONTROL),
+            );
+        }
+        assert_eq!(app.sel, 0, "Ctrl-U clamps at the first row");
+        key(
+            &mut app,
+            &tx,
+            KeyEvent::new(KeyCode::Char('u'), KeyModifiers::CONTROL),
+        );
+        assert_eq!(app.sel, 0, "Ctrl-U at the top is a no-op");
+
+        // Ctrl-D keeps its delete-row meaning (here a plain query grid, so the
+        // delete handler reports that only table browsing supports it — proving
+        // the key reached the delete path instead of scrolling).
+        app.status.clear();
+        key(
+            &mut app,
+            &tx,
+            KeyEvent::new(KeyCode::Char('d'), KeyModifiers::CONTROL),
+        );
+        assert_eq!(app.sel, 0, "Ctrl-D does not scroll");
+        assert!(
+            app.status.contains("仅表格浏览支持删除行"),
+            "Ctrl-D reached delete-row, got status {:?}",
+            app.status
+        );
+    }
+
+    /// R62 audit: the results grid header is drawn through ratatui's
+    /// `Table::header`, so it stays pinned at the top of the pane while the rows
+    /// scroll underneath (the vertical scroll slices the body rows).
+    #[test]
+    fn results_grid_header_stays_pinned_while_scrolling() {
+        let mut app = test_app();
+        app.picker_open = false;
+        app.selected = Some(test_conn("mysql"));
+        app.backend_kind = Backend::Sql;
+        app.grid_kind = GridKind::Query;
+        app.set_grid(Grid {
+            columns: vec!["alpha".into(), "beta".into()],
+            rows: (0..60)
+                .map(|i| vec![Val::Text(format!("row{i}")), Val::Text(format!("v{i}"))])
+                .collect(),
+            note: String::new(),
+        });
+        app.focus = Focus::Preview;
+        app.sel = 0;
+        let top = draw(&mut app, 110, 30);
+        assert!(
+            top.iter().any(|l| l.contains("alpha")),
+            "header visible at the top:\n{}",
+            top.join("\n")
+        );
+
+        // Scroll well past the first screen: the header stays, the first row goes.
+        app.sel = 55;
+        let scrolled = draw(&mut app, 110, 30);
+        assert!(
+            scrolled
+                .iter()
+                .any(|l| l.contains("alpha") && l.contains("beta")),
+            "header stays pinned after scrolling:\n{}",
+            scrolled.join("\n")
+        );
+        assert!(
+            !scrolled.iter().any(|l| l.contains("row0")),
+            "the first data row scrolled out:\n{}",
+            scrolled.join("\n")
+        );
     }
 
     /// tui-textarea's readline bindings must survive `browse_key`'s routing:
