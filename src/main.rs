@@ -5165,7 +5165,7 @@ enum Op {
     Ddl(Box<ConnectionConfig>, String, String, String),
     TableData(Box<TableDataReq>),
     TableColumns(Box<ConnectionConfig>, String, String, String),
-    Query(Box<ConnectionConfig>, String, String, usize),
+    Query(Box<ConnectionConfig>, String, String, usize, &'static str),
     Redis(Box<ConnectionConfig>, u32, String),
     /// Paginated `SCAN` of the key browser.
     RedisScan {
@@ -5248,6 +5248,15 @@ enum Op {
         id: String,
     },
     Mongo(Box<ConnectionConfig>, String, String),
+    /// Lazily fetch one database's aggregate size (and, for the current
+    /// database, its per-table row estimates) on an explicit `s` (R45). Never
+    /// runs on startup or automatically.
+    DbSize {
+        cfg: Box<ConnectionConfig>,
+        db: String,
+        schema: String,
+        gen: u64,
+    },
     History(Box<ConnectionConfig>),
     /// Load the query-history panel: recent entries (newest first, unique SQL)
     /// plus the SQL texts already saved as favourites, in one round trip.
@@ -5265,6 +5274,9 @@ enum Op {
     SaveSnippet(Box<ConnectionConfig>, String, String),
     DatabasesRefresh(Box<ConnectionConfig>),
     AddConn(Box<ConnectionConfig>),
+    /// Copy a saved connection under a fresh id / `-copy` name (tree `Y`), so a
+    /// test / prod twin does not have to be re-entered by hand (R45).
+    CopyConn(Box<ConnectionConfig>),
     /// Replace an existing saved connection (id is preserved). The kernel has no
     /// UPDATE, so the op removes then re-adds the same id.
     UpdateConn(Box<ConnectionConfig>),
@@ -5400,6 +5412,14 @@ enum OpResult {
         error: Option<String>,
         gen: u64,
     },
+    /// One database's lazily fetched size info (R45). `error` keeps the tree
+    /// usable when the engine denies the metadata query.
+    DbSize {
+        db: String,
+        info: Box<DbSizeInfo>,
+        error: Option<String>,
+        gen: u64,
+    },
     /// A table list plus the request id it answers, so a slow reply for a
     /// database / schema the user already left cannot overwrite the current one.
     TablesFor {
@@ -5512,6 +5532,9 @@ enum OpResult {
     SnippetSaved(String),
     DatabasesRefresh(Vec<String>),
     Added(String),
+    /// A connection copy (`Y` in the tree) finished; the saved twin is merged
+    /// into the picker and the tree without leaving the browse view (R45).
+    ConnCopied(Box<ConnectionConfig>),
     /// A batch connection import finished: the saved configs (so the picker can
     /// be refreshed without a round trip) plus the duplicate-skip count, the
     /// “password missing” count and any per-connection errors.
@@ -5625,10 +5648,11 @@ async fn record_history(
     cfg: &ConnectionConfig,
     db: &str,
     sql: &str,
-    success: bool,
     error: Option<String>,
     elapsed_ms: u64,
+    origin: &str,
 ) {
+    let success = error.is_none();
     let entry = dbx_core::history::HistoryEntry {
         id: Uuid::new_v4().to_string(),
         connection_id: cfg.id.clone(),
@@ -5644,7 +5668,9 @@ async fn record_history(
         target: String::new(),
         affected_rows: None,
         rollback_sql: None,
-        details_json: None,
+        // dbxt stamps its own run origin here (`editor` / `script` / `direct`)
+        // so the Alt-H panel can show where a statement came from (R45).
+        details_json: Some(serde_json::json!({ "dbxt_origin": origin }).to_string()),
         // dbxt is a local TUI client, not the MCP server: mark the entry as a
         // plain SQL run so it shares the desktop/CLI retention bucket.
         source: "sql".to_string(),
@@ -6029,6 +6055,74 @@ async fn run_op(backend: &LocalBackend, op: Op, tx: &Tx) -> OpResult {
                 }
             }
         }
+        Op::DbSize {
+            cfg,
+            db,
+            schema,
+            gen,
+        } => {
+            let dt = cfg.db_type.as_str();
+            if is_mysql_family(dt) {
+                match backend
+                    .execute_query(&cfg, &db, &mysql_db_size_sql(&db), None, Some(30))
+                    .await
+                {
+                    Ok(r) => OpResult::DbSize {
+                        db,
+                        info: Box::new(parse_db_size_info(&r.rows)),
+                        error: None,
+                        gen,
+                    },
+                    Err(e) => OpResult::DbSize {
+                        db,
+                        info: Box::default(),
+                        error: Some(e.to_string()),
+                        gen,
+                    },
+                }
+            } else if is_postgres_family(dt) {
+                let mut info = DbSizeInfo::default();
+                let mut error: Option<String> = None;
+                match backend
+                    .execute_query(&cfg, &db, &pg_db_size_sql(&db), None, Some(30))
+                    .await
+                {
+                    Ok(r) => {
+                        info.total_bytes =
+                            r.rows.first().and_then(|row| row.first()).and_then(json_u64);
+                    }
+                    Err(e) => error = Some(e.to_string()),
+                }
+                match backend
+                    .execute_query(&cfg, &db, &pg_table_size_sql(&schema), None, Some(30))
+                    .await
+                {
+                    Ok(r) => {
+                        let t = parse_db_size_info(&r.rows);
+                        info.rows = t.rows;
+                        info.sizes = t.sizes;
+                    }
+                    Err(e) => {
+                        if error.is_none() {
+                            error = Some(e.to_string());
+                        }
+                    }
+                }
+                OpResult::DbSize {
+                    db,
+                    info: Box::new(info),
+                    error,
+                    gen,
+                }
+            } else {
+                OpResult::DbSize {
+                    db,
+                    info: Box::default(),
+                    error: Some(t("该引擎不支持尺寸查询").into()),
+                    gen,
+                }
+            }
+        }
         Op::ListSchemas(cfg, db) => {
             // `list_schemas_core` is the kernel's schema enumerator; it hides
             // system schemas unless the connection opts in (`show_system_schemas`).
@@ -6199,7 +6293,7 @@ async fn run_op(backend: &LocalBackend, op: Op, tx: &Tx) -> OpResult {
                 Err(e) => OpResult::Error(format!("table columns: {e}")),
             }
         }
-        Op::Query(cfg, db, sql, cap) => {
+        Op::Query(cfg, db, sql, cap, origin) => {
             let cap = cap.max(1);
             // Record only a fresh run, never a `Ctrl-N` load-more (which re-runs
             // the same statement with a higher cap and would duplicate it).
@@ -6214,21 +6308,32 @@ async fn run_op(backend: &LocalBackend, op: Op, tx: &Tx) -> OpResult {
                 match backend.execute_batch(&cfg, &db, None, &sql, options).await {
                     Ok(results) => {
                         let mut outcomes: Vec<StmtOutcome> = Vec::new();
+                        let mut total_ms: u64 = 0;
                         for (idx, r) in results.into_iter().enumerate() {
                             let text = statements
                                 .get(idx)
                                 .cloned()
                                 .unwrap_or_else(|| format!("-- statement {}",  idx + 1));
+                            total_ms = total_ms.saturating_add(r.result.execution_time_ms as u64);
                             outcomes.push(stmt_outcome(text, r));
                         }
                         if record {
-                            record_history(backend, &cfg, &db, &sql, true, None, 0).await;
+                            record_history(backend, &cfg, &db, &sql, None, total_ms, origin).await;
                         }
                         OpResult::Script(outcomes)
                     }
                     Err(e) => {
                         if record {
-                            record_history(backend, &cfg, &db, &sql, false, Some(e.clone()), 0).await;
+                            record_history(
+                                backend,
+                                &cfg,
+                                &db,
+                                &sql,
+                                Some(e.clone()),
+                                0,
+                                origin,
+                            )
+                            .await;
                         }
                         OpResult::Error(format!("script: {e}"))
                     }
@@ -6245,9 +6350,9 @@ async fn run_op(backend: &LocalBackend, op: Op, tx: &Tx) -> OpResult {
                                 &cfg,
                                 &db,
                                 &sql,
-                                true,
                                 None,
                                 r.execution_time_ms as u64,
+                                origin,
                             )
                             .await;
                         }
@@ -6255,7 +6360,16 @@ async fn run_op(backend: &LocalBackend, op: Op, tx: &Tx) -> OpResult {
                     }
                     Err(e) => {
                         if record {
-                            record_history(backend, &cfg, &db, &sql, false, Some(e.clone()), 0).await;
+                            record_history(
+                                backend,
+                                &cfg,
+                                &db,
+                                &sql,
+                                Some(e.clone()),
+                                0,
+                                origin,
+                            )
+                            .await;
                         }
                         OpResult::Error(format!("query: {e}"))
                     }
@@ -6599,6 +6713,12 @@ async fn run_op(backend: &LocalBackend, op: Op, tx: &Tx) -> OpResult {
                             executed_at: e.executed_at,
                             connection_name: e.connection_name,
                             success: e.success,
+                            duration_ms: if e.execution_time_ms > 0 {
+                                e.execution_time_ms as u64
+                            } else {
+                                0
+                            },
+                            origin: history_origin_from_details(e.details_json.as_deref()),
                         });
                         if rows.len() >= 300 {
                             break;
@@ -6766,6 +6886,10 @@ async fn run_op(backend: &LocalBackend, op: Op, tx: &Tx) -> OpResult {
             Ok(true) => OpResult::ConnDeleted { id, name },
             Ok(false) => OpResult::Error(tf("连接不存在: {}", &[&name])),
             Err(e) => OpResult::Error(format!("delete: {e}")),
+        },
+        Op::CopyConn(cfg) => match backend.add_connection_for_mcp(*cfg).await {
+            Ok(saved) => OpResult::ConnCopied(Box::new(saved)),
+            Err(e) => OpResult::Error(format!("copy: {e}")),
         },
         Op::ImportConns { items, skipped, needs_password } => {
             let mut saved: Vec<ConnectionConfig> = Vec::new();
@@ -8811,6 +8935,32 @@ struct HistoryRow {
     connection_name: String,
     /// Whether the statement succeeded, shown as a subtle marker.
     success: bool,
+    /// Execution time in milliseconds, when dbxt recorded one (> 0). Desktop /
+    /// CLI entries and multi-statement scripts may carry 0, which means
+    /// "unknown" and is not shown (R45).
+    duration_ms: u64,
+    /// Where dbxt ran it from: `editor` / `script` / `direct`. Empty for
+    /// entries another client wrote (no origin to show).
+    origin: String,
+}
+
+/// Short badge for a [`HistoryRow::origin`] value, or `None` when unknown.
+fn history_origin_badge(origin: &str) -> Option<&'static str> {
+    match origin {
+        "editor" => Some(t("编")),
+        "script" => Some(t("脚")),
+        "direct" => Some(t("直")),
+        _ => None,
+    }
+}
+
+/// `12` → `12ms`, `1234` → `1.2s`. Kept small so the panel stays narrow (R45).
+fn history_duration_label(ms: u64) -> String {
+    if ms < 1000 {
+        format!("{ms}ms")
+    } else {
+        format!("{:.1}s", ms as f64 / 1000.0)
+    }
 }
 
 /// The red confirmation for deleting a single history entry. Deleting the
@@ -8884,6 +9034,128 @@ enum SideRow {
 enum TreeDbState {
     Loading,
     Error(String),
+}
+
+/// One database's lazily fetched size metadata (R45). Fetched only when the
+/// user presses `s` on a database row, then cached for the session. `rows` and
+/// `sizes` are keyed by lowercased table name (the engines differ in case).
+#[derive(Clone, Default, Debug, PartialEq)]
+struct DbSizeInfo {
+    /// `SUM(data_length + index_length)` (MySQL) or `pg_database_size` (PG).
+    total_bytes: Option<u64>,
+    /// Per-table row estimate (`information_schema.tables.table_rows` on MySQL,
+    /// `pg_class.reltuples` on PG). Empty when the engine has no such metadata.
+    rows: HashMap<String, u64>,
+    /// Per-table on-disk bytes, when the metadata exposes it.
+    sizes: HashMap<String, u64>,
+}
+
+/// Parse the raw JSON cells of one metadata query into a `u64`, tolerating the
+/// numeric shape drivers report (`number` or a numeric `string`).
+fn json_u64(v: &serde_json::Value) -> Option<u64> {
+    match v {
+        serde_json::Value::Number(n) => n.as_u64().or_else(|| n.as_f64().map(|f| f.max(0.0) as u64)),
+        serde_json::Value::String(s) => s.trim().parse::<f64>().ok().map(|f| f.max(0.0) as u64),
+        _ => None,
+    }
+}
+
+/// Build a [`DbSizeInfo`] from `(name, row_estimate, bytes)` rows (MySQL shape:
+/// `data_length + index_length`). The total is the sum of the per-table bytes.
+fn parse_db_size_info(rows: &[Vec<serde_json::Value>]) -> DbSizeInfo {
+    let mut info = DbSizeInfo::default();
+    let mut total: u64 = 0;
+    for row in rows {
+        let name = row.first().and_then(|v| v.as_str()).unwrap_or_default();
+        if name.is_empty() {
+            continue;
+        }
+        let key = name.to_lowercase();
+        if let Some(r) = row.get(1).and_then(json_u64) {
+            info.rows.insert(key.clone(), r);
+        }
+        if let Some(b) = row.get(2).and_then(json_u64) {
+            info.sizes.insert(key, b);
+            total = total.saturating_add(b);
+        }
+    }
+    if !info.sizes.is_empty() {
+        info.total_bytes = Some(total);
+    }
+    info
+}
+
+/// `2.1 GB` / `512 MB` / `0 B` — human-readable byte size for the sidebar (R45).
+fn human_bytes(n: u64) -> String {
+    const UNITS: [&str; 5] = ["B", "KB", "MB", "GB", "TB"];
+    let mut v = n as f64;
+    let mut unit = 0usize;
+    while v >= 1024.0 && unit + 1 < UNITS.len() {
+        v /= 1024.0;
+        unit += 1;
+    }
+    if unit == 0 {
+        format!("{} {}", n, UNITS[0])
+    } else {
+        format!("{:.1} {}", v, UNITS[unit])
+    }
+}
+
+/// `12` / `1.2k` / `3.4M` — a compact row-count estimate for the sidebar (R45).
+fn human_count(n: u64) -> String {
+    if n < 1_000 {
+        n.to_string()
+    } else if n < 1_000_000 {
+        format!("{:.1}k", n as f64 / 1_000.0)
+    } else if n < 1_000_000_000 {
+        format!("{:.1}M", n as f64 / 1_000_000.0)
+    } else {
+        format!("{:.1}B", n as f64 / 1_000_000_000.0)
+    }
+}
+
+/// Parse dbxt's run-origin stamp out of a history entry's `details_json`.
+fn history_origin_from_details(details: Option<&str>) -> String {
+    details
+        .and_then(|j| serde_json::from_str::<serde_json::Value>(j).ok())
+        .and_then(|v| {
+            v.get("dbxt_origin")
+                .and_then(|o| o.as_str())
+                .map(str::to_string)
+        })
+        .unwrap_or_default()
+}
+
+/// MySQL: one cheap metadata scan returns both the per-table row estimate and
+/// the on-disk bytes (the caller sums the latter into the database total).
+fn mysql_db_size_sql(db: &str) -> String {
+    format!(
+        "SELECT table_name, table_rows, \
+         COALESCE(data_length, 0) + COALESCE(index_length, 0) \
+         FROM information_schema.tables WHERE table_schema = '{}'",
+        db.replace('\'', "''")
+    )
+}
+
+/// PostgreSQL: the whole-database on-disk size.
+fn pg_db_size_sql(db: &str) -> String {
+    format!("SELECT pg_database_size('{}')", db.replace('\'', "''"))
+}
+
+/// PostgreSQL: per-relation row estimate (`reltuples`) and total size. An empty
+/// `schema` falls back to the connection's visible schema.
+fn pg_table_size_sql(schema: &str) -> String {
+    let ns = if schema.trim().is_empty() {
+        "n.nspname = current_schema()".to_string()
+    } else {
+        format!("n.nspname = '{}'", schema.replace('\'', "''"))
+    };
+    format!(
+        "SELECT c.relname, c.reltuples::bigint, pg_total_relation_size(c.oid) \
+         FROM pg_catalog.pg_class c \
+         JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace \
+         WHERE c.relkind IN ('r', 'p') AND {ns}"
+    )
 }
 
 struct App {
@@ -8964,6 +9236,13 @@ struct App {
     /// Last `table_list` selection mirrored into `side_sel`; a change means an
     /// external caller moved the table cursor, so the tree follows it.
     side_table_seen: Option<usize>,
+    /// Session cache of lazily fetched database sizes (R45), keyed by database
+    /// name on the *active* connection. Populated only by an explicit `s`.
+    db_sizes: std::collections::HashMap<String, DbSizeInfo>,
+    /// Per-database state of that lazy fetch (`None` = idle / loaded).
+    db_size_state: std::collections::HashMap<String, TreeDbState>,
+    /// Monotonic request id per database, so a stale reply is dropped.
+    db_size_gen: std::collections::HashMap<String, u64>,
 
     /// Client-side substring filter over the loaded Redis keys (R42 one-step
     /// type-to-filter, mirrors the sidebar table filter). `redis_scan.keys` is
@@ -9010,6 +9289,12 @@ struct App {
     history_view: Vec<usize>,
     /// The red layer for deleting one history entry.
     history_confirm: Option<HistoryConfirm>,
+    /// Where the next [`execute_sql`] came from, so a run that goes through the
+    /// danger-confirm layer still records its origin (R45).
+    pending_run_origin: &'static str,
+    /// The in-flight query was started by `Ctrl-Enter` in the history panel;
+    /// the result status names it a direct run plus its elapsed time (R45).
+    direct_run: bool,
 
     // results
     grid: Option<Grid>,
@@ -9668,6 +9953,9 @@ impl App {
             tree_dbs: std::collections::HashMap::new(),
             tree_db_state: std::collections::HashMap::new(),
             tree_gen: std::collections::HashMap::new(),
+            db_sizes: std::collections::HashMap::new(),
+            db_size_state: std::collections::HashMap::new(),
+            db_size_gen: std::collections::HashMap::new(),
             side_rows: Vec::new(),
             side_sel: 0,
             side_table_seen: None,
@@ -9692,6 +9980,8 @@ impl App {
             history_filter: None,
             history_view: Vec::new(),
             history_confirm: None,
+            pending_run_origin: "editor",
+            direct_run: false,
             grid: None,
             grid_kind: GridKind::Query,
             page_state: None,
@@ -10177,6 +10467,37 @@ fn apply_op_result(app: &mut App, res: OpResult, tx: &Tx) {
             }
             rebuild_side_rows(app);
         }
+        OpResult::DbSize {
+            db,
+            info,
+            error,
+            gen,
+        } => {
+            // Only the newest request for this database may land.
+            if app.db_size_gen.get(&db).copied() != Some(gen) {
+                return;
+            }
+            match error {
+                Some(msg) => {
+                    app.db_size_state.insert(db.clone(), TreeDbState::Error(msg.clone()));
+                    app.status = tf("✗ {} 尺寸查询失败: {}", &[&db, &msg]);
+                }
+                None => {
+                    let total = info.total_bytes;
+                    let tables = info.rows.len();
+                    app.db_sizes.insert(db.clone(), *info);
+                    app.db_size_state.remove(&db);
+                    rebuild_side_rows(app);
+                    app.status = match total {
+                        Some(b) => tf(
+                            "✓ {} 尺寸 {} · {} 张表行数估计（会话缓存，s 重查）",
+                            &[&db, &human_bytes(b), &tables],
+                        ),
+                        None => tf("✓ {} 尺寸已获取", &[&db]),
+                    };
+                }
+            }
+        }
         OpResult::Schemas { db, schemas, warning } => {
             // A reply for a database the user already left must not resurrect a
             // stale schema list.
@@ -10421,6 +10742,9 @@ fn apply_op_result(app: &mut App, res: OpResult, tx: &Tx) {
             }
         }
         OpResult::Query(r, sql, cap) => {
+            // A `Ctrl-Enter` history direct run lands with a distinct status that
+            // names its elapsed time (R45).
+            let direct = std::mem::take(&mut app.direct_run);
             // Remember the SQL so `y` can guess a table name for a query result.
             app.last_sql = Some(sql.clone());
             // A fresh run starts a new result, so drop any previous row search
@@ -10459,7 +10783,14 @@ fn apply_op_result(app: &mut App, res: OpResult, tx: &Tx) {
             let note = note_of(&r);
             let truncated = r.truncated;
             let grid = Grid::from_query(r.columns.clone(), &r.rows, note.clone());
-            app.status = format!("{} · {} · {}",  app.selected_name(),  grid.rows.len(),  note);
+            app.status = if direct {
+                tf(
+                    "直跑历史 · {} · {} 行 · {}",
+                    &[&app.selected_name(), &(grid.rows.len()), &note],
+                )
+            } else {
+                format!("{} · {} · {}",  app.selected_name(),  grid.rows.len(),  note)
+            };
             // Keep every query result as a tab so consecutive SELECTs can be flipped
             // with `[` / `]` instead of overwriting each other. A `Ctrl-N` "load more"
             // (a cap above the default) replaces the active tab instead of spawning
@@ -10478,6 +10809,9 @@ fn apply_op_result(app: &mut App, res: OpResult, tx: &Tx) {
         }
         OpResult::Script(outcomes) => {
             app.count_cache.clear();
+            // A `Ctrl-Enter` history direct run lands with a distinct status that
+            // names its total elapsed time (R45).
+            let direct = std::mem::take(&mut app.direct_run);
             // A script result replaces any grid on screen; a result-row search
             // (which only applies to a data grid) must not leak into it.
             app.result_needle.clear();
@@ -10485,6 +10819,7 @@ fn apply_op_result(app: &mut App, res: OpResult, tx: &Tx) {
             let n = outcomes.len();
             let errors = outcomes.iter().filter(|o| o.error.is_some()).count();
             let affected: u64 = outcomes.iter().map(|o| o.affected).sum();
+            let total_ms: u64 = outcomes.iter().map(|o| o.ms as u64).sum();
             let was_batch = app.pending_write;
             app.pending_write = false;
             app.query_more = None;
@@ -10503,6 +10838,11 @@ fn apply_op_result(app: &mut App, res: OpResult, tx: &Tx) {
                 } else {
                     tf("✗ 批量提交失败 · {} 错误 · 影响 {} 行（事务可能已回滚）· Enter 看详情", &[&(errors), &(affected)])
                 };
+            } else if direct {
+                app.status = tf(
+                    "直跑历史 · {} 条语句 · 影响 {} 行 · {} 错误 · {}",
+                    &[&(n), &(affected), &(errors), &history_duration_label(total_ms)],
+                );
             } else {
                 app.status =
                     tf("脚本 · {} 条语句 · 影响 {} 行 · {} 错误 · Enter 看结果", &[&(n), &(affected), &(errors)]);
@@ -10770,7 +11110,7 @@ fn apply_op_result(app: &mut App, res: OpResult, tx: &Tx) {
                 app.status = if n == 0 {
                     t("没有查询历史（执行一条 SQL 后再按 Alt-H）").into()
                 } else {
-                    tf("查询历史 · {} 条 · Enter 回填 · f 收藏 · Del 删除 · y 复制 · / 搜索", &[&n])
+                    tf("查询历史 · {} 条 · Enter 回填 · Ctrl-↵ 直跑 · f 收藏 · Del 删除 · y 复制 · / 搜索", &[&n])
                 };
             }
         }
@@ -10790,12 +11130,17 @@ fn apply_op_result(app: &mut App, res: OpResult, tx: &Tx) {
         } => {
             if let Some(e) = error {
                 app.status = tf("✗ 收藏操作失败: {}", &[&e]);
-            } else if favorited {
-                app.history_favorites.insert(sql);
-                app.status = t("✓ 已收藏该条 SQL（DBX saved_sql_files）").into();
             } else {
-                app.history_favorites.remove(&sql);
-                app.status = t("已取消收藏").into();
+                if favorited {
+                    app.history_favorites.insert(sql.clone());
+                    app.status = t("✓ 已收藏该条 SQL（DBX saved_sql_files）").into();
+                } else {
+                    app.history_favorites.remove(&sql);
+                    app.status = t("已取消收藏").into();
+                }
+                // The entry just moved between the 收藏 / 时间序 sections;
+                // keep the cursor on it (R45).
+                recompute_history_view_keep(app, &sql);
             }
         }
         OpResult::Snippets(items) => {
@@ -10847,6 +11192,27 @@ fn apply_op_result(app: &mut App, res: OpResult, tx: &Tx) {
             app.picker_open = true;
             app.loading = true;
             app.spawn(tx, Op::ListConnections);
+        }
+        OpResult::ConnCopied(cfg) => {
+            // Merge the twin in place (like an import) so the browse view and
+            // its tree stay put; the new root shows immediately and can be
+            // expanded with `l` / `→` (R45).
+            let name = cfg.name.clone();
+            let id = cfg.id.clone();
+            match app.connections.iter().position(|c| c.id == id) {
+                Some(i) => app.connections[i] = *cfg,
+                None => app.connections.push(*cfg),
+            }
+            sort_connection_list(&mut app.connections, app.conn_sort);
+            rebuild_side_rows(app);
+            if let Some(pos) = app.side_rows.iter().position(|r| {
+                matches!(r, SideRow::Conn { idx }
+                    if side_root_cfg(app, *idx).is_some_and(|c| c.id == id))
+            }) {
+                app.side_sel = pos;
+                side_mirror_table(app);
+            }
+            app.status = tf("✓ 已复制连接 {} · 树中新根 · l/→ 展开", &[&name]);
         }
         OpResult::ConnsImported { saved, skipped, needs_password, failed } => {
             // Merge the saved configs in place (an overwrite keeps the same id,
@@ -11228,6 +11594,7 @@ fn apply_op_result(app: &mut App, res: OpResult, tx: &Tx) {
             // v0.6.27+ secret-store failures get a human hint (key missing /
             // migration pending); every other error passes through unchanged.
             let e = humanize_backend_error(&e);
+            app.direct_run = false;
             app.import_progress = None;
             app.page_pending = false;
             app.pending_sel = None;
@@ -11694,7 +12061,7 @@ fn confirm_key(app: &mut App, tx: &Tx, k: KeyEvent) {
                 if c.refresh {
                     app.pending_write = true;
                 }
-                execute_sql(app, tx, c.sql);
+                execute_sql(app, tx, c.sql, app.pending_run_origin);
             }
         }
         KeyCode::Esc | KeyCode::Char('n') | KeyCode::Char('N') => {
@@ -12936,10 +13303,20 @@ fn sidebar_key(app: &mut App, tx: &Tx, k: KeyEvent) {
         }
         // Duplicate the current connection into the form (new id on save).
         KeyCode::Char('p') => duplicate_connection(app),
+        // `Y` — copy the connection under the cursor as `xxx-copy` (password +
+        // SSH tunnel included) and show the new root immediately (R45).
+        KeyCode::Char('Y') => copy_connection_at_cursor(app, tx),
         KeyCode::Char('o') => back_to_picker(app),
         KeyCode::Char('r') => load_structure(app, tx),
-        // `s` — cycle the sidebar order: name → type (TABLE/VIEW).
-        KeyCode::Char('s') => app.cycle_table_sort(),
+        // `s` — on a database row: lazily fetch that database's size (R45).
+        // Everywhere else: cycle the sidebar order (name → type TABLE/VIEW).
+        KeyCode::Char('s') => {
+            if matches!(app.side_rows.get(app.side_sel), Some(SideRow::Db { .. })) {
+                request_db_size(app, tx);
+            } else {
+                app.cycle_table_sort();
+            }
+        }
         // `;` / `,` repeat the last Alt+letter jump forward / backward.
         KeyCode::Char(';') => {
             repeat_table_jump(app, 1);
@@ -15487,6 +15864,45 @@ fn expand_conn(app: &mut App, tx: &Tx, idx: usize) {
     app.tree_db_state.insert(id.clone(), TreeDbState::Loading);
     rebuild_side_rows(app);
     app.spawn(tx, Op::TreeDatabases(Box::new(c), gen));
+}
+
+/// `s` on a database row: lazily fetch that database's aggregate size and
+/// per-table row estimates, cached for the session (R45). This is the *only*
+/// trigger — nothing scans sizes on startup or automatically.
+fn request_db_size(app: &mut App, tx: &Tx) {
+    let Some(SideRow::Db { idx, db }) = app.side_rows.get(app.side_sel).cloned() else {
+        app.status = t("把光标移到库行上再按 s 查尺寸").into();
+        return;
+    };
+    if !side_is_active(app, idx) {
+        app.status = t("先切换到该连接再查尺寸").into();
+        return;
+    }
+    if matches!(app.db_size_state.get(&db), Some(TreeDbState::Loading)) {
+        app.status = tf("正在查询 {} 尺寸…", &[&db]);
+        return;
+    }
+    let Some(cfg) = app.selected.clone() else {
+        app.status = t("✗ 未选择连接").into();
+        return;
+    };
+    let gen = {
+        let g = app.db_size_gen.entry(db.clone()).or_insert(0);
+        *g = g.wrapping_add(1);
+        *g
+    };
+    app.db_size_state.insert(db.clone(), TreeDbState::Loading);
+    rebuild_side_rows(app);
+    app.status = tf("查询 {} 尺寸…（只读元数据，不扫表）", &[&db]);
+    app.spawn(
+        tx,
+        Op::DbSize {
+            cfg: Box::new(cfg),
+            db,
+            schema: app.schema.clone(),
+            gen,
+        },
+    );
 }
 
 /// Switch to the connection at `idx` and land on `db` once its database list
@@ -18094,16 +18510,25 @@ fn open_history(app: &mut App, tx: &Tx) {
 }
 
 /// Rebuild the filtered view (`history_view`) from the needle, keeping the
-/// cursor on a valid row.
+/// cursor on a valid row. Favourites come first (the panel's “收藏” section),
+/// then the rest in time order (R45).
 fn recompute_history_view(app: &mut App) {
     let needle = app.history_needle.trim().to_lowercase();
-    app.history_view = app
-        .history_rows
-        .iter()
-        .enumerate()
-        .filter(|(_, r)| needle.is_empty() || r.sql.to_lowercase().contains(&needle))
-        .map(|(i, _)| i)
-        .collect();
+    let matches = |r: &HistoryRow| needle.is_empty() || r.sql.to_lowercase().contains(&needle);
+    let mut favs: Vec<usize> = Vec::new();
+    let mut rest: Vec<usize> = Vec::new();
+    for (i, r) in app.history_rows.iter().enumerate() {
+        if !matches(r) {
+            continue;
+        }
+        if app.history_favorites.contains(&r.sql) {
+            favs.push(i);
+        } else {
+            rest.push(i);
+        }
+    }
+    favs.extend(rest);
+    app.history_view = favs;
     let n = app.history_view.len();
     if n == 0 {
         app.history_list.select(None);
@@ -18111,6 +18536,32 @@ fn recompute_history_view(app: &mut App) {
         let sel = app.history_list.selected().unwrap_or(0).min(n - 1);
         app.history_list.select(Some(sel));
     }
+}
+
+/// Recompute the view after a favourite toggle, keeping the cursor on the same
+/// statement even though it just moved between sections (R45).
+fn recompute_history_view_keep(app: &mut App, sql: &str) {
+    recompute_history_view(app);
+    if let Some(pos) = app
+        .history_view
+        .iter()
+        .position(|&ri| app.history_rows.get(ri).is_some_and(|r| r.sql == sql))
+    {
+        app.history_list.select(Some(pos));
+    }
+}
+
+/// How many leading entries of the view are favourites: the panel draws a
+/// “收藏” header before them and a “时间序” header before the rest.
+fn history_fav_count(app: &App) -> usize {
+    app.history_view
+        .iter()
+        .take_while(|&&ri| {
+            app.history_rows
+                .get(ri)
+                .is_some_and(|r| app.history_favorites.contains(&r.sql))
+        })
+        .count()
 }
 
 /// The row under the panel cursor.
@@ -18157,6 +18608,14 @@ fn history_key(app: &mut App, tx: &Tx, k: KeyEvent) {
     // The `/` input is modal on top of the panel.
     if app.history_filter.is_some() {
         history_filter_key(app, k);
+        return;
+    }
+    // Ctrl-Enter / p: run the selected statement directly (R45), bypassing the
+    // editor. Enter keeps its recall-into-editor behaviour below.
+    if (k.code == KeyCode::Enter && k.modifiers.contains(KeyModifiers::CONTROL))
+        || (k.modifiers.is_empty() && k.code == KeyCode::Char('p'))
+    {
+        history_run_selected(app, tx);
         return;
     }
     let n = app.history_view.len();
@@ -18252,6 +18711,50 @@ fn history_key(app: &mut App, tx: &Tx, k: KeyEvent) {
         }
         _ => {}
     }
+}
+
+/// `Ctrl-Enter` / `p` in the history panel: run the selected statement straight
+/// through the normal query pipeline (multi-statement included), closing the
+/// panel so the result lands in the results pane (R45).
+fn history_run_selected(app: &mut App, tx: &Tx) {
+    let Some(row) = history_selected_row(app) else {
+        app.status = t("没有可执行的历史").into();
+        return;
+    };
+    let sql = row.sql.clone();
+    let Some(cfg) = app.selected.clone() else {
+        app.status = t("✗ 未选择连接").into();
+        return;
+    };
+    app.history_open = false;
+    app.history_filter = None;
+    // The same per-statement danger check the editor uses, so a re-run of a
+    // DELETE / DROP still stops at the red confirmation layer.
+    let statements = dbx_core::sql::split_sql_statements_for_database(&sql, cfg.db_type);
+    let mut reasons: Vec<String> = Vec::new();
+    for st in &statements {
+        if let Some(r) = detect_danger(st) {
+            if !reasons.contains(&r) {
+                reasons.push(r);
+            }
+        }
+    }
+    if !reasons.is_empty() {
+        app.pending_run_origin = "direct";
+        app.confirm = Some(Confirm {
+            sql,
+            reasons,
+            refresh: false,
+            clear_batch: false,
+            conn: None,
+            redis: None,
+            mongo: None,
+        });
+        app.status = t("危险语句确认 · Enter 执行 · Esc 取消").into();
+        return;
+    }
+    app.status = t("直跑历史语句…").into();
+    execute_sql(app, tx, sql, "direct");
 }
 
 fn history_filter_key(app: &mut App, k: KeyEvent) {
@@ -20081,6 +20584,7 @@ fn file_load_plan_key(app: &mut App, tx: &Tx, k: KeyEvent) {
                 return;
             };
             if !plan.danger.is_empty() {
+                app.pending_run_origin = "script";
                 app.confirm = Some(Confirm {
                     sql: plan.sql,
                     reasons: plan.danger,
@@ -20099,7 +20603,7 @@ fn file_load_plan_key(app: &mut App, tx: &Tx, k: KeyEvent) {
                 "执行 {} · {} 条语句…",
                 &[&(plan.path.display()), &n],
             );
-            execute_sql(app, tx, plan.sql);
+            execute_sql(app, tx, plan.sql, "script");
         }
         KeyCode::Esc => {
             app.file_load_plan = None;
@@ -22021,6 +22525,7 @@ fn submit_edit_sql(app: &mut App, tx: &Tx, sql: String) {
         reason = Some(t("WHERE 恒真（1 = 1），会作用于整张表").into());
     }
     if let Some(reason) = reason {
+        app.pending_run_origin = "editor";
         app.confirm = Some(Confirm {
             sql,
             reasons: vec![reason],
@@ -22034,7 +22539,7 @@ fn submit_edit_sql(app: &mut App, tx: &Tx, sql: String) {
     }
     app.push_history(&sql);
     app.pending_write = true;
-    execute_sql(app, tx, sql);
+    execute_sql(app, tx, sql, "editor");
 }
 
 /// Ctrl-S — package every queued edit into one transaction and ask for
@@ -22311,6 +22816,7 @@ fn run_sql(app: &mut App, tx: &Tx, scope: RunScope) {
         }
     }
     if !reasons.is_empty() {
+        app.pending_run_origin = "editor";
         app.confirm = Some(Confirm {
             sql,
             reasons,
@@ -22323,20 +22829,23 @@ fn run_sql(app: &mut App, tx: &Tx, scope: RunScope) {
         return;
     }
     app.push_history(&sql);
-    execute_sql(app, tx, sql);
+    execute_sql(app, tx, sql, "editor");
 }
 
-fn execute_sql(app: &mut App, tx: &Tx, sql: String) {
+fn execute_sql(app: &mut App, tx: &Tx, sql: String, origin: &'static str) {
     let Some(cfg) = app.selected.clone() else {
         app.status = t("✗ 未选择连接").into();
         return;
     };
     app.loading = true;
+    // A history direct run gets a distinct landing status that names its elapsed
+    // time once the result arrives (R45).
+    app.direct_run = origin == "direct";
     app.status = t("执行中…").into();
     let db = app.current_db();
     app.spawn(
         tx,
-        Op::Query(Box::new(cfg), db, sql, QUERY_MAX_ROWS),
+        Op::Query(Box::new(cfg), db, sql, QUERY_MAX_ROWS, origin),
     );
 }
 
@@ -22358,7 +22867,7 @@ fn load_more_rows(app: &mut App, tx: &Tx) {
     app.loading = true;
     app.status = tf("加载更多… (上限 {} 行)", &[&(next)]);
     let db = app.current_db();
-    app.spawn(tx, Op::Query(Box::new(cfg), db, sql, next));
+    app.spawn(tx, Op::Query(Box::new(cfg), db, sql, next, "editor"));
 }
 
 fn run_cmd_line(app: &mut App, tx: &Tx) {
@@ -24168,7 +24677,7 @@ fn explain_current(app: &mut App, tx: &Tx) {
             let db = app.current_db();
             app.spawn(
                 tx,
-                Op::Query(Box::new(cfg), db, explain, QUERY_MAX_ROWS),
+                Op::Query(Box::new(cfg), db, explain, QUERY_MAX_ROWS, "editor"),
             );
         }
         None => {
@@ -25740,6 +26249,44 @@ fn duplicate_connection(app: &mut App) {
     app.status = tf("复制连接 {} · 改参数后 Enter 保存", &[&(cfg.name)]);
 }
 
+/// A fresh, unique `xxx-copy` name for a duplicated connection (R45):
+/// `prod` → `prod-copy`, and `prod-copy-2`, `prod-copy-3` when taken.
+fn copy_connection_name(base: &str, existing: &[String]) -> String {
+    let first = format!("{base}-copy");
+    if !existing.iter().any(|n| n == &first) {
+        return first;
+    }
+    let mut i = 2u32;
+    loop {
+        let cand = format!("{base}-copy-{i}");
+        if !existing.iter().any(|n| n == &cand) {
+            return cand;
+        }
+        i += 1;
+    }
+}
+
+/// `Y` in the sidebar tree: copy the connection under the cursor in one step
+/// (no form), keeping its password and SSH tunnel, and show the new root as soon
+/// as the save lands. Built for test / prod twins that differ only by host (R45).
+fn copy_connection_at_cursor(app: &mut App, tx: &Tx) {
+    let Some(SideRow::Conn { idx }) = app.side_rows.get(app.side_sel).cloned() else {
+        app.status = t("把光标移到连接行上再按 Y 复制").into();
+        return;
+    };
+    let Some(cfg) = side_root_cfg(app, idx).cloned() else {
+        return;
+    };
+    let existing: Vec<String> = app.connections.iter().map(|c| c.name.clone()).collect();
+    let name = copy_connection_name(&cfg.name, &existing);
+    let original = cfg.name.clone();
+    let mut copy = cfg;
+    copy.id = Uuid::new_v4().to_string();
+    copy.name = name.clone();
+    app.status = tf("复制连接 {} → {}…", &[&original, &name]);
+    app.spawn(tx, Op::CopyConn(Box::new(copy)));
+}
+
 /// `e` in the connection picker: open the selected connection in the form
 /// (including its SSH tunnel section) and update it in place on save.
 fn edit_connection(app: &mut App) {
@@ -26519,6 +27066,7 @@ fn footer_hints_ctx(ctx: FooterCtx) -> Vec<Hint> {
         FooterView::History => vec![
             ("↑↓", t("选择")),
             ("Enter", t("回填编辑器")),
+            ("Ctrl-↵", t("直跑")),
             ("f", t("收藏")),
             ("y", t("复制语句")),
             ("Del", t("删除")),
@@ -28307,7 +28855,47 @@ fn side_row_line(
             }
         }
     }
+    // R45 size column: right-aligned + muted. It only appears when the terminal
+    // is wide enough (<56 hides it so the table name keeps the width).
+    if let Some(size) = side_row_size(app, row) {
+        let full_w = (area_w as usize).saturating_sub(2);
+        let used: usize = spans.iter().map(|s| disp_width(&s.content)).sum();
+        let size_w = disp_width(&size);
+        let pad = full_w.saturating_sub(used + size_w);
+        if pad > 0 {
+            spans.push(Span::styled(" ".repeat(pad), mk(Style::default())));
+        }
+        spans.push(Span::styled(size, mk(Style::default().fg(Color::DarkGray))));
+    }
     Line::from(spans)
+}
+
+/// The right-aligned size cell for a database (`2.1 GB`) or table (`1.2k` row
+/// estimate) row, or `None` when there is nothing (or no room) to show (R45).
+fn side_row_size(app: &App, row: &SideRow) -> Option<String> {
+    // Width first: a narrow screen gives every cell to the name.
+    if app.term_w < 56 {
+        return None;
+    }
+    match row {
+        SideRow::Db { db, .. } => match app.db_size_state.get(db) {
+            Some(TreeDbState::Loading) => Some("…".to_string()),
+            Some(TreeDbState::Error(_)) => Some("✗".to_string()),
+            None => app
+                .db_sizes
+                .get(db)
+                .and_then(|i| i.total_bytes)
+                .map(human_bytes),
+        },
+        SideRow::Table { table, .. } => {
+            let name = app.tables.get(*table)?.name.to_lowercase();
+            app.db_sizes
+                .get(&app.current_db())
+                .and_then(|i| i.rows.get(&name))
+                .map(|n| human_count(*n))
+        }
+        _ => None,
+    }
 }
 
 /// Single-letter type badge shown next to a key in the sidebar.
@@ -29033,6 +29621,83 @@ fn render_recent_tables(f: &mut Frame, area: Rect, app: &mut App) {
     f.render_stateful_widget(list, box_area, &mut app.recent_list);
 }
 
+/// One non-selectable section header inside the history panel (R45).
+fn history_section_header(text: &str, color: Color) -> ListItem<'static> {
+    ListItem::new(Line::from(Span::styled(
+        text.to_string(),
+        Style::default().fg(color).add_modifier(Modifier::BOLD),
+    )))
+}
+
+/// One history list row: time · ★ · summary · duration · origin · source. On a
+/// narrow panel the time shrinks to `HH:MM` and the duration / origin / source
+/// columns drop out entirely so the statement summary keeps a usable width
+/// (R41 / R45).
+fn history_list_item(app: &App, ri: usize, list_w: usize) -> ListItem<'static> {
+    let Some(r) = app.history_rows.get(ri) else {
+        return ListItem::new(Line::from(""));
+    };
+    let fav = app.history_favorites.contains(&r.sql);
+    let time = if list_w >= 44 {
+        history_time_label(&r.executed_at)
+    } else {
+        history_time_label_short(&r.executed_at)
+    };
+    let duration = if list_w >= 40 && r.duration_ms > 0 {
+        history_duration_label(r.duration_ms)
+    } else {
+        String::new()
+    };
+    let origin = if list_w >= 52 {
+        history_origin_badge(&r.origin).unwrap_or("").to_string()
+    } else {
+        String::new()
+    };
+    let src = if list_w >= 56 {
+        truncate_disp(&r.connection_name, 18)
+    } else {
+        String::new()
+    };
+    let reserved = disp_width(&time)
+        + 4
+        + disp_width(&src)
+        + 2
+        + disp_width(&duration)
+        + disp_width(&origin);
+    let summary = truncate_disp(
+        &history_summary(&r.sql),
+        list_w.saturating_sub(reserved).max(8),
+    );
+    let sum_style = if r.success {
+        Style::default().add_modifier(Modifier::BOLD)
+    } else {
+        Style::default().fg(Color::Red)
+    };
+    let mut spans = vec![
+        Span::styled(time, Style::default().fg(Color::DarkGray)),
+        Span::raw(" "),
+        Span::styled(if fav { "★" } else { " " }, Style::default().fg(Color::Yellow)),
+        Span::raw(" "),
+        Span::styled(summary, sum_style),
+    ];
+    if !duration.is_empty() {
+        spans.push(Span::styled(
+            format!("  {duration}"),
+            Style::default().fg(Color::DarkGray),
+        ));
+    }
+    if !origin.is_empty() {
+        spans.push(Span::styled(
+            format!(" {origin}"),
+            Style::default().fg(Color::Magenta),
+        ));
+    }
+    if !src.is_empty() {
+        spans.push(Span::styled(format!("  {src}"), Style::default().fg(Color::Cyan)));
+    }
+    ListItem::new(Line::from(spans))
+}
+
 /// The query-history overlay (`Alt-H`): a list of recent statements on top and a
 /// wrapped preview of the focused statement below. The `/` filter input takes
 /// the bottom slot while it is being typed.
@@ -29054,10 +29719,10 @@ fn render_history_panel(f: &mut Frame, area: Rect, app: &mut App) {
     let title = if app.history_needle.trim().is_empty() {
         fit_title(
             &tf(
-                " 查询历史 · {} 条 · Enter 回填 · f 收藏 · Del 删除 · y 复制 · / 搜索 · Esc 关 ",
+                " 查询历史 · {} 条 · Enter 回填 · Ctrl-↵ 直跑 · f 收藏 · Del 删除 · y 复制 · / 搜索 · Esc 关 ",
                 &[&total],
             ),
-            t(" 查询历史 · Enter 回填 · Esc "),
+            t(" 查询历史 · Enter 回填 · Ctrl-↵ 直跑 · Esc "),
             box_area.width,
         )
     } else {
@@ -29082,60 +29747,53 @@ fn render_history_panel(f: &mut Frame, area: Rect, app: &mut App) {
     }
 
     let list_w = inner.width as usize;
-    let items: Vec<ListItem> = if app.history_view.is_empty() {
-        vec![ListItem::new(Line::from(Span::styled(
+    let fav_count = history_fav_count(app);
+    let mut items: Vec<ListItem> = Vec::new();
+    // View index → display index (the section headers occupy slots too).
+    let mut display_of: Vec<usize> = Vec::with_capacity(app.history_view.len());
+    if app.history_view.is_empty() {
+        items.push(ListItem::new(Line::from(Span::styled(
             t("（没有匹配的历史记录）"),
             Style::default().fg(Color::DarkGray),
-        )))]
+        ))));
     } else {
-        app.history_view
-            .iter()
-            .map(|&ri| {
-                let r = &app.history_rows[ri];
-                let fav = app.history_favorites.contains(&r.sql);
-                // On a very narrow panel the time shrinks to `HH:MM` and the
-                // source connection is dropped entirely so the statement summary
-                // keeps a usable width (R41).
-                let time = if list_w >= 44 {
-                    history_time_label(&r.executed_at)
-                } else {
-                    history_time_label_short(&r.executed_at)
-                };
-                let src = if list_w >= 56 {
-                    truncate_disp(&r.connection_name, 18)
-                } else {
-                    String::new()
-                };
-                let reserved = disp_width(&time) + 4 + disp_width(&src) + 2;
-                let summary = truncate_disp(&history_summary(&r.sql), list_w.saturating_sub(reserved).max(8));
-                let sum_style = if r.success {
-                    Style::default().add_modifier(Modifier::BOLD)
-                } else {
-                    Style::default().fg(Color::Red)
-                };
-                let mut spans = vec![
-                    Span::styled(time, Style::default().fg(Color::DarkGray)),
-                    Span::raw(" "),
-                    Span::styled(if fav { "★" } else { " " }, Style::default().fg(Color::Yellow)),
-                    Span::raw(" "),
-                    Span::styled(summary, sum_style),
-                ];
-                if !src.is_empty() {
-                    spans.push(Span::styled(format!("  {src}"), Style::default().fg(Color::Cyan)));
-                }
-                ListItem::new(Line::from(spans))
-            })
-            .collect()
-    };
+        // Favourites get their own section pinned above the chronological list
+        // (R45); `f` moves an entry between the two.
+        if fav_count > 0 {
+            items.push(history_section_header(
+                &tf("★ 收藏 · {}", &[&fav_count]),
+                Color::Yellow,
+            ));
+        }
+        for (vi, &ri) in app.history_view.iter().enumerate() {
+            if vi == fav_count && fav_count < app.history_view.len() {
+                items.push(history_section_header(
+                    &tf("─ 时间序 · {}", &[&(app.history_view.len() - fav_count)]),
+                    Color::DarkGray,
+                ));
+            }
+            display_of.push(items.len());
+            items.push(history_list_item(app, ri, list_w));
+        }
+    }
     let list = List::new(items).highlight_style(
         Style::default()
             .bg(Color::DarkGray)
             .add_modifier(Modifier::BOLD),
     );
+    // Section headers are not selectable: map the cursor onto its display slot
+    // and let the list scroll the selection into view (a fresh state each frame
+    // is fine; `List` re-derives its offset from the selection).
+    let mut list_state = ListState::default();
+    if let Some(sel) = app.history_list.selected() {
+        if let Some(&d) = display_of.get(sel) {
+            list_state.select(Some(d));
+        }
+    }
 
     // Too short to split: show the list alone rather than squeezing three panes.
     if inner.height < 6 {
-        f.render_stateful_widget(list, inner, &mut app.history_list);
+        f.render_stateful_widget(list, inner, &mut list_state);
         return;
     }
 
@@ -29150,7 +29808,7 @@ fn render_history_panel(f: &mut Frame, area: Rect, app: &mut App) {
         Constraint::Length(filter_h),
     ])
     .split(inner);
-    f.render_stateful_widget(list, chunks[0], &mut app.history_list);
+    f.render_stateful_widget(list, chunks[0], &mut list_state);
     f.render_widget(
         Paragraph::new(Line::from(Span::styled(
             "─".repeat(chunks[2].width as usize),
@@ -31630,6 +32288,9 @@ const HELP_ROWS: &[(&str, &str)] = &[
     ("a-z / /", "过滤：命中表名 / 库名，父节点保留（Enter 打开首个命中，Esc 清除）"),
     ("Ctrl-U / Alt-⌫", "清除表过滤（过滤提示框内）"),
     ("s", "表排序：名称 / 类型（TABLE / VIEW）"),
+    ("s（库行）", "惰性查询该库聚合大小 + 各表行数估计（information_schema，不扫表；会话缓存）"),
+    ("Y", "复制连接（新名字 xxx-copy，含密码 / SSH 隧道，树中新根）"),
+    ("尺寸列", "库大小 / 表行数估计右对齐；终端 <56 列自动隐藏"),
     ("Alt+a-z · ; ,", "首字母跳：跳到以该字母开头的下一张表；; , 前后循环（与过滤互斥）"),
     ("t", "最近表浮层（Enter 直达）"),
     ("r", "表结构（字段 + DDL）"),
@@ -31784,6 +32445,7 @@ const HELP_ROWS: &[(&str, &str)] = &[
     ("— 查询历史（Alt-H）—", ""),
     ("↑ ↓ / PgUp PgDn", "移动光标（列表即过滤视图）"),
     ("Enter", "回填到编辑器（关面板，光标到末尾）"),
+    ("Ctrl-↵ / p", "直跑选中语句（不经编辑器，结果直接进结果区）"),
     ("f", "收藏 / 取消收藏该条（同一 DBX saved_sql_files 存储）"),
     ("y", "复制整条语句"),
     ("Del", "删除单条历史（红色确认，不影响数据库数据）"),
@@ -33810,6 +34472,8 @@ mod tests {
                             executed_at: "2026-06-27T12:34:56Z".into(),
                             connection_name: "prod-mysql".into(),
                             success: i % 5 != 0,
+                            duration_ms: if i % 3 == 0 { 12 } else { 0 },
+                            origin: if i % 2 == 0 { "editor".into() } else { String::new() },
                         })
                         .collect();
                     a.history_view = (0..a.history_rows.len()).collect();
@@ -33826,6 +34490,8 @@ mod tests {
                         executed_at: "2026-06-27T12:34:56Z".into(),
                         connection_name: "prod".into(),
                         success: true,
+                        duration_ms: 0,
+                        origin: String::new(),
                     }];
                     a.history_view = vec![0];
                     a.history_list.select(Some(0));
@@ -36157,6 +36823,8 @@ mod tests {
             executed_at: "2026-06-27T12:34:56Z".into(),
             connection_name: "prod".into(),
             success: true,
+            duration_ms: 0,
+            origin: String::new(),
         }
     }
 
@@ -36258,6 +36926,215 @@ mod tests {
         assert!(!app.history_favorites.contains("SELECT 2"));
     }
 
+    #[tokio::test(flavor = "multi_thread")]
+    async fn history_direct_run_bypasses_the_editor() {
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel::<OpResult>();
+        let mut app = test_app();
+        app.selected = Some(test_conn("mysql"));
+        app.backend_kind = Backend::Sql;
+        app.history_rows = vec![history_row("1", "SELECT 42")];
+        app.history_view = vec![0];
+        app.history_list.select(Some(0));
+        app.history_open = true;
+        app.editor.insert_str("SELECT untouched");
+        history_key(
+            &mut app,
+            &tx,
+            KeyEvent::new(KeyCode::Enter, KeyModifiers::CONTROL),
+        );
+        assert!(!app.history_open, "the panel closes on a direct run");
+        assert!(app.direct_run, "the run is marked as a direct run");
+        assert_eq!(
+            app.editor_sql(),
+            "SELECT untouched",
+            "a direct run must not touch the editor"
+        );
+    }
+
+    #[test]
+    fn history_direct_run_danger_stops_at_confirm() {
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel::<OpResult>();
+        let mut app = test_app();
+        app.selected = Some(test_conn("mysql"));
+        app.backend_kind = Backend::Sql;
+        app.history_rows = vec![history_row("1", "DELETE FROM users")];
+        app.history_view = vec![0];
+        app.history_list.select(Some(0));
+        app.history_open = true;
+        history_key(
+            &mut app,
+            &tx,
+            KeyEvent::new(KeyCode::Char('p'), KeyModifiers::NONE),
+        );
+        assert!(app.confirm.is_some(), "a DELETE still needs the red confirm");
+        assert_eq!(app.pending_run_origin, "direct");
+        assert!(!app.history_open);
+    }
+
+    #[test]
+    fn history_favorites_sort_to_the_top_and_toggle_moves() {
+        let mut app = test_app();
+        app.history_rows = vec![
+            history_row("1", "SELECT 1"),
+            history_row("2", "SELECT 2"),
+            history_row("3", "SELECT 3"),
+        ];
+        app.history_favorites.insert("SELECT 3".into());
+        recompute_history_view(&mut app);
+        assert_eq!(app.history_view, vec![2, 0, 1], "favorite first, then time order");
+        assert_eq!(history_fav_count(&app), 1);
+        // Toggling SELECT 1 into favorites moves it under the favorites header,
+        // and the cursor follows it.
+        app.history_favorites.insert("SELECT 1".into());
+        recompute_history_view_keep(&mut app, "SELECT 1");
+        assert_eq!(app.history_view, vec![0, 2, 1], "favorites stay in time order");
+        assert_eq!(history_fav_count(&app), 2);
+        assert_eq!(app.history_list.selected(), Some(0));
+        // Un-favoriting drops it back to the chronological section.
+        app.history_favorites.remove("SELECT 3");
+        recompute_history_view_keep(&mut app, "SELECT 3");
+        assert_eq!(app.history_view, vec![0, 1, 2]);
+        assert_eq!(history_fav_count(&app), 1);
+    }
+
+    #[test]
+    fn size_and_row_labels_are_human_readable() {
+        assert_eq!(human_bytes(0), "0 B");
+        assert_eq!(human_bytes(512), "512 B");
+        assert_eq!(human_bytes(1024), "1.0 KB");
+        assert_eq!(human_bytes(2 * 1024 * 1024 * 1024 + 100 * 1024 * 1024), "2.1 GB");
+        assert_eq!(human_count(12), "12");
+        assert_eq!(human_count(1200), "1.2k");
+        assert_eq!(human_count(3_400_000), "3.4M");
+    }
+
+    #[test]
+    fn parse_db_size_info_sums_bytes_and_keeps_rows() {
+        let rows = vec![
+            vec![
+                serde_json::json!("users"),
+                serde_json::json!(10),
+                serde_json::json!(1024),
+            ],
+            vec![
+                serde_json::json!("orders"),
+                serde_json::json!("250"),
+                serde_json::json!("2048"),
+            ],
+        ];
+        let info = parse_db_size_info(&rows);
+        assert_eq!(info.total_bytes, Some(3072));
+        assert_eq!(info.rows.get("users"), Some(&10));
+        assert_eq!(info.rows.get("orders"), Some(&250));
+        assert_eq!(info.sizes.get("users"), Some(&1024));
+    }
+
+    #[test]
+    fn connection_copy_name_is_unique() {
+        assert_eq!(copy_connection_name("prod", &[]), "prod-copy");
+        assert_eq!(
+            copy_connection_name("prod", &["prod".to_string()]),
+            "prod-copy"
+        );
+        assert_eq!(
+            copy_connection_name("prod", &["prod".to_string(), "prod-copy".to_string()]),
+            "prod-copy-2"
+        );
+        assert_eq!(
+            copy_connection_name(
+                "prod",
+                &["prod-copy".to_string(), "prod-copy-2".to_string()]
+            ),
+            "prod-copy-3"
+        );
+    }
+
+    #[test]
+    fn history_origin_and_duration_labels() {
+        assert_eq!(
+            history_origin_from_details(Some("{\"dbxt_origin\":\"direct\"}")),
+            "direct"
+        );
+        assert_eq!(history_origin_from_details(Some("not json")), "");
+        assert_eq!(history_origin_from_details(None), "");
+        assert_eq!(history_duration_label(12), "12ms");
+        assert_eq!(history_duration_label(1234), "1.2s");
+    }
+
+    #[test]
+    fn tree_size_column_respects_narrow_and_wide() {
+        let mut app = test_app();
+        app.selected = Some(test_conn("mysql"));
+        app.backend_kind = Backend::Sql;
+        app.databases = vec!["shop".into()];
+        app.db_index = 0;
+        app.tables = vec![TableInfo {
+            name: "orders".into(),
+            table_type: "TABLE".into(),
+            valid: None,
+            comment: None,
+            parent_schema: None,
+            parent_name: None,
+        }];
+        let info = DbSizeInfo {
+            total_bytes: Some(2 * 1024 * 1024 * 1024 + 100 * 1024 * 1024),
+            rows: std::collections::HashMap::from([("orders".to_string(), 1200)]),
+            sizes: std::collections::HashMap::new(),
+        };
+        app.db_sizes.insert("shop".into(), info);
+        let db_row = SideRow::Db {
+            idx: 0,
+            db: "shop".into(),
+        };
+        let table_row = SideRow::Table {
+            idx: 0,
+            table: 0,
+            depth: 2,
+        };
+        app.term_w = 42;
+        assert_eq!(side_row_size(&app, &db_row), None, "hidden below 56 columns");
+        assert_eq!(side_row_size(&app, &table_row), None);
+        app.term_w = 80;
+        assert_eq!(side_row_size(&app, &db_row), Some("2.1 GB".into()));
+        assert_eq!(side_row_size(&app, &table_row), Some("1.2k".into()));
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn sidebar_s_on_db_row_requests_size_else_sorts() {
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel::<OpResult>();
+        let mut app = test_app();
+        app.selected = Some(test_conn("mysql"));
+        app.backend_kind = Backend::Sql;
+        app.connections = vec![app.selected.clone().unwrap()];
+        app.databases = vec!["shop".into()];
+        app.db_index = 0;
+        app.focus = Focus::Sidebar;
+        rebuild_side_rows(&mut app);
+        app.side_sel = app
+            .side_rows
+            .iter()
+            .position(|r| matches!(r, SideRow::Db { .. }))
+            .expect("a database row is visible");
+        sidebar_key(
+            &mut app,
+            &tx,
+            KeyEvent::new(KeyCode::Char('s'), KeyModifiers::NONE),
+        );
+        assert!(matches!(
+            app.db_size_state.get("shop"),
+            Some(TreeDbState::Loading)
+        ));
+        // On a connection row, `s` keeps its old job: cycle the table sort.
+        app.side_sel = 0;
+        let before = app.table_sort;
+        sidebar_key(
+            &mut app,
+            &tx,
+            KeyEvent::new(KeyCode::Char('s'), KeyModifiers::NONE),
+        );
+        assert_ne!(app.table_sort, before);
+    }
+
     #[test]
     fn watchdog_tiers_are_bounded() {
         // Metadata / Redis / Mongo calls must never spin forever...
@@ -36281,6 +37158,7 @@ mod tests {
             "db".into(),
             "SELECT 1".into(),
             QUERY_MAX_ROWS,
+            "editor",
         );
         assert_eq!(q.watchdog(), OP_WATCHDOG_SQL);
         assert!(OP_WATCHDOG_FALLBACK < OP_WATCHDOG_SQL);
@@ -36444,14 +37322,16 @@ mod tests {
     fn help_has_no_bare_uppercase_shortcuts() {
         // Regression guard for the R8 keymap: every shortcut must be lowercase,
         // a named key, or a Ctrl/Alt/Shift/F-key combination — never a lone
-        // uppercase letter the user has to reach with Shift. `I` (CSV import)
-        // and `G` (vim's go-to-bottom, R42) are the two deliberate exceptions.
+        // uppercase letter the user has to reach with Shift. `I` (CSV import),
+        // `G` (vim's go-to-bottom, R42) and `Y` (copy connection, R45, which
+        // mirrors the vim-ish uppercase twin of the picker's `p`) are the three
+        // deliberate exceptions.
         for (key, _) in HELP_ROWS {
             if key.starts_with('—') {
                 continue;
             }
             for tok in key.split(['/', ' ', '+']).filter(|t| !t.is_empty()) {
-                if tok == "I" || tok == "G" {
+                if tok == "I" || tok == "G" || tok == "Y" {
                     continue;
                 }
                 assert!(

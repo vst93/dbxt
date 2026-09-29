@@ -945,6 +945,37 @@ pub static ALL_KEYS: &[&str] = &[
     "复制整条语句",
     "删除单条历史（红色确认，不影响数据库数据）",
     "按语句内容过滤（大小写不敏感子串）",
+    "直跑",
+    "编",
+    "脚",
+    "直",
+    "查询历史 · {} 条 · Enter 回填 · Ctrl-↵ 直跑 · f 收藏 · Del 删除 · y 复制 · / 搜索",
+    " 查询历史 · {} 条 · Enter 回填 · Ctrl-↵ 直跑 · f 收藏 · Del 删除 · y 复制 · / 搜索 · Esc 关 ",
+    " 查询历史 · Enter 回填 · Ctrl-↵ 直跑 · Esc ",
+    "★ 收藏 · {}",
+    "─ 时间序 · {}",
+    "没有可执行的历史",
+    "直跑历史语句…",
+    "直跑历史 · {} · {} 行 · {}",
+    "直跑历史 · {} 条语句 · 影响 {} 行 · {} 错误 · {}",
+    "直跑选中语句（不经编辑器，结果直接进结果区）",
+    "✓ 已复制连接 {} · 树中新根 · l/→ 展开",
+    "复制连接 {} → {}…",
+    "把光标移到连接行上再按 Y 复制",
+    "复制连接（新名字 xxx-copy，含密码 / SSH 隧道，树中新根）",
+    "惰性查询该库聚合大小 + 各表行数估计（information_schema，不扫表；会话缓存）",
+    "库大小 / 表行数估计右对齐；终端 <56 列自动隐藏",
+    "s（库行）",
+    "尺寸列",
+    "✓ {} 尺寸 {} · {} 张表行数估计（会话缓存，s 重查）",
+    "✓ {} 尺寸已获取",
+    "✗ {} 尺寸查询失败: {}",
+    "该引擎不支持尺寸查询",
+    "查询 {} 尺寸…",
+    "查询 {} 尺寸…（只读元数据，不扫表）",
+    "正在查询 {} 尺寸…",
+    "把光标移到库行上再按 s 查尺寸",
+    "先切换到该连接再查尺寸",
     "数据对比需要主键：两表都没有主键，无法按行对齐",
     "数据对比需要主键：源表没有主键，无法按行对齐",
     "数据对比需要主键：目标表没有主键，无法按行对齐",
@@ -2656,6 +2687,66 @@ fn en_of(zh: &'static str) -> Option<&'static str> {
         "行首 / 行尾（Home / End 同）" => Some("line head / tail (Home / End too)"),
         "删至行尾（kill line）" => Some("kill to end of line"),
         "删前一个词" => Some("delete previous word"),
+        // ── R45: history direct run, favorites section, tree sizes, conn copy ──
+        "编" => Some("E"),
+        "脚" => Some("S"),
+        "直" => Some("D"),
+        "直跑" => Some("run"),
+        "查询历史 · {} 条 · Enter 回填 · Ctrl-↵ 直跑 · f 收藏 · Del 删除 · y 复制 · / 搜索" => {
+            Some("Query history · {} · Enter recall · Ctrl-↵ run · f favorite · Del delete · y copy · / search")
+        }
+        " 查询历史 · {} 条 · Enter 回填 · Ctrl-↵ 直跑 · f 收藏 · Del 删除 · y 复制 · / 搜索 · Esc 关 " => {
+            Some(" Query history · {} · Enter recall · Ctrl-↵ run · f favorite · Del delete · y copy · / search · Esc close ")
+        }
+        " 查询历史 · Enter 回填 · Ctrl-↵ 直跑 · Esc " => {
+            Some(" Query history · Enter recall · Ctrl-↵ run · Esc ")
+        }
+        "★ 收藏 · {}" => Some("★ Favorites · {}"),
+        "─ 时间序 · {}" => Some("─ Chronological · {}"),
+        "没有可执行的历史" => Some("no history to run"),
+        "直跑历史语句…" => Some("Running the history statement…"),
+        "直跑历史 · {} · {} 行 · {}" => Some("Direct run · {} · {} rows · {}"),
+        "直跑历史 · {} 条语句 · 影响 {} 行 · {} 错误 · {}" => {
+            Some("Direct run · {} statements · {} rows affected · {} errors · {}")
+        }
+        "✓ 已复制连接 {} · 树中新根 · l/→ 展开" => {
+            Some("✓ copied connection {} · new root in the tree · l/→ to expand")
+        }
+        "复制连接 {} → {}…" => Some("Copying connection {} → {}…"),
+        "把光标移到连接行上再按 Y 复制" => {
+            Some("move the cursor to a connection row, then press Y to copy")
+        }
+        "✓ {} 尺寸 {} · {} 张表行数估计（会话缓存，s 重查）" => {
+            Some("✓ {} size {} · row estimates for {} tables (session cache; s re-queries)")
+        }
+        "✓ {} 尺寸已获取" => Some("✓ {} size fetched"),
+        "✗ {} 尺寸查询失败: {}" => Some("✗ {} size query failed: {}"),
+        "该引擎不支持尺寸查询" => Some("this engine does not support size queries"),
+        "查询 {} 尺寸…" => Some("Querying {} size…"),
+        "查询 {} 尺寸…（只读元数据，不扫表）" => {
+            Some("Querying {} size… (read-only metadata, no table scan)")
+        }
+        "正在查询 {} 尺寸…" => Some("Querying {} size…"),
+        "把光标移到库行上再按 s 查尺寸" => {
+            Some("move the cursor to a database row, then press s for its size")
+        }
+        "先切换到该连接再查尺寸" => {
+            Some("switch to that connection before querying its size")
+        }
+        "直跑选中语句（不经编辑器，结果直接进结果区）" => {
+            Some("run the selected statement directly (skips the editor; result lands in the results pane)")
+        }
+        "惰性查询该库聚合大小 + 各表行数估计（information_schema，不扫表；会话缓存）" => {
+            Some("lazily query that database's aggregate size + per-table row estimates (information_schema, no table scan; session cache)")
+        }
+        "复制连接（新名字 xxx-copy，含密码 / SSH 隧道，树中新根）" => {
+            Some("copy a connection (new name xxx-copy, password / SSH tunnel included, new root in the tree)")
+        }
+        "库大小 / 表行数估计右对齐；终端 <56 列自动隐藏" => {
+            Some("database size / table row estimate, right-aligned; auto-hidden below 56 columns")
+        }
+        "s（库行）" => Some("s (db row)"),
+        "尺寸列" => Some("size column"),
         _ => None,
     }
 }
