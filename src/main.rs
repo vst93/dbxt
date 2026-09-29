@@ -286,6 +286,12 @@ fn cycle_focus(app: &mut App, forward: bool) {
         None => 0,
     };
     app.focus = order[next];
+    // R57: the results row selection belongs to the results pane; leaving it
+    // ends row-select mode so a stray `d` in the sidebar is not mistaken for the
+    // batch-DELETE gesture.
+    if app.focus != Focus::Preview {
+        app.row_sel_anchor = None;
+    }
 }
 
 /// Which kind of content the results pane currently shows.
@@ -3409,6 +3415,17 @@ fn redis_ttl_label(ttl: i64) -> String {
     }
 }
 
+/// R57: advance a locally-displayed Redis TTL by `secs` for the key browser's
+/// countdown. `-1` (persistent) and `-2` (missing) stay put; a positive TTL
+/// floors at `0` so the badge can never read a negative countdown.
+fn redis_ttl_advance(ttl: i64, secs: i64) -> i64 {
+    if ttl <= 0 {
+        ttl
+    } else {
+        (ttl - secs.max(0)).max(0)
+    }
+}
+
 /// How many keys one batch command may carry. A multi-key `DEL` with thousands
 /// of arguments risks a huge line and a slow single round trip, so the batch is
 /// split into chunks of this size (also the per-batch safety ceiling).
@@ -4093,6 +4110,10 @@ struct RedisConfirm {
     typed_confirm: Option<usize>,
     /// Human summary used by the typed confirmation prompt.
     summary: String,
+    /// R57: raw keys to drop from the loaded key browser in place after a
+    /// successful single-key delete, so the SCAN cursor and loaded pages stay
+    /// put (a full rescan would jump the list back to the first page).
+    remove_in_place: Vec<String>,
 }
 
 /// A pending MongoDB document write shown in the red confirmation layer.
@@ -10794,7 +10815,11 @@ struct App {
     grid_kind: GridKind,
     page_state: Option<PageState>,
     script: Option<ScriptView>,
-    sel: usize,        // cursor row inside the current page / result set
+    sel: usize, // cursor row inside the current page / result set
+    /// R57: row-selection anchor for the results grid (`V`). `None` = not in
+    /// row-select mode; otherwise `min(anchor, sel)..=max(anchor, sel)` is the
+    /// highlighted block (anchor == sel is a single row).
+    row_sel_anchor: Option<usize>,
     col_offset: usize, // leftmost column of the scrollable window
     col_cursor: usize, // focused column (cell cursor)
     /// R47b: while `Instant::now() < deadline` the horizontal scroll bar is
@@ -11106,6 +11131,9 @@ struct App {
     redis_anchor: Option<usize>,
     /// A batch confirm awaiting its typed re-confirmation.
     redis_pending_batch: Option<RedisConfirm>,
+    /// R57: wall clock of the last local TTL countdown step for the loaded key
+    /// browser, so the `…s` badge refreshes without a server round-trip.
+    redis_ttl_clock: Instant,
     // ── MongoDB document browser ──
     mongo_page: usize,
     mongo_filter: String,
@@ -11672,6 +11700,7 @@ impl App {
             grid_epoch: 0,
             width_cache: None,
             col_width_mem: ColWidthMemory::default(),
+            row_sel_anchor: None,
             confirm: None,
             loading: true,
             // The initial `ListConnections` below is the one call not spawned through
@@ -11691,6 +11720,7 @@ impl App {
             redis_selected: HashSet::new(),
             redis_anchor: None,
             redis_pending_batch: None,
+            redis_ttl_clock: Instant::now(),
             mongo_page: 0,
             mongo_filter: String::new(),
             mongo_gen: 0,
@@ -11818,6 +11848,26 @@ async fn run_app(mut terminal: ratatui::DefaultTerminal, backend: Arc<LocalBacke
             _ = ticker.tick() => {
                 if app.loading {
                     app.spinner = app.spinner.wrapping_add(1);
+                }
+                // R57: refresh the Redis key browser's TTL countdown locally once
+                // a second, so `…s` counts down without a server round-trip.
+                if app.backend_kind == Backend::Redis {
+                    let now = Instant::now();
+                    let secs = now
+                        .saturating_duration_since(app.redis_ttl_clock)
+                        .as_secs() as i64;
+                    if secs > 0 {
+                        app.redis_ttl_clock = now;
+                        for k in app.redis_scan.all.iter_mut() {
+                            k.ttl = redis_ttl_advance(k.ttl, secs);
+                        }
+                        for k in app.redis_scan.keys.iter_mut() {
+                            k.ttl = redis_ttl_advance(k.ttl, secs);
+                        }
+                        if let Some(v) = app.redis_value.as_mut() {
+                            v.ttl = redis_ttl_advance(v.ttl, secs);
+                        }
+                    }
                 }
                 // A digit typed without a following motion becomes a direct list
                 // jump once the short grace window closes.
@@ -13820,6 +13870,8 @@ fn reset_overlays_for_backend_switch(app: &mut App) {
     app.pinned_result = None;
     // R55: cancel an in-place tree rename on a backend switch.
     app.rename_edit = None;
+    // R57: drop a results row selection with the grid it belonged to.
+    app.row_sel_anchor = None;
 }
 
 /// True when quitting would discard unrun work: the editor holds SQL that was
@@ -13983,6 +14035,11 @@ fn confirm_key(app: &mut App, tx: &Tx, k: KeyEvent) {
                         return;
                     }
                     if !rc.batch.is_empty() {
+                        // R57: a single-key delete prunes the loaded list in
+                        // place before the command runs, keeping the cursor.
+                        if !rc.remove_in_place.is_empty() {
+                            redis_remove_keys_in_place(app, &rc.remove_in_place);
+                        }
                         run_redis_batch(app, tx, rc.db, rc.batch, rc.reload_list);
                         return;
                     }
@@ -14403,9 +14460,12 @@ fn browse_key(app: &mut App, tx: &Tx, k: KeyEvent) {
     }
 
     // `d` opens the database list from any non-text area: one uniform gesture for
-    // SQL databases, MongoDB databases and Redis logical DBs.
+    // SQL databases, MongoDB databases and Redis logical DBs. R57: while the
+    // results grid is in row-select mode, `d` is the batch-DELETE gesture, so the
+    // picker yields and the key reaches the grid handler below.
     if k.code == KeyCode::Char('d')
         && k.modifiers.is_empty()
+        && !(app.row_sel_anchor.is_some() && app.focus == Focus::Preview)
         && app.selected.is_some()
         && !matches!(app.focus, Focus::Editor | Focus::CmdInput)
     {
@@ -16352,6 +16412,45 @@ fn focused_full_row(app: &App) -> Option<Vec<Val>> {
     grid.rows.get(idx).cloned()
 }
 
+/// `display` row index (into the on-screen, filtered grid) → index into the
+/// *unfiltered* grid. `full_row_index` is the focused-row case of this; R57's
+/// row-select mode needs the mapping for a whole range.
+fn full_row_at(app: &App, display: usize) -> Option<usize> {
+    if let Some(s) = &app.script {
+        let i = s.drilled?;
+        let full = &s.outcomes.get(i)?.grid;
+        let col = app.col_filter_spec();
+        let row_active = !app.result_needle.trim().is_empty();
+        let col_active = col.is_some_and(|(_, n)| !n.trim().is_empty());
+        if !row_active && !col_active {
+            return (display < full.rows.len()).then_some(display);
+        }
+        // filter_grid only drops columns, so row indices still line up with
+        // `full.rows`; the map translates the filtered display row back.
+        let cols = filter_grid(full, &app.col_hidden);
+        let map = kept_row_indices(&cols, &app.result_needle, col);
+        return map.get(display).copied();
+    }
+    app.result_rows.get(display).copied()
+}
+
+/// The rows currently covered by the R57 row selection, read from the
+/// *unfiltered* grid so hidden columns and an active row filter do not change
+/// what `Y` / `d` / `c` act on.
+fn selected_full_rows(app: &App) -> Vec<Vec<Val>> {
+    let Some(anchor) = app.row_sel_anchor else {
+        return Vec::new();
+    };
+    let Some(full) = full_grid(app) else {
+        return Vec::new();
+    };
+    let (lo, hi) = (anchor.min(app.sel), anchor.max(app.sel));
+    (lo..=hi)
+        .filter_map(|d| full_row_at(app, d))
+        .filter_map(|f| full.rows.get(f).cloned())
+        .collect()
+}
+
 /// True when the results pane is showing a browsable table (not a query result,
 /// structure list or script).
 fn in_table_data_view(app: &App) -> bool {
@@ -16921,6 +17020,8 @@ fn start_redis_scan(app: &mut App, tx: &Tx, reset: bool) {
         app.redis_scan.cursor = 0;
         app.redis_scan.exhausted = false;
         app.redis_scan.gen = app.redis_scan.gen.wrapping_add(1);
+        // R57: a fresh scan re-reads TTLs, so restart the local countdown clock.
+        app.redis_ttl_clock = Instant::now();
     } else if app.redis_scan.exhausted || app.redis_scan.pending {
         // A page is already in flight: a second request would start from the
         // same cursor and append a duplicate page (the fresh-scan race).
@@ -19997,6 +20098,7 @@ fn redis_confirm_delete(app: &mut App) {
             reload_list: true,
             typed_confirm: None,
             summary: String::new(),
+            remove_in_place: Vec::new(),
         }),
         mongo: None,
     });
@@ -20216,10 +20318,44 @@ fn redis_open_batch_confirm(
             reload_list: true,
             typed_confirm,
             summary,
+            remove_in_place: Vec::new(),
         }),
         mongo: None,
     });
     app.status = t("批量确认 · Enter 执行 · Esc 取消").into();
+}
+
+/// R57: drop just-deleted keys from the loaded SCAN window without rescanning,
+/// so the cursor and the already-loaded pages stay put (a full `SCAN` reset
+/// jumps the list back to the first page). The filtered `keys` view and the
+/// loaded `all` window are both pruned, and the selection / open value follow.
+fn redis_remove_keys_in_place(app: &mut App, raws: &[String]) {
+    if raws.is_empty() {
+        return;
+    }
+    let gone: HashSet<&str> = raws.iter().map(|s| s.as_str()).collect();
+    app.redis_scan
+        .all
+        .retain(|k| !gone.contains(k.key_raw.as_str()));
+    app.redis_scan
+        .keys
+        .retain(|k| !gone.contains(k.key_raw.as_str()));
+    for r in raws {
+        app.redis_selected.remove(r);
+    }
+    let n = app.redis_scan.keys.len();
+    let sel = app.redis_list.selected().unwrap_or(0);
+    app.redis_list
+        .select(if n == 0 { None } else { Some(sel.min(n - 1)) });
+    app.redis_anchor = None;
+    // The open value belonged to a deleted key: close it and hand focus back.
+    if let Some(v) = &app.redis_value {
+        if gone.contains(v.key_raw.as_str()) {
+            app.redis_value = None;
+            app.clear_grid();
+            app.focus = Focus::Sidebar;
+        }
+    }
 }
 
 /// `Del` in the key browser: batch delete the selected keys.
@@ -20242,6 +20378,7 @@ fn redis_batch_delete(app: &mut App) {
     };
     let n = targets.len();
     let pattern = app.redis_scan.pattern.clone();
+    let single = targets.first().map(|(raw, _)| raw.clone());
     redis_open_batch_confirm(
         app,
         plan.commands,
@@ -20254,6 +20391,15 @@ fn redis_batch_delete(app: &mut App) {
             tf("将批量删除 {} 个 key（模式 {}）", &[&n, &pattern]),
             t("DEL 不可撤销，Enter 后立即执行").into(),
         ];
+        // R57: a single-key delete stays put — remove it from the loaded list in
+        // place instead of rescanning from cursor 0 (which would jump the list
+        // back to the first page). Confirmed exactly like any other delete.
+        if n == 1 {
+            if let (Some(rc), Some(raw)) = (c.redis.as_mut(), single) {
+                rc.reload_list = false;
+                rc.remove_in_place = vec![raw];
+            }
+        }
     }
 }
 
@@ -20700,6 +20846,9 @@ fn redis_prompt_key(app: &mut App, tx: &Tx, k: KeyEvent) {
             }
             if let Some(rc) = app.redis_pending_batch.take() {
                 if !rc.batch.is_empty() {
+                    if !rc.remove_in_place.is_empty() {
+                        redis_remove_keys_in_place(app, &rc.remove_in_place);
+                    }
                     run_redis_batch(app, tx, rc.db, rc.batch, rc.reload_list);
                 }
             }
@@ -20809,6 +20958,7 @@ fn redis_prompt_key(app: &mut App, tx: &Tx, k: KeyEvent) {
             reload_list,
             typed_confirm: None,
             summary: String::new(),
+            remove_in_place: Vec::new(),
         }),
         mongo: None,
     });
@@ -20824,6 +20974,11 @@ fn preview_key(app: &mut App, tx: &Tx, k: KeyEvent) {
     }
     if app.backend_kind == Backend::Mongo && app.grid_kind == GridKind::MongoDocs {
         mongo_docs_key(app, tx, k);
+        return;
+    }
+    // R57: row-select mode owns the keyboard until Esc / an action; a key the
+    // mode does not use exits it and falls through to the normal grid keymap.
+    if app.row_sel_anchor.is_some() && row_select_key(app, tx, k) {
         return;
     }
     // Every results-pane command that needs a modifier is a Ctrl combo, so no
@@ -21148,6 +21303,9 @@ fn preview_key(app: &mut App, tx: &Tx, k: KeyEvent) {
             // popup directly from the grid.
             open_row_popup(app);
         }
+        // R57: `V` enters row-select mode (vim's linewise visual). `v` is taken
+        // by the cell popup, so the uppercase twin carries the bulk-row gesture.
+        KeyCode::Char('V') => enter_row_select(app),
         // `v`: full cell value, straight from the grid (the shortcut path that
         // skips the row popup).
         KeyCode::Char('v') => open_cell_popup(app),
@@ -26642,20 +26800,7 @@ fn copy_row_sql(app: &mut App) {
         app.status = t("没有可复制的行").into();
         return;
     };
-    let target = if let Some(ps) = &app.page_state {
-        Some((ps.schema.clone(), ps.table.clone()))
-    } else if let Some(s) = &app.script {
-        s.drilled
-            .and_then(|i| s.outcomes.get(i))
-            .and_then(|o| guess_table_from_sql(&o.sql))
-            .map(|t| (String::new(), t))
-    } else {
-        app.last_sql
-            .as_deref()
-            .and_then(guess_table_from_sql)
-            .map(|t| (String::new(), t))
-    };
-    let Some((schema, table)) = target else {
+    let Some((schema, table)) = table_target(app) else {
         app.status = t("无法从当前结果确定表名（仅表格浏览与含 FROM 的查询支持 y）").into();
         return;
     };
@@ -26670,6 +26815,365 @@ fn copy_row_sql(app: &mut App) {
         }
         None => app.status = tf("✓ 已复制 INSERT（{} 字符）· OSC52 剪贴板", &[&(n)]),
     }
+}
+
+/// The `(schema, table)` a result grid belongs to: the browsed table, else the
+/// table guessed from a drilled statement / the last executed SQL. An empty
+/// schema when it cannot be known. Shared by `y` (copy as INSERT) and R57's
+/// batch `d` / `c`.
+fn table_target(app: &App) -> Option<(String, String)> {
+    if let Some(ps) = &app.page_state {
+        return Some((ps.schema.clone(), ps.table.clone()));
+    }
+    if let Some(s) = &app.script {
+        return s
+            .drilled
+            .and_then(|i| s.outcomes.get(i))
+            .and_then(|o| guess_table_from_sql(&o.sql))
+            .map(|t| (String::new(), t));
+    }
+    app.last_sql
+        .as_deref()
+        .and_then(guess_table_from_sql)
+        .map(|t| (String::new(), t))
+}
+
+// ── R57: results row selection (`V`) + batch statements (`Y` / `d` / `c`) ──
+
+/// Everything needed to turn selected result rows into `DELETE` / `UPDATE`
+/// statements. Built only when the result is tied to a browsable table with a
+/// real primary key whose columns all appear in the grid — an expression /
+/// aggregate / join result has neither, and `d` / `c` must refuse, never guess.
+struct BatchTarget {
+    db_type: DatabaseType,
+    schema: String,
+    table: String,
+    /// Grid column names, in display order (indexed by row position).
+    columns: Vec<String>,
+    /// Declared type per grid column (drives literal quoting).
+    types: Vec<Option<String>>,
+    /// Primary-key column names, in key order.
+    pks: Vec<String>,
+}
+
+impl BatchTarget {
+    fn col_index(&self, name: &str) -> Option<usize> {
+        self.columns.iter().position(|c| c == name)
+    }
+
+    /// `key = literal` for one primary-key column of `row`, using the column's
+    /// declared type so text is quoted and numbers stay bare.
+    fn pk_eq(&self, name: &str, row: &[Val]) -> Option<String> {
+        let ci = self.col_index(name)?;
+        let v = row.get(ci).cloned().unwrap_or(Val::Null);
+        Some(format!(
+            "{} = {}",
+            quote_table_identifier(Some(self.db_type), name),
+            val_literal(&v, self.types.get(ci).and_then(|t| t.as_deref()))
+        ))
+    }
+}
+
+/// The batch target for the currently focused result grid, or `None` when there
+/// is no browsable table / primary key to key the statements by.
+fn batch_target(app: &App) -> Option<BatchTarget> {
+    let full = full_grid(app)?;
+    let (schema, table) = table_target(app)?;
+    let cfg = app.selected.as_ref()?;
+    let meta = app
+        .table_meta
+        .as_ref()
+        .filter(|m| m.table == table && m.schema == schema)?;
+    let pks: Vec<String> = meta
+        .columns
+        .iter()
+        .filter(|c| c.is_primary_key)
+        .map(|c| c.name.clone())
+        .collect();
+    if pks.is_empty() {
+        return None;
+    }
+    // Every key column must be in the result, or the `WHERE` cannot be written.
+    if !pks.iter().all(|k| full.columns.iter().any(|c| c == k)) {
+        return None;
+    }
+    let types = full
+        .columns
+        .iter()
+        .map(|c| column_type(app, &schema, &table, c))
+        .collect();
+    Some(BatchTarget {
+        db_type: cfg.db_type,
+        schema,
+        table,
+        columns: full.columns.clone(),
+        types,
+        pks,
+    })
+}
+
+/// R57 `d`: one `DELETE` for the selected rows. A one-column key uses
+/// `pk IN (…)`; a composite key falls back to a portable
+/// `(k1 = … AND k2 = …) OR (…)` chain (row-value `IN` is not universal). Values
+/// are escaped by the shared literal rules. This is a statement for review —
+/// dbxt never runs it.
+fn batch_delete_sql(t: &BatchTarget, rows: &[Vec<Val>]) -> String {
+    let table = table_ref(t.db_type, &t.schema, &t.table);
+    if t.pks.len() == 1 {
+        let pk = &t.pks[0];
+        let vals = rows
+            .iter()
+            .filter_map(|r| {
+                let ci = t.col_index(pk)?;
+                let v = r.get(ci).cloned().unwrap_or(Val::Null);
+                Some(val_literal(&v, t.types.get(ci).and_then(|x| x.as_deref())))
+            })
+            .collect::<Vec<_>>()
+            .join(", ");
+        return format!(
+            "DELETE FROM {table}\nWHERE {} IN ({});",
+            quote_table_identifier(Some(t.db_type), pk),
+            vals
+        );
+    }
+    let clauses = rows
+        .iter()
+        .filter_map(|r| {
+            let parts = t
+                .pks
+                .iter()
+                .filter_map(|k| t.pk_eq(k, r))
+                .collect::<Vec<_>>();
+            (!parts.is_empty()).then(|| format!("({})", parts.join(" AND ")))
+        })
+        .collect::<Vec<_>>()
+        .join("\n   OR ");
+    format!("DELETE FROM {table}\nWHERE {clauses};")
+}
+
+/// R57 `c`: an `UPDATE … SET <every non-key column> = <current value> WHERE
+/// <pk> = …;` template per selected row. Every value is the row's *current*
+/// value, so the statement is a no-op until the user edits a `SET` value; it is
+/// a starting point in the editor, never executed.
+fn batch_update_sql(t: &BatchTarget, rows: &[Vec<Val>]) -> String {
+    let table = table_ref(t.db_type, &t.schema, &t.table);
+    let mut stmts: Vec<String> = Vec::new();
+    for r in rows {
+        let sets = t
+            .columns
+            .iter()
+            .enumerate()
+            .filter(|(_, c)| !t.pks.iter().any(|k| k == *c))
+            .map(|(ci, c)| {
+                let v = r.get(ci).cloned().unwrap_or(Val::Null);
+                format!(
+                    "{} = {}",
+                    quote_table_identifier(Some(t.db_type), c),
+                    val_literal(&v, t.types.get(ci).and_then(|x| x.as_deref()))
+                )
+            })
+            .collect::<Vec<_>>();
+        let Some(first) = t.pks.first().and_then(|k| t.pk_eq(k, r)) else {
+            continue;
+        };
+        let mut parts = vec![first];
+        parts.extend(t.pks.iter().skip(1).filter_map(|k| t.pk_eq(k, r)));
+        let clause = parts.join(" AND ");
+        if sets.is_empty() {
+            stmts.push(tf("-- {}：仅有主键列，无可更新列", &[&table]));
+        } else {
+            stmts.push(format!(
+                "UPDATE {table}\nSET {}\nWHERE {clause};",
+                sets.join(", ")
+            ));
+        }
+    }
+    stmts.join("\n\n")
+}
+
+/// R57: the results pane currently has selectable rows (a real data grid, not
+/// the structure list, DDL text or the script statement list).
+fn row_select_available(app: &App) -> bool {
+    if app.grid_kind == GridKind::Columns {
+        return false;
+    }
+    if app.struct_view == StructView::Ddl && app.ddl.is_some() {
+        return false;
+    }
+    if app.script.as_ref().is_some_and(|s| s.drilled.is_none()) {
+        return false;
+    }
+    active_grid(app).is_some_and(|g| !g.rows.is_empty())
+}
+
+/// R57: `V` enters row-select mode with the cursor row as the anchor.
+fn enter_row_select(app: &mut App) {
+    if !row_select_available(app) {
+        app.status = t("当前视图没有可选行").into();
+        return;
+    }
+    app.row_sel_anchor = Some(app.sel);
+    app.status = row_select_status(app);
+}
+
+/// The row-select mode status line: the block range and the operation keys.
+fn row_select_status(app: &App) -> String {
+    let Some(anchor) = app.row_sel_anchor else {
+        return String::new();
+    };
+    let (lo, hi) = (anchor.min(app.sel), anchor.max(app.sel));
+    tf(
+        "行选 {}-{}（{} 行）· ↑↓ 移动 · Shift+↑↓ / v 扩展 · Y 复制 · d 删除语句 · c 更新模板 · Esc 退出",
+        &[&(lo + 1), &(hi + 1), &(hi - lo + 1)],
+    )
+}
+
+/// R57: row-select mode keys. Returns `true` when consumed; a key the mode does
+/// not use exits the mode (so the rest of the grid keymap stays one keystroke
+/// away) and returns `false` for the caller to handle normally.
+fn row_select_key(app: &mut App, tx: &Tx, k: KeyEvent) -> bool {
+    if k.modifiers.contains(KeyModifiers::CONTROL) || k.modifiers.contains(KeyModifiers::ALT) {
+        app.row_sel_anchor = None;
+        return false;
+    }
+    let anchor = app.row_sel_anchor.unwrap_or(app.sel);
+    let shift = k.modifiers.contains(KeyModifiers::SHIFT);
+    match k.code {
+        KeyCode::Esc => {
+            app.row_sel_anchor = None;
+            app.status = t("已退出行选").into();
+            true
+        }
+        // Plain ↑/↓ move the anchor and the cursor together (collapsing the
+        // block to one row); Shift+↑/↓ stretch it from the anchor.
+        KeyCode::Up | KeyCode::Char('k') => {
+            move_cursor(app, tx, -1);
+            app.row_sel_anchor = Some(if shift { anchor } else { app.sel });
+            app.status = row_select_status(app);
+            true
+        }
+        KeyCode::Down | KeyCode::Char('j') => {
+            move_cursor(app, tx, 1);
+            app.row_sel_anchor = Some(if shift { anchor } else { app.sel });
+            app.status = row_select_status(app);
+            true
+        }
+        // `v` / `V` extend the block one row down (vim's linewise stretch).
+        KeyCode::Char('v') | KeyCode::Char('V') => {
+            move_cursor(app, tx, 1);
+            app.row_sel_anchor = Some(anchor);
+            app.status = row_select_status(app);
+            true
+        }
+        KeyCode::Char('Y') => {
+            row_select_copy(app);
+            true
+        }
+        KeyCode::Char('d') => {
+            row_select_delete_sql(app);
+            true
+        }
+        KeyCode::Char('c') => {
+            row_select_update_sql(app);
+            true
+        }
+        _ => {
+            app.row_sel_anchor = None;
+            false
+        }
+    }
+}
+
+/// R57 `Y`: copy the selected rows as TSV (with a header line), so a block can
+/// be pasted straight into a spreadsheet / another issue.
+fn row_select_copy(app: &mut App) {
+    let Some(full) = full_grid(app) else {
+        app.status = t("没有可复制的行").into();
+        return;
+    };
+    let rows = selected_full_rows(app);
+    if rows.is_empty() {
+        app.status = t("没有可复制的行").into();
+        return;
+    }
+    let text = rows_to_tsv(&full.columns, &rows);
+    let n = rows.len();
+    app.row_sel_anchor = None;
+    match clipboard_copy(&text) {
+        Some(p) => {
+            app.status = tf(
+                "✓ 已复制 {} 行（TSV，含列头）· 兜底 {}",
+                &[&n, &(p.display())],
+            )
+        }
+        None => app.status = tf("✓ 已复制 {} 行（TSV，含列头）", &[&n]),
+    }
+}
+
+/// The TSV body for R57 `Y`: a header line then one tab-joined line per row.
+/// NULL (`NULL`) and the empty string (`''`) keep their display shapes, so a
+/// paste never silently turns one into the other.
+fn rows_to_tsv(columns: &[String], rows: &[Vec<Val>]) -> String {
+    let mut text = columns
+        .iter()
+        .map(|c| fix_double_encoding(c))
+        .collect::<Vec<_>>()
+        .join("\t");
+    for r in rows {
+        text.push('\n');
+        text.push_str(&r.iter().map(cell_copy_text).collect::<Vec<_>>().join("\t"));
+    }
+    text
+}
+
+/// R57 `d`: generate `DELETE …` for the selected rows and hand it to the editor
+/// for review. Nothing is executed — the zero-write red line holds.
+fn row_select_delete_sql(app: &mut App) {
+    let rows = selected_full_rows(app);
+    if rows.is_empty() {
+        app.status = t("没有可操作的行").into();
+        return;
+    }
+    let Some(t) = batch_target(app) else {
+        app.row_sel_anchor = None;
+        app.status = t("无主键，跳过（表达式 / 聚合 / 无主键结果不支持批量删除）").into();
+        return;
+    };
+    let sql = batch_delete_sql(&t, &rows);
+    let n = rows.len();
+    let pk = t.pks.join(", ");
+    app.row_sel_anchor = None;
+    app.set_editor_text(&sql);
+    app.focus = Focus::Editor;
+    app.status = tf(
+        "✓ 已生成 DELETE（{} 行 · 主键 {}）→ 编辑器待确认，未执行",
+        &[&n, &pk],
+    );
+}
+
+/// R57 `c`: generate an `UPDATE … SET …` template for the selected rows and
+/// hand it to the editor for review. Nothing is executed.
+fn row_select_update_sql(app: &mut App) {
+    let rows = selected_full_rows(app);
+    if rows.is_empty() {
+        app.status = t("没有可操作的行").into();
+        return;
+    }
+    let Some(t) = batch_target(app) else {
+        app.row_sel_anchor = None;
+        app.status = t("无主键，跳过（表达式 / 聚合 / 无主键结果不支持批量更新）").into();
+        return;
+    };
+    let sql = batch_update_sql(&t, &rows);
+    let n = rows.len();
+    let pk = t.pks.join(", ");
+    app.row_sel_anchor = None;
+    app.set_editor_text(&sql);
+    app.focus = Focus::Editor;
+    app.status = tf(
+        "✓ 已生成 UPDATE 模板（{} 行 · 主键 {}）→ 编辑器待确认，未执行",
+        &[&n, &pk],
+    );
 }
 
 /// New value typed in the edit dialog → SQL literal. A blank box (or `NULL`,
@@ -29047,6 +29551,8 @@ impl App {
         self.grid = None;
         self.grid_full = None;
         self.result_rows.clear();
+        // R57: a row selection belongs to the grid it was started on.
+        self.row_sel_anchor = None;
         // A value locate belongs to the grid it was started on; a new result
         // (another table, a query, a tab switch) starts clean.
         self.locate_needle.clear();
@@ -29090,6 +29596,10 @@ impl App {
         // The displayed grid is about to change: invalidate the width cache.
         self.grid_epoch = self.grid_epoch.wrapping_add(1);
         self.width_cache = None;
+        // R57: the display→source row map is rebuilt below, so any row selection
+        // indexed into the old view is dropped rather than pointing at a
+        // different row after a filter change.
+        self.row_sel_anchor = None;
         let Some(full) = self.grid_full.clone() else {
             self.grid = None;
             self.result_rows.clear();
@@ -29138,25 +29648,7 @@ impl App {
     /// filter is active. Handles both the top-level grid and a drilled script
     /// result.
     fn full_row_index(&self) -> Option<usize> {
-        if let Some(s) = &self.script {
-            let i = s.drilled?;
-            let full = &s.outcomes.get(i)?.grid;
-            let col = self.col_filter_spec();
-            let row_active = !self.result_needle.trim().is_empty();
-            let col_active = col.is_some_and(|(_, n)| !n.trim().is_empty());
-            if !row_active && !col_active {
-                return (self.sel < full.rows.len()).then_some(self.sel);
-            }
-            // filter_grid only drops columns, so row indices still line up with
-            // `full.rows`; the map translates the filtered display row back.
-            let cols = filter_grid(full, &self.col_hidden);
-            let map = kept_row_indices(&cols, &self.result_needle, col);
-            return map.get(self.sel).copied();
-        }
-        if self.result_rows.is_empty() {
-            return None;
-        }
-        self.result_rows.get(self.sel).copied()
+        full_row_at(self, self.sel)
     }
 
     /// Persist the in-memory config (best-effort, silent on failure).
@@ -33072,6 +33564,8 @@ fn render_grid(
         .min(nrows.saturating_sub(h.min(nrows)));
     let sel = app.sel;
     let cc = app.col_cursor;
+    // R57: the row-select block, if any, drawn as full-row reverse video.
+    let sel_range = app.row_sel_anchor.map(|a| (a.min(sel), a.max(sel)));
 
     let inner = block.inner(area);
     f.render_widget(block, area);
@@ -33100,7 +33594,9 @@ fn render_grid(
             });
         }
         let mut r = Row::new(cells);
-        if i == sel {
+        if sel_range.is_some_and(|(lo, hi)| i >= lo && i <= hi) {
+            r = r.style(row_select_style());
+        } else if i == sel {
             r = r.style(highlight_style());
         }
         lrows.push(r);
@@ -33154,7 +33650,9 @@ fn render_grid(
                     });
                 }
                 let mut r = Row::new(cells);
-                if i == sel {
+                if sel_range.is_some_and(|(lo, hi)| i >= lo && i <= hi) {
+                    r = r.style(row_select_style());
+                } else if i == sel {
                     r = r.style(highlight_style());
                 }
                 rrows.push(r);
@@ -33470,6 +33968,13 @@ fn highlight_style() -> Style {
     Style::default()
         .bg(Color::Rgb(38, 48, 38))
         .add_modifier(Modifier::BOLD)
+}
+
+/// R57: a row inside the rows-select block — full-row reverse video so a
+/// multi-row selection reads as one solid band, clearly distinct from the
+/// single cursor row's dark highlight above.
+fn row_select_style() -> Style {
+    Style::default().add_modifier(Modifier::REVERSED | Modifier::BOLD)
 }
 
 fn focused_cell_style() -> Style {
@@ -38035,6 +38540,10 @@ const HELP_ROWS: &[(&str, &str)] = &[
     ("y", "复制当前行为 INSERT 语句（OSC52 + 文件兜底）"),
     ("Y", "复制当前单元格值（状态栏显示列名与字符数）"),
     (
+        "V",
+        "行选模式：↑↓ 移动 · Shift+↑↓ / v 扩展 · Y 复制 TSV（含列头）· d 生成 DELETE · c 生成 UPDATE 模板 · Esc 退出；d/c 只把语句送进编辑器，绝不执行",
+    ),
+    (
         "/",
         "搜索结果行（隐藏不匹配行，输入即筛，Enter 保留，Esc 清除）",
     ),
@@ -38246,7 +38755,7 @@ const HELP_ROWS: &[(&str, &str)] = &[
     ("[ ]", "切换逻辑 db"),
     (
         "Del / x / m",
-        "批量删除 / 设 TTL / 前缀重命名选中 key（均确认）",
+        "删除 / 设 TTL / 前缀重命名选中 key（均确认）；删单个 key 就地移除，SCAN 游标不动",
     ),
     ("y", "复制选中的 key 名（每行一个）"),
     (
@@ -38255,7 +38764,7 @@ const HELP_ROWS: &[(&str, &str)] = &[
     ),
     ("value: y / Esc", "复制值（string）/ 返回 key 列表"),
     ("value: n", "大集合继续加载 200 项"),
-    ("窄屏徽章", "类型与 TTL 融合为单行 `S·12s`，key 名不换行"),
+    ("窄屏徽章", "类型与 TTL 融合为单行 `S·12s`，key 名不换行；TTL 秒数本地倒计时刷新"),
     ("— MongoDB 文档浏览器 —", ""),
     ("Enter", "浏览 collection 文档（JSON 网格）"),
     ("n / p", "文档翻页"),
@@ -46449,15 +46958,16 @@ mod tests {
         // Regression guard for the R8 keymap: every shortcut must be lowercase,
         // a named key, or a Ctrl/Alt/Shift/F-key combination — never a lone
         // uppercase letter the user has to reach with Shift. `I` (CSV import),
-        // `G` (vim's go-to-bottom, R42) and `Y` (copy connection, R45, which
-        // mirrors the vim-ish uppercase twin of the picker's `p`) are the three
+        // `G` (vim's go-to-bottom, R42), `Y` (copy connection, R45, which
+        // mirrors the vim-ish uppercase twin of the picker's `p`) and `V` (R57
+        // linewise row-select, whose lowercase `v` is the cell popup) are the
         // deliberate exceptions.
         for (key, _) in HELP_ROWS {
             if key.starts_with('—') {
                 continue;
             }
             for tok in key.split(['/', ' ', '+']).filter(|t| !t.is_empty()) {
-                if tok == "I" || tok == "G" || tok == "Y" {
+                if tok == "I" || tok == "G" || tok == "Y" || tok == "V" {
                     continue;
                 }
                 assert!(
@@ -53177,5 +53687,391 @@ mod tests {
             .filter(|c| !c.is_whitespace())
             .collect();
         assert!(text.contains("查询历史"), "{text}");
+    }
+
+    // ── R57: results row selection + batch statements + Redis cursor-preserving delete ──
+
+    fn test_tx() -> Tx {
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel::<OpResult>();
+        tx
+    }
+
+    /// An App showing a browsable `orders` table whose first column is the
+    /// primary key, so `batch_target` resolves. `rows` is the row count.
+    fn orders_app(cols: &[(&str, &str)], rows: usize) -> App {
+        let mut app = test_app();
+        app.picker_open = false;
+        app.selected = Some(test_conn("mysql"));
+        app.backend_kind = Backend::Sql;
+        app.grid_kind = GridKind::TableData;
+        app.page_state = Some(orders_page(None));
+        let columns: Vec<ColumnInfo> = cols
+            .iter()
+            .enumerate()
+            .map(|(i, (n, t))| {
+                let mut c = col_info(n, t);
+                c.is_primary_key = i == 0;
+                c
+            })
+            .collect();
+        app.table_meta = Some(TableMeta {
+            table: "orders".into(),
+            schema: String::new(),
+            columns,
+            indexes: Vec::new(),
+        });
+        let grid = Grid {
+            columns: cols.iter().map(|(n, _)| n.to_string()).collect(),
+            rows: (0..rows)
+                .map(|r| {
+                    cols.iter()
+                        .enumerate()
+                        .map(|(c, (_, ty))| {
+                            if *ty == "int" {
+                                Val::Text((r + 1).to_string())
+                            } else {
+                                Val::Text(format!("r{r}c{c}"))
+                            }
+                        })
+                        .collect()
+                })
+                .collect(),
+            note: String::new(),
+        };
+        app.set_grid(grid);
+        app.focus = Focus::Preview;
+        app.sel = 0;
+        app
+    }
+
+    #[test]
+    fn row_select_state_machine_moves_extends_and_clears() {
+        let tx = test_tx();
+        let mut app = orders_app(&[("id", "int"), ("name", "text")], 6);
+        app.sel = 1;
+        key(
+            &mut app,
+            &tx,
+            KeyEvent::new(KeyCode::Char('V'), KeyModifiers::NONE),
+        );
+        assert_eq!(app.row_sel_anchor, Some(1));
+        // Shift+Down stretches the block; the anchor stays put.
+        key(
+            &mut app,
+            &tx,
+            KeyEvent::new(KeyCode::Down, KeyModifiers::SHIFT),
+        );
+        assert_eq!((app.row_sel_anchor, app.sel), (Some(1), 2));
+        key(
+            &mut app,
+            &tx,
+            KeyEvent::new(KeyCode::Down, KeyModifiers::SHIFT),
+        );
+        assert_eq!((app.row_sel_anchor, app.sel), (Some(1), 3));
+        // In-mode `v` extends down as well.
+        key(
+            &mut app,
+            &tx,
+            KeyEvent::new(KeyCode::Char('v'), KeyModifiers::NONE),
+        );
+        assert_eq!((app.row_sel_anchor, app.sel), (Some(1), 4));
+        // A plain arrow collapses the block onto one row.
+        key(
+            &mut app,
+            &tx,
+            KeyEvent::new(KeyCode::Up, KeyModifiers::NONE),
+        );
+        assert_eq!((app.row_sel_anchor, app.sel), (Some(3), 3));
+        // Esc leaves the mode.
+        key(
+            &mut app,
+            &tx,
+            KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE),
+        );
+        assert_eq!(app.row_sel_anchor, None);
+        // V is refused where there is no selectable row.
+        app.clear_grid();
+        key(
+            &mut app,
+            &tx,
+            KeyEvent::new(KeyCode::Char('V'), KeyModifiers::NONE),
+        );
+        assert_eq!(app.row_sel_anchor, None);
+    }
+
+    /// R57: a three-row block is drawn as a reverse-video band.
+    #[test]
+    fn row_select_draws_a_reverse_video_block() {
+        let mut app = orders_app(&[("id", "int"), ("name", "text")], 8);
+        app.sel = 0;
+        enter_row_select(&mut app);
+        app.row_sel_anchor = Some(2);
+        app.sel = 4;
+        let buf = draw_buffer(&mut app, 60, 20);
+        let reversed = (0..buf.area.height)
+            .flat_map(|y| (0..buf.area.width).map(move |x| (x, y)))
+            .filter(|&(x, y)| {
+                buf.cell((x, y))
+                    .is_some_and(|c| c.modifier.contains(Modifier::REVERSED))
+            })
+            .count();
+        assert!(reversed > 0, "no reversed row band was drawn");
+    }
+
+    fn batch_target_for(db: DatabaseType, cols: &[(&str, &str, bool)]) -> BatchTarget {
+        BatchTarget {
+            db_type: db,
+            schema: "public".into(),
+            table: "orders".into(),
+            columns: cols.iter().map(|(n, _, _)| n.to_string()).collect(),
+            types: cols.iter().map(|(_, t, _)| Some(t.to_string())).collect(),
+            pks: cols
+                .iter()
+                .filter(|(_, _, pk)| *pk)
+                .map(|(n, _, _)| n.to_string())
+                .collect(),
+        }
+    }
+
+    #[test]
+    fn batch_delete_sql_uses_in_for_a_single_key_and_escapes_values() {
+        let t = batch_target_for(
+            DatabaseType::Mysql,
+            &[("id", "int", true), ("name", "varchar(64)", false)],
+        );
+        let rows = vec![
+            vec![Val::Text("1".into()), Val::Text("a".into())],
+            vec![Val::Text("2".into()), Val::Text("b".into())],
+        ];
+        assert_eq!(
+            batch_delete_sql(&t, &rows),
+            "DELETE FROM `public`.`orders`\nWHERE `id` IN (1, 2);"
+        );
+        // A text key is quoted with doubled single quotes; NULL stays bare.
+        let ts = batch_target_for(DatabaseType::Postgres, &[("code", "text", true)]);
+        let rows = vec![vec![Val::Text("O'Brien".into())], vec![Val::Null]];
+        assert_eq!(
+            batch_delete_sql(&ts, &rows),
+            "DELETE FROM \"public\".\"orders\"\nWHERE \"code\" IN ('O''Brien', NULL);"
+        );
+        // The pk column is picked by name even when it is not the first column.
+        let swapped = batch_target_for(
+            DatabaseType::Mysql,
+            &[("name", "text", false), ("id", "int", true)],
+        );
+        let rows = vec![vec![Val::Text("a".into()), Val::Text("7".into())]];
+        assert_eq!(
+            batch_delete_sql(&swapped, &rows),
+            "DELETE FROM `public`.`orders`\nWHERE `id` IN (7);"
+        );
+    }
+
+    #[test]
+    fn batch_delete_sql_chains_composite_keys() {
+        let t = batch_target_for(
+            DatabaseType::Postgres,
+            &[
+                ("a", "int", true),
+                ("b", "text", true),
+                ("note", "text", false),
+            ],
+        );
+        let rows = vec![
+            vec![Val::Text("1".into()), Val::Text("x".into()), Val::Null],
+            vec![Val::Text("2".into()), Val::Text("y".into()), Val::Null],
+        ];
+        assert_eq!(
+            batch_delete_sql(&t, &rows),
+            "DELETE FROM \"public\".\"orders\"\nWHERE (\"a\" = 1 AND \"b\" = 'x')\n   OR (\"a\" = 2 AND \"b\" = 'y');"
+        );
+    }
+
+    #[test]
+    fn batch_update_sql_templates_every_non_key_column() {
+        let t = batch_target_for(
+            DatabaseType::Mysql,
+            &[("id", "int", true), ("name", "varchar(64)", false)],
+        );
+        let rows = vec![
+            vec![Val::Text("1".into()), Val::Text("a".into())],
+            vec![Val::Text("2".into()), Val::Text("O'Brien".into())],
+        ];
+        assert_eq!(
+            batch_update_sql(&t, &rows),
+            "UPDATE `public`.`orders`\nSET `name` = 'a'\nWHERE `id` = 1;\n\nUPDATE `public`.`orders`\nSET `name` = 'O''Brien'\nWHERE `id` = 2;"
+        );
+        // A key-only table yields a comment rather than an empty SET.
+        let key_only = batch_target_for(DatabaseType::Mysql, &[("id", "int", true)]);
+        let sql = batch_update_sql(&key_only, &[vec![Val::Text("1".into())]]);
+        assert!(sql.starts_with("--"), "{sql}");
+    }
+
+    #[test]
+    fn rows_to_tsv_keeps_header_and_null_shapes() {
+        let cols = vec!["id".to_string(), "name".to_string()];
+        let rows = vec![
+            vec![Val::Text("1".into()), Val::Null],
+            vec![Val::Text("2".into()), Val::Text(String::new())],
+        ];
+        assert_eq!(rows_to_tsv(&cols, &rows), "id\tname\n1\tNULL\n2\t''");
+    }
+
+    #[test]
+    fn row_select_d_and_c_land_in_the_editor_without_executing() {
+        let tx = test_tx();
+        let mut app = orders_app(&[("id", "int"), ("name", "text")], 5);
+        app.sel = 0;
+        key(
+            &mut app,
+            &tx,
+            KeyEvent::new(KeyCode::Char('V'), KeyModifiers::NONE),
+        );
+        key(
+            &mut app,
+            &tx,
+            KeyEvent::new(KeyCode::Down, KeyModifiers::SHIFT),
+        );
+        key(
+            &mut app,
+            &tx,
+            KeyEvent::new(KeyCode::Down, KeyModifiers::SHIFT),
+        );
+        assert_eq!(app.sel, 2);
+        key(
+            &mut app,
+            &tx,
+            KeyEvent::new(KeyCode::Char('d'), KeyModifiers::NONE),
+        );
+        let sql = app.editor_sql();
+        assert!(sql.starts_with("DELETE FROM"), "{sql}");
+        assert!(sql.contains("IN (1, 2, 3)"), "{sql}");
+        assert!(app.focus == Focus::Editor);
+        assert_eq!(app.row_sel_anchor, None);
+        // Zero-write red line: nothing was queued to run.
+        assert!(!app.pending_write);
+        // `c` produces the UPDATE template instead.
+        app.focus = Focus::Preview;
+        app.sel = 1;
+        key(
+            &mut app,
+            &tx,
+            KeyEvent::new(KeyCode::Char('V'), KeyModifiers::NONE),
+        );
+        key(
+            &mut app,
+            &tx,
+            KeyEvent::new(KeyCode::Char('c'), KeyModifiers::NONE),
+        );
+        let sql = app.editor_sql();
+        assert!(sql.contains("SET `name` = 'r1c1'"), "{sql}");
+        assert!(sql.contains("WHERE `id` = 2;"), "{sql}");
+    }
+
+    #[test]
+    fn row_select_d_without_a_primary_key_warns_and_keeps_the_editor() {
+        let tx = test_tx();
+        let mut app = test_app();
+        app.picker_open = false;
+        app.selected = Some(test_conn("mysql"));
+        app.grid_kind = GridKind::Query;
+        app.set_grid(sample_grid());
+        app.focus = Focus::Preview;
+        app.editor = TextArea::from(vec!["SELECT 1".to_string()]);
+        let before = app.editor_sql();
+        app.sel = 1;
+        key(
+            &mut app,
+            &tx,
+            KeyEvent::new(KeyCode::Char('V'), KeyModifiers::NONE),
+        );
+        key(
+            &mut app,
+            &tx,
+            KeyEvent::new(KeyCode::Char('d'), KeyModifiers::NONE),
+        );
+        assert_eq!(app.row_sel_anchor, None);
+        assert_eq!(app.editor_sql(), before);
+        assert!(!app.status.is_empty());
+        // `c` behaves the same way.
+        app.sel = 0;
+        key(
+            &mut app,
+            &tx,
+            KeyEvent::new(KeyCode::Char('V'), KeyModifiers::NONE),
+        );
+        key(
+            &mut app,
+            &tx,
+            KeyEvent::new(KeyCode::Char('c'), KeyModifiers::NONE),
+        );
+        assert_eq!(app.editor_sql(), before);
+    }
+
+    #[test]
+    fn redis_ttl_counts_down_locally() {
+        assert_eq!(redis_ttl_advance(60, 1), 59);
+        assert_eq!(redis_ttl_advance(1, 5), 0);
+        assert_eq!(redis_ttl_advance(0, 5), 0);
+        assert_eq!(redis_ttl_advance(-1, 5), -1);
+        assert_eq!(redis_ttl_advance(-2, 5), -2);
+    }
+
+    #[test]
+    fn redis_single_key_delete_confirms_and_removes_in_place() {
+        let mut app = test_app();
+        app.picker_open = false;
+        app.selected = Some(test_conn("redis"));
+        app.backend_kind = Backend::Redis;
+        app.redis_scan.all = vec![mk_redis_key("a"), mk_redis_key("b"), mk_redis_key("c")];
+        apply_redis_filter(&mut app);
+        app.redis_list.select(Some(1));
+        app.redis_scan.cursor = 42;
+        redis_batch_delete(&mut app);
+        let rc = app
+            .confirm
+            .as_ref()
+            .and_then(|c| c.redis.as_ref())
+            .expect("delete confirm opened");
+        assert!(!rc.batch.is_empty(), "a DEL command is generated");
+        assert_eq!(rc.remove_in_place.len(), 1);
+        assert!(
+            !rc.reload_list,
+            "single delete must not rescan from cursor 0"
+        );
+        // Esc cancels the confirm: nothing changes.
+        confirm_key(
+            &mut app,
+            &test_tx(),
+            KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE),
+        );
+        assert!(app.confirm.is_none());
+        assert_eq!(app.redis_scan.keys.len(), 3);
+        // The confirmed delete prunes in place: cursor index and SCAN cursor stay.
+        let raw = app.redis_scan.keys[1].key_raw.clone();
+        redis_remove_keys_in_place(&mut app, &[raw]);
+        assert_eq!(app.redis_scan.keys.len(), 2);
+        assert_eq!(app.redis_list.selected(), Some(1));
+        assert_eq!(app.redis_scan.cursor, 42);
+    }
+
+    #[test]
+    fn redis_multi_key_delete_still_rescans() {
+        let mut app = test_app();
+        app.picker_open = false;
+        app.selected = Some(test_conn("redis"));
+        app.backend_kind = Backend::Redis;
+        app.redis_scan.all = vec![mk_redis_key("a"), mk_redis_key("b")];
+        apply_redis_filter(&mut app);
+        for k in &app.redis_scan.keys {
+            app.redis_selected.insert(k.key_raw.clone());
+        }
+        redis_batch_delete(&mut app);
+        let rc = app
+            .confirm
+            .as_ref()
+            .and_then(|c| c.redis.as_ref())
+            .expect("delete confirm opened");
+        assert!(rc.reload_list);
+        assert!(rc.remove_in_place.is_empty());
     }
 }

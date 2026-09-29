@@ -731,7 +731,7 @@ pub static ALL_KEYS: &[&str] = &[
     "没有 key 匹配该前缀（未改名）",
     "没有可操作的 key",
     "勾选 key / 范围选（a 全选已加载）",
-    "批量删除 / 设 TTL / 前缀重命名选中 key（均确认）",
+    "删除 / 设 TTL / 前缀重命名选中 key（均确认）；删单个 key 就地移除，SCAN 游标不动",
     "复制选中的 key 名（每行一个）",
     "编辑 / 插入 / 删除文档（均确认，_id 不可改）",
     "二次确认 · {}",
@@ -1140,6 +1140,18 @@ pub static ALL_KEYS: &[&str] = &[
     " 跳行 1-{} 或 $ · Enter 跳转 · Esc 取消 ",
     " 跳行 · Enter/Esc ",
     "跳行：输入行号直达该行，:$ 跳末行（结果 / 表 / Redis / Mongo 均可）",
+    // R57: results row selection + batch statements + Redis cursor-preserving delete.
+    "当前视图没有可选行",
+    "行选 {}-{}（{} 行）· ↑↓ 移动 · Shift+↑↓ / v 扩展 · Y 复制 · d 删除语句 · c 更新模板 · Esc 退出",
+    "已退出行选",
+    "✓ 已复制 {} 行（TSV，含列头）· 兜底 {}",
+    "✓ 已复制 {} 行（TSV，含列头）",
+    "没有可操作的行",
+    "无主键，跳过（表达式 / 聚合 / 无主键结果不支持批量删除）",
+    "✓ 已生成 DELETE（{} 行 · 主键 {}）→ 编辑器待确认，未执行",
+    "无主键，跳过（表达式 / 聚合 / 无主键结果不支持批量更新）",
+    "✓ 已生成 UPDATE 模板（{} 行 · 主键 {}）→ 编辑器待确认，未执行",
+    "-- {}：仅有主键列，无可更新列",
 ];
 
 /// The Chinese → English table. Keys must match the source literals exactly.
@@ -1159,6 +1171,11 @@ fn en_of(zh: &'static str) -> Option<&'static str> {
         "✓ 已复制「{}」= {} · {} 字符" => Some("✓ Copied [{}] = {} · {} chars"),
         "复制当前单元格值（状态栏显示列名与字符数）" => {
             Some("copy the focused cell's value (status shows the column and char count)")
+        }
+        "行选模式：↑↓ 移动 · Shift+↑↓ / v 扩展 · Y 复制 TSV（含列头）· d 生成 DELETE · c 生成 UPDATE 模板 · Esc 退出；d/c 只把语句送进编辑器，绝不执行" => {
+            Some(
+                "row-select mode: ↑↓ move · Shift+↑↓ / v extend · Y copy TSV (with header) · d generate DELETE · c generate UPDATE template · Esc exit; d/c only send SQL to the editor, never execute it",
+            )
         }
         // ── R52: editor statement jump + results column filter + server version ──
         "语句 {}/{}" => Some("statement {}/{}"),
@@ -1449,8 +1466,10 @@ fn en_of(zh: &'static str) -> Option<&'static str> {
         "复制值（string）/ 返回 key 列表" => Some("copy value (string) / back to the key list"),
         "窄屏徽章" => Some("narrow badge"),
         "y（脚本列表）" => Some("y (script list)"),
-        "类型与 TTL 融合为单行 `S·12s`，key 名不换行" => {
-            Some("type and TTL fuse into one `S·12s` token so a key stays on one line")
+        "类型与 TTL 融合为单行 `S·12s`，key 名不换行；TTL 秒数本地倒计时刷新" => {
+            Some(
+                "type and TTL fuse into one `S·12s` token so a key stays on one line; the TTL seconds count down locally",
+            )
         }
         "复制当前文档 JSON / 返回集合列表" => {
             Some("copy the current document JSON / back to the collection list")
@@ -2364,7 +2383,9 @@ fn en_of(zh: &'static str) -> Option<&'static str> {
         "没有 key 匹配该前缀（未改名）" => Some("no key matches that prefix (nothing renamed)"),
         "没有可操作的 key" => Some("no keys to operate on"),
         "勾选 key / 范围选（a 全选已加载）" => Some("toggle / range-select keys (a selects all loaded)"),
-        "批量删除 / 设 TTL / 前缀重命名选中 key（均确认）" => Some("batch delete / set TTL / prefix-rename the selected keys (all confirmed)"),
+        "删除 / 设 TTL / 前缀重命名选中 key（均确认）；删单个 key 就地移除，SCAN 游标不动" => Some(
+            "delete / set TTL / prefix-rename the selected keys (all confirmed); deleting a single key removes it in place, keeping the SCAN cursor",
+        ),
         "复制选中的 key 名（每行一个）" => Some("copy the selected key names (one per line)"),
         "编辑 / 插入 / 删除文档（均确认，_id 不可改）" => Some("edit / insert / delete a document (all confirmed, _id immutable)"),
         "二次确认 · {}" => Some("Re-confirm · {}"),
@@ -3171,6 +3192,32 @@ fn en_of(zh: &'static str) -> Option<&'static str> {
         "跳行：输入行号直达该行，:$ 跳末行（结果 / 表 / Redis / Mongo 均可）" => Some(
             "Row jump: type a row number to land on it, :$ for the last row (results / tables / Redis / Mongo)",
         ),
+        // R57: results row selection + batch statements + Redis cursor-preserving delete.
+        "当前视图没有可选行" => Some("No selectable rows in this view"),
+        "行选 {}-{}（{} 行）· ↑↓ 移动 · Shift+↑↓ / v 扩展 · Y 复制 · d 删除语句 · c 更新模板 · Esc 退出" => {
+            Some(
+                "Row select {}-{} ({} rows) · ↑↓ move · Shift+↑↓ / v extend · Y copy · d delete SQL · c update template · Esc exit",
+            )
+        }
+        "已退出行选" => Some("Row select off"),
+        "✓ 已复制 {} 行（TSV，含列头）· 兜底 {}" => {
+            Some("✓ Copied {} rows (TSV, with header) · fallback {}")
+        }
+        "✓ 已复制 {} 行（TSV，含列头）" => Some("✓ Copied {} rows (TSV, with header)"),
+        "没有可操作的行" => Some("No rows to act on"),
+        "无主键，跳过（表达式 / 聚合 / 无主键结果不支持批量删除）" => Some(
+            "No primary key, skipped (batch delete needs a keyed table, not an expression / aggregate result)",
+        ),
+        "✓ 已生成 DELETE（{} 行 · 主键 {}）→ 编辑器待确认，未执行" => Some(
+            "✓ Generated DELETE ({} rows · key {}) → in the editor for review, not executed",
+        ),
+        "无主键，跳过（表达式 / 聚合 / 无主键结果不支持批量更新）" => Some(
+            "No primary key, skipped (batch update needs a keyed table, not an expression / aggregate result)",
+        ),
+        "✓ 已生成 UPDATE 模板（{} 行 · 主键 {}）→ 编辑器待确认，未执行" => Some(
+            "✓ Generated UPDATE template ({} rows · key {}) → in the editor for review, not executed",
+        ),
+        "-- {}：仅有主键列，无可更新列" => Some("-- {}: primary key only, no updatable column"),
         _ => None,
     }
 }
