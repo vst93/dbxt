@@ -146,6 +146,16 @@ const TRANSFER_COUNT_PROBE: u64 = 1_000_001;
 /// A data transfer is a long sequence of chunk reads and batched writes; the
 /// last-resort watchdog is generous (each statement keeps its 60 s timeout).
 const OP_WATCHDOG_TRANSFER: Duration = Duration::from_secs(3600);
+/// R53: how many editor lines above / below the caret the passive bracket
+/// highlight reads. The pair is resolved inside this window only, so the cost of
+/// a frame never depends on the size of the buffer — a SQL file of any length
+/// costs the same as a one-line query. A pair that reaches further than this is
+/// simply left unhighlighted (`%` still jumps there on demand).
+const BRACKET_SCAN_LINES: usize = 200;
+/// A second, byte-sized safety valve on top of [`BRACKET_SCAN_LINES`]: 401 very
+/// long lines could still be megabytes, so a window wider than this is skipped
+/// (an editor line that big has no useful bracket pairing to show anyway).
+const BRACKET_SCAN_BYTES: usize = 256 * 1024;
 
 // ─── pages & focus ───────────────────────────────────────────────────────────
 
@@ -18686,6 +18696,85 @@ fn jump_matching_bracket(app: &mut App) -> bool {
     true
 }
 
+/// R53: the bracket the caret sits on (or right after, the same rule `%` uses)
+/// and its match, both as editor `(row, col)` char positions. Only the caret's
+/// ±`span`-line window is read: the lines are joined into a small string and run
+/// through the shared `code_mask` lexer, so a `)` inside a string literal or a
+/// comment still cannot pair with a `(` in code, while a buffer of any size
+/// costs the same. `None` when the caret is not beside a bracket, the pair is
+/// unbalanced, or the match lies outside the window.
+fn bracket_pair_near(
+    lines: &[String],
+    row: usize,
+    col: usize,
+    span: usize,
+) -> Option<((usize, usize), (usize, usize))> {
+    let line = lines.get(row)?;
+    let lchars: Vec<char> = line.chars().collect();
+    // Cheap rejection first: the caret must be on a bracket or immediately after
+    // one, so most frames never build the window string at all.
+    let near = lchars.get(col).copied().is_some_and(is_bracket)
+        || (col > 0 && lchars.get(col - 1).copied().is_some_and(is_bracket));
+    if !near {
+        return None;
+    }
+
+    let lo = row.saturating_sub(span);
+    let hi = (row + span).min(lines.len().saturating_sub(1));
+    // Bounded by lines *and* bytes, so a pathological buffer (very long lines)
+    // still cannot make a frame expensive.
+    if lines[lo..=hi].iter().map(|l| l.len() + 1).sum::<usize>() > BRACKET_SCAN_BYTES {
+        return None;
+    }
+    // Caret offset inside the window text (one `\n` between the joined lines).
+    let mut base = 0usize;
+    for l in &lines[lo..row] {
+        base += l.chars().count() + 1;
+    }
+    let pos = base + col;
+
+    let win = lines[lo..=hi].join("\n");
+    let wchars: Vec<char> = win.chars().collect();
+    let at = |i: usize| wchars.get(i).copied();
+    let pos = if at(pos).is_some_and(is_bracket) {
+        pos
+    } else if pos > 0 && at(pos - 1).is_some_and(is_bracket) {
+        pos - 1
+    } else {
+        return None;
+    };
+    let m = matching_bracket(&win, pos)?;
+    let (pr, pc) = offset_to_cursor(&win, pos);
+    let (mr, mc) = offset_to_cursor(&win, m);
+    Some(((lo + pr, pc), (lo + mr, mc)))
+}
+
+/// The pair [`bracket_pair_near`] should highlight for the editor's current
+/// caret, read at the session window size.
+fn editor_bracket_pair(app: &App) -> Option<((usize, usize), (usize, usize))> {
+    let (row, col) = app.editor.cursor();
+    bracket_pair_near(app.editor.lines(), row, col, BRACKET_SCAN_LINES)
+}
+
+/// Display (terminal) column of char column `col` in `line`, expanding tabs the
+/// way tui-textarea does (tab stop 4, its default and the one dbxt never
+/// changes). Used to place the bracket highlight on the exact screen cell,
+/// including wide CJK characters.
+fn editor_display_col(line: &str, col: usize) -> usize {
+    let mut w = 0usize;
+    for (i, ch) in line.chars().enumerate() {
+        if i >= col {
+            break;
+        }
+        if ch == '\t' {
+            w += 4 - (w % 4);
+        } else {
+            w += UnicodeWidthChar::width(ch).unwrap_or(0);
+        }
+    }
+    w
+}
+
 fn editor_key(app: &mut App, tx: &Tx, k: KeyEvent) {
     // The completion popup owns the keyboard while it is open: Tab / Enter
     // accept, Esc cancels, arrows move, anything else keeps typing (and refines
@@ -19221,6 +19310,7 @@ fn redis_value_key(app: &mut App, tx: &Tx, k: KeyEvent) {
         KeyCode::Char('v') => open_cell_popup(app),
         KeyCode::Char('/') => open_result_filter(app),
         KeyCode::Char('y') => copy_redis_row(app),
+        KeyCode::Char('Y') => copy_cell_value(app),
         KeyCode::Char('z') => {
             app.freeze_first = !app.freeze_first;
         }
@@ -19273,6 +19363,7 @@ fn mongo_docs_key(app: &mut App, tx: &Tx, k: KeyEvent) {
         // R42: `y` copies the focused document's full JSON (the natural unit for
         // a document store), not the flattened grid row.
         KeyCode::Char('y') => copy_mongo_doc_json(app),
+        KeyCode::Char('Y') => copy_cell_value(app),
         KeyCode::Char('o') => open_row_popup(app),
         KeyCode::Char('v') => open_cell_popup(app),
         KeyCode::Char('/') => open_result_filter(app),
@@ -19894,6 +19985,10 @@ fn preview_key(app: &mut App, tx: &Tx, k: KeyEvent) {
                 copy_row_sql(app);
             }
         }
+        // `Y` (R53): copy just the focused cell's value — the row-level `y`
+        // above keeps copying the whole row as INSERT, and the row popup's `y`
+        // is the same "copy value" gesture one level down.
+        KeyCode::Char('Y') => copy_cell_value(app),
         // Bare-key aliases for the two view commands (mobile reachability).
         KeyCode::Char('w') => toggle_compact(app),
         KeyCode::Char('c') => open_col_picker(app),
@@ -24163,7 +24258,8 @@ fn open_row_popup(app: &mut App) {
             Some(Val::Text(s)) => (s.clone(), Style::default()),
         };
         cols.push(fix_double_encoding(col));
-        values.push(shown.clone());
+        // The popup's `y` copies this same text, so both paths share one mapping.
+        values.push(cell_copy_text(row.get(ci).unwrap_or(&Val::Null)));
         lines.push(PopupLine {
             text: format!("{} = {}", fix_double_encoding(col), shown),
             style,
@@ -24948,6 +25044,59 @@ fn clipboard_copy(text: &str) -> Option<PathBuf> {
         path
     } else {
         None
+    }
+}
+
+/// Clipboard text for one cell: the same shapes the row popup and the grid show
+/// (`NULL` for a SQL NULL, `''` for the empty string), so what lands on the
+/// clipboard is unambiguous when pasted back into SQL.
+fn cell_copy_text(v: &Val) -> String {
+    value_display(v).0
+}
+
+/// `Y` in the results grid: copy just the focused cell's value (the row-level
+/// `y` keeps copying the whole row as `INSERT`, R22). The column name is named in
+/// the status so a wide table stays unambiguous.
+fn copy_cell_value(app: &mut App) {
+    if app.grid_kind == GridKind::Columns
+        || (app.struct_view == StructView::Ddl && app.ddl.is_some())
+    {
+        app.status = t("表结构视图没有可复制的单元格").into();
+        return;
+    }
+    if app.script.as_ref().is_some_and(|s| s.drilled.is_none()) {
+        app.status = t("脚本列表没有可复制的单元格（先 Enter 进入某条语句的结果）").into();
+        return;
+    }
+    let Some(grid) = active_grid(app) else {
+        app.status = t("没有可复制的单元格").into();
+        return;
+    };
+    let Some(name) = grid.columns.get(app.col_cursor).cloned() else {
+        app.status = t("没有可复制的单元格").into();
+        return;
+    };
+    let Some(val) = grid.rows.get(app.sel).and_then(|r| r.get(app.col_cursor)) else {
+        app.status = t("没有可复制的单元格").into();
+        return;
+    };
+    let text = cell_copy_text(val);
+    let n = text.chars().count();
+    // NULL / '' / a short text read best in the status; a long cell would blow it up.
+    let short = truncate_disp(&one_line(&text), 24);
+    match clipboard_copy(&text) {
+        Some(p) => {
+            app.status = tf(
+                "✓ 已复制「{}」= {} · {} 字符 · 兜底 {}",
+                &[&(fix_double_encoding(&name)), &short, &n, &(p.display())],
+            )
+        }
+        None => {
+            app.status = tf(
+                "✓ 已复制「{}」= {} · {} 字符",
+                &[&(fix_double_encoding(&name)), &short, &n],
+            )
+        }
     }
 }
 
@@ -30707,6 +30856,7 @@ fn render_main_area(
         );
         app.editor_vp.follow(app.editor.cursor());
         f.render_widget(&app.editor, main_chunks[0]);
+        paint_bracket_pair(f, main_chunks[0], app);
     }
 
     if has_cmd {
@@ -30731,6 +30881,51 @@ fn render_main_area(
         render_results_strip(f, res_area, app);
     } else {
         render_results_pane(f, res_area, app);
+    }
+}
+
+/// R53: mark the editor caret's bracket and its match, straight in the frame
+/// buffer after the textarea drew. Purely presentational — no key, no state, no
+/// query — so it can never affect execution; the pair is resolved from the
+/// caret's ±[`BRACKET_SCAN_LINES`] lines only. The glyph stays exactly where the
+/// widget painted it; only the colour and modifiers are added. Underline alone
+/// would not stand out (tui-textarea already underlines the caret's whole line),
+/// so the pair gets the accent colour plus bold as well.
+fn paint_bracket_pair(f: &mut Frame, area: Rect, app: &App) {
+    let Some((a, b)) = editor_bracket_pair(app) else {
+        return;
+    };
+    // tui-textarea draws the text inside the `Borders::ALL` block dbxt sets on
+    // it, so the glyph area is the block's inner rect.
+    let inner = Rect {
+        x: area.x.saturating_add(1),
+        y: area.y.saturating_add(1),
+        width: area.width.saturating_sub(2),
+        height: area.height.saturating_sub(2),
+    };
+    if inner.width == 0 || inner.height == 0 {
+        return;
+    }
+    // The widget's own scroll origin for this frame, mirrored in `editor_vp`.
+    let top_row = app.editor_vp.row as usize;
+    let top_col = app.editor_vp.col as usize;
+    let lines = app.editor.lines();
+    for (row, col) in [a, b] {
+        let Some(line) = lines.get(row) else {
+            continue;
+        };
+        let dcol = editor_display_col(line, col);
+        if row < top_row || row - top_row >= inner.height as usize {
+            continue;
+        }
+        if dcol < top_col || dcol - top_col >= inner.width as usize {
+            continue;
+        }
+        let x = inner.x + (dcol - top_col) as u16;
+        let y = inner.y + (row - top_row) as u16;
+        let cell = &mut f.buffer_mut()[(x, y)];
+        cell.fg = Color::LightCyan;
+        cell.modifier.insert(Modifier::UNDERLINED | Modifier::BOLD);
     }
 }
 
@@ -36125,6 +36320,7 @@ const HELP_ROWS: &[(&str, &str)] = &[
         "导出当前结果（CSV / JSON / NDJSON / Markdown / INSERT）",
     ),
     ("y", "复制当前行为 INSERT 语句（OSC52 + 文件兜底）"),
+    ("Y", "复制当前单元格值（状态栏显示列名与字符数）"),
     (
         "/",
         "搜索结果行（隐藏不匹配行，输入即筛，Enter 保留，Esc 清除）",
@@ -36216,7 +36412,7 @@ const HELP_ROWS: &[(&str, &str)] = &[
         "SQL 前缀补全（表名 T / 列名 C / 关键字 K，Tab 上屏）",
     ),
     ("Alt-P", "片段收藏：选中即插到光标处（一步）"),
-    ("%", "跳到配对括号（光标在 ()[]{} 上或旁；否则照常输入 %）"),
+    ("%", "跳到配对括号（光标在 ()[]{} 上或旁；否则照常输入 %；停在括号上时配对项自动高亮）"),
     ("Ctrl-A / Ctrl-E", "行首 / 行尾（Home / End 同）"),
     ("Ctrl-K / Ctrl-⇧K", "删至行尾（kill line）"),
     ("Ctrl-W", "删前一个词"),
@@ -37783,6 +37979,16 @@ mod tests {
                     .collect::<String>()
             })
             .collect()
+    }
+
+    /// Same as [`draw`] but hands back the raw buffer, so a test can inspect the
+    /// per-cell styles (the bracket highlight is a modifier, not a glyph).
+    fn draw_buffer(app: &mut App, w: u16, h: u16) -> ratatui::buffer::Buffer {
+        use ratatui::backend::TestBackend;
+        use ratatui::Terminal;
+        let mut term = Terminal::new(TestBackend::new(w.max(1), h.max(1))).unwrap();
+        term.draw(|f| ui(f, app)).unwrap();
+        term.backend().buffer().clone()
     }
 
     fn sample_grid() -> Grid {
@@ -41549,6 +41755,286 @@ mod tests {
         assert_eq!(matching_bracket("a[b{c}d]", 1), Some(7));
         assert_eq!(matching_bracket("(a", 0), None);
         assert_eq!(matching_bracket("a)", 1), None);
+    }
+
+    /// R53: the passive bracket highlight resolves the caret's bracket (or the
+    /// one just before it, the `%` rule) inside a ±span-line window, reusing the
+    /// same lexer as `%` so brackets inside strings / comments never pair.
+    #[test]
+    fn bracket_pair_near_is_lexer_aware_and_windowed() {
+        let lines = |s: &str| s.split('\n').map(str::to_string).collect::<Vec<_>>();
+
+        let sql = lines("SELECT f(a, (b)) FROM t");
+        assert_eq!(
+            bracket_pair_near(&sql, 0, 12, BRACKET_SCAN_LINES),
+            Some(((0, 12), (0, 14)))
+        );
+        // The closing bracket pairs back the other way.
+        assert_eq!(
+            bracket_pair_near(&sql, 0, 14, BRACKET_SCAN_LINES),
+            Some(((0, 14), (0, 12)))
+        );
+        // Just after the bracket still highlights it (same rule as `%`).
+        assert_eq!(
+            bracket_pair_near(&sql, 0, 13, BRACKET_SCAN_LINES),
+            Some(((0, 12), (0, 14)))
+        );
+        // Away from any bracket there is nothing to highlight.
+        assert_eq!(bracket_pair_near(&sql, 0, 17, BRACKET_SCAN_LINES), None);
+
+        // A `)` inside a string literal is invisible to the lexer, so the code
+        // `(` pairs with the code `)`.
+        let lit = lines("f(')')");
+        assert_eq!(
+            bracket_pair_near(&lit, 0, 1, BRACKET_SCAN_LINES),
+            Some(((0, 1), (0, 5)))
+        );
+        assert_eq!(
+            bracket_pair_near(&lit, 0, 3, BRACKET_SCAN_LINES),
+            None,
+            "a bracket inside a literal never highlights"
+        );
+        // ...and neither is a bracket inside a comment.
+        assert_eq!(
+            bracket_pair_near(&lines("-- (x)"), 0, 3, BRACKET_SCAN_LINES),
+            None
+        );
+        assert_eq!(
+            bracket_pair_near(&lines("/* [a] */"), 0, 3, BRACKET_SCAN_LINES),
+            None
+        );
+
+        // Unbalanced brackets and stale cursors report `None` instead of panicking.
+        assert_eq!(
+            bracket_pair_near(&lines("(a"), 0, 0, BRACKET_SCAN_LINES),
+            None
+        );
+        assert_eq!(
+            bracket_pair_near(&lines("abc"), 9, 0, BRACKET_SCAN_LINES),
+            None
+        );
+        assert_eq!(
+            bracket_pair_near(&lines("abc"), 0, 5, BRACKET_SCAN_LINES),
+            None
+        );
+
+        // The window is real: a pair three rows away is out of reach at ±1 line,
+        // in reach at ±3, and the session window resolves it too.
+        let wide = lines("f(\n1,\n2\n)");
+        assert_eq!(bracket_pair_near(&wide, 0, 1, 1), None);
+        assert_eq!(bracket_pair_near(&wide, 0, 1, 3), Some(((0, 1), (3, 0))));
+        assert_eq!(
+            bracket_pair_near(&wide, 0, 1, BRACKET_SCAN_LINES),
+            Some(((0, 1), (3, 0)))
+        );
+        // A window that spans >200 lines stays bounded: the default constant is
+        // the ceiling, and a 400-line pair is simply not highlighted.
+        let mut deep: Vec<String> = vec!["f(".to_string()];
+        deep.extend((0..400).map(|i| format!("{i},")));
+        deep.push(")".to_string());
+        assert_eq!(bracket_pair_near(&deep, 0, 1, BRACKET_SCAN_LINES), None);
+        // A window wider than the byte cap is skipped as well (a single giant
+        // line has no useful pairing to show).
+        let huge = lines(&format!("f({})", "x".repeat(BRACKET_SCAN_BYTES)));
+        assert_eq!(bracket_pair_near(&huge, 0, 1, BRACKET_SCAN_LINES), None);
+    }
+
+    /// The display-column mapper keeps the highlight on the exact cell the glyph
+    /// occupies: tabs expand to the next stop of four, CJK chars take two cells.
+    #[test]
+    fn editor_display_col_expands_tabs_and_wide_chars() {
+        assert_eq!(editor_display_col("abc", 2), 2);
+        assert_eq!(editor_display_col("\tab", 1), 4);
+        assert_eq!(editor_display_col("a\tb", 2), 4);
+        assert_eq!(editor_display_col("中x", 1), 2);
+        assert_eq!(editor_display_col("中x", 2), 3);
+    }
+
+    /// R53: the highlight reaches the rendered frame — both brackets carry the
+    /// bold accent marker and unrelated cells do not. (`UNDERLINED` cannot be the
+    /// marker here: tui-textarea already underlines the caret's whole line by
+    /// default, so the pair is marked with `BOLD` plus the accent colour.)
+    #[test]
+    fn editor_renders_the_matching_bracket_highlight() {
+        let mut app = test_app();
+        app.picker_open = false;
+        app.focus = Focus::Editor;
+        let text = "SELECT f(a) FROM t";
+        let open = text.find('(').unwrap();
+        let close = text.find(')').unwrap();
+        app.set_editor_text(text);
+        app.editor.move_cursor(CursorMove::Jump(0, open as u16));
+        let buf = draw_buffer(&mut app, 80, 30);
+        let ed = app.rects.editor;
+        let y = ed.y + 1;
+        let marked = |dx: u16| {
+            let cell = buf.cell((ed.x + 1 + dx, y)).expect("editor cell");
+            cell.modifier.contains(Modifier::BOLD) && cell.fg == Color::LightCyan
+        };
+        assert!(marked(open as u16), "the caret's `(` is marked");
+        assert!(marked(close as u16), "the matching `)` is marked");
+        assert!(!marked(3), "an unrelated cell is untouched");
+
+        // Moving the caret off the bracket restores the plain editor.
+        app.editor.move_cursor(CursorMove::Jump(0, 3));
+        let buf = draw_buffer(&mut app, 80, 30);
+        let cell = buf.cell((ed.x + 1 + open as u16, y)).unwrap();
+        assert!(
+            !cell.modifier.contains(Modifier::BOLD) && cell.fg != Color::LightCyan,
+            "leaving the bracket clears the highlight"
+        );
+
+        // Degenerate panes must not panic: the highlight clips to the inner rect.
+        app.editor.move_cursor(CursorMove::Jump(0, open as u16));
+        for (w, h) in [(20u16, 6u16), (40, 2), (18, 1), (1, 1)] {
+            draw(&mut app, w, h);
+        }
+    }
+
+    /// R53: the highlight follows the editor's horizontal scroll — a pair that is
+    /// only visible after scrolling is still marked on the right cells.
+    #[test]
+    fn bracket_highlight_follows_horizontal_scroll() {
+        let mut app = test_app();
+        app.picker_open = false;
+        app.focus = Focus::Editor;
+        let text = format!("{}f(a)", "x".repeat(120));
+        let open = text.find('(').unwrap();
+        let close = text.find(')').unwrap();
+        app.set_editor_text(&text);
+        // Park the caret on the closing bracket so both glyphs stay in view once
+        // the widget scrolls to it.
+        app.editor.move_cursor(CursorMove::Jump(0, close as u16));
+        let buf = draw_buffer(&mut app, 80, 30);
+        assert!(app.editor_vp.col > 0, "the editor scrolled horizontally");
+        let ed = app.rects.editor;
+        let y = ed.y + 1;
+        let top = app.editor_vp.col;
+        let marked = |col: usize| {
+            let cell = buf
+                .cell((ed.x + 1 + (col as u16 - top), y))
+                .expect("editor cell");
+            cell.modifier.contains(Modifier::BOLD) && cell.fg == Color::LightCyan
+        };
+        assert!(marked(open), "the scrolled-to `(` is marked");
+        assert!(marked(close), "the scrolled-to `)` is marked");
+    }
+
+    /// R53: a cell's clipboard text matches what the row popup shows, so a paste
+    /// reads the same everywhere.
+    #[test]
+    fn cell_copy_text_shapes_match_the_row_popup() {
+        assert_eq!(cell_copy_text(&Val::Null), "NULL");
+        assert_eq!(cell_copy_text(&Val::Text(String::new())), "''");
+        assert_eq!(cell_copy_text(&Val::Text("plain".into())), "plain");
+    }
+
+    /// R53: `Y` copies the focused cell and flashes the column + char count in
+    /// the status bar; a grid without a cell (structure view / script list)
+    /// reports instead of copying.
+    #[test]
+    fn shift_y_copies_the_focused_cell() {
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel::<OpResult>();
+        let mut app = test_app();
+        app.picker_open = false;
+        app.selected = Some(test_conn("mysql"));
+        app.backend_kind = Backend::Sql;
+        app.grid_kind = GridKind::Query;
+        app.set_grid(Grid {
+            columns: vec!["id".into(), "name".into()],
+            rows: vec![vec![Val::Text("7".into()), Val::Text("seven".into())]],
+            note: String::new(),
+        });
+        app.focus = Focus::Preview;
+        app.sel = 0;
+        app.col_cursor = 1;
+        key(
+            &mut app,
+            &tx,
+            KeyEvent::new(KeyCode::Char('Y'), KeyModifiers::SHIFT),
+        );
+        assert!(app.status.contains("已复制"), "{}", app.status);
+        assert!(app.status.contains("name"), "{}", app.status);
+        assert!(app.status.contains("5 字符"), "{}", app.status);
+
+        // The structure (DDL) view has no cell on screen to copy.
+        app.struct_view = StructView::Ddl;
+        app.ddl = Some("CREATE TABLE t (id int)".into());
+        app.status.clear();
+        copy_cell_value(&mut app);
+        assert!(app.status.contains("没有可复制的单元格"), "{}", app.status);
+        app.struct_view = StructView::Fields;
+        app.ddl = None;
+
+        // The script list has no cell cursor either.
+        app.script = Some(sample_script(2));
+        app.status.clear();
+        copy_cell_value(&mut app);
+        assert!(app.status.contains("没有可复制的单元格"), "{}", app.status);
+    }
+
+    /// R53 audit: `PageUp` / `PageDown` in the results grid are a whole-screen
+    /// jump (R42), clamped at the first / last row, counted, and crossing no page
+    /// boundary here (a plain 40-row result).
+    #[test]
+    fn page_keys_move_a_screen_and_clamp_at_the_edges() {
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel::<OpResult>();
+        let mut app = test_app();
+        app.picker_open = false;
+        app.selected = Some(test_conn("mysql"));
+        app.backend_kind = Backend::Sql;
+        app.grid_kind = GridKind::Query;
+        app.set_grid(Grid {
+            columns: vec!["c".into()],
+            rows: (0..40).map(|i| vec![Val::Text(i.to_string())]).collect(),
+            note: String::new(),
+        });
+        app.focus = Focus::Preview;
+        app.sel = 0;
+        // `viewport_rows` reads the laid-out results rect, so draw one frame.
+        draw(&mut app, 110, 30);
+        let screen = viewport_rows(&app);
+        assert!(screen > 1, "a screenful should be more than one row");
+
+        key(
+            &mut app,
+            &tx,
+            KeyEvent::new(KeyCode::PageDown, KeyModifiers::NONE),
+        );
+        assert_eq!(app.sel, screen);
+        // A count prefix jumps several screens at once, clamped to the last row.
+        key(
+            &mut app,
+            &tx,
+            KeyEvent::new(KeyCode::Char('3'), KeyModifiers::NONE),
+        );
+        key(
+            &mut app,
+            &tx,
+            KeyEvent::new(KeyCode::PageDown, KeyModifiers::NONE),
+        );
+        assert_eq!(app.sel, 39);
+        key(
+            &mut app,
+            &tx,
+            KeyEvent::new(KeyCode::PageUp, KeyModifiers::NONE),
+        );
+        assert_eq!(app.sel, 39 - screen);
+        // Repeated PageUp walks up to the first row and clamps there.
+        for _ in 0..4 {
+            key(
+                &mut app,
+                &tx,
+                KeyEvent::new(KeyCode::PageUp, KeyModifiers::NONE),
+            );
+        }
+        assert_eq!(app.sel, 0, "PageUp clamps at the first row");
+        key(
+            &mut app,
+            &tx,
+            KeyEvent::new(KeyCode::PageUp, KeyModifiers::NONE),
+        );
+        assert_eq!(app.sel, 0, "PageUp at the top is a no-op");
     }
 
     /// tui-textarea's readline bindings must survive `browse_key`'s routing:

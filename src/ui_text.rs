@@ -1039,7 +1039,7 @@ pub static ALL_KEYS: &[&str] = &[
     "数据对比 WHERE 过滤（两边同时生效）· Enter 开始 · Esc 返回",
     "配对括号",
     "最近表 / 集合 / Redis key 后退 / 前进（浏览器语义，最多 50 个，跨库可用）",
-    "跳到配对括号（光标在 ()[]{} 上或旁；否则照常输入 %）",
+    "跳到配对括号（光标在 ()[]{} 上或旁；否则照常输入 %；停在括号上时配对项自动高亮）",
     "行首 / 行尾（Home / End 同）",
     "删至行尾（kill line）",
     "删前一个词",
@@ -1104,11 +1104,31 @@ pub static ALL_KEYS: &[&str] = &[
     "▤{}「{}」{} 行 · ",
     "按当前列过滤：输入值只留该列含值的行（预填当前单元格，Esc 清除）",
     "跳到下 / 上一条 SQL 语句开头（分号边界，注释/空语句跳过；状态栏显示 语句 i/n）",
+    "表结构视图没有可复制的单元格",
+    "脚本列表没有可复制的单元格（先 Enter 进入某条语句的结果）",
+    "没有可复制的单元格",
+    "✓ 已复制「{}」= {} · {} 字符 · 兜底 {}",
+    "✓ 已复制「{}」= {} · {} 字符",
 ];
 
 /// The Chinese → English table. Keys must match the source literals exactly.
 fn en_of(zh: &'static str) -> Option<&'static str> {
     match zh {
+        // ── R53: editor bracket highlight + cell copy ──
+        "表结构视图没有可复制的单元格" => {
+            Some("No cell to copy in the structure view")
+        }
+        "脚本列表没有可复制的单元格（先 Enter 进入某条语句的结果）" => Some(
+            "No cell to copy in the script list (press Enter to open a statement's result first)",
+        ),
+        "没有可复制的单元格" => Some("No cell to copy"),
+        "✓ 已复制「{}」= {} · {} 字符 · 兜底 {}" => {
+            Some("✓ Copied [{}] = {} · {} chars · fallback {}")
+        }
+        "✓ 已复制「{}」= {} · {} 字符" => Some("✓ Copied [{}] = {} · {} chars"),
+        "复制当前单元格值（状态栏显示列名与字符数）" => {
+            Some("copy the focused cell's value (status shows the column and char count)")
+        }
         // ── R52: editor statement jump + results column filter + server version ──
         "语句 {}/{}" => Some("statement {}/{}"),
         "服务器 {}" => Some("server {}"),
@@ -2955,8 +2975,8 @@ fn en_of(zh: &'static str) -> Option<&'static str> {
         "最近表 / 集合 / Redis key 后退 / 前进（浏览器语义，最多 50 个，跨库可用）" => {
             Some("back / forward over tables / collections / Redis keys (browser semantics, up to 50)")
         }
-        "跳到配对括号（光标在 ()[]{} 上或旁；否则照常输入 %）" => {
-            Some("jump to the matching bracket (cursor on or beside ()[]{}; otherwise types %)")
+        "跳到配对括号（光标在 ()[]{} 上或旁；否则照常输入 %；停在括号上时配对项自动高亮）" => {
+            Some("jump to the matching bracket (cursor on or beside ()[]{}; otherwise types %; the match under the cursor is highlighted automatically)")
         }
         "行首 / 行尾（Home / End 同）" => Some("line head / tail (Home / End too)"),
         "删至行尾（kill line）" => Some("kill to end of line"),
