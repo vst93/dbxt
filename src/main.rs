@@ -156,6 +156,14 @@ const BRACKET_SCAN_LINES: usize = 200;
 /// long lines could still be megabytes, so a window wider than this is skipped
 /// (an editor line that big has no useful bracket pairing to show anyway).
 const BRACKET_SCAN_BYTES: usize = 256 * 1024;
+/// R56: the editor dims every statement except the one under the caret. Under
+/// this many bytes the whole buffer is split at `;` once per frame (cheap enough
+/// the spec allows it); above it only ±[`STMT_DIM_SCAN_LINES`] lines around the
+/// caret are considered, the same windowing the bracket highlight uses.
+const STMT_DIM_MAX_BYTES: usize = 256 * 1024;
+/// R56: the ±line window for the active-statement dim on a buffer over
+/// [`STMT_DIM_MAX_BYTES`].
+const STMT_DIM_SCAN_LINES: usize = 500;
 
 // ─── pages & focus ───────────────────────────────────────────────────────────
 
@@ -3767,13 +3775,17 @@ enum PageSeek {
 
 /// Column metadata for the table currently open in the data browser. Used to
 /// build `UPDATE`/`INSERT` templates (primary-key detection, value typing).
-#[derive(Clone)]
+#[derive(Clone, Default)]
 struct TableMeta {
     table: String,
     /// Schema the metadata was read from; matched alongside the table name so
     /// `public.orders` and `inv.orders` never swap column metadata.
     schema: String,
     columns: Vec<ColumnInfo>,
+    /// R56: the table's indexes, fetched alongside the columns (best effort) so
+    /// the `g c` popup can mark a non-unique index column as `MUL` without a
+    /// query of its own. Empty when the backend could not list them.
+    indexes: Vec<IndexInfo>,
 }
 
 /// One paginated table-data request (first load, page turn, filter or sort).
@@ -6134,6 +6146,9 @@ enum OpResult {
         table: String,
         schema: String,
         columns: Vec<ColumnInfo>,
+        /// R56: cached index metadata so `g c` can mark `MUL` columns without a
+        /// query of its own (best effort; empty when the backend cannot list).
+        indexes: Vec<IndexInfo>,
     },
     Query(Box<dbx_core::db::QueryResult>, String, usize),
     Script(Vec<StmtOutcome>),
@@ -7142,11 +7157,23 @@ async fn run_op(backend: &LocalBackend, op: Op, tx: &Tx) -> OpResult {
         }
         Op::TableColumns(cfg, db, schema, table) => {
             match backend.get_columns(&cfg, &db, &schema, &table).await {
-                Ok(columns) => OpResult::TableColumns {
-                    table,
-                    schema,
-                    columns,
-                },
+                Ok(columns) => {
+                    // R56: fetch the indexes in the same metadata pass (best
+                    // effort) so the `g c` popup can mark a non-unique index
+                    // column `MUL` from cache. MUL is a MySQL-family concept, so
+                    // the extra read is skipped elsewhere.
+                    let indexes = if is_mysql_family(cfg.db_type.as_str()) {
+                        list_indexes_best_effort(backend, &cfg, &db, &schema, &table).await
+                    } else {
+                        Vec::new()
+                    };
+                    OpResult::TableColumns {
+                        table,
+                        schema,
+                        columns,
+                        indexes,
+                    }
+                }
                 Err(e) => OpResult::Error(format!("table columns: {e}")),
             }
         }
@@ -8223,6 +8250,21 @@ async fn run_op(backend: &LocalBackend, op: Op, tx: &Tx) -> OpResult {
     }
 }
 
+/// R56: list a table's indexes, treating any failure as “none” — used where the
+/// indexes only enrich something else (the `g c` popup key mark, a diff, the
+/// keyset primary key) and a driver that cannot list them must not fail the call.
+async fn list_indexes_best_effort(
+    backend: &LocalBackend,
+    cfg: &ConnectionConfig,
+    db: &str,
+    schema: &str,
+    table: &str,
+) -> Vec<IndexInfo> {
+    dbx_core::schema::list_indexes_core(backend.state().as_ref(), &cfg.id, db, schema, table)
+        .await
+        .unwrap_or_default()
+}
+
 /// Fetch one side of a table diff: columns (required) plus indexes (best
 /// effort — a driver that cannot list them still diffs columns).
 async fn fetch_diff_side(
@@ -8233,10 +8275,7 @@ async fn fetch_diff_side(
     table: &str,
 ) -> Result<DiffSide, String> {
     let columns = backend.get_columns(cfg, db, schema, table).await?;
-    let indexes =
-        dbx_core::schema::list_indexes_core(backend.state().as_ref(), &cfg.id, db, schema, table)
-            .await
-            .unwrap_or_default();
+    let indexes = list_indexes_best_effort(backend, cfg, db, schema, table).await;
     Ok(DiffSide {
         db: db.to_string(),
         schema: schema.to_string(),
@@ -8265,10 +8304,7 @@ async fn resolve_data_pk(
     table: &str,
     columns: &[ColumnInfo],
 ) -> Vec<String> {
-    let indexes =
-        dbx_core::schema::list_indexes_core(backend.state().as_ref(), &cfg.id, db, schema, table)
-            .await
-            .unwrap_or_default();
+    let indexes = list_indexes_best_effort(backend, cfg, db, schema, table).await;
     pk_from_metadata(columns, &indexes)
 }
 
@@ -10787,6 +10823,11 @@ struct App {
     /// top visible line.
     cols_popup_open: bool,
     cols_popup_scroll: u16,
+    /// R56: `/` inside the popup filters the column list by name.
+    /// `cols_popup_needle` is the active needle (empty = show every column) and
+    /// `cols_popup_filter` is the modal one-line input while it is being typed.
+    cols_popup_needle: String,
+    cols_popup_filter: Option<TextArea<'static>>,
     /// The unfiltered grid backing the filtered `grid` (needed to re-show a
     /// hidden column without re-querying).
     grid_full: Option<Grid>,
@@ -10854,6 +10895,9 @@ struct App {
     // ── grid column jump (`|` in the results pane) ──
     /// The modal input for `|` (column number or name prefix).
     col_jump: Option<TextArea<'static>>,
+    /// R56: `:` in the results pane — jump to a row by number (`:12`) or to the
+    /// last row (`:$`). The modal input while the row number is typed.
+    goto_prompt: Option<TextArea<'static>>,
     /// Last SQL sent to the backend, used to guess a table for `y`.
     last_sql: Option<String>,
     /// Last SQL actually executed (set by [`execute_sql`]), so the quit guard
@@ -11524,6 +11568,8 @@ impl App {
             col_picker_list: ListState::default(),
             cols_popup_open: false,
             cols_popup_scroll: 0,
+            cols_popup_needle: String::new(),
+            cols_popup_filter: None,
             grid_full: None,
             recent_tables: Vec::new(),
             recent_open: false,
@@ -11550,6 +11596,7 @@ impl App {
             locate_needle: String::new(),
             locate_col: None,
             col_jump: None,
+            goto_prompt: None,
             last_sql: None,
             last_executed: None,
             quit_armed: false,
@@ -12432,6 +12479,7 @@ fn apply_op_result(app: &mut App, res: OpResult, tx: &Tx) {
             table,
             schema,
             columns,
+            indexes,
         } => {
             // Only keep metadata that belongs to the table on screen (same
             // database *and* schema: `public.orders` ≠ `inv.orders`).
@@ -12446,6 +12494,7 @@ fn apply_op_result(app: &mut App, res: OpResult, tx: &Tx) {
                     table: table.clone(),
                     schema: schema.clone(),
                     columns,
+                    indexes,
                 });
             }
             // The initial page load waits for this so keyset-vs-OFFSET is chosen
@@ -13738,6 +13787,8 @@ fn reset_overlays_for_backend_switch(app: &mut App) {
     app.recent_open = false;
     app.col_picker_open = false;
     app.cols_popup_open = false;
+    app.cols_popup_needle.clear();
+    app.cols_popup_filter = None;
     app.snippet_open = false;
     app.snippet_name = None;
     app.completion = None;
@@ -13750,6 +13801,7 @@ fn reset_overlays_for_backend_switch(app: &mut App) {
     app.clear_col_filter();
     app.locate_prompt = None;
     app.col_jump = None;
+    app.goto_prompt = None;
     app.mongo_dialog = None;
     app.redis_prompt = None;
     app.help_open = false;
@@ -14116,6 +14168,12 @@ fn browse_key(app: &mut App, tx: &Tx, k: KeyEvent) {
     }
     if app.col_jump.is_some() {
         col_jump_key(app, k);
+        return;
+    }
+
+    // R56: the `:` row-number jump prompt is modal too.
+    if app.goto_prompt.is_some() {
+        goto_row_key(app, k);
         return;
     }
 
@@ -19501,6 +19559,58 @@ fn statement_index_at(ranges: &[(usize, usize)], cursor: usize) -> Option<usize>
     Some(ranges.iter().rposition(|&(s, _)| s <= cursor).unwrap_or(0))
 }
 
+/// R56: the inclusive `(first_row, last_row)` of the statement the caret at
+/// `(row, col)` sits in, for dimming every other statement in the editor.
+///
+/// `None` when there is nothing to dim — no text, a single-statement buffer, or
+/// a caret outside the lines. The `;` split reuses the R52 statement splitter
+/// (literals / comments never split a statement). Under
+/// [`STMT_DIM_MAX_BYTES`] the whole buffer is split; above it only
+/// ±[`STMT_DIM_SCAN_LINES`] lines around the caret are read, so a huge SQL file
+/// costs the same per frame as a small one.
+fn active_statement_rows(lines: &[String], row: usize, col: usize) -> Option<(usize, usize)> {
+    if lines.is_empty() || row >= lines.len() {
+        return None;
+    }
+    // A single-statement buffer (the common case) has no `;` at all: skip the
+    // lexer entirely.
+    if !lines.iter().any(|l| l.contains(';')) {
+        return None;
+    }
+    let bytes: usize = lines.iter().map(|l| l.len() + 1).sum();
+    let (lo, hi) = if bytes <= STMT_DIM_MAX_BYTES {
+        (0, lines.len())
+    } else {
+        let lo = row.saturating_sub(STMT_DIM_SCAN_LINES);
+        let hi = (row + STMT_DIM_SCAN_LINES + 1).min(lines.len());
+        (lo, hi)
+    };
+    if hi <= lo {
+        return None;
+    }
+    // Caret char offset inside the window text (one `\n` between joined lines).
+    let mut off = 0usize;
+    for l in &lines[lo..row] {
+        off += l.chars().count() + 1;
+    }
+    off += col.min(lines[row].chars().count());
+
+    let win = lines[lo..hi].join("\n");
+    let ranges = statement_ranges(&win);
+    if ranges.len() < 2 {
+        return None;
+    }
+    // Resolve the caret's statement the same way `Alt-↓`/`Alt-↑` does (the last
+    // statement starting at or before the caret), so a caret parked just after a
+    // `;` still belongs to the statement it just ended rather than jumping to the
+    // next one.
+    let idx = statement_index_at(&ranges, off)?;
+    let (start, end) = ranges[idx];
+    let (sr, _) = offset_to_cursor(&win, start);
+    let (er, _) = offset_to_cursor(&win, end.saturating_sub(1).max(start));
+    Some((lo + sr, lo + er))
+}
+
 /// First char offset in `start..end` that is real code (not whitespace and not
 /// inside a leading comment), so a statement jump lands on the statement's first
 /// token rather than on the comment block above it. Falls back to `start` when
@@ -20227,6 +20337,7 @@ fn redis_value_key(app: &mut App, tx: &Tx, k: KeyEvent) {
         KeyCode::Char('/') => open_result_filter(app),
         KeyCode::Char('y') => copy_redis_row(app),
         KeyCode::Char('Y') => copy_cell_value(app),
+        KeyCode::Char(':') => open_goto_row(app),
         KeyCode::Char('z') => {
             app.freeze_first = !app.freeze_first;
         }
@@ -20283,6 +20394,7 @@ fn mongo_docs_key(app: &mut App, tx: &Tx, k: KeyEvent) {
         KeyCode::Char('o') => open_row_popup(app),
         KeyCode::Char('v') => open_cell_popup(app),
         KeyCode::Char('/') => open_result_filter(app),
+        KeyCode::Char(':') => open_goto_row(app),
         KeyCode::Up | KeyCode::Char('k') => move_cursor(app, tx, -1),
         KeyCode::Down | KeyCode::Char('j') => move_cursor(app, tx, 1),
         KeyCode::Left | KeyCode::Char('h') => move_col_cursor(app, -1),
@@ -20891,6 +21003,9 @@ fn preview_key(app: &mut App, tx: &Tx, k: KeyEvent) {
         KeyCode::Char('*') => open_col_filter(app),
         // `|` jumps straight to a column by number or name prefix (wide tables).
         KeyCode::Char('|') => open_col_jump(app),
+        // R56: `:` jumps straight to a row by number (or `:$` for the last), the
+        // vim `:<n>` gesture for a long grid. `gg` / `G` stay first / last.
+        KeyCode::Char(':') => open_goto_row(app),
         // R55: `<` / `>` narrow / widen the focused column, remembered for the
         // session per table (never persisted). The terminal twin of dragging a
         // column border.
@@ -21756,6 +21871,82 @@ fn col_jump_key(app: &mut App, k: KeyEvent) {
     }
 }
 
+// ── R56: `:` row-number jump ──
+
+/// `:` in the results pane — jump to a row by number (`:12`) or to the last row
+/// (`:$`). Reuses the existing one-line prompt infrastructure; unlike the cell
+/// cursor it never touches the column, so a wide row keeps its place.
+fn open_goto_row(app: &mut App) {
+    let n = result_row_count(app);
+    if n == 0 {
+        app.status = t("没有可跳转的行").into();
+        return;
+    }
+    let mut ta = TextArea::default();
+    ta.set_placeholder_text(tf("行号 1-{} 或 $ 末行…", &[&(n)]));
+    app.goto_prompt = Some(ta);
+}
+
+/// Parse a `:` row-jump input against a row count: a 1-based number (`1` and `0`
+/// both mean the first row) or `$` / `end` for the last row. Out-of-range numbers
+/// are rejected rather than clamped, so a typo reports instead of jumping
+/// somewhere unexpected. Pure so it can be tested directly.
+fn parse_row_jump(count: usize, input: &str) -> Result<usize, String> {
+    if count == 0 {
+        return Err(t("没有可跳转的行").to_string());
+    }
+    let q = input.trim();
+    if q.is_empty() {
+        return Err(t("请输入行号").to_string());
+    }
+    if q == "$" || q.eq_ignore_ascii_case("end") {
+        return Ok(count - 1);
+    }
+    if q == "0" || q == "1" {
+        return Ok(0);
+    }
+    match q.parse::<usize>() {
+        Ok(n) if n >= 1 && n <= count => Ok(n - 1),
+        Ok(_) => Err(tf("行号超出范围（1-{}）", &[&(count)])),
+        Err(_) => Err(tf("无法识别的行号「{}」", &[&(q)])),
+    }
+}
+
+/// Prompt handler for `:`: Enter jumps, Esc cancels, anything else is text.
+fn goto_row_key(app: &mut App, k: KeyEvent) {
+    match k.code {
+        KeyCode::Enter => {
+            let input = app
+                .goto_prompt
+                .as_ref()
+                .map(|t| t.lines().join(" ").trim().to_string())
+                .unwrap_or_default();
+            app.goto_prompt = None;
+            let n = result_row_count(app);
+            match parse_row_jump(n, &input) {
+                Ok(i) => {
+                    // The column cursor parks on the first column so the jump
+                    // lands on a known corner (same rule as `gg` / `G`).
+                    app.sel = i;
+                    app.col_cursor = 0;
+                    app.col_offset = 0;
+                    app.status = tf("跳到第 {} 行 / 共 {}", &[&(i + 1), &(n)]);
+                }
+                Err(msg) => app.status = msg,
+            }
+        }
+        KeyCode::Esc => {
+            app.goto_prompt = None;
+            app.status = t("已取消跳行").into();
+        }
+        _ => {
+            if let Some(t) = &mut app.goto_prompt {
+                t.input(k);
+            }
+        }
+    }
+}
+
 // ── mobile efficiency: compact columns / column visibility / recents / filter ──
 
 /// Ctrl-Shift-C — toggle the compact column-width mode. The first press always
@@ -21848,54 +22039,221 @@ fn col_picker_key(app: &mut App, k: KeyEvent) {
 
 /// Space in the column picker: hide / show the highlighted column. The last
 /// visible column can never be hidden.
-/// R48 `gc`: open the column-structure popup. It lists the columns already
+/// R48 `gc` / R56: open the column-structure popup. It lists the columns already
 /// cached for the open table (`table_meta`, read from information_schema when
 /// the table was loaded) — no extra query. A query result has no table metadata,
-/// so its grid columns are shown by name only.
+/// so its grid columns are shown by name only. R56 adds the default value and
+/// the `PRI` / `UNI` / `MUL` key mark, and a fresh popup starts unfiltered.
 fn open_cols_popup(app: &mut App) {
-    if cols_popup_lines_for(app).is_empty() {
+    if cols_popup_rows(app).is_empty() {
         app.status = t("无可显示的列（先打开一张表或执行查询）").into();
         return;
     }
     app.cols_popup_open = true;
     app.cols_popup_scroll = 0;
+    app.cols_popup_needle.clear();
+    app.cols_popup_filter = None;
 }
 
-/// One line per column: `name  type  PK / NOT NULL  · comment`. Empty when there
-/// is neither table metadata nor a grid.
-fn cols_popup_lines_for(app: &App) -> Vec<String> {
+/// R56: one column row for the `g c` popup. The key mark follows MySQL's
+/// `information_schema.COLUMNS.COLUMN_KEY` where the pinned dbx-core exposes it
+/// — `PRI` from `is_primary_key`, `UNI` from `is_unique` — and derives `MUL`
+/// from the cached index metadata.
+#[derive(Clone, Debug, PartialEq)]
+struct ColPopupRow {
+    name: String,
+    data_type: String,
+    key: &'static str,
+    default: String,
+    nullable: bool,
+    comment: String,
+}
+
+/// The `COLUMN_KEY` shorthand of one column. `MUL` (the first column of a
+/// non-unique index, a value may repeat) needs index metadata, so it is only
+/// produced when the backend listed the indexes into `table_meta`.
+fn column_key_mark(c: &ColumnInfo, indexes: &[IndexInfo]) -> &'static str {
+    if c.is_primary_key {
+        return "PRI";
+    }
+    if c.is_unique {
+        return "UNI";
+    }
+    let mul = indexes.iter().any(|ix| {
+        !ix.is_primary
+            && !ix.is_unique
+            && ix
+                .columns
+                .first()
+                .is_some_and(|n| n.eq_ignore_ascii_case(&c.name))
+    });
+    if mul {
+        "MUL"
+    } else {
+        ""
+    }
+}
+
+/// The popup's columns, from the cached `table_meta` (name / type / key /
+/// default / nullability / comment) or, for a bare query result, the grid's
+/// column names alone. Empty when there is neither metadata nor a grid.
+fn cols_popup_rows(app: &App) -> Vec<ColPopupRow> {
     if let Some(meta) = &app.table_meta {
         if !meta.columns.is_empty() {
             return meta
                 .columns
                 .iter()
-                .map(|c| {
-                    let mut s = format!("{}  {}", fix_double_encoding(&c.name), c.data_type);
-                    if c.is_primary_key {
-                        s.push_str("  PK");
-                    }
-                    if !c.is_nullable {
-                        s.push_str("  NOT NULL");
-                    }
-                    if let Some(cm) = c.comment.as_deref().filter(|c| !c.is_empty()) {
-                        s.push_str(&format!("  · {cm}"));
-                    }
-                    s
+                .map(|c| ColPopupRow {
+                    name: fix_double_encoding(&c.name),
+                    data_type: c.data_type.clone(),
+                    key: column_key_mark(c, &meta.indexes),
+                    default: c
+                        .column_default
+                        .as_deref()
+                        .map(str::trim)
+                        .filter(|d| !d.is_empty())
+                        .unwrap_or("")
+                        .to_string(),
+                    nullable: c.is_nullable,
+                    comment: c
+                        .comment
+                        .as_deref()
+                        .map(str::trim)
+                        .filter(|v| !v.is_empty())
+                        .unwrap_or("")
+                        .to_string(),
                 })
                 .collect();
         }
     }
     match full_grid(app) {
-        Some(g) if !g.columns.is_empty() => {
-            g.columns.iter().map(|c| fix_double_encoding(c)).collect()
-        }
+        Some(g) if !g.columns.is_empty() => g
+            .columns
+            .iter()
+            .map(|c| ColPopupRow {
+                name: fix_double_encoding(c),
+                data_type: String::new(),
+                key: "",
+                default: String::new(),
+                nullable: true,
+                comment: String::new(),
+            })
+            .collect(),
         _ => Vec::new(),
     }
 }
 
+/// `/` inside the popup keeps only the columns whose name contains the needle
+/// (case-insensitive substring), the same rule the result search uses.
+fn cols_popup_matches(row: &ColPopupRow, needle: &str) -> bool {
+    let n = needle.trim();
+    if n.is_empty() {
+        return true;
+    }
+    row.name.to_lowercase().contains(&n.to_lowercase())
+}
+
+/// `(hits, total)` of the popup's column filter, for the title and the status.
+fn cols_popup_hits(app: &App) -> (usize, usize) {
+    let rows = cols_popup_rows(app);
+    let total = rows.len();
+    let hits = rows
+        .iter()
+        .filter(|r| cols_popup_matches(r, &app.cols_popup_needle))
+        .count();
+    (hits, total)
+}
+
+/// Fixed widths for the popup table: the name and type columns are padded so the
+/// rows line up, while the key / default / flags / comment tail flows after them
+/// and is clipped last. A narrow terminal shrinks the type before the name (and
+/// the default silently clips first), so the column name always stays readable.
+struct ColPopupLayout {
+    name_w: usize,
+    type_w: usize,
+    show_key: bool,
+}
+
+fn cols_popup_layout(rows: &[&ColPopupRow], width: usize) -> ColPopupLayout {
+    let name_w = rows
+        .iter()
+        .map(|r| disp_width(&r.name))
+        .max()
+        .unwrap_or(4)
+        .min((width / 3).max(6));
+    let type_w = rows
+        .iter()
+        .map(|r| disp_width(&r.data_type))
+        .max()
+        .unwrap_or(0)
+        .min((width / 4).max(4));
+    ColPopupLayout {
+        name_w,
+        type_w,
+        show_key: rows.iter().any(|r| !r.key.is_empty()),
+    }
+}
+
+/// Pad `s` with spaces to `w` display columns, truncating when it is longer so a
+/// wide CJK name never pushes the key column off the row.
+fn pad_disp(s: &str, w: usize) -> String {
+    let d = disp_width(s);
+    if d >= w {
+        truncate_disp(s, w)
+    } else {
+        format!("{s}{}", " ".repeat(w - d))
+    }
+}
+
+/// One aligned popup line: `name  type  KEY  =default  NOT NULL  · comment`,
+/// clipped to `width`. Empty columns collapse, so a query result stays a clean
+/// single name column.
+fn cols_popup_line(r: &ColPopupRow, l: &ColPopupLayout, width: usize) -> String {
+    let mut s = pad_disp(&r.name, l.name_w);
+    if l.type_w > 0 && !r.data_type.is_empty() {
+        s.push_str("  ");
+        s.push_str(&pad_disp(&r.data_type, l.type_w));
+    }
+    if l.show_key {
+        s.push_str("  ");
+        s.push_str(&pad_disp(r.key, 3));
+    }
+    if !r.default.is_empty() {
+        s.push_str("  =");
+        s.push_str(&r.default);
+    }
+    if !r.nullable {
+        s.push_str("  NOT NULL");
+    }
+    if !r.comment.is_empty() {
+        s.push_str("  · ");
+        s.push_str(&r.comment);
+    }
+    truncate_disp(&s, width)
+}
+
+/// `/` inside the popup opens the column-name filter (prefilled with the active
+/// needle, so a second `/` refines it).
+fn open_cols_popup_filter(app: &mut App) {
+    let mut ta = TextArea::from([app.cols_popup_needle.clone()]);
+    ta.set_placeholder_text(t("过滤列名…"));
+    ta.move_cursor(CursorMove::End);
+    app.cols_popup_filter = Some(ta);
+}
+
 fn cols_popup_key(app: &mut App, k: KeyEvent) {
+    // The filter prompt is modal on top of the popup and owns the keyboard first.
+    if app.cols_popup_filter.is_some() {
+        cols_popup_filter_key(app, k);
+        return;
+    }
     match k.code {
-        KeyCode::Esc | KeyCode::Char('q') | KeyCode::Char('c') => app.cols_popup_open = false,
+        KeyCode::Esc | KeyCode::Char('q') | KeyCode::Char('c') => {
+            app.cols_popup_open = false;
+            app.cols_popup_needle.clear();
+            app.cols_popup_filter = None;
+        }
+        KeyCode::Char('/') => open_cols_popup_filter(app),
         KeyCode::Up | KeyCode::Char('k') => {
             app.cols_popup_scroll = app.cols_popup_scroll.saturating_sub(1)
         }
@@ -21905,6 +22263,50 @@ fn cols_popup_key(app: &mut App, k: KeyEvent) {
         KeyCode::PageUp => app.cols_popup_scroll = app.cols_popup_scroll.saturating_sub(8),
         KeyCode::PageDown => app.cols_popup_scroll = app.cols_popup_scroll.saturating_add(8),
         _ => {}
+    }
+}
+
+/// Filter-as-you-type handler for the popup's column-name filter (mirrors the
+/// result search: Enter keeps the needle, Esc clears it).
+fn cols_popup_filter_key(app: &mut App, k: KeyEvent) {
+    match k.code {
+        KeyCode::Enter => {
+            app.cols_popup_filter = None;
+            let (hits, total) = cols_popup_hits(app);
+            app.status = if app.cols_popup_needle.trim().is_empty() {
+                t("列名过滤已清除").into()
+            } else {
+                tf(
+                    "列名过滤「{}」· {}/{} 列",
+                    &[&(app.cols_popup_needle), &(hits), &(total)],
+                )
+            };
+        }
+        KeyCode::Esc => {
+            app.cols_popup_filter = None;
+            app.cols_popup_needle.clear();
+            app.status = t("已清除列名过滤").into();
+        }
+        _ => {
+            if let Some(t) = &mut app.cols_popup_filter {
+                t.input(k);
+            }
+            app.cols_popup_needle = app
+                .cols_popup_filter
+                .as_ref()
+                .map(|t| t.lines().join(" ").trim().to_string())
+                .unwrap_or_default();
+            app.cols_popup_scroll = 0;
+            let (hits, total) = cols_popup_hits(app);
+            app.status = if app.cols_popup_needle.trim().is_empty() {
+                t("输入以过滤列名…").into()
+            } else {
+                tf(
+                    "列名过滤「{}」· {}/{} 列",
+                    &[&(app.cols_popup_needle), &(hits), &(total)],
+                )
+            };
+        }
     }
 }
 
@@ -28650,6 +29052,8 @@ impl App {
         self.locate_needle.clear();
         self.locate_col = None;
         self.locate_prompt = None;
+        // R56: a row-number jump belongs to the grid it was started on.
+        self.goto_prompt = None;
         self.clear_col_filter();
         self.grid_epoch = self.grid_epoch.wrapping_add(1);
         self.width_cache = None;
@@ -30821,6 +31225,20 @@ fn ui(f: &mut Frame, app: &mut App) {
     if app.result_filter.is_some() {
         render_result_filter(f, f.area(), app);
     }
+    // R56: the `gc` popup's column-name filter sits on top of the popup.
+    if app.cols_popup_filter.is_some() {
+        let (hits, total) = cols_popup_hits(app);
+        render_prompt_input(
+            f,
+            f.area(),
+            app.cols_popup_filter.as_mut(),
+            &tf(
+                " 过滤列名 {}/{} · Enter 保留 · Esc 清除 ",
+                &[&(hits), &(total)],
+            ),
+            t(" 过滤列名 · Enter 保留 "),
+        );
+    }
     if app.col_filter_prompt.is_some() {
         let title = tf(
             " 列过滤「{}」· {} 行 · Enter 保留 · Esc 清除 ",
@@ -30851,6 +31269,17 @@ fn ui(f: &mut Frame, app: &mut App) {
             app.col_jump.as_mut(),
             t(" 跳列：列号 1-9 或列名前缀 · Enter 跳转 · Esc 取消 "),
             t(" 跳列 · Enter/Esc "),
+        );
+    }
+    // R56: `:` row jump in the results pane.
+    if app.goto_prompt.is_some() {
+        let n = result_row_count(app);
+        render_prompt_input(
+            f,
+            f.area(),
+            app.goto_prompt.as_mut(),
+            &tf(" 跳行 1-{} 或 $ · Enter 跳转 · Esc 取消 ", &[&(n)]),
+            t(" 跳行 · Enter/Esc "),
         );
     }
     // The row popup draws first so a drilled cell popup sits on top of it.
@@ -31304,6 +31733,8 @@ enum FooterView {
     ColFilter,
     LocatePrompt,
     ColJump,
+    /// R56: the `:` row-number jump prompt.
+    GotoRow,
     Completion,
     SnippetName,
     Snippets,
@@ -31408,6 +31839,8 @@ fn footer_ctx_inner(app: &App, include_help: bool) -> FooterCtx {
         FooterView::LocatePrompt
     } else if app.col_jump.is_some() {
         FooterView::ColJump
+    } else if app.goto_prompt.is_some() {
+        FooterView::GotoRow
     } else if app.completion.is_some() {
         FooterView::Completion
     } else if app.snippet_name.is_some() {
@@ -31548,6 +31981,7 @@ fn footer_hints_ctx(ctx: FooterCtx) -> Vec<Hint> {
         }
         FooterView::LocatePrompt => vec![("Enter", t("跳到命中")), ("Esc", t("清除"))],
         FooterView::ColJump => vec![("Enter", t("跳列")), ("Esc", t("取消"))],
+        FooterView::GotoRow => vec![("Enter", t("跳行")), ("Esc", t("取消"))],
         FooterView::HistoryFilter => vec![("Enter", t("保留")), ("Esc", t("清除"))],
         FooterView::History => vec![
             ("↑↓", t("选择")),
@@ -31997,6 +32431,9 @@ fn render_main_area(
         );
         app.editor_vp.follow(app.editor.cursor());
         f.render_widget(&app.editor, main_chunks[0]);
+        // R56: dim every statement except the caret's own, then mark the bracket
+        // pair on top (so the accent survives the dim).
+        paint_statement_dim(f, main_chunks[0], app);
         paint_bracket_pair(f, main_chunks[0], app);
     }
 
@@ -32022,6 +32459,42 @@ fn render_main_area(
         render_results_strip(f, res_area, app);
     } else {
         render_results_pane(f, res_area, app);
+    }
+}
+
+/// R56: dim the editor lines that belong to a statement other than the one the
+/// caret is in, so a multi-statement buffer reads as one bright block amid the
+/// rest. Purely presentational — no key, no state, no query — and it only
+/// touches the foreground colour of a cell, so the textarea's own caret / line
+/// highlight (background + modifiers) survives. A single-statement buffer is
+/// left untouched; the span is resolved by [`active_statement_rows`].
+fn paint_statement_dim(f: &mut Frame, area: Rect, app: &App) {
+    let (row, col) = app.editor.cursor();
+    let Some((active_lo, active_hi)) = active_statement_rows(app.editor.lines(), row, col) else {
+        return;
+    };
+    // tui-textarea draws the text inside the `Borders::ALL` block dbxt sets on
+    // it, so the glyph area is the block's inner rect.
+    let inner = Rect {
+        x: area.x.saturating_add(1),
+        y: area.y.saturating_add(1),
+        width: area.width.saturating_sub(2),
+        height: area.height.saturating_sub(2),
+    };
+    if inner.width == 0 || inner.height == 0 {
+        return;
+    }
+    let top_row = app.editor_vp.row as usize;
+    for i in 0..inner.height as usize {
+        let r = top_row + i;
+        if r >= active_lo && r <= active_hi {
+            continue;
+        }
+        let y = inner.y + i as u16;
+        for x in inner.x..inner.x + inner.width {
+            let cell = &mut f.buffer_mut()[(x, y)];
+            cell.fg = Color::DarkGray;
+        }
     }
 }
 
@@ -34373,17 +34846,23 @@ fn render_snippets(f: &mut Frame, area: Rect, app: &mut App) {
 /// switching to the full `gd` structure view. On a narrow screen it uses the
 /// full width; otherwise it caps at 72 columns.
 fn render_cols_popup(f: &mut Frame, area: Rect, app: &mut App) {
-    let lines = cols_popup_lines_for(app);
-    if lines.is_empty() {
+    let all_rows = cols_popup_rows(app);
+    if all_rows.is_empty() {
         app.cols_popup_open = false;
         return;
     }
+    let rows: Vec<&ColPopupRow> = all_rows
+        .iter()
+        .filter(|r| cols_popup_matches(r, &app.cols_popup_needle))
+        .collect();
+    // R56: the popup carries two extra columns now, so it opens wider than the
+    // R48 72-column cap; a narrow terminal still uses the full width.
     let w = if area.width < 48 {
         area.width
     } else {
-        area.width.min(72)
+        area.width.min(96)
     };
-    let (y, h) = overlay_list_box(lines.len(), area);
+    let (y, h) = overlay_list_box(rows.len().max(1), area);
     let x = area.x + (area.width.saturating_sub(w)) / 2;
     let box_area = Rect {
         x,
@@ -34392,8 +34871,9 @@ fn render_cols_popup(f: &mut Frame, area: Rect, app: &mut App) {
         height: h,
     };
     f.render_widget(Clear, box_area);
+    let inner_w = box_area.width.saturating_sub(2) as usize;
     let inner_h = h.saturating_sub(2) as usize;
-    let max_scroll = lines.len().saturating_sub(inner_h) as u16;
+    let max_scroll = rows.len().saturating_sub(inner_h) as u16;
     if app.cols_popup_scroll > max_scroll {
         app.cols_popup_scroll = max_scroll;
     }
@@ -34402,19 +34882,34 @@ fn render_cols_popup(f: &mut Frame, area: Rect, app: &mut App) {
         .as_ref()
         .map(|m| fix_double_encoding(&m.table))
         .unwrap_or_default();
-    let full = tf(
-        " 列结构 · {} · {} 列 · j/k 滚动 · Esc 关 ",
-        &[&table, &lines.len()],
-    );
-    let items: Vec<Line> = lines
-        .iter()
-        .map(|l| {
-            Line::from(vec![Span::styled(
-                truncate_disp(l, box_area.width.saturating_sub(3) as usize),
-                Style::default(),
-            )])
-        })
-        .collect();
+    let needle = app.cols_popup_needle.trim();
+    let full = if needle.is_empty() {
+        tf(
+            " 列结构 · {} · {} 列 · / 过滤 · j/k 滚动 · Esc 关 ",
+            &[&table, &rows.len()],
+        )
+    } else {
+        tf(
+            " 列结构 · {} · {}/{} 列 · 过滤「{}」· Esc 关 ",
+            &[&table, &rows.len(), &all_rows.len(), &needle],
+        )
+    };
+    let items: Vec<Line> = if rows.is_empty() {
+        vec![Line::from(Span::styled(
+            t("（没有匹配的列）").to_string(),
+            Style::default().fg(Color::DarkGray),
+        ))]
+    } else {
+        let layout = cols_popup_layout(&rows, inner_w);
+        rows.iter()
+            .map(|r| {
+                Line::from(Span::styled(
+                    cols_popup_line(r, &layout, inner_w),
+                    Style::default(),
+                ))
+            })
+            .collect()
+    };
     f.render_widget(
         Paragraph::new(items)
             .block(
@@ -37553,6 +38048,10 @@ const HELP_ROWS: &[(&str, &str)] = &[
     ),
     ("|", "跳列：输入列号或列名前缀直达该列（宽表横滚）"),
     (
+        "(:)",
+        "跳行：输入行号直达该行，:$ 跳末行（结果 / 表 / Redis / Mongo 均可）",
+    ),
+    (
         "n / Shift-N",
         "搜索结果或定位命中时：下 / 上一个命中（否则 n 翻页）",
     ),
@@ -37588,7 +38087,7 @@ const HELP_ROWS: &[(&str, &str)] = &[
     ("g d / g t", "跳表结构视图 / 回表数据"),
     (
         "g c",
-        "列结构弹层：列名 / 类型 / 可空 / 注释（缓存元数据，不额外查库）",
+        "列结构弹层：列名 / 类型 / 键(PRI/UNI/MUL) / 默认值 / 可空 / 注释（缓存元数据，不额外查库；/ 过滤列名）",
     ),
     (
         "Alt-F",
@@ -37627,7 +38126,7 @@ const HELP_ROWS: &[(&str, &str)] = &[
     ("Ctrl-U", "撤销上一次 Alt-F 格式化"),
     (
         "Alt-↓ / Alt-↑",
-        "跳到下 / 上一条 SQL 语句开头（分号边界，注释/空语句跳过；状态栏显示 语句 i/n）",
+        "跳到下 / 上一条 SQL 语句开头（分号边界，注释/空语句跳过；状态栏显示 语句 i/n；当前语句高亮、其余淡化）",
     ),
     (
         "Alt-/",
@@ -39717,6 +40216,7 @@ mod tests {
                     ..Default::default()
                 },
             ],
+            indexes: Vec::new(),
         });
         app.focus = Focus::Preview;
         app.sel = 0;
@@ -40441,6 +40941,7 @@ mod tests {
                     ..Default::default()
                 },
             ],
+            indexes: Vec::new(),
         });
         let huge = "x".repeat(1_100_000);
         let grid = Grid {
@@ -40507,6 +41008,7 @@ mod tests {
                     ..Default::default()
                 })
                 .collect(),
+            indexes: Vec::new(),
         });
         app
     }
@@ -42269,6 +42771,7 @@ mod tests {
             table: "orders".into(),
             schema: String::new(),
             columns,
+            indexes: Vec::new(),
         }
     }
 
@@ -43184,6 +43687,98 @@ mod tests {
         assert_eq!(cell_copy_text(&Val::Null), "NULL");
         assert_eq!(cell_copy_text(&Val::Text(String::new())), "''");
         assert_eq!(cell_copy_text(&Val::Text("plain".into())), "plain");
+    }
+
+    /// R56: `alt-↓/↑` steps by statement; the editor renders the caret's
+    /// statement at full brightness and dims the rest. Pure-render: the span is
+    /// resolved by `active_statement_rows` and painted only on the visible rows.
+    #[test]
+    fn editor_dims_non_active_statements() {
+        let mut app = test_app();
+        app.picker_open = false;
+        app.focus = Focus::Editor;
+        app.set_editor_text("SELECT 1;\nSELECT 2;\nSELECT 3;");
+        app.editor.move_cursor(CursorMove::Jump(1, 3));
+        let buf = draw_buffer(&mut app, 80, 30);
+        let ed = app.rects.editor;
+        let row_fg =
+            |buf: &ratatui::buffer::Buffer, r: u16| buf.cell((ed.x + 1, ed.y + 1 + r)).unwrap().fg;
+        assert_ne!(
+            row_fg(&buf, 1),
+            Color::DarkGray,
+            "the caret statement stays lit"
+        );
+        assert_eq!(
+            row_fg(&buf, 0),
+            Color::DarkGray,
+            "the statement above is dimmed"
+        );
+        assert_eq!(
+            row_fg(&buf, 2),
+            Color::DarkGray,
+            "the statement below is dimmed"
+        );
+
+        // Moving the caret to the last statement dims the first two.
+        app.editor.move_cursor(CursorMove::Jump(2, 0));
+        let buf = draw_buffer(&mut app, 80, 30);
+        assert_eq!(row_fg(&buf, 0), Color::DarkGray);
+        assert_eq!(row_fg(&buf, 1), Color::DarkGray);
+        assert_ne!(row_fg(&buf, 2), Color::DarkGray);
+
+        // A single-statement buffer is never dimmed.
+        app.set_editor_text("SELECT 1");
+        app.editor.move_cursor(CursorMove::Jump(0, 0));
+        let buf = draw_buffer(&mut app, 80, 30);
+        assert_ne!(row_fg(&buf, 0), Color::DarkGray);
+
+        // Degenerate panes must not panic.
+        app.set_editor_text("SELECT 1;\nSELECT 2;");
+        for (w, h) in [(20u16, 6u16), (40, 2), (18, 1), (1, 1)] {
+            draw(&mut app, w, h);
+        }
+    }
+
+    /// R56: the active-statement row span comes from the same `;` splitter as the
+    /// statement jumper (literals / comments never split), and a single-statement
+    /// buffer (or a stale caret) has nothing to dim.
+    #[test]
+    fn active_statement_rows_tracks_the_caret_statement() {
+        let lines = |s: &str| s.split('\n').map(str::to_string).collect::<Vec<_>>();
+        let three = lines("SELECT 1;\nSELECT 2;\nSELECT 3;");
+        assert_eq!(active_statement_rows(&three, 0, 0), Some((0, 0)));
+        assert_eq!(active_statement_rows(&three, 1, 3), Some((1, 1)));
+        assert_eq!(active_statement_rows(&three, 2, 5), Some((2, 2)));
+
+        // A statement that spans several lines dims none of its own rows.
+        let multi = lines("SELECT a,\n b\nFROM t;\nSELECT 1;");
+        assert_eq!(active_statement_rows(&multi, 2, 0), Some((0, 2)));
+        assert_eq!(active_statement_rows(&multi, 3, 2), Some((3, 3)));
+
+        // One statement (or none) is nothing to dim.
+        assert_eq!(active_statement_rows(&lines("SELECT 1"), 0, 0), None);
+        assert_eq!(active_statement_rows(&lines("SELECT 1;"), 0, 0), None);
+
+        // A `;` inside a string literal never splits.
+        let lit = lines("SELECT ';';\nSELECT 2;");
+        assert_eq!(active_statement_rows(&lit, 0, 3), Some((0, 0)));
+        assert_eq!(active_statement_rows(&lit, 1, 0), Some((1, 1)));
+
+        // Empty buffer / stale caret.
+        assert_eq!(active_statement_rows(&[], 0, 0), None);
+        assert_eq!(active_statement_rows(&three, 9, 0), None);
+
+        // Over the byte cap only a ±`STMT_DIM_SCAN_LINES` window is split, so two
+        // statements close together still resolve while the far one does not.
+        let mut big: Vec<String> = vec!["SELECT 1;".to_string(), "SELECT 2;".to_string()];
+        big.extend((0..60_000).map(|i| format!("-- p{i}")));
+        let bytes: usize = big.iter().map(|l| l.len() + 1).sum();
+        assert!(
+            bytes > STMT_DIM_MAX_BYTES,
+            "test buffer must exceed the cap"
+        );
+        assert_eq!(active_statement_rows(&big, 0, 3), Some((0, 0)));
+        assert_eq!(active_statement_rows(&big, 1, 3), Some((1, 1)));
     }
 
     /// R53: `Y` copies the focused cell and flashes the column + char count in
@@ -44507,6 +45102,7 @@ mod tests {
             table: "orders".into(),
             schema: String::new(),
             columns: vec![pk_col("id", "bigint")],
+            indexes: Vec::new(),
         });
         app.focus = Focus::Preview;
         key(
@@ -44538,6 +45134,7 @@ mod tests {
             table: "orders".into(),
             schema: String::new(),
             columns: vec![pk_col("id", "bigint"), col_info("note", "text")],
+            indexes: Vec::new(),
         });
         open_cols_popup(&mut app);
         assert!(app.cols_popup_open);
@@ -44547,7 +45144,7 @@ mod tests {
             joined.contains("id") && joined.contains("bigint"),
             "{joined}"
         );
-        assert!(joined.contains("PK"), "primary-key mark missing: {joined}");
+        assert!(joined.contains("PRI"), "primary-key mark missing: {joined}");
         // A query result has no `table_meta`: the grid columns stand in.
         app.cols_popup_open = false;
         app.table_meta = None;
@@ -44563,6 +45160,249 @@ mod tests {
         app.clear_grid();
         open_cols_popup(&mut app);
         assert!(!app.cols_popup_open);
+    }
+
+    // ── R56: popup default value / key mark / in-place column filter ──
+
+    /// R56: the key mark follows `COLUMN_KEY` where dbx-core exposes it (`PRI` /
+    /// `UNI`) and derives `MUL` from the cached index metadata (first column of a
+    /// non-unique, non-primary index, MySQL's rule).
+    #[test]
+    fn column_key_mark_reads_flags_and_indexes() {
+        assert_eq!(column_key_mark(&pk_col("id", "bigint"), &[]), "PRI");
+        let mut uq = col_info("email", "varchar(64)");
+        uq.is_unique = true;
+        assert_eq!(column_key_mark(&uq, &[]), "UNI");
+
+        let mul = col_info("user_id", "bigint");
+        let ix = idx_info("idx_user", &["user_id"], false, false);
+        assert_eq!(column_key_mark(&mul, std::slice::from_ref(&ix)), "MUL");
+        // A second-position column of the same index is not `MUL`.
+        let second = col_info("created_at", "datetime");
+        assert_eq!(
+            column_key_mark(
+                &second,
+                &[idx_info(
+                    "idx_two",
+                    &["user_id", "created_at"],
+                    false,
+                    false
+                )]
+            ),
+            ""
+        );
+        // A unique / primary index never yields MUL.
+        assert_eq!(
+            column_key_mark(&mul, &[idx_info("uq", &["user_id"], true, false)]),
+            ""
+        );
+        assert_eq!(
+            column_key_mark(&mul, &[idx_info("pk", &["user_id"], true, true)]),
+            ""
+        );
+        // No cached index metadata (PostgreSQL, or a backend that cannot list)
+        // leaves the mark blank instead of guessing.
+        assert_eq!(column_key_mark(&mul, &[]), "");
+        // The column name matches case-insensitively.
+        assert_eq!(
+            column_key_mark(&col_info("USER_ID", "bigint"), &[ix]),
+            "MUL"
+        );
+    }
+
+    /// R56: the popup rows carry the default value and the key mark; a NULL or
+    /// whitespace-only default is an empty string, never the literal `NULL`.
+    #[test]
+    fn cols_popup_rows_carry_default_and_key_marks() {
+        let mut app = test_app();
+        app.picker_open = false;
+        app.selected = Some(test_conn("mysql"));
+        app.backend_kind = Backend::Sql;
+        app.grid_kind = GridKind::TableData;
+        app.set_grid(sample_grid());
+        let mut uq = col_info("email", "varchar(64)");
+        uq.is_unique = true;
+        uq.column_default = Some("anon@example.com".into());
+        let mut created = col_info("created_at", "datetime");
+        created.column_default = Some("CURRENT_TIMESTAMP".into());
+        created.is_nullable = false;
+        let mut blank = col_info("note", "text");
+        blank.column_default = Some("   ".into());
+        blank.comment = Some("free text".into());
+        app.table_meta = Some(TableMeta {
+            table: "orders".into(),
+            schema: String::new(),
+            columns: vec![pk_col("id", "bigint"), uq, created, blank],
+            indexes: vec![idx_info("idx_note", &["note"], false, false)],
+        });
+
+        let rows = cols_popup_rows(&app);
+        assert_eq!(rows.len(), 4);
+        assert_eq!(rows[0].key, "PRI");
+        assert_eq!(rows[1].key, "UNI");
+        assert_eq!(rows[1].default, "anon@example.com");
+        assert_eq!(rows[2].key, "");
+        assert_eq!(rows[2].default, "CURRENT_TIMESTAMP");
+        assert!(!rows[2].nullable);
+        assert_eq!(rows[3].key, "MUL");
+        assert_eq!(rows[3].default, "", "a blank default shows as empty");
+        assert_eq!(rows[3].comment, "free text");
+
+        // A query result (no metadata) degrades to names only, no key column.
+        app.table_meta = None;
+        let rows = cols_popup_rows(&app);
+        assert_eq!(rows.len(), 8);
+        assert!(rows
+            .iter()
+            .all(|r| r.key.is_empty() && r.default.is_empty()));
+    }
+
+    /// R56: the aligned popup line keeps the column name / type / key readable on
+    /// a narrow screen while the (lower-priority) default and comment clip first.
+    #[test]
+    fn cols_popup_line_keeps_name_and_type_on_a_narrow_screen() {
+        let row = ColPopupRow {
+            name: "user_id".into(),
+            data_type: "bigint".into(),
+            key: "MUL",
+            default: "CURRENT_TIMESTAMP".into(),
+            nullable: false,
+            comment: "the owner".into(),
+        };
+        let refs = vec![&row];
+        let wide = cols_popup_layout(&refs, 96);
+        let line = cols_popup_line(&row, &wide, 96);
+        assert!(line.starts_with("user_id  bigint  MUL"), "{line}");
+        assert!(line.contains("=CURRENT_TIMESTAMP"), "{line}");
+        assert!(line.contains("NOT NULL"), "{line}");
+        assert!(line.contains("· the owner"), "{line}");
+
+        // 28 columns: name / type / key survive, the comment is dropped first.
+        let narrow = cols_popup_layout(&refs, 28);
+        let line = cols_popup_line(&row, &narrow, 28);
+        assert!(disp_width(&line) <= 28, "{line}");
+        assert!(line.starts_with("user_id  bigint  MUL"), "{line}");
+        assert!(!line.contains("the owner"), "comment clips first: {line}");
+
+        // Empty columns collapse instead of leaving stray separators.
+        let name_only = ColPopupRow {
+            name: "column_0".into(),
+            data_type: String::new(),
+            key: "",
+            default: String::new(),
+            nullable: true,
+            comment: String::new(),
+        };
+        let refs = vec![&name_only];
+        let l = cols_popup_layout(&refs, 40);
+        assert_eq!(cols_popup_line(&name_only, &l, 40), "column_0");
+    }
+
+    /// R56: the popup renders the new default / key columns at both a phone and
+    /// a desktop width (the default clips on the phone, by design).
+    #[test]
+    fn cols_popup_renders_default_and_key() {
+        let mut app = test_app();
+        app.picker_open = false;
+        app.selected = Some(test_conn("mysql"));
+        app.backend_kind = Backend::Sql;
+        app.grid_kind = GridKind::TableData;
+        app.set_grid(sample_grid());
+        let mut created = col_info("created_at", "datetime");
+        created.column_default = Some("CURRENT_TIMESTAMP".into());
+        created.is_nullable = false;
+        app.table_meta = Some(TableMeta {
+            table: "orders".into(),
+            schema: String::new(),
+            columns: vec![pk_col("id", "bigint"), created],
+            indexes: Vec::new(),
+        });
+        open_cols_popup(&mut app);
+        let phone = draw(&mut app, 42, 22).join("\n");
+        assert!(phone.contains("PRI"), "{phone}");
+        assert!(
+            phone.contains("CURRENT"),
+            "default clipped but visible: {phone}"
+        );
+        let desktop = draw(&mut app, 110, 30).join("\n");
+        assert!(desktop.contains("PRI"), "{desktop}");
+        assert!(desktop.contains("CURRENT_TIMESTAMP"), "{desktop}");
+        assert!(desktop.contains("NOT NULL"), "{desktop}");
+    }
+
+    /// R56: `/` inside the popup filters the column list by name — typed needle,
+    /// Enter keeps it, Esc clears it, and a needle that matches nothing renders an
+    /// explicit empty state instead of a blank box.
+    #[test]
+    fn cols_popup_filter_state_machine() {
+        let mut app = test_app();
+        app.picker_open = false;
+        app.selected = Some(test_conn("mysql"));
+        app.backend_kind = Backend::Sql;
+        app.grid_kind = GridKind::TableData;
+        app.set_grid(sample_grid());
+        app.table_meta = Some(TableMeta {
+            table: "orders".into(),
+            schema: String::new(),
+            columns: vec![
+                col_info("id", "bigint"),
+                col_info("user_id", "bigint"),
+                col_info("total", "numeric"),
+            ],
+            indexes: Vec::new(),
+        });
+        open_cols_popup(&mut app);
+        assert!(app.cols_popup_open);
+        assert_eq!(cols_popup_hits(&app), (3, 3));
+
+        // `/` opens the prompt; typing filters as you go.
+        cols_popup_key(
+            &mut app,
+            KeyEvent::new(KeyCode::Char('/'), KeyModifiers::NONE),
+        );
+        assert!(app.cols_popup_filter.is_some());
+        for ch in "user".chars() {
+            cols_popup_filter_key(
+                &mut app,
+                KeyEvent::new(KeyCode::Char(ch), KeyModifiers::NONE),
+            );
+        }
+        assert_eq!(app.cols_popup_needle, "user");
+        assert_eq!(cols_popup_hits(&app), (1, 3));
+
+        // Enter keeps the needle and closes the prompt (popup stays open).
+        cols_popup_filter_key(&mut app, KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        assert!(app.cols_popup_filter.is_none());
+        assert_eq!(app.cols_popup_needle, "user");
+        assert!(app.cols_popup_open);
+
+        // Re-opening prefills the needle; Esc clears it.
+        cols_popup_key(
+            &mut app,
+            KeyEvent::new(KeyCode::Char('/'), KeyModifiers::NONE),
+        );
+        assert_eq!(
+            app.cols_popup_filter.as_ref().unwrap().lines().join(""),
+            "user"
+        );
+        cols_popup_filter_key(&mut app, KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+        assert!(app.cols_popup_filter.is_none());
+        assert!(app.cols_popup_needle.is_empty());
+        assert_eq!(cols_popup_hits(&app), (3, 3));
+
+        // A needle with no hit renders the empty state, and Esc closes the popup
+        // and clears the needle.
+        app.cols_popup_needle = "zzz".into();
+        assert_eq!(cols_popup_hits(&app), (0, 3));
+        let screen: String = draw(&mut app, 42, 22)
+            .join("\n")
+            .chars()
+            .filter(|c| !c.is_whitespace())
+            .collect();
+        assert!(screen.contains("没有匹配的列"), "{screen}");
+        cols_popup_key(&mut app, KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+        assert!(!app.cols_popup_open);
+        assert!(app.cols_popup_needle.is_empty());
     }
 
     /// R43: the tree cursor walks tables, `h` collapses the active database
@@ -47174,6 +48014,7 @@ mod tests {
                 data_type: "numeric(10,2)".into(),
                 ..Default::default()
             }],
+            indexes: Vec::new(),
         });
         assert_eq!(
             column_type(&app, "public", "orders", "amount").as_deref(),
@@ -47468,6 +48309,7 @@ mod tests {
             table: "t".into(),
             schema: String::new(),
             columns: vec![pk_col],
+            indexes: Vec::new(),
         });
         assert_eq!(locate_target_col(&app), Some(1));
         // An explicit sort column wins over the primary key.
@@ -47517,6 +48359,87 @@ mod tests {
         assert!(parse_col_jump(&cols, "").is_err());
     }
 
+    /// R56: `:` accepts a 1-based row number (`0` / `1` = first) or `$` / `end`
+    /// (last); out-of-range and nonsense inputs report instead of jumping.
+    #[test]
+    fn parse_row_jump_covers_bounds_and_last() {
+        assert_eq!(parse_row_jump(10, "1"), Ok(0));
+        assert_eq!(parse_row_jump(10, "0"), Ok(0));
+        assert_eq!(parse_row_jump(10, "10"), Ok(9));
+        assert_eq!(parse_row_jump(10, "$"), Ok(9));
+        assert_eq!(parse_row_jump(10, " $ "), Ok(9));
+        assert_eq!(parse_row_jump(10, "END"), Ok(9));
+        assert!(parse_row_jump(10, "11").is_err());
+        assert!(parse_row_jump(10, "").is_err());
+        assert!(parse_row_jump(10, "abc").is_err());
+        // No rows is reported, never a silent `sel = 0`.
+        assert!(parse_row_jump(0, "1").is_err());
+    }
+
+    /// R56: `:` in the results pane opens the jump prompt, Enter lands on the
+    /// row, an out-of-range input reports and stays put, and Esc cancels.
+    #[test]
+    fn colon_jump_lands_on_the_row() {
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel::<OpResult>();
+        let mut app = test_app();
+        app.picker_open = false;
+        app.selected = Some(test_conn("mysql"));
+        app.backend_kind = Backend::Sql;
+        app.grid_kind = GridKind::TableData;
+        app.set_grid(sample_grid());
+        app.focus = Focus::Preview;
+        key(
+            &mut app,
+            &tx,
+            KeyEvent::new(KeyCode::Char(':'), KeyModifiers::NONE),
+        );
+        assert!(app.goto_prompt.is_some());
+        // It renders at both widths.
+        let phone: String = draw(&mut app, 42, 22)
+            .join("\n")
+            .chars()
+            .filter(|c| !c.is_whitespace())
+            .collect();
+        assert!(phone.contains("跳行"), "{phone}");
+        let _ = draw(&mut app, 110, 30);
+        goto_row_key(
+            &mut app,
+            KeyEvent::new(KeyCode::Char('3'), KeyModifiers::NONE),
+        );
+        goto_row_key(&mut app, KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        assert!(app.goto_prompt.is_none());
+        assert_eq!(app.sel, 2);
+
+        // Out of range reports and leaves the cursor where it was.
+        app.sel = 0;
+        open_goto_row(&mut app);
+        goto_row_key(
+            &mut app,
+            KeyEvent::new(KeyCode::Char('9'), KeyModifiers::NONE),
+        );
+        goto_row_key(&mut app, KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        assert_eq!(app.sel, 0);
+
+        // `$` goes to the last row.
+        open_goto_row(&mut app);
+        goto_row_key(
+            &mut app,
+            KeyEvent::new(KeyCode::Char('$'), KeyModifiers::NONE),
+        );
+        goto_row_key(&mut app, KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        assert_eq!(app.sel, 3);
+
+        // Esc cancels.
+        open_goto_row(&mut app);
+        goto_row_key(&mut app, KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+        assert!(app.goto_prompt.is_none());
+
+        // With no rows there is nothing to open.
+        app.clear_grid();
+        open_goto_row(&mut app);
+        assert!(app.goto_prompt.is_none());
+    }
+
     /// R39 overlay small-screen sweep: every bottom-anchored prompt owns a
     /// short title that fits 42×22, and the frame still shows the pinned `?`
     /// help hint (key hints survive on small screens).
@@ -47558,12 +48481,18 @@ mod tests {
                 Box::new(|a| a.col_jump = Some(TextArea::default())),
                 "跳列",
             ),
+            (
+                "goto-row",
+                Box::new(|a| a.goto_prompt = Some(TextArea::default())),
+                "跳行",
+            ),
         ];
         for (name, open, fragment) in cases {
             app.table_prompt = None;
             app.result_filter = None;
             app.locate_prompt = None;
             app.col_jump = None;
+            app.goto_prompt = None;
             open(&mut app);
             let rows = draw(&mut app, 42, 22);
             // The TestBackend pads each wide CJK glyph with a space cell, so
@@ -47736,6 +48665,7 @@ mod tests {
             table: "users".into(),
             schema: String::new(),
             columns: vec![col_info("id", "int"), col_info("name", "text")],
+            indexes: Vec::new(),
         });
         // After FROM: only tables (no columns, no keywords).
         let from = completion_candidates(&app, &CompCtx::TableList, "");

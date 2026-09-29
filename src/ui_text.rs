@@ -1081,7 +1081,9 @@ pub static ALL_KEYS: &[&str] = &[
     "📌 已钉住结果区 · 切换表/库仍显示 · Alt-F 解除",
     "g… d=表结构 t=表数据 v=定位值 c=列结构",
     "无可显示的列（先打开一张表或执行查询）",
-    " 列结构 · {} · {} 列 · j/k 滚动 · Esc 关 ",
+    " 列结构 · {} · {} 列 · / 过滤 · j/k 滚动 · Esc 关 ",
+    " 列结构 · {} · {}/{} 列 · 过滤「{}」· Esc 关 ",
+    "（没有匹配的列）",
     " 列结构 · j/k · Esc ",
     // R51: connection-form defaults / history counts / grid Home-End column reset
     "切换字段：db_type → name → host → port → user → password → database（开启 ssh_tunnel 后自动展开 SSH 段）",
@@ -1112,12 +1114,32 @@ pub static ALL_KEYS: &[&str] = &[
     " 列过滤 · Enter/Esc ",
     "▤{}「{}」{} 行 · ",
     "按当前列过滤：输入值只留该列含值的行（预填当前单元格，Esc 清除）",
-    "跳到下 / 上一条 SQL 语句开头（分号边界，注释/空语句跳过；状态栏显示 语句 i/n）",
+    "跳到下 / 上一条 SQL 语句开头（分号边界，注释/空语句跳过；状态栏显示 语句 i/n；当前语句高亮、其余淡化）",
     "表结构视图没有可复制的单元格",
     "脚本列表没有可复制的单元格（先 Enter 进入某条语句的结果）",
     "没有可复制的单元格",
     "✓ 已复制「{}」= {} · {} 字符 · 兜底 {}",
     "✓ 已复制「{}」= {} · {} 字符",
+    // R56: popup column-name filter / multi-statement dim / `:` row jump.
+    "过滤列名…",
+    "列名过滤已清除",
+    "已清除列名过滤",
+    "列名过滤「{}」· {}/{} 列",
+    "输入以过滤列名…",
+    " 过滤列名 {}/{} · Enter 保留 · Esc 清除 ",
+    " 过滤列名 · Enter 保留 ",
+    "（没有匹配的列）",
+    "没有可跳转的行",
+    "行号 1-{} 或 $ 末行…",
+    "请输入行号",
+    "行号超出范围（1-{}）",
+    "无法识别的行号「{}」",
+    "跳到第 {} 行 / 共 {}",
+    "已取消跳行",
+    "跳行",
+    " 跳行 1-{} 或 $ · Enter 跳转 · Esc 取消 ",
+    " 跳行 · Enter/Esc ",
+    "跳行：输入行号直达该行，:$ 跳末行（结果 / 表 / Redis / Mongo 均可）",
 ];
 
 /// The Chinese → English table. Keys must match the source literals exactly.
@@ -1174,8 +1196,8 @@ fn en_of(zh: &'static str) -> Option<&'static str> {
         "按当前列过滤：输入值只留该列含值的行（预填当前单元格，Esc 清除）" => Some(
             "Filter by the focused column: type a value to keep only rows whose cell contains it (pre-filled from the current cell, Esc clears)",
         ),
-        "跳到下 / 上一条 SQL 语句开头（分号边界，注释/空语句跳过；状态栏显示 语句 i/n）" => Some(
-            "Jump to the next / previous SQL statement start (semicolon-delimited; comments/empty statements skipped; the status bar shows statement i/n)",
+        "跳到下 / 上一条 SQL 语句开头（分号边界，注释/空语句跳过；状态栏显示 语句 i/n；当前语句高亮、其余淡化）" => Some(
+            "Jump to the next / previous SQL statement start (semicolon-delimited; comments/empty statements skipped; the status bar shows statement i/n; the caret's statement stays lit while the rest is dimmed)",
         ),
         // ── R48: pinned results pane / zc column-structure popup ──
         "📌 已解除钉住" => Some("📌 Unpinned"),
@@ -1192,9 +1214,13 @@ fn en_of(zh: &'static str) -> Option<&'static str> {
         "无可显示的列（先打开一张表或执行查询）" => {
             Some("No columns to show (open a table or run a query first)")
         }
-        " 列结构 · {} · {} 列 · j/k 滚动 · Esc 关 " => {
-            Some(" Columns · {} · {} · j/k scroll · Esc close ")
+        " 列结构 · {} · {} 列 · / 过滤 · j/k 滚动 · Esc 关 " => {
+            Some(" Columns · {} · {} · / filter · j/k scroll · Esc close ")
         }
+        " 列结构 · {} · {}/{} 列 · 过滤「{}」· Esc 关 " => {
+            Some(" Columns · {} · {}/{} · filter \"{}\" · Esc close ")
+        }
+        "（没有匹配的列）" => Some("(no matching columns)"),
         " 列结构 · j/k · Esc " => Some(" Columns · j/k · Esc "),
         "分组节点" => Some("group node"),
         "DBX 桌面的连接分组（▾ 组名 [n]）；h l / ← → 折叠展开，会话内记忆；无分组则平铺" => Some(
@@ -1204,8 +1230,8 @@ fn en_of(zh: &'static str) -> Option<&'static str> {
         "分组行无连接池：x 无动作（不会误进表过滤）" => Some(
             "A group row has no connection pool: x does nothing (it no longer leaks into the table filter)",
         ),
-        "列结构弹层：列名 / 类型 / 可空 / 注释（缓存元数据，不额外查库）" => Some(
-            "Column-structure popup: name / type / nullable / comment (cached metadata, no extra query)",
+        "列结构弹层：列名 / 类型 / 键(PRI/UNI/MUL) / 默认值 / 可空 / 注释（缓存元数据，不额外查库；/ 过滤列名）" => Some(
+            "Column-structure popup: name / type / key (PRI/UNI/MUL) / default / nullable / comment (cached metadata, no extra query; / filters by name)",
         ),
         "钉住 / 解除当前结果区（钉住后切换表/库仍显示，上下对照）" => Some(
             "Pin / unpin the current results pane (a pinned grid stays visible after switching tables/DBs, for up-and-down comparison)",
@@ -1540,6 +1566,7 @@ fn en_of(zh: &'static str) -> Option<&'static str> {
         " 搜索 · Enter 保留 " => Some(" search · Enter keeps "),
         "跳到命中" => Some("jump to hit"),
         "跳列" => Some("column jump"),
+        "跳行" => Some("row jump"),
         "首字母跳" => Some("first-letter jump"),
         "定位值" => Some("locate value"),
         // ── R39 narrow overlay titles (short variants) ──
@@ -3120,6 +3147,30 @@ fn en_of(zh: &'static str) -> Option<&'static str> {
         "收窄 / 加宽当前列，会话内记忆（翻页 / 重新查询不丢，不跨会话持久化）" => {
             Some("narrow / widen the focused column, remembered for this session (survives paging / re-querying; not persisted across launches)")
         }
+        // R56: popup column-name filter / `:` row jump.
+        "过滤列名…" => Some("Filter column names…"),
+        "列名过滤已清除" => Some("column-name filter cleared"),
+        "已清除列名过滤" => Some("column-name filter cleared"),
+        "列名过滤「{}」· {}/{} 列" => Some("column filter \"{}\" · {}/{} columns"),
+        "输入以过滤列名…" => Some("type to filter column names…"),
+        " 过滤列名 {}/{} · Enter 保留 · Esc 清除 " => {
+            Some(" Filter columns {}/{} · Enter keep · Esc clear ")
+        }
+        " 过滤列名 · Enter 保留 " => Some(" Filter columns · Enter keep "),
+        "没有可跳转的行" => Some("no rows to jump to"),
+        "行号 1-{} 或 $ 末行…" => Some("row 1-{} or $ for last…"),
+        "请输入行号" => Some("enter a row number"),
+        "行号超出范围（1-{}）" => Some("row number out of range (1-{})"),
+        "无法识别的行号「{}」" => Some("unrecognized row number \"{}\""),
+        "跳到第 {} 行 / 共 {}" => Some("jumped to row {} / {}"),
+        "已取消跳行" => Some("row jump cancelled"),
+        " 跳行 1-{} 或 $ · Enter 跳转 · Esc 取消 " => {
+            Some(" Jump to row 1-{} or $ · Enter jump · Esc cancel ")
+        }
+        " 跳行 · Enter/Esc " => Some(" Jump row · Enter/Esc "),
+        "跳行：输入行号直达该行，:$ 跳末行（结果 / 表 / Redis / Mongo 均可）" => Some(
+            "Row jump: type a row number to land on it, :$ for the last row (results / tables / Redis / Mongo)",
+        ),
         _ => None,
     }
 }
