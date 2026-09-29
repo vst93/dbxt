@@ -6090,9 +6090,12 @@ enum OpResult {
     Connections(Vec<ConnectionConfig>),
     /// R52: a one-shot server-version read for the connection `id`; `version` is
     /// `None` when the backend could not answer (the read is best-effort).
+    /// R63: `rtt` is how long that same read took — a free connect-time latency
+    /// probe (no extra query), `None` whenever the version read failed.
     ServerVersion {
         id: String,
         version: Option<String>,
+        rtt: Option<Duration>,
     },
     /// R48/R55: the parsed desktop sidebar groups plus the raw store value.
     /// The raw JSON is kept so a group rename / row move can patch just the
@@ -6940,10 +6943,16 @@ async fn run_op(backend: &LocalBackend, op: Op, tx: &Tx) -> OpResult {
         // the only version query dbxt ever issues; it never runs on the browse
         // hot path.
         Op::ServerVersion(cfg) => {
+            // R63: time the version read so its duration doubles as the
+            // connection's round-trip latency. No second probe is issued — the
+            // redline stays "one free query at connect".
+            let started = Instant::now();
             let version = fetch_server_version(backend, &cfg).await;
+            let rtt = version.is_some().then(|| started.elapsed());
             OpResult::ServerVersion {
                 id: cfg.id.clone(),
                 version,
+                rtt,
             }
         }
         // R47b: pure registry reads. `is_connection_open` never opens a
@@ -10468,6 +10477,12 @@ fn history_duration_label(ms: u64) -> String {
     }
 }
 
+/// R63: the connect-time latency shown in the status bar. `12ms` under a
+/// second, `1.2s` above it, so a slow link is obvious without a wide field.
+fn format_rtt(d: Duration) -> String {
+    history_duration_label(d.as_millis() as u64)
+}
+
 /// The red confirmation for deleting a single history entry. Deleting the
 /// history row never touches the database's data.
 #[derive(Clone)]
@@ -10878,6 +10893,15 @@ fn pg_table_size_sql(schema: &str) -> String {
     )
 }
 
+/// R63: ordering of the recency panel (`t` / `Alt-R`). `Recent` keeps the
+/// canonical most-recently-browsed-first order; `Name` re-sorts the same list
+/// client-side, by `schema.table` then database, so a jump is easy to scan.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum RecentSort {
+    Recent,
+    Name,
+}
+
 struct App {
     backend: Arc<LocalBackend>,
     page: Page,
@@ -10997,6 +11021,12 @@ struct App {
     /// browse hot path — so the status bar can name the environment without
     /// another terminal. A failed read stays uncached, so a later switch retries.
     server_versions: HashMap<String, String>,
+    /// R63: the connect-time latency of the version probe above, per connection
+    /// id. Measured once (the same read, no extra query) and shown muted in the
+    /// status bar; a failed probe leaves no entry, so nothing is reported.
+    server_rtts: HashMap<String, Duration>,
+    /// R63: recency panel ordering — most-recently-browsed first, or by name.
+    recent_sort: RecentSort,
 
     /// Client-side substring filter over the loaded Redis keys (R42 one-step
     /// type-to-filter, mirrors the sidebar table filter). `redis_scan.keys` is
@@ -11818,6 +11848,8 @@ impl App {
             conn_live: HashMap::new(),
             conn_connecting: HashSet::new(),
             server_versions: HashMap::new(),
+            server_rtts: HashMap::new(),
+            recent_sort: RecentSort::Recent,
             side_rows: Vec::new(),
             side_sel: 0,
             side_table_seen: None,
@@ -12363,8 +12395,11 @@ fn apply_op_result(app: &mut App, res: OpResult, tx: &Tx) {
         }
         // R52: cache the server version under the connection it was read for. A
         // failed read (`None`) leaves the cache empty, so a later switch retries.
-        OpResult::ServerVersion { id, version } => {
+        OpResult::ServerVersion { id, version, rtt } => {
             if let Some(v) = version {
+                if let Some(d) = rtt {
+                    app.server_rtts.insert(id.clone(), d);
+                }
                 app.server_versions.insert(id, v);
             }
         }
@@ -23384,12 +23419,50 @@ fn recent_key(app: &mut App, tx: &Tx, k: KeyEvent) {
                 app.recent_list.select(Some(i));
             }
         }
+        // R63: toggle the panel between most-recent-first and name order. This
+        // is a pure client-side re-sort of the same five rows; the cursor
+        // returns to the top so the new first row is the highlighted one.
+        KeyCode::Char('s') => {
+            app.recent_sort = match app.recent_sort {
+                RecentSort::Recent => RecentSort::Name,
+                RecentSort::Name => RecentSort::Recent,
+            };
+            app.recent_list.select(Some(0));
+            app.status = tf("排序：{}", &[&t(recent_sort_label(app.recent_sort))]);
+        }
         KeyCode::Enter => {
             if let Some(i) = app.recent_list.selected() {
-                open_recent(app, tx, i);
+                if let Some(&real) = recent_order(app).get(i) {
+                    open_recent(app, tx, real);
+                }
             }
         }
         _ => {}
+    }
+}
+
+/// R63: the recency panel's visible order as indices into `recent_tables`. The
+/// canonical list is always recency-ordered; `Name` re-sorts a copy by
+/// `schema.table` then database, case-insensitively.
+fn recent_order(app: &App) -> Vec<usize> {
+    let mut idx: Vec<usize> = (0..app.recent_tables.len()).collect();
+    if app.recent_sort == RecentSort::Name {
+        idx.sort_by_key(|&i| {
+            let (db, schema, table) = &app.recent_tables[i];
+            (
+                fix_double_encoding(&qualified_display(schema, table)).to_lowercase(),
+                fix_double_encoding(db).to_lowercase(),
+            )
+        });
+    }
+    idx
+}
+
+/// R63: the status-bar / title label for a recency-panel ordering.
+fn recent_sort_label(sort: RecentSort) -> &'static str {
+    match sort {
+        RecentSort::Recent => "按最近",
+        RecentSort::Name => "按表名",
     }
 }
 
@@ -33016,6 +33089,17 @@ fn context_info(app: &App) -> String {
     if let Some(hint) = &app.nav_landing {
         parts.push(hint.clone());
     }
+    // R63: the connect-time latency is the next-most-useful connection fact and
+    // only a few cells wide, so it sits here — before the wide fields — and
+    // survives the tail truncation on a 42-column status bar. Absent when the
+    // probe failed, so a failure is silent (no error, no second query).
+    if let Some(d) = app
+        .selected
+        .as_ref()
+        .and_then(|c| app.server_rtts.get(&c.id))
+    {
+        parts.push(tf("延迟 {}", &[&format_rtt(*d)]));
+    }
     // Mobile efficiency markers go next: on a phone the status bar is narrow,
     // and whether the wide table now fits is the single most useful fact.
     let mut fits: Option<usize> = None;
@@ -36769,10 +36853,13 @@ fn render_recent_tables(f: &mut Frame, area: Rect, app: &mut App) {
     };
     f.render_widget(Clear, box_area);
     let cur_db = app.current_db();
-    let items: Vec<ListItem> = app
-        .recent_tables
+    // R63: render the panel in the active order (`s` toggles), which is just an
+    // index permutation over the canonical recency list.
+    let order = recent_order(app);
+    let items: Vec<ListItem> = order
         .iter()
-        .map(|(db, schema, table)| {
+        .map(|&i| {
+            let (db, schema, table) = &app.recent_tables[i];
             let here = *db == cur_db;
             ListItem::new(Line::from(vec![
                 Span::styled(
@@ -36790,11 +36877,15 @@ fn render_recent_tables(f: &mut Frame, area: Rect, app: &mut App) {
             ]))
         })
         .collect();
+    let title = tf(
+        " 最近表 · {} · s 排序 · ↑↓ Enter 直达 · Esc 关 ",
+        &[&t(recent_sort_label(app.recent_sort))],
+    );
     let list = List::new(items)
         .block(
             Block::default()
                 .borders(Borders::ALL)
-                .title(t(" 最近表 · ↑↓ Enter 直达 · Esc 关 "))
+                .title(title)
                 .border_set(border::ROUNDED)
                 .border_style(Style::default().fg(Color::Cyan)),
         )
@@ -39574,7 +39665,7 @@ const HELP_ROWS: &[(&str, &str)] = &[
         "Alt-V / c",
         "列显隐：空格勾选显示的列（按 库.表 记住，跨会话）",
     ),
-    ("Alt-R / t", "最近浏览的 5 张表，Enter 直达（侧栏 t）"),
+    ("Alt-R / t", "最近浏览的 5 张表，Enter 直达 · s 排序（侧栏 t）"),
     (
         "Alt-← →",
         "最近表 / 集合 / Redis key 后退 / 前进（浏览器语义，最多 50 个，跨库可用）",
@@ -39732,7 +39823,7 @@ const HELP_ROWS: &[(&str, &str)] = &[
         "Alt+a-z · ; ,",
         "首字母跳：跳到以该字母开头的下一张表；; , 前后循环（与过滤互斥）",
     ),
-    ("t", "最近表浮层（Enter 直达）"),
+    ("t", "最近表浮层（Enter 直达 · s 排序）"),
     ("r", "表结构（字段 + DDL）"),
     (
         "r（连接根 / 分组行）",
@@ -46643,6 +46734,95 @@ mod tests {
         assert_eq!(app.nav_pos, 2);
     }
 
+    /// R63: the recency panel can re-sort by name, purely client-side — the
+    /// canonical most-recent-first list never changes, only the view does.
+    #[test]
+    fn recent_panel_sorts_by_recency_or_name() {
+        let mut app = test_app();
+        remember_recent_table(&mut app, "shop", "public", "orders");
+        remember_recent_table(&mut app, "shop", "public", "accounts");
+        remember_recent_table(&mut app, "shop", "public", "items");
+        // Default: newest first.
+        assert_eq!(app.recent_sort, RecentSort::Recent);
+        assert_eq!(recent_order(&app), vec![0, 1, 2]);
+        assert_eq!(app.recent_tables[0].2, "items");
+        // Name order is a permutation of the same rows: accounts, items, orders.
+        app.recent_sort = RecentSort::Name;
+        assert_eq!(recent_order(&app), vec![1, 0, 2]);
+        assert_eq!(app.recent_tables[0].2, "items");
+    }
+
+    /// R63: `s` toggles the order and parks the cursor at the top; `k` stays
+    /// vim-up in this panel (the ironclad key rule), never the sort key.
+    #[test]
+    fn recent_panel_s_toggles_sort_and_k_still_moves() {
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel::<OpResult>();
+        let mut app = test_app();
+        remember_recent_table(&mut app, "shop", "public", "orders");
+        remember_recent_table(&mut app, "shop", "public", "items");
+        remember_recent_table(&mut app, "shop", "public", "accounts");
+        app.recent_open = true;
+        app.recent_list.select(Some(2));
+        recent_key(&mut app, &tx, KeyEvent::from(KeyCode::Char('s')));
+        assert_eq!(app.recent_sort, RecentSort::Name);
+        assert_eq!(app.recent_list.selected(), Some(0));
+        assert!(app.status.contains("按表名"), "{}", app.status);
+        // `k` still walks up the list and leaves the order alone.
+        app.recent_list.select(Some(2));
+        recent_key(&mut app, &tx, KeyEvent::from(KeyCode::Char('k')));
+        assert_eq!(app.recent_sort, RecentSort::Name);
+        assert_eq!(app.recent_list.selected(), Some(1));
+        // `s` flips back to recency order.
+        recent_key(&mut app, &tx, KeyEvent::from(KeyCode::Char('s')));
+        assert_eq!(app.recent_sort, RecentSort::Recent);
+        assert!(app.status.contains("按最近"), "{}", app.status);
+    }
+
+    /// R63: the connect-time latency is formatted compactly, and a failed probe
+    /// stays silent — nothing is cached, so nothing is shown.
+    #[test]
+    fn connect_latency_formats_and_fails_silently() {
+        assert_eq!(format_rtt(Duration::from_millis(0)), "0ms");
+        assert_eq!(format_rtt(Duration::from_millis(12)), "12ms");
+        assert_eq!(format_rtt(Duration::from_millis(999)), "999ms");
+        assert_eq!(format_rtt(Duration::from_millis(1000)), "1.0s");
+        assert_eq!(format_rtt(Duration::from_millis(1234)), "1.2s");
+
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel::<OpResult>();
+        let mut app = test_app();
+        apply_op_result(
+            &mut app,
+            OpResult::ServerVersion {
+                id: "id-postgres".into(),
+                version: Some("16.2".into()),
+                rtt: Some(Duration::from_millis(12)),
+            },
+            &tx,
+        );
+        assert_eq!(
+            app.server_versions.get("id-postgres").map(String::as_str),
+            Some("16.2")
+        );
+        assert_eq!(
+            app.server_rtts.get("id-postgres"),
+            Some(&Duration::from_millis(12))
+        );
+        // A failed read caches neither the version nor a latency.
+        apply_op_result(
+            &mut app,
+            OpResult::ServerVersion {
+                id: "id-postgres".into(),
+                version: None,
+                rtt: None,
+            },
+            &tx,
+        );
+        assert_eq!(
+            app.server_versions.get("id-postgres").map(String::as_str),
+            Some("16.2")
+        );
+    }
+
     /// Alt-← / Alt-→ are the history keys outside the text panes; the editor
     /// keeps them local so editing SQL is never interrupted.
     #[test]
@@ -46786,6 +46966,34 @@ mod tests {
         assert!(info.contains("6/8"), "{info}");
         assert_eq!(info.matches("列 ").count(), 1, "{info}");
         assert!(!info.contains("-"), "no a-b scroll window: {info}");
+    }
+
+    /// R63: the connect-time latency rides next to the server version in the
+    /// status context block, and is omitted entirely when no probe succeeded.
+    #[test]
+    fn status_bar_shows_connect_latency_when_known() {
+        let mut app = test_app();
+        app.selected = Some(test_conn("postgres"));
+        let id = app.selected.as_ref().unwrap().id.clone();
+        app.server_versions.insert(id.clone(), "16.2".into());
+        app.server_rtts
+            .insert(id.clone(), Duration::from_millis(12));
+        let info = context_info(&app);
+        assert!(info.contains("服务器 16.2"), "{info}");
+        assert!(info.contains("延迟 12ms"), "{info}");
+        // The compact latency survives even on a phone status bar, while the
+        // long version string is hidden below 56 columns (same rule as before).
+        app.term_w = 42;
+        let narrow = context_info(&app);
+        assert!(narrow.contains("延迟 12ms"), "{narrow}");
+        assert!(!narrow.contains("服务器"), "{narrow}");
+        app.term_w = 0;
+        // A connection whose probe failed shows the version (if any) but no
+        // latency, and never an error.
+        app.server_rtts.clear();
+        let info = context_info(&app);
+        assert!(info.contains("服务器 16.2"), "{info}");
+        assert!(!info.contains("延迟"), "{info}");
     }
 
     /// Build the shared fixture for the tree tests: two connections, the first
