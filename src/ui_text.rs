@@ -1192,6 +1192,24 @@ pub static ALL_KEYS: &[&str] = &[
     "删除选中收藏（红色确认；只删本地配置，不动数据库）",
     "上限 100",
     "收藏上限 100 条，满时先删再存",
+    // ── R61: editor buffer find (Ctrl-F) ──
+    "查找…（大小写不敏感，纯客户端）",
+    "查找：输入关键词 · Enter/F3 下一个 · Esc 退出",
+    "查找「{}」· 无命中",
+    "查找「{}」· {}/{} · Enter/F3/Alt-N 下一个 · Alt-B 上一个 · Esc 退出",
+    "已退出查找",
+    "查找「{}」· {}/{} · F3/Alt-N 下一个 · Alt-B 上一个 · 编辑后清除高亮",
+    " 查找（编辑器）· 大小写不敏感 · 纯客户端 ",
+    " 查找「{}」· 无命中 · Esc 退出 ",
+    " 查找「{}」· {}/{} · Enter/F3/Alt-N 下一个 · Alt-B 上一个 ",
+    "查找 {}/{}",
+    " 查找 {}/{} · Enter ",
+    " 查找 · Enter/Esc ",
+    "下一个",
+    "上一个",
+    "退出保留高亮",
+    "编辑器内查找：底栏输入，Enter/F3/Alt-N 下一个、Alt-B 上一个（Shift-Enter / Shift-F3 在支持的终端也可用）；命中高亮 + 状态栏 3/7 计数；大小写不敏感、纯客户端不发查询；Esc 退出保留高亮，下次编辑自动清除",
+    "查找命中循环：F3/Alt-N 下一个、Alt-B 上一个（Esc 退出查找后仍可用；无查找词时按下即打开查找框）",
 ];
 
 /// The Chinese → English table. Keys must match the source literals exactly.
@@ -3355,6 +3373,42 @@ fn en_of(zh: &'static str) -> Option<&'static str> {
         "上限 100" => Some("limit 100"),
         "收藏上限 100 条，满时先删再存" => {
             Some("Favourite limit is 100; delete some before saving more")
+        }
+        // ── R61: editor buffer find (Ctrl-F) ──
+        "查找…（大小写不敏感，纯客户端）" => {
+            Some("Find… (case-insensitive, client-side)")
+        }
+        "查找：输入关键词 · Enter/F3 下一个 · Esc 退出" => {
+            Some("Find: type a term · Enter/F3 next · Esc exit")
+        }
+        "查找「{}」· 无命中" => Some("Find “{}” · no match"),
+        "查找「{}」· {}/{} · Enter/F3/Alt-N 下一个 · Alt-B 上一个 · Esc 退出" => {
+            Some("Find “{}” · {}/{} · Enter/F3 next · Shift-Enter/Alt-B previous · Esc exit")
+        }
+        "已退出查找" => Some("Find closed"),
+        "查找「{}」· {}/{} · F3/Alt-N 下一个 · Alt-B 上一个 · 编辑后清除高亮" => {
+            Some("Find “{}” · {}/{} · F3/Shift-F3 jump · highlight clears on edit")
+        }
+        " 查找（编辑器）· 大小写不敏感 · 纯客户端 " => {
+            Some(" find (editor) · case-insensitive · client-side ")
+        }
+        " 查找「{}」· 无命中 · Esc 退出 " => {
+            Some(" find “{}” · no match · Esc exit ")
+        }
+        " 查找「{}」· {}/{} · Enter/F3/Alt-N 下一个 · Alt-B 上一个 " => {
+            Some(" find “{}” · {}/{} · Enter/F3 next · Shift-Enter/Alt-B previous ")
+        }
+        "查找 {}/{}" => Some("find {}/{}"),
+        " 查找 {}/{} · Enter " => Some(" find {}/{} · Enter "),
+        " 查找 · Enter/Esc " => Some(" find · Enter/Esc "),
+        "下一个" => Some("next"),
+        "上一个" => Some("previous"),
+        "退出保留高亮" => Some("exit, keep highlight"),
+        "编辑器内查找：底栏输入，Enter/F3/Alt-N 下一个、Alt-B 上一个（Shift-Enter / Shift-F3 在支持的终端也可用）；命中高亮 + 状态栏 3/7 计数；大小写不敏感、纯客户端不发查询；Esc 退出保留高亮，下次编辑自动清除" => {
+            Some("Find in the editor: type in the bottom bar, Enter/F3/Alt-N next, Alt-B previous (Shift-Enter / Shift-F3 too where the terminal reports them); matches highlight with a 3/7 count in the status bar; case-insensitive and client-side (no query); Esc exits and keeps the highlight until the next edit")
+        }
+        "查找命中循环：F3/Alt-N 下一个、Alt-B 上一个（Esc 退出查找后仍可用；无查找词时按下即打开查找框）" => {
+            Some("Cycle find matches: F3/Alt-N next, Alt-B previous (still works after Esc; with no needle yet the key opens the find box)")
         }
         _ => None,
     }

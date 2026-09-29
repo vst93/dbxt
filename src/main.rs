@@ -11012,6 +11012,21 @@ struct App {
     /// for a whole-buffer replace).
     editor_undo: Option<String>,
 
+    // ── editor buffer find (R61 `Ctrl-F`) ──
+    /// The modal one-line input while the find needle is being typed (bottom
+    /// bar). `None` once the input is closed, even while the highlight stays.
+    editor_find: Option<TextArea<'static>>,
+    /// Active find needle. Non-empty keeps every match highlighted in the
+    /// editor; `Esc` closes the input but keeps the highlight until the next
+    /// edit. Case-insensitive substring, entirely client-side (no query).
+    editor_find_needle: String,
+    /// Index into the current hit list of the match the caret last jumped to,
+    /// so the status bar can show `3/7`.
+    editor_find_idx: Option<usize>,
+    /// Editor buffer snapshot from when the needle was computed; any edit makes
+    /// the matches stale, so the highlight is dropped.
+    editor_find_snapshot: Vec<String>,
+
     // ── query-history panel (Alt-H) ──
     /// The overlay is open (it owns the keyboard until Esc / Enter).
     history_open: bool,
@@ -11806,6 +11821,10 @@ impl App {
             history_idx: None,
             history_draft: String::new(),
             editor_undo: None,
+            editor_find: None,
+            editor_find_needle: String::new(),
+            editor_find_idx: None,
+            editor_find_snapshot: Vec::new(),
             history_open: false,
             history_list: ListState::default(),
             history_rows: Vec::new(),
@@ -14040,11 +14059,16 @@ fn handle_event(app: &mut App, tx: &Tx, ev: Event) {
     trace_event(app, &ev);
     match ev {
         Event::Key(k) if matches!(k.kind, KeyEventKind::Press | KeyEventKind::Repeat) => {
-            key(app, tx, k)
+            key(app, tx, k);
+            // R61: an edit through any path (paste, snippet insert, history
+            // recall, completion accept, …) invalidates the editor find
+            // highlight, not only the keys routed through `editor_key`.
+            sync_editor_find(app);
         }
         Event::Paste(s) => match app.focus {
             Focus::Editor => {
                 app.editor.insert_str(s);
+                sync_editor_find(app);
             }
             Focus::CmdInput => {
                 app.cmd_input.insert_str(s);
@@ -14117,6 +14141,8 @@ fn reset_overlays_for_backend_switch(app: &mut App) {
     app.locate_prompt = None;
     app.col_jump = None;
     app.goto_prompt = None;
+    // R61: drop the editor find highlight with the rest of the overlays.
+    clear_editor_find(app);
     app.mongo_dialog = None;
     app.redis_prompt = None;
     app.help_open = false;
@@ -14496,6 +14522,12 @@ fn browse_key(app: &mut App, tx: &Tx, k: KeyEvent) {
     // R56: the `:` row-number jump prompt is modal too.
     if app.goto_prompt.is_some() {
         goto_row_key(app, k);
+        return;
+    }
+
+    // R61: the editor find prompt (Ctrl-F) is modal while it is open.
+    if app.editor_find.is_some() {
+        editor_find_key(app, k);
         return;
     }
 
@@ -20261,6 +20293,63 @@ fn editor_display_col(line: &str, col: usize) -> usize {
     w
 }
 
+/// One match of the editor find needle: a run of `len` chars starting at char
+/// column `col` on line `row`. Columns are char indices (not bytes), matching
+/// tui-textarea's cursor coordinates, so a hit maps straight onto the caret and
+/// onto [`editor_display_col`] for painting.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+struct FindHit {
+    row: usize,
+    col: usize,
+    len: usize,
+}
+
+/// Case-insensitive char equality. ASCII is the hot path; non-ASCII falls back
+/// to a per-char `to_lowercase`, so `SELECT` matches `select` and `Ä` matches
+/// `ä`. A multi-char lowercase expansion simply cannot match one needle char,
+/// which is the correct substring behaviour.
+fn chars_equal_ci(a: char, b: char) -> bool {
+    if a == b {
+        return true;
+    }
+    if a.is_ascii() && b.is_ascii() {
+        return a.eq_ignore_ascii_case(&b);
+    }
+    a.to_lowercase().eq(b.to_lowercase())
+}
+
+/// R61: case-insensitive, client-side substring search over the editor buffer.
+/// Pure so the find state machine is unit-testable without a backend. A match
+/// never crosses a line boundary (each line is searched on its own) and the
+/// returned columns are char indices.
+fn editor_find_hits(lines: &[String], needle: &str) -> Vec<FindHit> {
+    let needle: Vec<char> = needle.chars().collect();
+    if needle.is_empty() {
+        return Vec::new();
+    }
+    let mut hits = Vec::new();
+    for (row, line) in lines.iter().enumerate() {
+        let chars: Vec<char> = line.chars().collect();
+        if chars.len() < needle.len() {
+            continue;
+        }
+        for start in 0..=chars.len() - needle.len() {
+            let matched = chars[start..start + needle.len()]
+                .iter()
+                .zip(&needle)
+                .all(|(a, b)| chars_equal_ci(*a, *b));
+            if matched {
+                hits.push(FindHit {
+                    row,
+                    col: start,
+                    len: needle.len(),
+                });
+            }
+        }
+    }
+    hits
+}
+
 /// Outcome of an editor undo, so the caller can name what happened.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum EditorUndo {
@@ -20302,7 +20391,170 @@ fn editor_undo_status(outcome: EditorUndo) -> &'static str {
     }
 }
 
+/// R61: open the `Ctrl-F` find prompt (bottom bar). Pre-filled with the last
+/// needle so a repeated search is one keystroke away; the highlight is kept.
+fn open_editor_find(app: &mut App) {
+    let mut ta = TextArea::from([app.editor_find_needle.clone()]);
+    ta.set_placeholder_text(t("查找…（大小写不敏感，纯客户端）"));
+    ta.move_cursor(CursorMove::End);
+    app.editor_find = Some(ta);
+    app.editor_find_snapshot = app.editor.lines().to_vec();
+    editor_find_recompute_idx(app);
+    app.status = editor_find_status(app);
+}
+
+/// The current hit index for the caret: the first match at or after it, wrapping
+/// to the first. `None` when the needle is empty or matches nothing.
+fn editor_find_recompute_idx(app: &mut App) {
+    if app.editor_find_needle.is_empty() {
+        app.editor_find_idx = None;
+        return;
+    }
+    let hits = editor_find_hits(app.editor.lines(), &app.editor_find_needle);
+    app.editor_find_idx = if hits.is_empty() {
+        None
+    } else {
+        let cur = app.editor.cursor();
+        Some(hits.iter().position(|h| (h.row, h.col) >= cur).unwrap_or(0))
+    };
+}
+
+/// The `3/7` status line for the active find. Kept beside the state machine so
+/// the count and the highlight can never disagree.
+fn editor_find_status(app: &App) -> String {
+    if app.editor_find_needle.is_empty() {
+        return t("查找：输入关键词 · Enter/F3 下一个 · Esc 退出").into();
+    }
+    let n = editor_find_hits(app.editor.lines(), &app.editor_find_needle).len();
+    if n == 0 {
+        return tf("查找「{}」· 无命中", &[&(app.editor_find_needle)]);
+    }
+    let i = app.editor_find_idx.map(|i| i + 1).unwrap_or(1).min(n);
+    tf(
+        "查找「{}」· {}/{} · Enter/F3/Alt-N 下一个 · Alt-B 上一个 · Esc 退出",
+        &[&(app.editor_find_needle), &(i), &(n)],
+    )
+}
+
+/// Move the caret to the next (`dir > 0`) / previous (`dir < 0`) match, wrapping
+/// around. Anchors on the caret when it is not itself a hit, so the first step
+/// lands on the nearest match rather than the first in the buffer. Used by
+/// Enter / F3 / Alt-N and their reverse keys, both in the prompt and after it
+/// closed (highlight kept). Returns whether a match was found.
+fn editor_find_step(app: &mut App, dir: i32) -> bool {
+    if app.editor_find_needle.is_empty() {
+        // No needle yet: F3 / Alt-N just open the input.
+        open_editor_find(app);
+        return false;
+    }
+    let lines = app.editor.lines().to_vec();
+    let hits = editor_find_hits(&lines, &app.editor_find_needle);
+    if hits.is_empty() {
+        app.editor_find_idx = None;
+        app.status = tf("查找「{}」· 无命中", &[&(app.editor_find_needle)]);
+        return false;
+    }
+    let n = hits.len();
+    let cur = app.editor.cursor();
+    let idx = match hits.iter().position(|h| (h.row, h.col) == cur) {
+        Some(i) => (i as i32 + dir).rem_euclid(n as i32) as usize,
+        None if dir > 0 => hits.iter().position(|h| (h.row, h.col) > cur).unwrap_or(0),
+        None => hits
+            .iter()
+            .rposition(|h| (h.row, h.col) < cur)
+            .unwrap_or(n - 1),
+    };
+    let hit = hits[idx];
+    app.editor_find_idx = Some(idx);
+    app.editor_find_snapshot = lines;
+    app.editor
+        .move_cursor(CursorMove::Jump(hit.row as u16, hit.col as u16));
+    app.status = editor_find_status(app);
+    true
+}
+
+/// Drop the whole find state (needle, prompt, index, snapshot). Called on an
+/// edit so a stale highlight never lingers over text it no longer matches, and
+/// by a backend switch.
+fn clear_editor_find(app: &mut App) {
+    app.editor_find = None;
+    app.editor_find_needle.clear();
+    app.editor_find_idx = None;
+    app.editor_find_snapshot.clear();
+}
+
+/// R61: drop the highlight once the buffer changed under it (any edit). While
+/// the buffer is untouched the needle survives, so `Esc` keeps the highlight
+/// exactly until the next edit.
+fn sync_editor_find(app: &mut App) {
+    if app.editor_find_needle.is_empty() {
+        return;
+    }
+    if app.editor.lines() != app.editor_find_snapshot.as_slice() {
+        clear_editor_find(app);
+    }
+}
+
+/// Prompt handler for `Ctrl-F`. Enter / F3 / Alt-N step forward, Shift-Enter /
+/// Shift-F3 / Alt-B step back, Esc closes the input but keeps the highlight.
+/// Anything else types into the needle and refreshes the live count.
+fn editor_find_key(app: &mut App, k: KeyEvent) {
+    match (k.modifiers, k.code) {
+        (m, KeyCode::Enter) if m.contains(KeyModifiers::SHIFT) => {
+            editor_find_step(app, -1);
+        }
+        (KeyModifiers::NONE, KeyCode::Enter) => {
+            editor_find_step(app, 1);
+        }
+        (m, KeyCode::F(3)) if m.contains(KeyModifiers::SHIFT) => {
+            editor_find_step(app, -1);
+        }
+        (_, KeyCode::F(3)) => {
+            editor_find_step(app, 1);
+        }
+        (KeyModifiers::ALT, KeyCode::Char('n')) | (KeyModifiers::ALT, KeyCode::Char('N')) => {
+            editor_find_step(app, 1);
+        }
+        (KeyModifiers::ALT, KeyCode::Char('b')) | (KeyModifiers::ALT, KeyCode::Char('B')) => {
+            editor_find_step(app, -1);
+        }
+        (KeyModifiers::NONE, KeyCode::Esc) => {
+            app.editor_find = None;
+            let n = editor_find_hits(app.editor.lines(), &app.editor_find_needle).len();
+            if app.editor_find_needle.is_empty() || n == 0 {
+                app.status = t("已退出查找").into();
+            } else {
+                let i = app.editor_find_idx.map(|i| i + 1).unwrap_or(1).min(n);
+                app.status = tf(
+                    "查找「{}」· {}/{} · F3/Alt-N 下一个 · Alt-B 上一个 · 编辑后清除高亮",
+                    &[&(app.editor_find_needle), &(i), &(n)],
+                );
+            }
+        }
+        _ => {
+            if let Some(t) = &mut app.editor_find {
+                t.input(k);
+            }
+            app.editor_find_needle = app
+                .editor_find
+                .as_ref()
+                .map(|t| t.lines().join(" "))
+                .unwrap_or_default();
+            app.editor_find_snapshot = app.editor.lines().to_vec();
+            editor_find_recompute_idx(app);
+            app.status = editor_find_status(app);
+        }
+    }
+}
+
 fn editor_key(app: &mut App, tx: &Tx, k: KeyEvent) {
+    editor_key_inner(app, tx, k);
+    // R61: any edit invalidates the find highlight (matches moved); `Esc` keeps
+    // it until exactly this moment.
+    sync_editor_find(app);
+}
+
+fn editor_key_inner(app: &mut App, tx: &Tx, k: KeyEvent) {
     // The completion popup owns the keyboard while it is open: Tab / Enter
     // accept, Esc cancels, arrows move, anything else keeps typing (and refines
     // the candidate list).
@@ -20312,6 +20564,25 @@ fn editor_key(app: &mut App, tx: &Tx, k: KeyEvent) {
     }
     match (k.modifiers, k.code) {
         (m, KeyCode::Char('j')) if m.contains(KeyModifiers::CONTROL) => run_current(app, tx),
+        // R61 Ctrl-F: find inside the editor buffer (client-side, no query).
+        // Free in the editor — the results pane owns Ctrl-F for page turn.
+        (m, KeyCode::Char('f')) if m.contains(KeyModifiers::CONTROL) => open_editor_find(app),
+        // R61: F3 / Shift-F3 and Alt-N / Alt-B cycle the matches. They work both
+        // in the find prompt and after it closed (Esc keeps the highlight); with
+        // no needle yet they just open the input. Alt-N is the non-Shift forward
+        // key, Alt-B the non-Shift backward key (both free in the editor).
+        (KeyModifiers::NONE, KeyCode::F(3)) => {
+            editor_find_step(app, 1);
+        }
+        (m, KeyCode::F(3)) if m.contains(KeyModifiers::SHIFT) => {
+            editor_find_step(app, -1);
+        }
+        (KeyModifiers::ALT, KeyCode::Char('n')) | (KeyModifiers::ALT, KeyCode::Char('N')) => {
+            editor_find_step(app, 1);
+        }
+        (KeyModifiers::ALT, KeyCode::Char('b')) | (KeyModifiers::ALT, KeyCode::Char('B')) => {
+            editor_find_step(app, -1);
+        }
         // Alt-/ : table / column / keyword prefix completion at the cursor.
         // Chosen over Ctrl-Space because that combination is claimed by the
         // input-method switcher in fcitx5/ibus and on Windows.
@@ -32389,6 +32660,37 @@ fn ui(f: &mut Frame, app: &mut App) {
             t(" 跳行 · Enter/Esc "),
         );
     }
+    // R61: the editor find prompt (`Ctrl-F`) is a bottom-bar input. The title
+    // carries the live `3/7` count so it is visible while typing.
+    if app.editor_find.is_some() {
+        let n = editor_find_hits(app.editor.lines(), &app.editor_find_needle).len();
+        let i = app
+            .editor_find_idx
+            .map(|i| i + 1)
+            .unwrap_or(1)
+            .min(n.max(1));
+        let title = if app.editor_find_needle.is_empty() {
+            t(" 查找（编辑器）· 大小写不敏感 · 纯客户端 ").to_string()
+        } else if n == 0 {
+            tf(
+                " 查找「{}」· 无命中 · Esc 退出 ",
+                &[&(app.editor_find_needle)],
+            )
+        } else {
+            tf(
+                " 查找「{}」· {}/{} · Enter/F3/Alt-N 下一个 · Alt-B 上一个 ",
+                &[&(app.editor_find_needle), &(i), &(n)],
+            )
+        };
+        // The short title keeps the count too, so a 42-column phone never hides
+        // it when the full title does not fit.
+        let short = if app.editor_find_needle.is_empty() || n == 0 {
+            t(" 查找 · Enter/Esc ").to_string()
+        } else {
+            tf(" 查找 {}/{} · Enter ", &[&(i), &(n)])
+        };
+        render_prompt_input(f, f.area(), app.editor_find.as_mut(), &title, &short);
+    }
     // The row popup draws first so a drilled cell popup sits on top of it.
     if app.row_popup.is_some() {
         render_row_popup(f, f.area(), app);
@@ -32601,6 +32903,15 @@ fn spinner_frame(i: usize) -> char {
 /// Right-hand section of the status bar: context about the current result set.
 fn context_info(app: &App) -> String {
     let mut parts: Vec<String> = Vec::new();
+    // R61: an active editor find leads the context block so its `3/7` count
+    // survives on a 42-column status bar (the block is truncated from the tail).
+    if !app.editor_find_needle.is_empty() {
+        let n = editor_find_hits(app.editor.lines(), &app.editor_find_needle).len();
+        if n > 0 {
+            let i = app.editor_find_idx.map(|i| i + 1).unwrap_or(1).min(n);
+            parts.push(tf("查找 {}/{}", &[&(i), &(n)]));
+        }
+    }
     // A back/forward landing goes first so even a 42-column status bar shows it
     // (the block is truncated from the tail, not the head).
     if let Some(hint) = &app.nav_landing {
@@ -32843,6 +33154,8 @@ enum FooterView {
     ColJump,
     /// R56: the `:` row-number jump prompt.
     GotoRow,
+    /// R61: the editor find prompt (`Ctrl-F`).
+    EditorFind,
     Completion,
     SnippetName,
     Snippets,
@@ -32955,6 +33268,8 @@ fn footer_ctx_inner(app: &App, include_help: bool) -> FooterCtx {
         FooterView::ColJump
     } else if app.goto_prompt.is_some() {
         FooterView::GotoRow
+    } else if app.editor_find.is_some() {
+        FooterView::EditorFind
     } else if app.completion.is_some() {
         FooterView::Completion
     } else if app.snippet_name.is_some() {
@@ -33101,6 +33416,11 @@ fn footer_hints_ctx(ctx: FooterCtx) -> Vec<Hint> {
         FooterView::LocatePrompt => vec![("Enter", t("跳到命中")), ("Esc", t("清除"))],
         FooterView::ColJump => vec![("Enter", t("跳列")), ("Esc", t("取消"))],
         FooterView::GotoRow => vec![("Enter", t("跳行")), ("Esc", t("取消"))],
+        FooterView::EditorFind => vec![
+            ("Enter/F3", t("下一个")),
+            ("⇧Enter", t("上一个")),
+            ("Esc", t("退出保留高亮")),
+        ],
         FooterView::HistoryFilter => vec![("Enter", t("保留")), ("Esc", t("清除"))],
         FooterView::History => vec![
             ("↑↓", t("选择")),
@@ -33557,9 +33877,11 @@ fn render_main_area(
         app.editor_vp.follow(app.editor.cursor());
         f.render_widget(&app.editor, main_chunks[0]);
         // R56: dim every statement except the caret's own, then mark the bracket
-        // pair on top (so the accent survives the dim).
+        // pair on top (so the accent survives the dim). R61: the find matches go
+        // on last so their background wins over both.
         paint_statement_dim(f, main_chunks[0], app);
         paint_bracket_pair(f, main_chunks[0], app);
+        paint_editor_find(f, main_chunks[0], app);
     }
 
     if has_cmd {
@@ -33665,6 +33987,73 @@ fn paint_bracket_pair(f: &mut Frame, area: Rect, app: &App) {
         let cell = &mut f.buffer_mut()[(x, y)];
         cell.fg = Color::LightCyan;
         cell.modifier.insert(Modifier::UNDERLINED | Modifier::BOLD);
+    }
+}
+
+/// R61: paint the editor find matches straight into the frame buffer, after the
+/// textarea drew (and after the statement dim / bracket pair), so the highlight
+/// sits on top. Purely presentational: no key, no state change, no query. Every
+/// match shares one background; the match the caret jumped to (the one the `3/7`
+/// count names) gets the accent colour, so the count and the screen agree.
+/// Char columns are mapped through [`editor_display_col`], so tabs and wide CJK
+/// characters highlight their real screen cells.
+fn paint_editor_find(f: &mut Frame, area: Rect, app: &App) {
+    if app.editor_find_needle.is_empty() {
+        return;
+    }
+    let hits = editor_find_hits(app.editor.lines(), &app.editor_find_needle);
+    if hits.is_empty() {
+        return;
+    }
+    // tui-textarea draws the text inside the `Borders::ALL` block dbxt sets on
+    // it, so the glyph area is the block's inner rect.
+    let inner = Rect {
+        x: area.x.saturating_add(1),
+        y: area.y.saturating_add(1),
+        width: area.width.saturating_sub(2),
+        height: area.height.saturating_sub(2),
+    };
+    if inner.width == 0 || inner.height == 0 {
+        return;
+    }
+    let top_row = app.editor_vp.row as usize;
+    let top_col = app.editor_vp.col as usize;
+    let lines = app.editor.lines();
+    for (hi, hit) in hits.iter().enumerate() {
+        let Some(line) = lines.get(hit.row) else {
+            continue;
+        };
+        if hit.row < top_row || hit.row - top_row >= inner.height as usize {
+            continue;
+        }
+        let current = app.editor_find_idx == Some(hi);
+        let y = inner.y + (hit.row - top_row) as u16;
+        for k in 0..hit.len {
+            let dcol = editor_display_col(line, hit.col + k);
+            if dcol < top_col || dcol - top_col >= inner.width as usize {
+                continue;
+            }
+            // The next char's display column minus this one is the exact cell
+            // span (a tab is 1..4 cells, a wide CJK glyph 2, a combining mark 0).
+            let dnext = editor_display_col(line, hit.col + k + 1);
+            let span = dnext.saturating_sub(dcol).max(1);
+            let x0 = inner.x + (dcol - top_col) as u16;
+            for dx in 0..span as u16 {
+                if x0 + dx >= inner.x + inner.width {
+                    break;
+                }
+                let cell = &mut f.buffer_mut()[(x0 + dx, y)];
+                cell.fg = Color::Black;
+                cell.bg = if current {
+                    Color::LightGreen
+                } else {
+                    Color::Yellow
+                };
+                if current {
+                    cell.modifier.insert(Modifier::BOLD);
+                }
+            }
+        }
     }
 }
 
@@ -39417,6 +39806,14 @@ const HELP_ROWS: &[(&str, &str)] = &[
     (
         "Alt-↓ / Alt-↑",
         "跳到下 / 上一条 SQL 语句开头（分号边界，注释/空语句跳过；状态栏显示 语句 i/n；当前语句高亮、其余淡化）",
+    ),
+    (
+        "Ctrl-F",
+        "编辑器内查找：底栏输入，Enter/F3/Alt-N 下一个、Alt-B 上一个（Shift-Enter / Shift-F3 在支持的终端也可用）；命中高亮 + 状态栏 3/7 计数；大小写不敏感、纯客户端不发查询；Esc 退出保留高亮，下次编辑自动清除",
+    ),
+    (
+        "F3 / Shift-F3 · Alt-N / Alt-B",
+        "查找命中循环：F3/Alt-N 下一个、Alt-B 上一个（Esc 退出查找后仍可用；无查找词时按下即打开查找框）",
     ),
     (
         "Alt-/",
@@ -45288,6 +45685,199 @@ mod tests {
         assert_eq!(bracket_pair_near(&huge, 0, 1, BRACKET_SCAN_LINES), None);
     }
 
+    /// R61: the find hit list is a case-insensitive substring scan per line, with
+    /// char columns (so a hit maps straight onto the caret), overlapping matches
+    /// included. Pure — no backend needed.
+    #[test]
+    fn editor_find_hits_counts_and_ignores_case() {
+        let lines = |s: &str| s.split('\n').map(str::to_string).collect::<Vec<_>>();
+        let two = lines("SELECT a FROM t;\nselect A from T;");
+        // `select` matches once per line, whatever the case.
+        assert_eq!(
+            editor_find_hits(&two, "select"),
+            vec![
+                FindHit {
+                    row: 0,
+                    col: 0,
+                    len: 6
+                },
+                FindHit {
+                    row: 1,
+                    col: 0,
+                    len: 6
+                },
+            ]
+        );
+        // A one-char needle counts every occurrence in both cases.
+        assert_eq!(editor_find_hits(&two, "a").len(), 2);
+        assert_eq!(editor_find_hits(&two, "t").len(), 4);
+        // Overlapping matches are all reported.
+        assert_eq!(editor_find_hits(&lines("aaa"), "aa").len(), 2);
+        // A match never crosses a line boundary, and an empty needle is inert.
+        assert!(editor_find_hits(&lines("fo\no"), "foo").is_empty());
+        assert!(editor_find_hits(&two, "").is_empty());
+        // Char columns, not bytes: a CJK prefix does not skew the column.
+        assert_eq!(
+            editor_find_hits(&lines("中中x"), "x"),
+            vec![FindHit {
+                row: 0,
+                col: 2,
+                len: 1
+            }]
+        );
+        // Non-ASCII case folding: `Ä` matches `ä`.
+        assert_eq!(editor_find_hits(&lines("ÄBC"), "äb").len(), 1);
+    }
+
+    /// R61: the find cursor walks the hits forward and back with wrap-around,
+    /// anchoring on the caret when it is not itself a hit.
+    #[test]
+    fn editor_find_cycles_hits_and_wraps() {
+        let mut app = test_app();
+        app.picker_open = false;
+        app.focus = Focus::Editor;
+        app.set_editor_text("foo bar foo\nbaz foo");
+        app.editor_find_needle = "foo".into();
+        app.editor_find_snapshot = app.editor.lines().to_vec();
+
+        // The caret sits on the first hit, so a forward step goes to the second.
+        app.editor.move_cursor(CursorMove::Jump(0, 0));
+        assert!(editor_find_step(&mut app, 1));
+        assert_eq!(app.editor.cursor(), (0, 8));
+        assert!(editor_find_step(&mut app, 1));
+        assert_eq!(app.editor.cursor(), (1, 4));
+        // ...and wraps to the first.
+        assert!(editor_find_step(&mut app, 1));
+        assert_eq!(app.editor.cursor(), (0, 0));
+        // Backward wraps to the last.
+        assert!(editor_find_step(&mut app, -1));
+        assert_eq!(app.editor.cursor(), (1, 4));
+
+        // Off a hit, forward finds the next and backward the previous.
+        app.editor.move_cursor(CursorMove::Jump(0, 1));
+        assert!(editor_find_step(&mut app, 1));
+        assert_eq!(app.editor.cursor(), (0, 8));
+        app.editor.move_cursor(CursorMove::Jump(0, 1));
+        assert!(editor_find_step(&mut app, -1));
+        assert_eq!(app.editor.cursor(), (0, 0), "the nearest earlier hit");
+
+        // A needle with no hit reports it and moves nowhere.
+        app.editor_find_needle = "zzz".into();
+        app.editor.move_cursor(CursorMove::Jump(0, 0));
+        assert!(!editor_find_step(&mut app, 1));
+        assert_eq!(app.editor.cursor(), (0, 0));
+        assert!(app.status.contains("无命中"));
+    }
+
+    /// R61: `Ctrl-F` opens the bottom-bar input, `Enter` jumps to the next hit,
+    /// `Esc` closes the input but keeps the needle + highlight, and the next edit
+    /// drops the highlight. All client-side.
+    #[test]
+    fn editor_find_esc_keeps_highlight_until_the_next_edit() {
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel::<OpResult>();
+        let mut app = test_app();
+        app.picker_open = false;
+        app.focus = Focus::Editor;
+        app.set_editor_text("alpha beta alpha");
+        app.editor.move_cursor(CursorMove::Jump(0, 0));
+
+        key(
+            &mut app,
+            &tx,
+            KeyEvent::new(KeyCode::Char('f'), KeyModifiers::CONTROL),
+        );
+        assert!(app.editor_find.is_some(), "Ctrl-F opens the find input");
+        assert_eq!(footer_ctx(&app).view, FooterView::EditorFind);
+        for c in "alpha".chars() {
+            key(
+                &mut app,
+                &tx,
+                KeyEvent::new(KeyCode::Char(c), KeyModifiers::NONE),
+            );
+        }
+        assert_eq!(app.editor_find_needle, "alpha");
+        assert_eq!(editor_find_hits(app.editor.lines(), "alpha").len(), 2);
+        assert!(app.status.contains("/2"), "the live count is shown");
+
+        // Enter steps to the next hit and the count tracks it.
+        key(
+            &mut app,
+            &tx,
+            KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+        );
+        assert_eq!(app.editor.cursor(), (0, 11));
+        assert!(
+            app.status.contains("2/2"),
+            "status shows 2/2: {}",
+            app.status
+        );
+
+        // Esc closes the input but the needle (and highlight) stay.
+        key(
+            &mut app,
+            &tx,
+            KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE),
+        );
+        assert!(app.editor_find.is_none());
+        assert_eq!(app.editor_find_needle, "alpha");
+
+        // The matches are painted: the current one is the accent colour.
+        let buf = draw_buffer(&mut app, 80, 30);
+        let ed = app.rects.editor;
+        let cell = |dx: u16| buf.cell((ed.x + 1 + dx, ed.y + 1)).unwrap();
+        assert_eq!(cell(0).bg, Color::Yellow, "a non-current hit is marked");
+        assert_eq!(
+            cell(11).bg,
+            Color::LightGreen,
+            "the current hit gets the accent"
+        );
+        assert_ne!(cell(5).bg, Color::Yellow, "a non-match stays plain");
+
+        // F3 keeps cycling after Esc (the highlight is still alive).
+        key(
+            &mut app,
+            &tx,
+            KeyEvent::new(KeyCode::F(3), KeyModifiers::NONE),
+        );
+        assert_eq!(app.editor.cursor(), (0, 0));
+
+        // The next edit clears the whole find state.
+        key(
+            &mut app,
+            &tx,
+            KeyEvent::new(KeyCode::Char('z'), KeyModifiers::NONE),
+        );
+        assert!(
+            app.editor_find_needle.is_empty(),
+            "an edit drops the needle"
+        );
+        let buf = draw_buffer(&mut app, 80, 30);
+        let ed = app.rects.editor;
+        assert_ne!(buf.cell((ed.x + 1, ed.y + 1)).unwrap().bg, Color::Yellow);
+    }
+
+    /// R61: a bare cursor move keeps the find highlight (only an edit clears it),
+    /// and a backend switch drops it with the other overlays.
+    #[test]
+    fn editor_find_survives_navigation_and_drops_on_backend_switch() {
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel::<OpResult>();
+        let mut app = test_app();
+        app.picker_open = false;
+        app.focus = Focus::Editor;
+        app.set_editor_text("one two one");
+        app.editor_find_needle = "one".into();
+        app.editor_find_snapshot = app.editor.lines().to_vec();
+        key(
+            &mut app,
+            &tx,
+            KeyEvent::new(KeyCode::Right, KeyModifiers::NONE),
+        );
+        assert_eq!(app.editor_find_needle, "one", "navigation keeps the find");
+        reset_overlays_for_backend_switch(&mut app);
+        assert!(app.editor_find_needle.is_empty());
+        assert!(app.editor_find.is_none());
+    }
+
     /// The display-column mapper keeps the highlight on the exact cell the glyph
     /// occupies: tabs expand to the next stop of four, CJK chars take two cells.
     #[test]
@@ -48362,6 +48952,8 @@ mod tests {
             "Alt-Tab / Alt-`",
             "Alt-Enter",
             "Alt-P",
+            "Ctrl-F",
+            "F3 / Shift-F3 · Alt-N / Alt-B",
         ] {
             assert!(
                 keys.iter().any(|k| k.contains(needle)),
