@@ -170,7 +170,7 @@ enum Focus {
     CmdInput,
 }
 
-#[derive(Clone, Copy, PartialEq)]
+#[derive(Clone, Copy, PartialEq, Debug)]
 enum LayoutMode {
     Narrow, // cols < 46  (phone portrait / tiny tmux)
     Mid,    // 46..99
@@ -3944,12 +3944,50 @@ struct CellPopup {
     scroll: u16,
 }
 
-/// A modal showing every column of the focused row, one per line.
+/// A modal showing every column of the focused row, one per line. Beyond
+/// scrolling it carries a cursor (so `y` / `Enter` act on one column), a
+/// column-name filter (`/`, for 40+ column tables) and a vim count prefix
+/// (`5j`). `Enter` / `v` drill into the full cell popup, which stays on top so
+/// `Esc` returns here before closing the row.
 #[derive(Clone)]
 struct RowPopup {
     title: String,
     lines: Vec<PopupLine>,
+    /// Column name per line, parallel to `lines` (drives the `/` filter).
+    cols: Vec<String>,
+    /// Raw display value per line, parallel to `lines` (drives `y` and the
+    /// drilled cell popup).
+    values: Vec<String>,
+    /// Absolute row number (1-based, across pages) for the drilled cell title.
+    row_abs: usize,
     scroll: u16,
+    /// Selected entry, an index into the *visible* (filtered) line list.
+    cursor: usize,
+    /// Column-name substring filter (case-insensitive).
+    filter: String,
+    /// True while the `/` filter is being typed, so `j`/`k` are text.
+    filtering: bool,
+    /// Pending vim count prefix for `j`/`k` / `PageDown`.
+    count: String,
+}
+
+/// Build a row popup from just its display lines (tests / simple callers); the
+/// column and raw-value side tables stay empty.
+#[cfg(test)]
+fn row_popup_from_lines(title: String, lines: Vec<PopupLine>) -> RowPopup {
+    let n = lines.len();
+    RowPopup {
+        title,
+        lines,
+        cols: vec![String::new(); n],
+        values: vec![String::new(); n],
+        row_abs: 0,
+        scroll: 0,
+        cursor: 0,
+        filter: String::new(),
+        filtering: false,
+        count: String::new(),
+    }
 }
 
 /// Memoised wrap of the modal text popups (R42). A 100 KB cell would otherwise
@@ -8889,6 +8927,11 @@ struct App {
     /// step. Shown at the head of the status bar's context block (where a narrow
     /// screen cannot truncate it) and cleared by the next key press.
     nav_landing: Option<String>,
+    /// One-shot discovery hint shown the first time a data grid appears this
+    /// session (`Enter 看整行 · v 看单元格`). Any key clears it, and a deadline
+    /// fades it after a few seconds so it never lingers.
+    row_hint_shown: bool,
+    row_hint_until: Option<Instant>,
     /// Memoised wrap for the cell / row / error text popups (R42).
     popup_cache: Option<PopupCache>,
     /// A `(schema, table)` to open as soon as the (new) table list arrives.
@@ -9537,6 +9580,8 @@ impl App {
             nav_pos: 0,
             pending_open_redis_key: None,
             nav_landing: None,
+            row_hint_shown: false,
+            row_hint_until: None,
             popup_cache: None,
             pending_open_table: None,
             pending_table_filter: None,
@@ -9765,6 +9810,18 @@ async fn run_app(mut terminal: ratatui::DefaultTerminal, backend: Arc<LocalBacke
                     .is_some_and(|deadline| Instant::now() >= deadline)
                 {
                     flush_count(&mut app, &tx);
+                }
+                // First landing in a data grid: one-shot discovery hint. Fades
+                // out after a few seconds, or on the next key.
+                maybe_show_row_hint(&mut app);
+                if app
+                    .row_hint_until
+                    .is_some_and(|deadline| Instant::now() >= deadline)
+                {
+                    if app.status == row_hint_text() {
+                        app.status.clear();
+                    }
+                    app.row_hint_until = None;
                 }
             }
         }
@@ -11355,6 +11412,10 @@ fn key(app: &mut App, tx: &Tx, k: KeyEvent) {
     if !is_nav_key {
         app.nav_landing = None;
     }
+    // The one-shot table-view discovery hint also yields to any key press.
+    if app.row_hint_until.take().is_some() && app.status == row_hint_text() {
+        app.status.clear();
+    }
     // global: quit. Ctrl-Shift-C is a *view* toggle (compact columns), so the
     // quit must not swallow it on terminals that report Shift as a modifier.
     if k.modifiers.contains(KeyModifiers::CONTROL)
@@ -11595,12 +11656,14 @@ fn browse_key(app: &mut App, tx: &Tx, k: KeyEvent) {
         error_popup_key(app, k);
         return;
     }
-    if app.row_popup.is_some() {
-        popup_key(app, k, PopupTarget::Row);
+    // The cell popup sits on top of a drilled row popup, so it owns the keyboard
+    // first; Esc closes it and reveals the row underneath.
+    if app.cell_popup.is_some() {
+        cell_popup_key(app, k);
         return;
     }
-    if app.cell_popup.is_some() {
-        popup_key(app, k, PopupTarget::Cell);
+    if app.row_popup.is_some() {
+        row_popup_key(app, k);
         return;
     }
 
@@ -12236,6 +12299,35 @@ fn db_picker_apply(app: &mut App, tx: &Tx, idx: usize) {
 /// A bare digit waits this long for a motion key before it is taken as a direct
 /// list jump (`3` → third item). Kept short so a jump still feels immediate.
 const COUNT_JUMP_TIMEOUT: Duration = Duration::from_millis(350);
+
+/// How long the one-shot `Enter 看整行 · v 看单元格` discovery hint stays up
+/// before it fades (any key clears it sooner).
+const ROW_HINT_TTL: Duration = Duration::from_secs(3);
+
+/// The one-shot table-view discovery hint (translated at call time).
+fn row_hint_text() -> &'static str {
+    t("Enter 看整行 · v 看单元格")
+}
+
+/// Show the one-shot table-view discovery hint the first time a data grid owns
+/// the screen this session. A query / table / Redis / Mongo grid all qualify;
+/// the structure list does not.
+fn maybe_show_row_hint(app: &mut App) {
+    if app.row_hint_shown {
+        return;
+    }
+    let data_grid = app.focus == Focus::Preview
+        && matches!(
+            app.grid_kind,
+            GridKind::Query | GridKind::TableData | GridKind::RedisValue | GridKind::MongoDocs
+        )
+        && active_grid(app).is_some_and(|g| !g.rows.is_empty());
+    if data_grid {
+        app.row_hint_shown = true;
+        app.status = row_hint_text().into();
+        app.row_hint_until = Some(Instant::now() + ROW_HINT_TTL);
+    }
+}
 
 /// Parse a count buffer into a repetition count (`None` for empty / zero).
 fn parse_count(buf: &str) -> Option<u32> {
@@ -14395,10 +14487,15 @@ fn mouse(app: &mut App, tx: &Tx, m: MouseEvent) {
                 return;
             }
             if let Some(p) = app.row_popup.as_mut() {
-                p.scroll = if up {
-                    p.scroll.saturating_sub(1)
+                // The row popup keeps its cursor on screen, so the wheel moves
+                // the selection rather than a raw scroll offset.
+                let visible = row_popup_visible(p).len();
+                let last = visible.saturating_sub(1);
+                let cur = p.cursor.min(last);
+                p.cursor = if up {
+                    cur.saturating_sub(1)
                 } else {
-                    p.scroll.saturating_add(1)
+                    (cur + 1).min(last)
                 };
                 return;
             }
@@ -15584,13 +15681,8 @@ fn redis_value_key(app: &mut App, tx: &Tx, k: KeyEvent) {
                 app.sel = n - 1;
             }
         }
-        KeyCode::Enter => {
-            if compact_active(app.compact, app.layout_mode) {
-                open_row_popup(app);
-            } else {
-                open_cell_popup(app);
-            }
-        }
+        // Enter always opens the whole row (R42b); `v` opens the cell directly.
+        KeyCode::Enter => open_row_popup(app),
         _ => {}
     }
 }
@@ -15643,13 +15735,8 @@ fn mongo_docs_key(app: &mut App, tx: &Tx, k: KeyEvent) {
         }
         KeyCode::Char('n') => page_turn(app, tx, true),
         KeyCode::Char('p') => page_turn(app, tx, false),
-        KeyCode::Enter => {
-            if compact_active(app.compact, app.layout_mode) {
-                open_row_popup(app);
-            } else {
-                open_cell_popup(app);
-            }
-        }
+        // Enter opens the whole document row (R42b); `v` opens the cell directly.
+        KeyCode::Enter => open_row_popup(app),
         _ => {}
     }
 }
@@ -16312,17 +16399,14 @@ fn preview_key(app: &mut App, tx: &Tx, k: KeyEvent) {
                     return;
                 }
             }
-            // Row-expand mode: in compact (mobile) mode Enter opens the whole row
-            // as a vertical column=value list — the narrow-screen replacement for
-            // reading a truncated cell.
-            if compact_active(app.compact, app.layout_mode) {
-                open_row_popup(app);
-            } else {
-                open_cell_popup(app);
-            }
+            // Enter always opens the whole row (the higher-frequency intent);
+            // the cell's full value is one more key away — move within the row
+            // popup and press Enter/v to drill in. `v` still opens the cell
+            // popup directly from the grid.
+            open_row_popup(app);
         }
-        // `v`: full cell value. Kept alongside Enter so the cell popup stays
-        // reachable when Enter means "expand the row" in compact mode.
+        // `v`: full cell value, straight from the grid (the shortcut path that
+        // skips the row popup).
         KeyCode::Char('v') => open_cell_popup(app),
         _ => {}
     }
@@ -16395,20 +16479,12 @@ fn copy_stmt_result(app: &mut App) {
     }
 }
 
-#[derive(Clone, Copy)]
-enum PopupTarget {
-    Cell,
-    Row,
-}
-
-/// Shared key handling for the scrollable text popups (cell value / row detail).
-/// Esc (and q / Enter) close the current popup.
-fn popup_key(app: &mut App, k: KeyEvent, target: PopupTarget) {
+/// Key handling for the full-cell popup: Esc / q / Enter close it (returning to
+/// the row popup underneath when it was drilled from one), and the arrows scroll
+/// the wrapped value.
+fn cell_popup_key(app: &mut App, k: KeyEvent) {
     if matches!(k.code, KeyCode::Esc | KeyCode::Char('q') | KeyCode::Enter) {
-        match target {
-            PopupTarget::Cell => app.cell_popup = None,
-            PopupTarget::Row => app.row_popup = None,
-        }
+        app.cell_popup = None;
         return;
     }
     let delta: i32 = match k.code {
@@ -16421,17 +16497,8 @@ fn popup_key(app: &mut App, k: KeyEvent, target: PopupTarget) {
     if delta == 0 {
         return;
     }
-    match target {
-        PopupTarget::Cell => {
-            if let Some(p) = &mut app.cell_popup {
-                p.scroll = (p.scroll as i32 + delta).max(0) as u16;
-            }
-        }
-        PopupTarget::Row => {
-            if let Some(p) = &mut app.row_popup {
-                p.scroll = (p.scroll as i32 + delta).max(0) as u16;
-            }
-        }
+    if let Some(p) = &mut app.cell_popup {
+        p.scroll = (p.scroll as i32 + delta).max(0) as u16;
     }
 }
 
@@ -20067,7 +20134,9 @@ fn open_cell_popup(app: &mut App) {
 }
 
 /// Open the focused row as a vertical `column = value` list. Uses the unfiltered
-/// grid so a column hidden with Ctrl-Shift-H is still readable here.
+/// grid so a column hidden with Ctrl-Shift-H is still readable here. The title
+/// carries the absolute row number plus the primary-key value(s) when the
+/// browsed table's metadata identifies them (`第 12 行 · id=4821`).
 fn open_row_popup(app: &mut App) {
     let Some(grid) = full_grid(app) else {
         return;
@@ -20077,24 +20146,264 @@ fn open_row_popup(app: &mut App) {
         return;
     };
     let mut lines: Vec<PopupLine> = Vec::new();
+    let mut cols: Vec<String> = Vec::new();
+    let mut values: Vec<String> = Vec::new();
     for (ci, col) in grid.columns.iter().enumerate() {
         let (shown, style) = match row.get(ci) {
             Some(Val::Null) | None => ("NULL".to_string(), null_style()),
             Some(Val::Text(s)) if s.is_empty() => ("''".to_string(), empty_string_style()),
             Some(Val::Text(s)) => (s.clone(), Style::default()),
         };
+        cols.push(fix_double_encoding(col));
+        values.push(shown.clone());
         lines.push(PopupLine {
-            text: format!("{} = {}",  fix_double_encoding(col),  shown),
+            text: format!("{} = {}", fix_double_encoding(col), shown),
             style,
         });
     }
-    let title = tf("第 {} 行 · {} 列", &[&(cursor_abs_row(app)), &(grid.columns.len())]);
+    let abs = cursor_abs_row(app);
+    let title = match row_pk_locator(app, &grid, row) {
+        Some(pk) => tf("第 {} 行 · {}", &[&abs, &pk]),
+        None => tf("第 {} 行 · {} 列", &[&abs, &(grid.columns.len())]),
+    };
     app.popup_cache = None;
     app.row_popup = Some(RowPopup {
         title,
         lines,
+        cols,
+        values,
+        row_abs: abs,
+        scroll: 0,
+        cursor: 0,
+        filter: String::new(),
+        filtering: false,
+        count: String::new(),
+    });
+}
+
+/// `id=4821` / `id=4821, tenant=7` for the focused row, when the grid is a
+/// browsed table (its metadata identifies the primary key) or a MongoDB
+/// document grid (whose alignment key is `_id`). A query result has no table
+/// metadata, so it falls back to the plain row number.
+fn row_pk_locator(app: &App, grid: &Grid, row: &[Val]) -> Option<String> {
+    let mut names: Vec<String> = Vec::new();
+    match app.grid_kind {
+        GridKind::TableData => {
+            if let Some(meta) = &app.table_meta {
+                let same = app
+                    .page_state
+                    .as_ref()
+                    .is_some_and(|p| p.table == meta.table && p.schema == meta.schema);
+                if same {
+                    for c in &meta.columns {
+                        if c.is_primary_key {
+                            names.push(c.name.clone());
+                        }
+                    }
+                }
+            }
+        }
+        GridKind::MongoDocs if grid.columns.iter().any(|c| c == "_id") => {
+            names.push("_id".to_string());
+        }
+        _ => {}
+    }
+    if names.is_empty() {
+        return None;
+    }
+    let mut parts: Vec<String> = Vec::new();
+    for name in &names {
+        if let Some(ci) = grid.columns.iter().position(|c| c.eq_ignore_ascii_case(name)) {
+            let shown = row
+                .get(ci)
+                .map(|v| value_display(v).0)
+                .unwrap_or_else(|| "NULL".to_string());
+            parts.push(format!("{}={}", fix_double_encoding(name), shown));
+        }
+    }
+    if parts.is_empty() {
+        None
+    } else {
+        Some(parts.join(", "))
+    }
+}
+
+/// Indices of the row-popup lines whose column name matches the active filter
+/// (case-insensitive substring). An empty filter keeps every line.
+fn row_popup_visible(popup: &RowPopup) -> Vec<usize> {
+    if popup.filter.is_empty() {
+        return (0..popup.lines.len()).collect();
+    }
+    let needle = popup.filter.to_lowercase();
+    popup
+        .cols
+        .iter()
+        .enumerate()
+        .filter(|(_, c)| c.to_lowercase().contains(&needle))
+        .map(|(i, _)| i)
+        .collect()
+}
+
+/// The selected entry index (into `lines`) of the row popup, if any.
+fn row_popup_selected(popup: &RowPopup) -> Option<usize> {
+    let visible = row_popup_visible(popup);
+    if visible.is_empty() {
+        return None;
+    }
+    let cur = popup.cursor.min(visible.len() - 1);
+    Some(visible[cur])
+}
+
+/// `Enter` / `v` inside the row popup: open the selected column's full value as
+/// the cell popup on top. The row popup stays open underneath, so `Esc` in the
+/// cell popup returns here before closing the row.
+fn drill_row_popup_cell(app: &mut App) {
+    let Some(popup) = app.row_popup.as_ref() else {
+        return;
+    };
+    let Some(ei) = row_popup_selected(popup) else {
+        return;
+    };
+    let col = popup.cols.get(ei).cloned().unwrap_or_default();
+    let text = popup.values.get(ei).cloned().unwrap_or_default();
+    let style = popup.lines.get(ei).map(|l| l.style).unwrap_or_default();
+    let abs = popup.row_abs;
+    let title = tf(
+        "{} · 第 {} 行 · {} 字符",
+        &[&col, &abs, &(text.chars().count())],
+    );
+    app.popup_cache = None;
+    app.cell_popup = Some(CellPopup {
+        title,
+        lines: vec![PopupLine { text, style }],
         scroll: 0,
     });
+}
+
+/// `y` inside the row popup: copy the selected value, naming the column in the
+/// status so a wide table's many columns stay unambiguous.
+fn copy_row_popup_value(app: &mut App) {
+    let Some(popup) = app.row_popup.as_ref() else {
+        return;
+    };
+    let Some(ei) = row_popup_selected(popup) else {
+        app.status = t("没有可复制的列").into();
+        return;
+    };
+    let col = popup.cols.get(ei).cloned().unwrap_or_default();
+    let text = popup.values.get(ei).cloned().unwrap_or_default();
+    let n = text.chars().count();
+    let short = truncate_disp(&one_line(&text), 40);
+    match clipboard_copy(&text) {
+        Some(p) => {
+            app.status = tf(
+                "✓ 已复制 {} = {}（{} 字符）· 兜底 {}",
+                &[&col, &short, &n, &(p.display())],
+            )
+        }
+        None => app.status = tf("✓ 已复制 {} = {}（{} 字符）", &[&col, &short, &n]),
+    }
+}
+
+/// Keys for the row popup. `j`/`k` (with an optional count) move the entry
+/// cursor, `/` filters by column name, `y` copies the selected value, and
+/// `Enter` / `v` drill into the full cell popup. `Esc` / `q` close the row.
+fn row_popup_key(app: &mut App, k: KeyEvent) {
+    let Some(popup) = app.row_popup.as_mut() else {
+        return;
+    };
+    // Typing the `/` column filter: printable characters extend it, Enter keeps
+    // it (and hands control back to the cursor), Esc clears and closes the input.
+    if popup.filtering {
+        match k.code {
+            KeyCode::Esc => {
+                popup.filtering = false;
+                popup.filter.clear();
+                popup.cursor = 0;
+                popup.scroll = 0;
+            }
+            KeyCode::Enter => popup.filtering = false,
+            KeyCode::Backspace => {
+                popup.filter.pop();
+                popup.cursor = 0;
+                popup.scroll = 0;
+            }
+            KeyCode::Char(c)
+                if !c.is_control()
+                    && !k
+                        .modifiers
+                        .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) =>
+            {
+                popup.filter.push(c);
+                popup.cursor = 0;
+                popup.scroll = 0;
+            }
+            _ => {}
+        }
+        return;
+    }
+    // A leading digit is a count prefix for the next motion (5j).
+    if let KeyCode::Char(c @ '1'..='9') = k.code {
+        if k.modifiers.is_empty() && popup.count.len() < 4 {
+            popup.count.push(c);
+            return;
+        }
+    }
+    let count: usize = parse_count(&popup.count).map(|n| n as usize).unwrap_or(1);
+    let visible = row_popup_visible(popup);
+    let last = visible.len().saturating_sub(1);
+    let cur = popup.cursor.min(last);
+    match k.code {
+        KeyCode::Esc | KeyCode::Char('q') => {
+            app.row_popup = None;
+        }
+        KeyCode::Enter | KeyCode::Char('v') => {
+            popup.count.clear();
+            drill_row_popup_cell(app);
+        }
+        KeyCode::Char('y') => {
+            popup.count.clear();
+            copy_row_popup_value(app);
+        }
+        // `?` from inside the popup opens the context mini help (which shows
+        // this popup's own keys); Esc returns to the row.
+        KeyCode::Char('?') => {
+            popup.count.clear();
+            open_help(app);
+        }
+        KeyCode::Char('/') => {
+            popup.count.clear();
+            popup.filtering = true;
+            popup.filter.clear();
+            popup.cursor = 0;
+            popup.scroll = 0;
+        }
+        KeyCode::Down | KeyCode::Char('j') => {
+            popup.cursor = (cur + count).min(last);
+            popup.count.clear();
+        }
+        KeyCode::Up | KeyCode::Char('k') => {
+            popup.cursor = cur.saturating_sub(count);
+            popup.count.clear();
+        }
+        KeyCode::PageDown => {
+            popup.cursor = (cur + 10 * count).min(last);
+            popup.count.clear();
+        }
+        KeyCode::PageUp => {
+            popup.cursor = cur.saturating_sub(10 * count);
+            popup.count.clear();
+        }
+        KeyCode::Home => {
+            popup.cursor = 0;
+            popup.count.clear();
+        }
+        KeyCode::End => {
+            popup.cursor = last;
+            popup.count.clear();
+        }
+        _ => {}
+    }
 }
 
 // ── edit / insert templates ──
@@ -24880,11 +25189,11 @@ fn ui(f: &mut Frame, app: &mut App) {
             t(" 跳列 · Enter/Esc "),
         );
     }
-    if let Some(popup) = app.cell_popup.as_ref() {
-        let cache = &mut app.popup_cache;
-        render_text_popup(f, f.area(), &popup.title, &popup.lines, popup.scroll, cache);
+    // The row popup draws first so a drilled cell popup sits on top of it.
+    if app.row_popup.is_some() {
+        render_row_popup(f, f.area(), app);
     }
-    if let Some(popup) = app.row_popup.as_ref() {
+    if let Some(popup) = app.cell_popup.as_ref() {
         let cache = &mut app.popup_cache;
         render_text_popup(f, f.area(), &popup.title, &popup.lines, popup.scroll, cache);
     }
@@ -25284,6 +25593,7 @@ enum FooterView {
     ConnImportPlan,
     FilterPrompt,
     Popup,
+    RowPopup,
     ErrorBox,
     ResultFilter,
     LocatePrompt,
@@ -25376,6 +25686,8 @@ fn footer_ctx_inner(app: &App, include_help: bool) -> FooterCtx {
         FooterView::FilterPrompt
     } else if app.error_popup.is_some() {
         FooterView::ErrorBox
+    } else if app.row_popup.is_some() && app.cell_popup.is_none() {
+        FooterView::RowPopup
     } else if app.row_popup.is_some() || app.cell_popup.is_some() {
         FooterView::Popup
     } else if app.result_filter.is_some() {
@@ -25611,6 +25923,13 @@ fn footer_hints_ctx(ctx: FooterCtx) -> Vec<Hint> {
             vec![("Enter", t("应用")), ("Esc", t("取消")), ("⏎", t("清除"))]
         }
         FooterView::Popup => vec![("↑↓", t("滚动")), ("Esc/Enter", t("关闭"))],
+        FooterView::RowPopup => vec![
+            ("↑↓", t("移动")),
+            ("Enter/v", t("看值")),
+            ("y", t("复制值")),
+            ("/", t("过滤列")),
+            ("Esc", t("关闭")),
+        ],
         FooterView::ErrorBox => vec![
             ("Enter", t("看全量")),
             ("↑↓", t("滚动")),
@@ -25675,7 +25994,8 @@ fn footer_hints_ctx(ctx: FooterCtx) -> Vec<Hint> {
         FooterView::RedisValue => vec![
             ("↑↓", t("行")),
             ("←→", t("列")),
-            ("Enter", t("详情")),
+            ("Enter", t("整行")),
+            ("v", t("单元格")),
             ("y", t("复制值")),
             ("e", t("编辑")),
             ("x", t("TTL")),
@@ -25688,7 +26008,8 @@ fn footer_hints_ctx(ctx: FooterCtx) -> Vec<Hint> {
         FooterView::MongoDocs => vec![
             ("↑↓", t("行")),
             ("←→", t("列")),
-            ("Enter", t("详情")),
+            ("Enter", t("整行")),
+            ("v", t("单元格")),
             ("y", t("复制 JSON")),
             ("e", t("编辑")),
             ("i", t("插入")),
@@ -25739,7 +26060,8 @@ fn footer_hints_ctx(ctx: FooterCtx) -> Vec<Hint> {
             Focus::Preview => vec![
                 ("↑↓", t("行")),
                 ("←→", t("列")),
-                ("Enter", t("详情")),
+                ("Enter", t("整行")),
+                ("v", t("单元格")),
                 ("e", t("编辑")),
                 ("i", t("插入")),
                 ("Del", t("删行")),
@@ -29918,6 +30240,121 @@ fn render_text_popup(
     );
 }
 
+/// R42b: the row-detail popup. A scrollable `column = value` list with a
+/// cursor (highlighted with `▶` and bold, keeping the NULL / '' style), a
+/// column-name filter and a vim count prefix. Drawn under a drilled cell popup.
+fn render_row_popup(f: &mut Frame, area: Rect, app: &mut App) {
+    let w = overlay_width(area.width, 88, 24);
+    let inner_w = w.saturating_sub(4).max(1) as usize;
+    // Build the (filtered) body first, tracking where the cursor's entry starts.
+    let (base_title, body, sel_line, filtering, filter, cur, total) = {
+        let Some(popup) = app.row_popup.as_ref() else {
+            return;
+        };
+        let visible = row_popup_visible(popup);
+        let total = visible.len();
+        let cursor = if total == 0 {
+            0
+        } else {
+            popup.cursor.min(total - 1)
+        };
+        let mut body: Vec<Line<'static>> = Vec::new();
+        let mut sel_line = 0usize;
+        for (pos, &ei) in visible.iter().enumerate() {
+            let pl = &popup.lines[ei];
+            let selected = total > 0 && pos == cursor;
+            if selected {
+                sel_line = body.len();
+            }
+            let marker = if selected { "▶ " } else { "  " };
+            let style = if selected {
+                pl.style.add_modifier(Modifier::BOLD)
+            } else {
+                pl.style
+            };
+            for t in wrap_text(&format!("{marker}{}", pl.text), inner_w) {
+                body.push(Line::from(Span::styled(t, style)));
+            }
+        }
+        if body.is_empty() {
+            body.push(Line::from(Span::styled(
+                t("（无匹配列）").to_string(),
+                Style::default().fg(Color::DarkGray),
+            )));
+        }
+        (
+            popup.title.clone(),
+            body,
+            sel_line,
+            popup.filtering,
+            popup.filter.clone(),
+            if total == 0 { 0 } else { cursor + 1 },
+            total,
+        )
+    };
+    let total_lines = body.len();
+    let max_h = area.height.saturating_sub(4).max(3);
+    let h = ((total_lines as u16) + 2).min(max_h);
+    let box_area = centered_overlay(area, w, h);
+    let inner_h = box_area.height.saturating_sub(2) as usize;
+    let max_scroll = total_lines.saturating_sub(inner_h).min(u16::MAX as usize) as u16;
+    // Auto-scroll so the cursor's entry stays on screen.
+    let mut scroll = app
+        .row_popup
+        .as_ref()
+        .map(|p| p.scroll)
+        .unwrap_or(0)
+        .min(max_scroll);
+    if sel_line < scroll as usize {
+        scroll = sel_line as u16;
+    } else if inner_h > 0 && sel_line >= scroll as usize + inner_h {
+        scroll = (sel_line + 1 - inner_h) as u16;
+    }
+    let scroll = scroll.min(max_scroll);
+    if let Some(p) = app.row_popup.as_mut() {
+        p.scroll = scroll;
+    }
+    // Title: base locator · filter · position · hints. The full hint line is
+    // swapped for a short one when it would not fit, so a title is never cut.
+    let mut base = format!(" {} ", base_title);
+    if filtering {
+        base.push_str(&format!("· /{}_ ", filter));
+    } else if !filter.is_empty() {
+        base.push_str(&format!("· /{} ", filter));
+    }
+    base.push_str(&format!("· {}/{} ", cur, total));
+    let full = format!(
+        "{base}· ↑↓ {} · Enter/v {} · y {} · / {} · Esc {} ",
+        t("移动"),
+        t("看值"),
+        t("复制值"),
+        t("过滤列"),
+        t("关闭")
+    );
+    let short = format!("{}· Esc {} ", base, t("关闭"));
+    // The footer already carries the keys, so a narrow box can drop the hint
+    // tail entirely rather than clip it.
+    let minimal = base.trim_end().to_string();
+    let title = if disp_width(&full) <= box_area.width.saturating_sub(2) as usize {
+        full
+    } else if disp_width(&short) <= box_area.width.saturating_sub(2) as usize {
+        short
+    } else {
+        minimal
+    };
+    f.render_widget(Clear, box_area);
+    f.render_widget(
+        Paragraph::new(body).scroll((scroll, 0)).block(
+            Block::default()
+                .borders(Borders::ALL)
+                .title(title)
+                .border_set(border::THICK)
+                .border_style(Style::default().fg(Color::Cyan)),
+        ),
+        box_area,
+    );
+}
+
 /// R41: the compact execution-error box. On a small screen it shows only the
 /// first line plus the line count; `Enter` widens it to the full scrollable
 /// text. `Enter` again (or `Esc`) closes it.
@@ -30468,9 +30905,9 @@ const HELP_ROWS: &[(&str, &str)] = &[
     ("|", "跳列：输入列号或列名前缀直达该列（宽表横滚）"),
     ("n / Shift-N", "搜索结果或定位命中时：下 / 上一个命中（否则 n 翻页）"),
     ("Ctrl-N", "结果被截断时加载更多行"),
-    ("Enter", "整行详情（紧凑列模式）/ 完整单元格"),
-    ("v", "完整单元格（任意模式）"),
-    ("o", "整行详情（纵向，含隐藏列）"),
+    ("Enter", "整行详情（纵向，含隐藏列；看某一行从这里进）"),
+    ("v", "完整单元格（任意模式，不进整行弹层）"),
+    ("o", "整行详情（与 Enter 等价）"),
     ("e", "编辑单元格 → diff 确认后执行"),
     ("i", "快速插入 → diff 确认后执行"),
     ("Delete / Ctrl-D", "删除当前行 → 确认后执行"),
@@ -30486,6 +30923,12 @@ const HELP_ROWS: &[(&str, &str)] = &[
     ("g d / g t", "跳表结构视图 / 回表数据"),
     ("g v", "定位值（排序列 / 主键列，不隐藏行）"),
     ("Esc", "收起结果 / 关闭浮层"),
+    ("— 行详情浮层（Enter / o）—", ""),
+    ("↑ ↓ / j k · 5j", "移动选中列（计数前缀：5j 跳 5 列）"),
+    ("Enter / v", "下钻完整单元格（Esc 返回行弹层，再 Esc 回表格）"),
+    ("y", "复制选中列值（状态栏带列名）"),
+    ("/", "按列名过滤（宽表 40+ 列找列）"),
+    ("标题", "主键定位：第 12 行 · id=4821"),
     ("— 编辑确认层 —", ""),
     ("Enter", "执行（UPDATE / INSERT，SQL 全文可见）"),
     ("Esc", "取消编辑"),
@@ -31720,14 +32163,20 @@ mod tests {
             let dir =
                 std::env::temp_dir().join(format!("dbxt-render-test-{}", std::process::id()));
             let _ = std::fs::create_dir_all(&dir);
-            let rt = tokio::runtime::Builder::new_current_thread()
-                .enable_all()
-                .build()
-                .expect("tokio runtime");
-            Arc::new(
-                rt.block_on(LocalBackend::open(&dir.join("dbx.db")))
-                    .expect("open test backend"),
-            )
+            // Build on a dedicated thread: some tests call `test_app()` from
+            // inside their own `run_rt` runtime, and a nested `block_on` would
+            // panic with "Cannot start a runtime from within a runtime".
+            let path = dir.join("dbx.db");
+            let backend = std::thread::spawn(move || {
+                let rt = tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .expect("tokio runtime");
+                rt.block_on(LocalBackend::open(&path)).expect("open test backend")
+            })
+            .join()
+            .expect("test backend thread");
+            Arc::new(backend)
         })
         .clone()
     }
@@ -32117,6 +32566,170 @@ mod tests {
         assert_ne!(cache.width, width, "resize recomputes the wrap");
     }
 
+    /// R42b: `Enter` in a data grid opens the whole row in *both* layout modes
+    /// (the old compact/wide split is gone), while `v` still opens the cell
+    /// popup directly.
+    #[test]
+    fn enter_opens_the_whole_row_in_both_layout_modes() {
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel::<OpResult>();
+        for mode in [LayoutMode::Mid, LayoutMode::Narrow, LayoutMode::Wide] {
+            let mut app = test_app();
+            app.picker_open = false;
+            app.selected = Some(test_conn("mysql"));
+            app.backend_kind = Backend::Sql;
+            app.grid_kind = GridKind::TableData;
+            app.set_grid(sample_grid());
+            app.focus = Focus::Preview;
+            app.layout_mode = mode;
+            app.sel = 0;
+            app.col_cursor = 0;
+            key(&mut app, &tx, KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+            assert!(
+                app.row_popup.is_some(),
+                "{mode:?}: Enter should open the row"
+            );
+            assert!(
+                app.cell_popup.is_none(),
+                "{mode:?}: Enter should not open the cell"
+            );
+            // Esc closes the row, then `v` opens the cell directly.
+            key(&mut app, &tx, KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+            assert!(app.row_popup.is_none());
+            key(
+                &mut app,
+                &tx,
+                KeyEvent::new(KeyCode::Char('v'), KeyModifiers::NONE),
+            );
+            assert!(app.cell_popup.is_some());
+            assert!(app.row_popup.is_none());
+        }
+    }
+
+    /// R42b: `/` inside the row popup filters by column name, so a 40+ column
+    /// table can be narrowed without scanning. Digits are filter text while
+    /// typing, never a count prefix.
+    #[test]
+    fn row_popup_filters_columns_by_name() {
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel::<OpResult>();
+        let mut app = test_app();
+        app.grid_kind = GridKind::TableData;
+        app.set_grid(sample_grid()); // column_0 … column_7
+        app.focus = Focus::Preview;
+        app.sel = 0;
+        open_row_popup(&mut app);
+        assert_eq!(row_popup_visible(app.row_popup.as_ref().unwrap()).len(), 8);
+        key(&mut app, &tx, KeyEvent::new(KeyCode::Char('/'), KeyModifiers::NONE));
+        assert!(app.row_popup.as_ref().unwrap().filtering);
+        key(
+            &mut app,
+            &tx,
+            KeyEvent::new(KeyCode::Char('5'), KeyModifiers::NONE),
+        );
+        let popup = app.row_popup.as_ref().unwrap();
+        assert_eq!(popup.filter, "5", "digits are filter text while typing");
+        assert_eq!(row_popup_visible(popup).len(), 1);
+        // Enter keeps the filter and leaves the input mode.
+        key(&mut app, &tx, KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        assert!(!app.row_popup.as_ref().unwrap().filtering);
+        assert_eq!(row_popup_visible(app.row_popup.as_ref().unwrap()).len(), 1);
+        // Esc now closes the popup (the filter is no longer being typed).
+        key(&mut app, &tx, KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+        assert!(app.row_popup.is_none());
+    }
+
+    /// R42b: the row-popup title locates the row by primary key when the
+    /// browsed table's metadata is known (`第 1 行 · id=4821`).
+    #[test]
+    fn row_popup_title_carries_the_primary_key() {
+        let mut app = test_app();
+        app.grid_kind = GridKind::TableData;
+        app.set_grid(Grid {
+            columns: vec!["id".into(), "name".into()],
+            rows: vec![vec![Val::Text("4821".into()), Val::Text("ada".into())]],
+            note: String::new(),
+        });
+        app.page_state = Some(page_of("orders"));
+        app.table_meta = Some(TableMeta {
+            table: "orders".into(),
+            schema: String::new(),
+            columns: vec![
+                ColumnInfo {
+                    name: "id".into(),
+                    data_type: "int".into(),
+                    is_primary_key: true,
+                    ..Default::default()
+                },
+                ColumnInfo {
+                    name: "name".into(),
+                    data_type: "text".into(),
+                    ..Default::default()
+                },
+            ],
+        });
+        app.focus = Focus::Preview;
+        app.sel = 0;
+        open_row_popup(&mut app);
+        let title = &app.row_popup.as_ref().unwrap().title;
+        assert!(title.contains("id=4821"), "title missing the key: {title}");
+        assert!(title.contains('1'), "title missing the row number: {title}");
+    }
+
+    /// R42b: Enter inside the row popup drills into the cell popup, which stays
+    /// stacked over the row; Esc unwinds cell → row → grid.
+    #[test]
+    fn row_popup_drill_returns_to_the_row_then_the_grid() {
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel::<OpResult>();
+        let mut app = test_app();
+        app.picker_open = false;
+        app.selected = Some(test_conn("mysql"));
+        app.backend_kind = Backend::Sql;
+        app.grid_kind = GridKind::TableData;
+        app.set_grid(sample_grid());
+        app.focus = Focus::Preview;
+        app.sel = 0;
+        app.col_cursor = 0;
+        key(&mut app, &tx, KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        assert!(app.row_popup.is_some());
+        // Move to the second column and drill in.
+        key(
+            &mut app,
+            &tx,
+            KeyEvent::new(KeyCode::Char('j'), KeyModifiers::NONE),
+        );
+        key(&mut app, &tx, KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        assert!(app.cell_popup.is_some());
+        assert!(app.row_popup.is_some(), "row stays under the drilled cell");
+        assert_eq!(app.row_popup.as_ref().unwrap().cursor, 1);
+        // Esc unwinds to the row, then closes it.
+        key(&mut app, &tx, KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+        assert!(app.cell_popup.is_none());
+        assert!(app.row_popup.is_some());
+        key(&mut app, &tx, KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+        assert!(app.row_popup.is_none());
+    }
+
+    /// R42b: a vim count prefix moves the row-popup cursor (`5j`).
+    #[test]
+    fn row_popup_count_prefix_jumps_entries() {
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel::<OpResult>();
+        let mut app = test_app();
+        app.grid_kind = GridKind::TableData;
+        app.set_grid(sample_grid());
+        app.focus = Focus::Preview;
+        app.sel = 0;
+        open_row_popup(&mut app);
+        for c in ["5", "j"] {
+            let ch = c.chars().next().unwrap();
+            key(&mut app, &tx, KeyEvent::new(KeyCode::Char(ch), KeyModifiers::NONE));
+        }
+        assert_eq!(app.row_popup.as_ref().unwrap().cursor, 5);
+        for c in ["2", "k"] {
+            let ch = c.chars().next().unwrap();
+            key(&mut app, &tx, KeyEvent::new(KeyCode::Char(ch), KeyModifiers::NONE));
+        }
+        assert_eq!(app.row_popup.as_ref().unwrap().cursor, 3);
+    }
+
     /// One overlay fixture for [`overlays_render_at_extreme_sizes`].
     type OverlayCase = (&'static str, Box<dyn Fn(&mut App)>);
 
@@ -32342,14 +32955,13 @@ mod tests {
             (
                 "row-popup",
                 Box::new(|a| {
-                    a.row_popup = Some(RowPopup {
-                        title: "row".into(),
-                        lines: vec![PopupLine {
+                    a.row_popup = Some(row_popup_from_lines(
+                        "row".into(),
+                        vec![PopupLine {
                             text: "x".into(),
                             style: Style::default(),
                         }],
-                        scroll: 0,
-                    })
+                    ))
                 }),
             ),
             ("db-picker", Box::new(|a| a.db_picker_open = true)),
@@ -37123,11 +37735,7 @@ mod tests {
             (
                 "row-popup",
                 Box::new(move |a| {
-                    a.row_popup = Some(RowPopup {
-                        title: "r".into(),
-                        lines: vec![line()],
-                        scroll: 0,
-                    })
+                    a.row_popup = Some(row_popup_from_lines("r".into(), vec![line()]))
                 }),
                 Box::new(|a| a.row_popup.is_none()),
             ),
@@ -37281,6 +37889,7 @@ mod tests {
             FooterView::MongoDocs,
             FooterView::MongoDoc,
             FooterView::Popup,
+            FooterView::RowPopup,
             FooterView::FilterPrompt,
             FooterView::DbPicker,
             FooterView::Recent,
@@ -37368,6 +37977,19 @@ mod tests {
         app.search_open = true;
         assert_eq!(footer_ctx(&app).view, FooterView::Search);
         app.search_open = false;
+
+        // A drilled cell popup sits over the row popup, so the footer follows
+        // the cell; the row popup alone gets its own group.
+        app.row_popup = Some(row_popup_from_lines("r".into(), vec![]));
+        assert_eq!(footer_ctx(&app).view, FooterView::RowPopup);
+        app.cell_popup = Some(CellPopup {
+            title: "c".into(),
+            lines: vec![],
+            scroll: 0,
+        });
+        assert_eq!(footer_ctx(&app).view, FooterView::Popup);
+        app.cell_popup = None;
+        app.row_popup = None;
 
         // `confirm` is checked first in `key`, so it must win over a browse
         // overlay that happens to be open underneath it.

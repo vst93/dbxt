@@ -982,6 +982,44 @@ pub static ALL_KEYS: &[&str] = &[
 /// The Chinese → English table. Keys must match the source literals exactly.
 fn en_of(zh: &'static str) -> Option<&'static str> {
     match zh {
+        // ── R42b single-row discoverability ──
+        "Enter 看整行 · v 看单元格" => Some("Enter: whole row · v: cell"),
+        "整行" => Some("row"),
+        "单元格" => Some("cell"),
+        "移动" => Some("move"),
+        "看值" => Some("view value"),
+        "过滤列" => Some("filter columns"),
+        "（无匹配列）" => Some("(no matching column)"),
+        "没有可复制的列" => Some("no column to copy"),
+        "✓ 已复制 {} = {}（{} 字符）· 兜底 {}" => {
+            Some("✓ copied {} = {} ({} chars) · fallback {}")
+        }
+        "✓ 已复制 {} = {}（{} 字符）" => Some("✓ copied {} = {} ({} chars)"),
+        "整行详情（纵向，含隐藏列；看某一行从这里进）" => {
+            Some("whole-row details (vertical, including hidden columns; this is how you read one row)")
+        }
+        "完整单元格（任意模式，不进整行弹层）" => {
+            Some("full cell (any mode, skips the row popup)")
+        }
+        "整行详情（与 Enter 等价）" => Some("whole-row details (same as Enter)"),
+        "— 行详情浮层（Enter / o）—" => Some("— Row-detail popup (Enter / o) —"),
+        "移动选中列（计数前缀：5j 跳 5 列）" => {
+            Some("move the selected column (count prefix: 5j jumps 5)")
+        }
+        "下钻完整单元格（Esc 返回行弹层，再 Esc 回表格）" => {
+            Some("drill into the full cell (Esc returns to the row, Esc again to the grid)")
+        }
+        "复制选中列值（状态栏带列名）" => {
+            Some("copy the selected column's value (status names the column)")
+        }
+        "按列名过滤（宽表 40+ 列找列）" => {
+            Some("filter by column name (find a column in a 40+ column table)")
+        }
+        "主键定位：第 12 行 · id=4821" => {
+            Some("primary-key locator: row 12 · id=4821")
+        }
+        "标题" => Some("title"),
+        "第 {} 行 · {}" => Some("row {} · {}"),
         // ── R42 Redis / Mongo key alignment + script console ──
         "语句分隔 + 耗时 开（Alt-O 关）" => {
             Some("statement separators + timing ON (Alt-O to turn off)")
