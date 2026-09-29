@@ -392,7 +392,7 @@ pub static ALL_KEYS: &[&str] = &[
     "底部进度条",
     "开",
     "强制 NULL 仅用灰色，不依赖终端斜体",
-    "当前列窗口位置 · 点击可跳转",
+    "当前列窗口位置 · 横滚后 2.5s 内显示 · 点击可跳转",
     "当前无过滤条件",
     "当前视图不支持列选择",
     "影响 {} 行",
@@ -485,7 +485,7 @@ pub static ALL_KEYS: &[&str] = &[
     "清除",
     "清除过滤",
     "滚动",
-    "点击向左/右翻一屏列（触屏可用）",
+    "点击向左/右翻一屏列（触屏可用；滚动条横滚后短暂显示，静止自动隐藏）",
     "焦点 SQL",
     "焦点 侧栏",
     "焦点 命令",
@@ -1070,6 +1070,46 @@ pub static ALL_KEYS: &[&str] = &[
 /// The Chinese → English table. Keys must match the source literals exactly.
 fn en_of(zh: &'static str) -> Option<&'static str> {
     match zh {
+        // ── R47b connection status / manual disconnect ──
+        "断开连接" => Some("disconnect"),
+        "断开选中连接（关闭连接池，未提交手动事务回滚；配置保留，可重连）" => Some(
+            "Disconnect the highlighted connection (closes the pools, uncommitted manual transactions roll back; the config stays and it can reconnect)",
+        ),
+        "断开连接 {}…" => Some("Disconnecting {}…"),
+        "该连接不在已保存列表中，无法断开" => {
+            Some("This connection is not in the saved list; cannot disconnect")
+        }
+        "连接 {} 已断开" => Some("Connection {} is already disconnected"),
+        "断开连接 {} · Enter 确认 · Esc 取消" => {
+            Some("Disconnect {} · Enter to confirm · Esc to cancel")
+        }
+        "✗ 断开 {} 失败：{}" => Some("✗ Disconnect {} failed: {}"),
+        "已断开 {} · 展开该根可重连" => {
+            Some("Disconnected {} · expand the root to reconnect")
+        }
+        " ⚠ 断开连接 " => Some(" ⚠ Disconnect "),
+        "断开连接 {} ({})？" => Some("Disconnect {} ({})?"),
+        "未提交的手动事务将回滚；下次展开该连接时重新连接" => {
+            Some("Uncommitted manual transactions roll back; expanding the connection reconnects")
+        }
+        "侧栏保留该连接根（灰点），已缓存的库/表仍可见" => {
+            Some("The sidebar keeps this root (grey dot); cached databases/tables stay visible")
+        }
+        "Enter/y 断开" => Some("Enter/y disconnect"),
+        "状态点（连接根）" => Some("Status dot (connection root)"),
+        "● 活跃（可查）/ ○ 已断开 / ◐ 连接中；沿用连接色，形状区分（色盲友好）" => Some(
+            "● live (queryable) / ○ disconnected / ◐ connecting; keeps the connection colour, shape tells them apart (colour-blind friendly)",
+        ),
+        "x（连接根）" => Some("x (connection root)"),
+        "断开连接：关闭连接池（未提交手动事务回滚）；树保留灰根，展开可重连" => Some(
+            "Disconnect: closes the pools (uncommitted manual transactions roll back); the tree keeps a grey root, expand to reconnect",
+        ),
+        "点击向左/右翻一屏列（触屏可用；滚动条横滚后短暂显示，静止自动隐藏）" => Some(
+            "Tap to pan one screen of columns left/right (touch-friendly; the bar shows briefly after a horizontal scroll, then auto-hides)",
+        ),
+        "当前列窗口位置 · 横滚后 2.5s 内显示 · 点击可跳转" => Some(
+            "Current column window · visible for 2.5s after a horizontal scroll · click to jump",
+        ),
         // ── R47 safety valves (read-only / quit guard / danger impact) ──
         "拒绝写语句" => Some("refuses write statements"),
         "✗ 只读连接：拒绝写语句（{}）" => {
@@ -1790,7 +1830,6 @@ fn en_of(zh: &'static str) -> Option<&'static str> {
         "底部进度条" => Some("bottom bar"),
         "开" => Some("on"),
         "强制 NULL 仅用灰色，不依赖终端斜体" => Some("Force NULL to grey only, without relying on terminal italics"),
-        "当前列窗口位置 · 点击可跳转" => Some("Current column window position · click to jump"),
         "当前无过滤条件" => Some("no filter active"),
         "当前视图不支持列选择" => Some("column selection is not supported in this view"),
         "影响 {} 行" => Some("{} rows affected"),
@@ -1889,7 +1928,6 @@ fn en_of(zh: &'static str) -> Option<&'static str> {
         "清除" => Some("clear"),
         "清除过滤" => Some("Clear filter"),
         "滚动" => Some("scroll"),
-        "点击向左/右翻一屏列（触屏可用）" => Some("Click to pan one screen of columns left/right (touch friendly)"),
         "焦点 SQL" => Some("focus SQL"),
         "焦点 侧栏" => Some("focus sidebar"),
         "焦点 命令" => Some("focus command"),

@@ -3863,12 +3863,39 @@ struct Confirm {
     conn: Option<ConnConfirm>,
 }
 
-/// A pending connection deletion shown in the red confirmation layer.
+/// A pending connection action shown in the red confirmation layer. `disconnect`
+/// picks the semantics: `false` deletes the saved config, `true` is a manual
+/// disconnect (R47b) that drains the connection's pools.
 #[derive(Clone)]
 struct ConnConfirm {
     id: String,
     name: String,
     db_type: String,
+    /// R47b: true = manual disconnect; false = delete the saved connection.
+    disconnect: bool,
+}
+
+/// Liveness of one connection root as the sidebar draws it (R47b).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum ConnStatus {
+    /// The kernel holds a pool: the connection can be queried now.
+    Active,
+    /// No pool (never connected, or explicitly disconnected): expand to connect.
+    Idle,
+    /// A switch / lazy expand is opening the pool right now.
+    Connecting,
+}
+
+impl ConnStatus {
+    /// The status glyph. Shape carries the state so the connection colour stays
+    /// free to carry identity (colour-blind friendly).
+    fn shape(self) -> &'static str {
+        match self {
+            ConnStatus::Active => "●",
+            ConnStatus::Idle => "○",
+            ConnStatus::Connecting => "◐",
+        }
+    }
 }
 
 /// A pending Redis write shown in the red confirmation layer.
@@ -5460,6 +5487,14 @@ enum Op {
     /// `gen` is that connection's own request id, so only the newest reply for
     /// that root is kept.
     TreeDatabases(Box<ConnectionConfig>, u64),
+    /// R47b: refresh the cached per-connection liveness from the kernel. This is
+    /// a pure registry read ([`AppState::is_connection_open`]), so checking the
+    /// state can never itself open a connection.
+    ConnStatus { ids: Vec<String> },
+    /// R47b: manual disconnect — drain the connection's pools through the
+    /// kernel's user-disconnect path, which rolls back manual-transaction
+    /// sessions before closing (never a bare drain).
+    Disconnect { id: String, name: String },
     /// Enumerate the schemas of one database (PostgreSQL and other
     /// schema-aware engines).
     ListSchemas(Box<ConnectionConfig>, String),
@@ -5714,6 +5749,16 @@ enum OpResult {
         databases: Vec<String>,
         error: Option<String>,
         gen: u64,
+    },
+    /// R47b: per-connection liveness `(connection id, is open)`, from the
+    /// kernel's pool registry.
+    ConnStatus(Vec<(String, bool)>),
+    /// R47b: a manual disconnect finished. `error` keeps the tree usable when
+    /// the kernel could not drain the pools.
+    ConnDisconnected {
+        id: String,
+        name: String,
+        error: Option<String>,
     },
     /// One database's lazily fetched size info (R45). `error` keeps the tree
     /// usable when the engine denies the metadata query.
@@ -6356,6 +6401,30 @@ async fn run_op(backend: &LocalBackend, op: Op, tx: &Tx) -> OpResult {
                         gen,
                     }
                 }
+            }
+        }
+        // R47b: pure registry reads. `is_connection_open` never opens a
+        // connection, so the status refresh cannot itself change the state it
+        // reports.
+        Op::ConnStatus { ids } => {
+            let state = backend.state();
+            let mut out = Vec::with_capacity(ids.len());
+            for id in ids {
+                let open = state.is_connection_open(&id).await;
+                out.push((id, open));
+            }
+            OpResult::ConnStatus(out)
+        }
+        // R47b: the kernel's user-disconnect path. `remove_connection_pools`
+        // invalidates the lifecycle, rolls back every manual-transaction session
+        // (so an open BEGIN cannot survive the disconnect), then closes the
+        // pools. This is the only disconnect path; dbxt never drains bare.
+        Op::Disconnect { id, name } => {
+            backend.state().remove_connection_pools(&id).await;
+            OpResult::ConnDisconnected {
+                id,
+                name,
+                error: None,
             }
         }
         Op::DbSize {
@@ -9689,6 +9758,14 @@ struct App {
     db_size_state: std::collections::HashMap<String, TreeDbState>,
     /// Monotonic request id per database, so a stale reply is dropped.
     db_size_gen: std::collections::HashMap<String, u64>,
+    /// R47b: cached kernel liveness per connection id — `true` when DBX holds a
+    /// pool for it. Refreshed by `Op::ConnStatus` (a pure registry read) and
+    /// updated optimistically on connect / disconnect so the tree dot reacts at
+    /// once. The kernel is the source of truth; this is only a cache.
+    conn_live: HashMap<String, bool>,
+    /// R47b: connections whose pool is being opened right now (a switch or a
+    /// lazy tree expand). Drives the half-filled `◐` status dot.
+    conn_connecting: HashSet<String>,
 
     /// Client-side substring filter over the loaded Redis keys (R42 one-step
     /// type-to-filter, mirrors the sidebar table filter). `redis_scan.keys` is
@@ -9750,6 +9827,11 @@ struct App {
     sel: usize,       // cursor row inside the current page / result set
     col_offset: usize, // leftmost column of the scrollable window
     col_cursor: usize, // focused column (cell cursor)
+    /// R47b: while `Instant::now() < deadline` the horizontal scroll bar is
+    /// drawn. A horizontal scroll (wheel / drag / pan / column jump) refreshes
+    /// it; at rest the bar hides so the bottom border is not a permanent thick
+    /// band. `None` means "never poked yet" (hidden).
+    hbar_until: Option<Instant>,
     vis_cols: usize,   // columns currently visible (set while rendering)
     /// Width cap actually used for the last render (compact mode aware).
     grid_max_cell: usize,
@@ -10111,6 +10193,11 @@ impl App {
     fn now_ms(&self) -> u64 {
         self.mouse_epoch.elapsed().as_millis() as u64
     }
+    /// R47b: keep the horizontal scroll bar on screen for the next
+    /// [`HBAR_VISIBLE_MS`] after a horizontal scroll.
+    fn poke_hbar(&mut self) {
+        self.hbar_until = Some(Instant::now() + Duration::from_millis(HBAR_VISIBLE_MS));
+    }
     fn selected_name(&self) -> String {
         self.selected
             .as_ref()
@@ -10426,6 +10513,8 @@ impl App {
             db_sizes: std::collections::HashMap::new(),
             db_size_state: std::collections::HashMap::new(),
             db_size_gen: std::collections::HashMap::new(),
+            conn_live: HashMap::new(),
+            conn_connecting: HashSet::new(),
             side_rows: Vec::new(),
             side_sel: 0,
             side_table_seen: None,
@@ -10459,6 +10548,7 @@ impl App {
             sel: 0,
             col_offset: 0,
             col_cursor: 0,
+            hbar_until: None,
             vis_cols: 0,
             grid_max_cell: 44,
             freeze_first: true,
@@ -10744,8 +10834,19 @@ fn apply_op_result(app: &mut App, res: OpResult, tx: &Tx) {
             | OpResult::SearchProgress { .. }
             | OpResult::DataDiffProgress { .. }
             | OpResult::TransferProgress { .. }
+            | OpResult::ConnStatus(_)
     ) {
         match res {
+            // R47b: a background liveness refresh. The kernel is the source of
+            // truth, so an open pool clears the local "connecting" mark.
+            OpResult::ConnStatus(list) => {
+                for (id, open) in list {
+                    app.conn_live.insert(id.clone(), open);
+                    if open {
+                        app.conn_connecting.remove(&id);
+                    }
+                }
+            }
             OpResult::SearchProgress { gen, done, total } => {
                 if gen == app.search_gen {
                     app.search_progress = Some((done, total));
@@ -10842,9 +10943,15 @@ fn apply_op_result(app: &mut App, res: OpResult, tx: &Tx) {
             app.conn_list.select(sel);
             app.picker_open = app.selected.is_none();
             app.status = tf("{} 个连接 · ↑↓+Enter 选择 · c 新建 · s 排序", &[&(n)]);
+            // R47b: seed the tree's liveness cache from the kernel now that the
+            // connection list is known.
+            refresh_conn_status(app, tx);
         }
         OpResult::ConnDeleted { id, name } => {
             app.connections.retain(|c| c.id != id);
+            // R47b: forget the removed connection's cached liveness.
+            app.conn_live.remove(&id);
+            app.conn_connecting.remove(&id);
             let n = app.connections.len();
             let sel = app.conn_list.selected().unwrap_or(0).min(n.saturating_sub(1));
             app.conn_list.select((n > 0).then_some(sel));
@@ -10867,7 +10974,12 @@ fn apply_op_result(app: &mut App, res: OpResult, tx: &Tx) {
             if let Some(cfg) = app.selected.clone() {
                 app.tree_dbs.insert(cfg.id.clone(), app.databases.clone());
                 app.tree_db_state.remove(&cfg.id);
-                app.tree_conn_open.insert(cfg.id);
+                app.tree_conn_open.insert(cfg.id.clone());
+                // R47b: the active pool answered, so it is live. Confirm the
+                // other connections' state with a background registry read.
+                app.conn_connecting.remove(&cfg.id);
+                app.conn_live.insert(cfg.id, true);
+                refresh_conn_status(app, tx);
             }
             app.db_index = configured
                 .as_deref()
@@ -10933,17 +11045,67 @@ fn apply_op_result(app: &mut App, res: OpResult, tx: &Tx) {
             if app.tree_gen.get(&conn_id).copied() != Some(gen) {
                 return;
             }
+            // R47b: the lazy fetch finished; the dot leaves the connecting
+            // state and reflects whether the pool actually came up.
+            app.conn_connecting.remove(&conn_id);
             match error {
                 Some(msg) => {
+                    app.conn_live.insert(conn_id.clone(), false);
                     app.tree_db_state.insert(conn_id, TreeDbState::Error(msg));
                 }
                 None => {
+                    app.conn_live.insert(conn_id.clone(), true);
                     app.tree_dbs.insert(conn_id.clone(), databases);
                     app.tree_db_state.remove(&conn_id);
                 }
             }
+            refresh_conn_status(app, tx);
             rebuild_side_rows(app);
         }
+        // R47b: a manual disconnect finished. The pool is gone, the cached
+        // database list stays (muted), and a disconnected *active* connection
+        // collapses to a grey root with the cursor moved to the nearest other
+        // root — never a silent drop to an empty screen.
+        OpResult::ConnDisconnected { id, name, error } => {
+            app.conn_connecting.remove(&id);
+            if let Some(msg) = error {
+                app.status = tf("✗ 断开 {} 失败：{}", &[&name, &msg]);
+                refresh_conn_status(app, tx);
+                return;
+            }
+            app.conn_live.insert(id.clone(), false);
+            // A stale error row would be misleading once disconnected; the
+            // cached database list is kept so the tree keeps its shape.
+            app.tree_db_state.remove(&id);
+            let was_active = app.selected.as_ref().is_some_and(|c| c.id == id);
+            if was_active {
+                // Collapse the root and drop the browse state that belonged to
+                // the dead pool. `selected` stays put so the sidebar keeps its
+                // tree and the picker never flashes.
+                app.tree_conn_closed.insert(id.clone());
+                app.tree_conn_open.remove(&id);
+                app.databases.clear();
+                app.db_index = 0;
+                app.tables.clear();
+                app.tables_all.clear();
+                app.table_list = ListState::default();
+                app.clear_grid();
+                app.script = None;
+                app.ddl = None;
+                app.page_state = None;
+                app.set_placeholder();
+                app.loading = false;
+            }
+            app.status = tf("已断开 {} · 展开该根可重连", &[&name]);
+            rebuild_side_rows(app);
+            if was_active {
+                side_focus_nearest_root(app, &id);
+            }
+            refresh_conn_status(app, tx);
+        }
+        // R47b: handled as an intermediate message above; this arm keeps the
+        // main match exhaustive without treating it as a finished op.
+        OpResult::ConnStatus(_) => {}
         OpResult::DbSize {
             db,
             info,
@@ -11122,6 +11284,9 @@ fn apply_op_result(app: &mut App, res: OpResult, tx: &Tx) {
             if gen != app.page_gen {
                 return;
             }
+            // R47b: a page arrived, so the pool is live (a query re-opens a
+            // disconnected connection silently).
+            mark_active_live(app);
             app.page_pending = false;
             let rows = grid.rows.len();
             if let Some(t) = total {
@@ -11219,6 +11384,8 @@ fn apply_op_result(app: &mut App, res: OpResult, tx: &Tx) {
             }
         }
         OpResult::Query(r, sql, cap) => {
+            // R47b: a query answered, so the pool is live.
+            mark_active_live(app);
             // A `Ctrl-Enter` history direct run lands with a distinct status that
             // names its elapsed time (R45).
             let direct = std::mem::take(&mut app.direct_run);
@@ -11292,6 +11459,8 @@ fn apply_op_result(app: &mut App, res: OpResult, tx: &Tx) {
         }
         OpResult::Script(outcomes) => {
             app.count_cache.clear();
+            // R47b: the script ran, so the pool is live.
+            mark_active_live(app);
             // A `Ctrl-Enter` history direct run lands with a distinct status that
             // names its total elapsed time (R45).
             let direct = std::mem::take(&mut app.direct_run);
@@ -11346,6 +11515,8 @@ fn apply_op_result(app: &mut App, res: OpResult, tx: &Tx) {
             if gen != app.redis_scan.gen {
                 return;
             }
+            // R47b: Redis shares the LocalBackend pool, so a scan proves liveness.
+            mark_active_live(app);
             app.redis_scan.pending = false;
             if append {
                 app.redis_scan.all.extend(keys);
@@ -11506,6 +11677,8 @@ fn apply_op_result(app: &mut App, res: OpResult, tx: &Tx) {
             if gen != app.mongo_gen {
                 return;
             }
+            // R47b: documents arrived, so the pool is live.
+            mark_active_live(app);
             app.col_hidden.clear();
             app.result_needle.clear();
             app.result_filter = None;
@@ -12554,6 +12727,13 @@ fn confirm_key(app: &mut App, tx: &Tx, k: KeyEvent) {
                     return;
                 }
                 if let Some(cc) = c.conn {
+                    if cc.disconnect {
+                        // R47b: drain the pools (manual transactions roll back)
+                        // and let the reply collapse the root to a grey dot.
+                        app.status = tf("断开连接 {}…", &[&cc.name]);
+                        app.spawn(tx, Op::Disconnect { id: cc.id, name: cc.name });
+                        return;
+                    }
                     app.status = tf("删除连接 {}…", &[&cc.name]);
                     app.spawn(tx, Op::DeleteConn { id: cc.id, name: cc.name });
                     return;
@@ -13562,6 +13742,16 @@ fn sidebar_key(app: &mut App, tx: &Tx, k: KeyEvent) {
                 app.sort_connections();
                 app.status = tf("排序：{} · s 切换（名称/类型/颜色）", &[&app.conn_sort.label()]);
             }
+            // R47b: disconnect the highlighted connection. The picker is the one
+            // place every backend can reach the action (the Redis browser has no
+            // tree root row to put `x` on).
+            KeyCode::Char('d') => {
+                if let Some(idx) = app.conn_list.selected() {
+                    if let Some(cfg) = app.connections.get(idx).cloned() {
+                        open_disconnect_confirm(app, &cfg);
+                    }
+                }
+            }
             // Delete the highlighted connection (red confirm; config only).
             KeyCode::Char('x') | KeyCode::Delete => {
                 if let Some(idx) = app.conn_list.selected() {
@@ -13575,6 +13765,7 @@ fn sidebar_key(app: &mut App, tx: &Tx, k: KeyEvent) {
                                 id: cfg.id.clone(),
                                 name: cfg.name.clone(),
                                 db_type: cfg.db_type.as_str().to_string(),
+                                disconnect: false,
                             }),
                             redis: None,
                             mongo: None,
@@ -13907,6 +14098,16 @@ fn sidebar_key(app: &mut App, tx: &Tx, k: KeyEvent) {
         // the tree; `d` is still the discoverable database list.
         KeyCode::Char('[') => cycle_db(app, tx, false),
         KeyCode::Char(']') => cycle_db(app, tx, true),
+        // R47b: `x` on a connection root opens the red disconnect confirmation.
+        // On any other row it falls through to the type-to-filter below, so the
+        // key stays free for the table filter everywhere it is not a root.
+        KeyCode::Char('x')
+            if matches!(app.side_rows.get(app.side_sel), Some(SideRow::Conn { .. })) =>
+        {
+            if let Some(SideRow::Conn { idx }) = app.side_rows.get(app.side_sel).cloned() {
+                request_disconnect(app, idx);
+            }
+        }
         // One-step type-to-filter (R39): any printable character that is not a
         // bound shortcut starts the filter with that character already typed,
         // so a lookup is a single keystroke instead of `/` then type.
@@ -14717,6 +14918,9 @@ fn move_col_cursor(app: &mut App, delta: i32) {
     }
     let next = (app.col_cursor as i32 + delta).clamp(0, n as i32 - 1);
     app.col_cursor = next as usize;
+    // R47b: moving the cell cursor across columns can scroll the window, so the
+    // progress bar reappears for a moment.
+    app.poke_hbar();
 }
 
 /// The grid the cell cursor currently operates on: a drilled script result
@@ -14977,6 +15181,10 @@ fn activate_connection(
     app.conn_gen = app.conn_gen.wrapping_add(1);
     let gen = app.conn_gen;
     app.selected = Some(cfg.clone());
+    // R47b: the pool is opening now; the dot turns half-filled until the
+    // database list (or the status refresh) confirms it is live.
+    app.conn_connecting.insert(cfg.id.clone());
+    app.conn_live.remove(&cfg.id);
     // R43: the active connection's tree root starts expanded so its databases
     // (or, without a database layer, its tables) are visible immediately.
     app.tree_conn_open.insert(cfg.id.clone());
@@ -16124,6 +16332,8 @@ fn hbar_click(app: &mut App, x: u16, y: u16) -> bool {
     let target = frozen + (frac * (total.saturating_sub(1)) as f64).round() as usize;
     app.col_cursor = target.min(ncols - 1);
     app.col_offset = app.col_cursor;
+    // R47b: a tap on the track is a horizontal scroll, so keep the bar up.
+    app.poke_hbar();
     true
 }
 
@@ -16311,6 +16521,85 @@ fn side_conn_open(app: &App, idx: usize) -> bool {
         !app.tree_conn_closed.contains(&c.id)
     } else {
         app.tree_conn_open.contains(&c.id)
+    }
+}
+
+/// R47b: cached kernel liveness — `true` when DBX holds a pool for this
+/// connection. Unknown ids read as idle.
+fn conn_is_live(app: &App, id: &str) -> bool {
+    app.conn_live.get(id).copied().unwrap_or(false)
+}
+
+/// R47b: the status dot state for one connection. Local optimistic marks
+/// (`conn_connecting`) win, then the cached kernel liveness.
+fn conn_status_for(app: &App, id: &str) -> ConnStatus {
+    if app.conn_connecting.contains(id) {
+        ConnStatus::Connecting
+    } else if conn_is_live(app, id) {
+        ConnStatus::Active
+    } else {
+        ConnStatus::Idle
+    }
+}
+
+/// R47b: the status dot state for tree root `idx`.
+fn side_conn_status(app: &App, idx: usize) -> ConnStatus {
+    side_root_cfg(app, idx)
+        .map(|c| conn_status_for(app, &c.id))
+        .unwrap_or(ConnStatus::Idle)
+}
+
+/// R47b: refresh the cached liveness from the kernel. Spawned as an
+/// intermediate op (it never drives the spinner), and only after a call that
+/// could have changed a pool, so a registry read is never on the hot path.
+fn refresh_conn_status(app: &mut App, tx: &Tx) {
+    let mut ids: Vec<String> = app.connections.iter().map(|c| c.id.clone()).collect();
+    if let Some(c) = &app.selected {
+        if !ids.iter().any(|id| id == &c.id) {
+            ids.push(c.id.clone());
+        }
+    }
+    if ids.is_empty() {
+        return;
+    }
+    spawn_op(&app.backend, tx, Op::ConnStatus { ids });
+}
+
+/// R47b: optimistically mark the active connection live. Called when a result
+/// that could only have come from a live connection lands, so a query that
+/// silently re-opened a disconnected pool flips the dot back without waiting
+/// for a status refresh.
+fn mark_active_live(app: &mut App) {
+    if let Some(c) = &app.selected {
+        let id = c.id.clone();
+        app.conn_connecting.remove(&id);
+        app.conn_live.insert(id, true);
+    }
+}
+
+/// R47b: move the tree cursor to the connection root nearest `from_id`,
+/// excluding that root. Used after the active connection is disconnected so the
+/// cursor never sits on a dead root while other roots exist.
+fn side_focus_nearest_root(app: &mut App, from_id: &str) {
+    let from_idx = app.connections.iter().position(|c| c.id == from_id);
+    let cur = app.side_sel;
+    let candidates: Vec<usize> = app
+        .side_rows
+        .iter()
+        .enumerate()
+        .filter(|(_, r)| match r {
+            SideRow::Conn { idx } => Some(*idx) != from_idx,
+            _ => false,
+        })
+        .map(|(i, _)| i)
+        .collect();
+    if let Some(target) = candidates
+        .iter()
+        .copied()
+        .min_by_key(|&i| i.abs_diff(cur))
+    {
+        app.side_sel = target;
+        side_mirror_table(app);
     }
 }
 
@@ -16574,6 +16863,13 @@ fn expand_conn(app: &mut App, tx: &Tx, idx: usize) {
     let id = c.id.clone();
     if side_is_active(app, idx) {
         app.tree_conn_closed.remove(&id);
+        // R47b: expanding a disconnected active root reconnects it — a fresh
+        // activate re-runs the database load and turns the dot green again.
+        if !conn_is_live(app, &id) {
+            let restore = app.conn_pointers.get(&id).cloned();
+            activate_connection(app, tx, c, restore, None);
+            return;
+        }
         rebuild_side_rows(app);
         return;
     }
@@ -16583,9 +16879,12 @@ fn expand_conn(app: &mut App, tx: &Tx, idx: usize) {
         rebuild_side_rows(app);
         return;
     }
-    let already = app.tree_dbs.contains_key(&id)
-        || matches!(app.tree_db_state.get(&id), Some(TreeDbState::Loading));
-    if already {
+    let live = conn_is_live(app, &id);
+    let loading = matches!(app.tree_db_state.get(&id), Some(TreeDbState::Loading));
+    // A live root with a cached list just opens (no refetch). A disconnected
+    // root always re-fetches, so its cached rows are refreshed and the pool
+    // reopens ("点开时重新懒连接").
+    if loading || (live && app.tree_dbs.contains_key(&id)) {
         rebuild_side_rows(app);
         return;
     }
@@ -16595,8 +16894,47 @@ fn expand_conn(app: &mut App, tx: &Tx, idx: usize) {
         *g
     };
     app.tree_db_state.insert(id.clone(), TreeDbState::Loading);
+    app.conn_connecting.insert(id.clone());
     rebuild_side_rows(app);
     app.spawn(tx, Op::TreeDatabases(Box::new(c), gen));
+}
+
+/// R47b: open the red confirmation for a manual disconnect. Shared by the SQL /
+/// Mongo tree (`x` on a connection root) and the Redis browser (`X`).
+fn open_disconnect_confirm(app: &mut App, cfg: &ConnectionConfig) {
+    if !conn_is_live(app, &cfg.id) && !app.conn_connecting.contains(&cfg.id) {
+        app.status = tf("连接 {} 已断开", &[&cfg.name]);
+        return;
+    }
+    app.confirm = Some(Confirm {
+        sql: String::new(),
+        reasons: Vec::new(),
+        refresh: false,
+        clear_batch: false,
+        conn: Some(ConnConfirm {
+            id: cfg.id.clone(),
+            name: cfg.name.clone(),
+            db_type: cfg.db_type.as_str().to_string(),
+            disconnect: true,
+        }),
+        redis: None,
+        mongo: None,
+    });
+    app.status = tf("断开连接 {} · Enter 确认 · Esc 取消", &[&cfg.name]);
+}
+
+/// R47b: `x` on a connection root opens the disconnect confirmation. A
+/// synthetic root (an active connection missing from the saved list) has no
+/// saved config to reconnect with, so it is refused with a hint instead.
+fn request_disconnect(app: &mut App, idx: usize) {
+    if idx >= app.connections.len() {
+        app.status = t("该连接不在已保存列表中，无法断开").into();
+        return;
+    }
+    let Some(c) = side_root_cfg(app, idx).cloned() else {
+        return;
+    };
+    open_disconnect_confirm(app, &c);
 }
 
 /// `s` on a database row: lazily fetch that database's aggregate size and
@@ -18824,6 +19162,7 @@ fn col_jump_key(app: &mut App, k: KeyEvent) {
                 Ok(i) => {
                     let name = grid.columns.get(i).cloned().unwrap_or_default();
                     app.col_cursor = i;
+                    app.poke_hbar();
                     app.sel = app.sel.min(grid.rows.len().saturating_sub(1));
                     app.status = tf(
                         "跳到第 {} 列 {}",
@@ -25003,6 +25342,16 @@ fn pan_window(
     (next, cursor)
 }
 
+/// R47b: how long the horizontal scroll bar stays visible after a horizontal
+/// scroll. Long enough to read the thumb position, short enough that the bottom
+/// border returns to a plain line at rest.
+const HBAR_VISIBLE_MS: u64 = 2500;
+
+/// Pure visibility test for the auto-hiding horizontal scroll bar.
+fn hbar_should_show(until: Option<Instant>, now: Instant) -> bool {
+    until.is_some_and(|deadline| now < deadline)
+}
+
 /// Pan the visible column *window* by `delta` columns and pull the cell cursor
 /// along so it never leaves the screen.
 ///
@@ -25031,6 +25380,8 @@ fn pan_columns(app: &mut App, delta: i32) -> bool {
     );
     app.col_offset = off;
     app.col_cursor = cursor;
+    // R47b: a horizontal scroll re-summons the auto-hiding progress bar.
+    app.poke_hbar();
     true
 }
 
@@ -28066,6 +28417,7 @@ fn footer_hints_ctx(ctx: FooterCtx) -> Vec<Hint> {
                 ("Alt-1..9", t("直切")),
                 ("c", t("新建")),
                 ("p", t("复制")),
+                ("d", t("断开连接")),
                 ("q", t("显隐")),
             ],
             Focus::Sidebar => vec![
@@ -28075,6 +28427,7 @@ fn footer_hints_ctx(ctx: FooterCtx) -> Vec<Hint> {
                 ("Enter", t("浏览")),
                 ("r", t("结构")),
                 ("s", t("排序")),
+                ("x", t("断开连接")),
                 ("Alt+a-z", t("首字母跳")),
                 ("Alt-1..9", t("切连接")),
                 ("d", t("切库")),
@@ -28837,10 +29190,14 @@ fn render_grid(
     app.rects.hbar_prev = Rect::default();
     app.rects.hbar_next = Rect::default();
     let scrollable_total = ncols.saturating_sub(frozen);
+    // R47b: auto-hide. The bar only appears for a moment after a horizontal
+    // scroll (`poke_hbar`), so the bottom border is not a permanent thick band.
+    // The `列 k/N` readout in the status line still names the window at rest.
+    let hbar_shown = hbar_should_show(app.hbar_until, Instant::now());
     // The bar sits on the bottom border, so a zero-height results pane (a tiny
     // terminal squeezes the pane to nothing) has no row to draw it on and
     // `area.height - 1` would underflow.
-    if visible > 0 && scrollable_total > visible && inner_w >= 16 && area.height > 0 {
+    if hbar_shown && visible > 0 && scrollable_total > visible && inner_w >= 16 && area.height > 0 {
         let win_start = off.saturating_sub(frozen);
         let pin = match frozen {
             0 => String::new(),
@@ -28864,22 +29221,23 @@ fn render_grid(
             "◀",
             Style::default().fg(Color::LightGreen),
         ));
-        // A half-height bar (lower block) instead of a full `█` keeps the
-        // indicator visually thin on the bottom border.
+        // R47b: a dashed mid-line track plus a heavy mid-line thumb. Both sit on
+        // the same thin line, so the bar reads as one hairline with a bright
+        // segment instead of the old `▁`/`▄` band that stood half a cell tall.
         if ts > 0 {
             spans.push(Span::styled(
-                "▁".repeat(ts),
+                "┄".repeat(ts),
                 Style::default().fg(Color::DarkGray),
             ));
         }
         spans.push(Span::styled(
-            "▄".repeat(tl),
+            "━".repeat(tl),
             Style::default().fg(Color::LightGreen),
         ));
         let after = bar_len.saturating_sub(ts + tl);
         if after > 0 {
             spans.push(Span::styled(
-                "▁".repeat(after),
+                "┄".repeat(after),
                 Style::default().fg(Color::DarkGray),
             ));
         }
@@ -29488,14 +29846,30 @@ fn render_sidebar(f: &mut Frame, area: Rect, app: &mut App) {
     if app.backend_kind == Backend::Redis {
         let conn_color = connection_color(&c);
         let mut lines: Vec<Line> = Vec::new();
+        // R47b: the same status dot the SQL/Mongo tree draws — Redis shares the
+        // LocalBackend pool, so `remove_connection_pools` disconnects it too.
+        let status = conn_status_for(app, &c.id);
+        let dot_style = match status {
+            ConnStatus::Active => Style::default().fg(conn_color),
+            ConnStatus::Connecting => Style::default()
+                .fg(conn_color)
+                .add_modifier(Modifier::BOLD),
+            ConnStatus::Idle => Style::default()
+                .fg(conn_color)
+                .add_modifier(Modifier::DIM),
+        };
+        let name_style = match status {
+            ConnStatus::Active => Style::default()
+                .fg(conn_color)
+                .add_modifier(Modifier::BOLD),
+            ConnStatus::Connecting => Style::default().fg(conn_color),
+            ConnStatus::Idle => Style::default()
+                .fg(Color::DarkGray)
+                .add_modifier(Modifier::DIM),
+        };
         lines.push(Line::from(vec![
-            Span::styled("● ", Style::default().fg(conn_color)),
-            Span::styled(
-                c.name.clone(),
-                Style::default()
-                    .fg(conn_color)
-                    .add_modifier(Modifier::BOLD),
-            ),
+            Span::styled(format!("{} ", status.shape()), dot_style),
+            Span::styled(c.name.clone(), name_style),
         ]));
         if sidebar_db_row(app) {
             let label = sidebar_db_label(app);
@@ -29606,19 +29980,38 @@ fn side_row_line(
                 ),
                 None => (String::new(), Color::Gray, false, false),
             };
+            let status = side_conn_status(app, *idx);
             spans.push(Span::styled(
                 if open { "▾ " } else { "▸ " }.to_string(),
                 mk(Style::default().fg(Color::DarkGray)),
             ));
-            spans.push(Span::styled("● ".to_string(), mk(Style::default().fg(color))));
+            // R47b: shape carries the state (● active / ○ idle / ◐ connecting),
+            // the connection colour carries identity. Idle dots are dimmed so a
+            // disconnected root reads as muted without losing its colour.
+            let dot_style = match status {
+                ConnStatus::Active => Style::default().fg(color),
+                ConnStatus::Connecting => Style::default()
+                    .fg(color)
+                    .add_modifier(Modifier::BOLD),
+                ConnStatus::Idle => Style::default().fg(color).add_modifier(Modifier::DIM),
+            };
+            spans.push(Span::styled(format!("{} ", status.shape()), mk(dot_style)));
             if ro {
                 spans.push(Span::styled("🔒 ".to_string(), mk(Style::default().fg(color))));
             }
             let name_w = inner.saturating_sub(if ro { 2 } else { 0 });
-            spans.push(Span::styled(
-                truncate_disp(&name, name_w),
-                mk(Style::default().fg(color).add_modifier(Modifier::BOLD)),
-            ));
+            // A disconnected root's name is muted grey so it cannot be mistaken
+            // for a live connection at a glance.
+            let name_style = match status {
+                ConnStatus::Active => Style::default()
+                    .fg(color)
+                    .add_modifier(Modifier::BOLD),
+                ConnStatus::Connecting => Style::default().fg(color),
+                ConnStatus::Idle => Style::default()
+                    .fg(Color::DarkGray)
+                    .add_modifier(Modifier::DIM),
+            };
+            spans.push(Span::styled(truncate_disp(&name, name_w), mk(name_style)));
         }
         SideRow::ConnLoading { .. } => {
             spans.push(Span::styled(
@@ -29642,9 +30035,17 @@ fn side_row_line(
             spans.push(Span::styled(tri.to_string(), mk(Style::default().fg(Color::DarkGray))));
             spans.push(Span::styled("▤ ".to_string(), mk(Style::default().fg(Color::Cyan))));
             let disp = fix_double_encoding(db);
-            let style = mk(Style::default()
+            // R47b: a database under a disconnected connection is a cached,
+            // muted row — still visible so the tree keeps its shape, but dimmed
+            // so it reads as stale. Clicking it reconnects (switch_to_db).
+            let live = side_root_cfg(app, *idx).is_some_and(|c| conn_is_live(app, &c.id));
+            let mut style = Style::default()
                 .fg(if is_cur { Color::Cyan } else { Color::Gray })
-                .add_modifier(Modifier::BOLD));
+                .add_modifier(Modifier::BOLD);
+            if !live {
+                style = style.add_modifier(Modifier::DIM);
+            }
+            let style = mk(style);
             let hit = style.add_modifier(Modifier::UNDERLINED);
             spans.extend(highlight_match_spans(
                 &truncate_disp(&disp, inner),
@@ -33144,6 +33545,7 @@ const HELP_ROWS: &[(&str, &str)] = &[
     ("p", "复制连接（预填表单）"),
     ("s", "循环排序：名称 / 类型 / 颜色（同色连接排在一起）"),
     ("x / Del", "删除选中连接（红色确认；只删配置，不删数据库数据）"),
+    ("d", "断开选中连接（关闭连接池，未提交手动事务回滚；配置保留，可重连）"),
     ("q", "折叠 / 展开连接列表"),
     ("— 连接表单 —", ""),
     ("↑ ↓ / Tab", "切换字段（开启 ssh_tunnel 后自动展开 SSH 段）"),
@@ -33174,6 +33576,8 @@ const HELP_ROWS: &[(&str, &str)] = &[
     ("s", "表排序：名称 / 类型（TABLE / VIEW）"),
     ("s（库行）", "惰性查询该库聚合大小 + 各表行数估计（information_schema，不扫表；会话缓存）"),
     ("Y", "复制连接（新名字 xxx-copy，含密码 / SSH 隧道，树中新根）"),
+    ("状态点（连接根）", "● 活跃（可查）/ ○ 已断开 / ◐ 连接中；沿用连接色，形状区分（色盲友好）"),
+    ("x（连接根）", "断开连接：关闭连接池（未提交手动事务回滚）；树保留灰根，展开可重连"),
     ("尺寸列", "库大小 / 表行数估计右对齐；终端 <56 列自动隐藏"),
     ("Alt+a-z · ; ,", "首字母跳：跳到以该字母开头的下一张表；; , 前后循环（与过滤互斥）"),
     ("t", "最近表浮层（Enter 直达）"),
@@ -33201,8 +33605,8 @@ const HELP_ROWS: &[(&str, &str)] = &[
     ),
     ("Shift+← →", "横滚列一列（任意区域，按住连滚）"),
     ("Ctrl-G", "横滚模式：纵向滚轮/上下滑改为横滚列"),
-    ("◀ ▶（底部）", "点击向左/右翻一屏列（触屏可用）"),
-    ("底部进度条", "当前列窗口位置 · 点击可跳转"),
+    ("◀ ▶（底部）", "点击向左/右翻一屏列（触屏可用；滚动条横滚后短暂显示，静止自动隐藏）"),
+    ("底部进度条", "当前列窗口位置 · 横滚后 2.5s 内显示 · 点击可跳转"),
     ("[ ]", "切换本次会话的结果标签"),
     ("Ctrl-Y", "导出当前结果（CSV / JSON / NDJSON / Markdown / INSERT）"),
     ("y", "复制当前行为 INSERT 语句（OSC52 + 文件兜底）"),
@@ -33543,20 +33947,53 @@ fn confirm_buttons(
 /// `[ 删除 ]` / `[ 取消 ]` hit rectangles.
 fn render_conn_confirm(f: &mut Frame, area: Rect, cc: &ConnConfirm) -> (Rect, Rect) {
     let w = overlay_width(area.width, 72, 30);
-    let mut lines = vec![
-        Line::from(Span::styled(
-            tf("将删除连接 {} ({})", &[&cc.name, &cc.db_type]),
-            Style::default()
-                .fg(Color::Red)
-                .add_modifier(Modifier::BOLD),
-        )),
-        Line::from(""),
-        Line::from(Span::styled(
-            t("只删除这条连接配置，不会删除数据库里的任何数据"),
-            Style::default().fg(Color::Yellow),
-        )),
-        Line::from(""),
-    ];
+    // R47b: the disconnect variant shares this red layer but spells out what a
+    // disconnect does (pools close, uncommitted manual transactions roll back)
+    // and that the tree keeps its shape.
+    let (title, body, ok_label) = if cc.disconnect {
+        (
+            t(" ⚠ 断开连接 "),
+            vec![
+                Line::from(Span::styled(
+                    tf("断开连接 {} ({})？", &[&cc.name, &cc.db_type]),
+                    Style::default()
+                        .fg(Color::Red)
+                        .add_modifier(Modifier::BOLD),
+                )),
+                Line::from(""),
+                Line::from(Span::styled(
+                    t("未提交的手动事务将回滚；下次展开该连接时重新连接"),
+                    Style::default().fg(Color::Yellow),
+                )),
+                Line::from(Span::styled(
+                    t("侧栏保留该连接根（灰点），已缓存的库/表仍可见"),
+                    Style::default().fg(Color::DarkGray),
+                )),
+                Line::from(""),
+            ],
+            t("Enter/y 断开"),
+        )
+    } else {
+        (
+            t(" ⚠ 删除连接 "),
+            vec![
+                Line::from(Span::styled(
+                    tf("将删除连接 {} ({})", &[&cc.name, &cc.db_type]),
+                    Style::default()
+                        .fg(Color::Red)
+                        .add_modifier(Modifier::BOLD),
+                )),
+                Line::from(""),
+                Line::from(Span::styled(
+                    t("只删除这条连接配置，不会删除数据库里的任何数据"),
+                    Style::default().fg(Color::Yellow),
+                )),
+                Line::from(""),
+            ],
+            t("Enter/y 删除"),
+        )
+    };
+    let mut lines = body;
     let h = (lines.len() as u16 + 1 + 2).min(area.height).max(3.min(area.height));
     let box_area = centered_overlay(area, w, h);
     let inner = Rect {
@@ -33568,7 +34005,7 @@ fn render_conn_confirm(f: &mut Frame, area: Rect, cc: &ConnConfirm) -> (Rect, Re
     let (buttons, ok, cancel) = confirm_buttons(
         inner,
         inner.y + lines.len() as u16,
-        t("Enter/y 删除"),
+        ok_label,
         t("Esc/n 取消"),
     );
     lines.push(buttons);
@@ -33576,7 +34013,7 @@ fn render_conn_confirm(f: &mut Frame, area: Rect, cc: &ConnConfirm) -> (Rect, Re
     let block = Block::default()
         .borders(Borders::ALL)
         .title(Span::styled(
-            t(" ⚠ 删除连接 "),
+            title,
             Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
         ))
         .border_set(border::THICK)
@@ -38381,6 +38818,290 @@ mod tests {
         assert!(rows
             .iter()
             .any(|r| matches!(r, SideRow::Db { db, .. } if db == "shop")));
+    }
+
+    // ── R47b: connection status dots + manual disconnect ──
+
+    /// The status dot is a pure function of the local connecting mark and the
+    /// cached kernel liveness; shape (not just colour) tells the states apart.
+    #[test]
+    fn conn_status_dot_state_machine() {
+        let mut app = tree_app();
+        let c1 = app.connections[0].id.clone();
+        let c2 = app.connections[1].id.clone();
+        // Unknown ids read as idle; the three shapes are distinct.
+        assert_eq!(conn_status_for(&app, &c1), ConnStatus::Idle);
+        assert_eq!(conn_status_for(&app, &c2), ConnStatus::Idle);
+        assert_eq!(ConnStatus::Active.shape(), "●");
+        assert_eq!(ConnStatus::Idle.shape(), "○");
+        assert_eq!(ConnStatus::Connecting.shape(), "◐");
+        // A pool in the kernel cache is active.
+        app.conn_live.insert(c1.clone(), true);
+        assert_eq!(conn_status_for(&app, &c1), ConnStatus::Active);
+        // A pending open wins over a stale live flag (it is the newer fact).
+        app.conn_connecting.insert(c1.clone());
+        assert_eq!(conn_status_for(&app, &c1), ConnStatus::Connecting);
+        // Resolving through the tree root index agrees, and an out-of-range root
+        // (or a config-less synthetic root) is idle, never a panic.
+        assert_eq!(side_conn_status(&app, 0), ConnStatus::Connecting);
+        assert_eq!(side_conn_status(&app, 1), ConnStatus::Idle);
+        assert_eq!(side_conn_status(&app, 99), ConnStatus::Idle);
+    }
+
+    /// The rendered tree shows the shape per connection: `●` live, `○` idle,
+    /// `◐` while a lazy open is in flight.
+    #[test]
+    fn tree_root_draws_the_status_shape_per_connection() {
+        let mut app = tree_app();
+        app.picker_open = false;
+        let c1 = app.connections[0].id.clone();
+        let c2 = app.connections[1].id.clone();
+        app.conn_live.insert(c1.clone(), true);
+        app.conn_live.insert(c2.clone(), false);
+        let joined = draw(&mut app, 100, 30).join("\n");
+        assert!(joined.contains("● "), "active dot missing: {joined}");
+        assert!(joined.contains("○ "), "idle dot missing: {joined}");
+        app.conn_connecting.insert(c2);
+        let joined = draw(&mut app, 100, 30).join("\n");
+        assert!(joined.contains("◐ "), "connecting dot missing: {joined}");
+    }
+
+    /// `x` on a root opens the red confirm only when the connection is live (or
+    /// opening); Enter then spawns a *disconnect*, not a delete.
+    #[test]
+    fn disconnect_confirm_opens_only_for_live_connections() {
+        run_rt(|| {
+            let (tx, _rx) = tokio::sync::mpsc::unbounded_channel::<OpResult>();
+            let mut app = tree_app();
+            app.picker_open = false;
+            let c1 = app.connections[0].clone();
+            // Idle: nothing to disconnect, no modal.
+            request_disconnect(&mut app, 0);
+            assert!(app.confirm.is_none());
+            assert!(app.status.contains("已断开"), "{}", app.status);
+            // Live: the confirm carries the disconnect semantics.
+            app.conn_live.insert(c1.id.clone(), true);
+            request_disconnect(&mut app, 0);
+            let cc = app
+                .confirm
+                .as_ref()
+                .and_then(|c| c.conn.clone())
+                .expect("a confirm layer");
+            assert!(cc.disconnect, "it is a disconnect, not a delete");
+            assert_eq!(cc.id, c1.id);
+            // Enter accepts and spawns the disconnect op.
+            key(&mut app, &tx, KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+            assert!(app.confirm.is_none(), "the layer closed");
+            assert!(app.status.contains("断开连接"), "{}", app.status);
+        });
+    }
+
+    /// Disconnecting the *active* connection clears the pool, collapses the root
+    /// to a grey anchor and moves the cursor to the nearest other root — never
+    /// an empty screen.
+    #[test]
+    fn disconnect_active_root_collapses_and_moves_focus() {
+        run_rt(|| {
+            let (tx, _rx) = tokio::sync::mpsc::unbounded_channel::<OpResult>();
+            let mut app = tree_app();
+            app.picker_open = false;
+            let c1 = app.connections[0].id.clone();
+            app.conn_live.insert(c1.clone(), true);
+            rebuild_side_rows(&mut app);
+            app.side_sel = app
+                .side_rows
+                .iter()
+                .position(|r| matches!(r, SideRow::Conn { idx: 0 }))
+                .unwrap();
+            apply_op_result(
+                &mut app,
+                OpResult::ConnDisconnected {
+                    id: c1.clone(),
+                    name: "test-mysql".into(),
+                    error: None,
+                },
+                &tx,
+            );
+            assert!(!conn_is_live(&app, &c1), "the pool is gone");
+            assert!(app.tree_conn_closed.contains(&c1), "the root collapsed");
+            assert!(app.databases.is_empty(), "the dead pool's browse state is gone");
+            // The cursor landed on the sibling root, not the dead one.
+            assert!(matches!(app.side_rows[app.side_sel], SideRow::Conn { idx: 1 }));
+            // Re-expanding the dead root reconnects (marks it connecting).
+            let idx = app
+                .side_rows
+                .iter()
+                .position(|r| matches!(r, SideRow::Conn { idx: 0 }))
+                .unwrap();
+            app.side_sel = idx;
+            side_expand(&mut app, &tx);
+            assert!(app.conn_connecting.contains(&c1), "reconnect is in flight");
+            assert!(!app.tree_conn_closed.contains(&c1));
+        });
+    }
+
+    /// Disconnecting a *non-active* connection keeps its cached database list
+    /// visible (muted) and leaves the active subtree alone.
+    #[test]
+    fn disconnect_sibling_keeps_cached_databases() {
+        run_rt(|| {
+            let (tx, _rx) = tokio::sync::mpsc::unbounded_channel::<OpResult>();
+            let mut app = tree_app();
+            app.picker_open = false;
+            let c2 = app.connections[1].id.clone();
+            app.tree_conn_open.insert(c2.clone());
+            app.tree_dbs
+                .insert(c2.clone(), vec!["analytics".into(), "staging".into()]);
+            app.conn_live.insert(c2.clone(), true);
+            apply_op_result(
+                &mut app,
+                OpResult::ConnDisconnected {
+                    id: c2.clone(),
+                    name: "test-postgres".into(),
+                    error: None,
+                },
+                &tx,
+            );
+            assert!(!conn_is_live(&app, &c2));
+            let rows = compute_side_rows(&app);
+            assert!(
+                rows.iter()
+                    .any(|r| matches!(r, SideRow::Db { idx: 1, db } if db == "analytics")),
+                "the cached sibling list stays visible"
+            );
+            assert!(
+                rows.iter().any(|r| matches!(r, SideRow::Table { .. })),
+                "the active subtree is untouched"
+            );
+        });
+    }
+
+    /// Expanding a collapsed, disconnected sibling re-fetches (a reconnect), not
+    /// just re-shows the stale cache.
+    #[test]
+    fn expand_reconnects_a_disconnected_sibling() {
+        run_rt(|| {
+            let (tx, _rx) = tokio::sync::mpsc::unbounded_channel::<OpResult>();
+            let mut app = tree_app();
+            app.picker_open = false;
+            let c2 = app.connections[1].id.clone();
+            app.tree_dbs.insert(c2.clone(), vec!["analytics".into()]);
+            app.conn_live.insert(c2.clone(), false);
+            rebuild_side_rows(&mut app);
+            let idx = app
+                .side_rows
+                .iter()
+                .position(|r| matches!(r, SideRow::Conn { idx: 1 }))
+                .unwrap();
+            app.side_sel = idx;
+            side_expand(&mut app, &tx);
+            assert!(app.conn_connecting.contains(&c2), "a reconnect is in flight");
+            assert!(matches!(
+                app.tree_db_state.get(&c2),
+                Some(TreeDbState::Loading)
+            ));
+        });
+    }
+
+    /// The red layer spells out the transaction-rollback semantics, at every
+    /// terminal size.
+    #[test]
+    fn disconnect_confirm_renders_the_rollback_warning() {
+        let mut app = tree_app();
+        app.picker_open = false;
+        let c1 = app.connections[0].clone();
+        app.conn_live.insert(c1.id.clone(), true);
+        open_disconnect_confirm(&mut app, &c1);
+        assert!(app.confirm.is_some());
+        let joined = draw(&mut app, 100, 30).join("\n");
+        // Wide glyphs leave a blank continuation cell; strip whitespace so the
+        // CJK runs are contiguous.
+        let tight: String = joined.chars().filter(|c| !c.is_whitespace()).collect();
+        assert!(tight.contains("断开连接"), "{joined}");
+        assert!(tight.contains("回滚"), "the rollback warning: {joined}");
+        // Degenerate sizes must not panic.
+        for (w, h) in [(42u16, 22u16), (30, 10), (20, 6), (1, 1)] {
+            draw(&mut app, w, h);
+        }
+    }
+
+    /// A lazy fetch failure flips the root back to idle and shows the error row.
+    #[test]
+    fn failed_lazy_fetch_marks_the_root_idle() {
+        run_rt(|| {
+            let (tx, _rx) = tokio::sync::mpsc::unbounded_channel::<OpResult>();
+            let mut app = tree_app();
+            let c2 = app.connections[1].id.clone();
+            app.conn_connecting.insert(c2.clone());
+            let gen = 1;
+            app.tree_gen.insert(c2.clone(), gen);
+            apply_op_result(
+                &mut app,
+                OpResult::TreeDatabases {
+                    conn_id: c2.clone(),
+                    databases: Vec::new(),
+                    error: Some("boom".into()),
+                    gen,
+                },
+                &tx,
+            );
+            assert!(!app.conn_connecting.contains(&c2), "the pending mark cleared");
+            assert!(!conn_is_live(&app, &c2), "a failed open is not live");
+            assert!(matches!(
+                app.tree_db_state.get(&c2),
+                Some(TreeDbState::Error(_))
+            ));
+        });
+    }
+
+    // ── R47b: auto-hiding, thin horizontal scroll bar ──
+
+    /// The pure auto-hide window.
+    #[test]
+    fn hbar_auto_hides_after_its_window() {
+        let now = Instant::now();
+        assert!(!hbar_should_show(None, now), "never poked means hidden");
+        assert!(hbar_should_show(Some(now + Duration::from_millis(1)), now));
+        assert!(!hbar_should_show(Some(now), now), "the deadline is exclusive");
+        assert!(!hbar_should_show(Some(now - Duration::from_millis(1)), now));
+        // `poke_hbar` sets a future deadline.
+        let mut app = test_app();
+        assert!(!hbar_should_show(app.hbar_until, Instant::now()));
+        app.poke_hbar();
+        assert!(hbar_should_show(app.hbar_until, Instant::now()));
+    }
+
+    /// At rest the bar is gone; a horizontal scroll brings it back, drawn with
+    /// the thin dashed/heavy line instead of the old half-cell band.
+    #[test]
+    fn hbar_shows_after_a_horizontal_scroll_with_a_thin_track() {
+        let mut app = test_app();
+        app.picker_open = false;
+        app.grid_kind = GridKind::TableData;
+        app.set_grid(ten_col_grid());
+        app.focus = Focus::Preview;
+        // First render lays out the grid and fills `vis_cols`.
+        let rows = draw(&mut app, 46, 20);
+        assert!(!app.rects.hbar_visible, "hidden at rest");
+        assert!(
+            rows.iter().all(|r| !r.contains('━') && !r.contains('┄')),
+            "no bar glyph at rest"
+        );
+        // A horizontal pan summons it.
+        assert!(pan_columns(&mut app, 1), "the grid overflows horizontally");
+        let rows = draw(&mut app, 46, 20);
+        assert!(app.rects.hbar_visible, "a horizontal scroll shows the bar");
+        let border = &rows[app.rects.hbar.y as usize];
+        assert!(
+            border.contains('━') || border.contains('┄'),
+            "thin bar drawn: {border:?}"
+        );
+        assert!(
+            !border.contains('▁') && !border.contains('▄'),
+            "the old thick band is gone: {border:?}"
+        );
+        // The `◀` / `▶` tap targets appear with the bar.
+        assert!(app.rects.hbar_prev.width == 1 && app.rects.hbar_next.width == 1);
     }
 
     fn history_row(id: &str, sql: &str) -> HistoryRow {
