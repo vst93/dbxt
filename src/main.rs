@@ -5755,6 +5755,10 @@ enum Op {
     /// A read-only store query that never touches a database connection; an
     /// unreadable / missing table degrades to the flat list.
     SidebarLayout,
+    /// R55: persist the desktop sidebar tree after a group rename / row move.
+    /// Written through the kernel store (the single sidebar_layout write point),
+    /// never a raw SQL edit of dbx.db.
+    SaveSidebarLayout(Box<serde_json::Value>),
     /// Enumerate a connection's databases. The id is [`App::conn_gen`], bumped on
     /// every switch so a slow reply for the connection the user just left is
     /// dropped instead of overwriting the new one's list.
@@ -5906,6 +5910,11 @@ enum Op {
     /// Replace an existing saved connection (id is preserved). The kernel has no
     /// UPDATE, so the op removes then re-adds the same id.
     UpdateConn(Box<ConnectionConfig>),
+    /// R55: rename a saved connection in place. A *single-connection* store
+    /// upsert (the app passes the already-loaded config), so it rewrites only
+    /// this one row and can never drop the connection's secrets or its live
+    /// pools the way a remove-then-add would.
+    RenameConn(Box<ConnectionConfig>),
     /// Remove a saved connection from DBX's store (config only; never touches
     /// the database's data).
     DeleteConn {
@@ -6028,8 +6037,20 @@ enum OpResult {
         id: String,
         version: Option<String>,
     },
-    /// R48: the parsed desktop sidebar groups (empty = flat list).
-    SidebarLayout(Box<SidebarLayout>),
+    /// R48/R55: the parsed desktop sidebar groups plus the raw store value.
+    /// The raw JSON is kept so a group rename / row move can patch just the
+    /// affected entry and persist the whole tree back, preserving every
+    /// desktop-only field the parser ignores. Empty = flat list.
+    SidebarLayout {
+        layout: Box<SidebarLayout>,
+        raw: Option<Box<serde_json::Value>>,
+    },
+    /// R55: the desktop sidebar tree was persisted (or the error that stopped
+    /// it, so a failed write is never silent).
+    SidebarLayoutSaved(Option<String>),
+    /// R55: a connection rename landed; carries the updated config so the
+    /// picker and tree can merge it in place.
+    ConnRenamed(Box<ConnectionConfig>),
     /// A saved connection was removed (id + name for the status line).
     ConnDeleted {
         id: String,
@@ -6768,17 +6789,27 @@ async fn run_op(backend: &LocalBackend, op: Op, tx: &Tx) -> OpResult {
         // desktop never wrote) or an unreadable value is not an error — it just
         // means “no groups”, so the tree stays flat.
         Op::SidebarLayout => {
-            let layout = backend
+            let raw = backend
                 .state()
                 .storage
                 .load_sidebar_layout()
                 .await
                 .ok()
-                .flatten()
-                .map(|v| parse_sidebar_layout(&v))
-                .unwrap_or_default();
-            OpResult::SidebarLayout(Box::new(layout))
+                .flatten();
+            let layout = raw.as_ref().map(parse_sidebar_layout).unwrap_or_default();
+            OpResult::SidebarLayout {
+                layout: Box::new(layout),
+                raw: raw.map(Box::new),
+            }
         }
+        // R55: the single sidebar-layout write point. Group rename / row move
+        // patch the raw JSON the tree was parsed from and save it here, so the
+        // desktop's own fields survive untouched.
+        Op::SaveSidebarLayout(raw) => match backend.state().storage.save_sidebar_layout(&raw).await
+        {
+            Ok(()) => OpResult::SidebarLayoutSaved(None),
+            Err(e) => OpResult::SidebarLayoutSaved(Some(e)),
+        },
         Op::Databases(cfg, gen) => match backend.list_databases(&cfg).await {
             Ok(dbs) if !dbs.is_empty() => OpResult::Databases {
                 databases: dbs,
@@ -7706,6 +7737,32 @@ async fn run_op(backend: &LocalBackend, op: Op, tx: &Tx) -> OpResult {
                     &[&(saved.name), &(saved.db_type.as_str())],
                 )),
                 Err(e) => OpResult::Error(format!("update: {e}")),
+            }
+        }
+        // R55: rename in place. `save_connections` is a single-connection upsert
+        // (delete + re-insert *this* id inside one transaction) that leaves every
+        // other saved connection and every stored secret untouched — the app
+        // passes the fully-loaded config, so the secret re-encrypts identically.
+        // The kernel's in-memory config map is refreshed to match.
+        Op::RenameConn(cfg) => {
+            let cfg = *cfg;
+            let id = cfg.id.clone();
+            match backend
+                .state()
+                .storage
+                .save_connections(std::slice::from_ref(&cfg))
+                .await
+            {
+                Ok(()) => {
+                    backend
+                        .state()
+                        .configs
+                        .write()
+                        .await
+                        .insert(id, cfg.clone());
+                    OpResult::ConnRenamed(Box::new(cfg))
+                }
+                Err(e) => OpResult::Error(format!("rename: {e}")),
             }
         }
         Op::DeleteConn { id, name } => match backend.remove_connection_for_mcp(&id).await {
@@ -10213,6 +10270,76 @@ enum SideHit {
     Table(String),
 }
 
+// ── R55: in-place tree rename / reorder ──
+
+/// Longest accepted connection / group display name. The field is a single-line
+/// sidebar label, so anything longer would only ever be truncated; rejecting it
+/// at save time keeps a typo (a stuck key) from silently becoming the name.
+const MAX_CONN_NAME_LEN: usize = 64;
+
+/// Upper bound for a manual per-column width override (R55).
+const COL_W_MAX: usize = 80;
+
+/// In-place rename state for a tree row (R55). Deliberately a plain string
+/// buffer — the same editing model the connection form uses (append /
+/// Backspace) — so there is no new text widget and no modal prompt: the name is
+/// edited on the row itself, Enter saves and Esc cancels.
+#[derive(Clone, Debug, PartialEq)]
+struct RenameEdit {
+    target: RenameTarget,
+    /// The live edit buffer; starts as the current name.
+    text: String,
+}
+
+/// What an in-place rename is editing. Each target is addressed by a stable id
+/// (not a list index) so a background refresh / re-sort cannot retarget the edit
+/// at the wrong row.
+#[derive(Clone, Debug, PartialEq)]
+enum RenameTarget {
+    /// A connection root.
+    Conn { id: String },
+    /// A desktop sidebar group.
+    Group { id: String },
+}
+
+/// Session-only per-column width overrides for result grids (R55). Keyed by a
+/// scope string (connection + database + schema + table, or a query bucket) and
+/// then by column *name*, so page turns, re-queries and reopening the same table
+/// in one session keep the widths. Never written to disk: the next launch starts
+/// from the natural, content-sized widths again.
+#[derive(Clone, Debug, Default, PartialEq)]
+struct ColWidthMemory {
+    scopes: HashMap<String, HashMap<String, usize>>,
+}
+
+impl ColWidthMemory {
+    fn get(&self, scope: &str, col: &str) -> Option<usize> {
+        self.scopes.get(scope).and_then(|m| m.get(col)).copied()
+    }
+
+    /// Widen / narrow `col` by `delta` display cells and return the new width.
+    /// The first adjustment starts from `current` (the width on screen), so a key
+    /// press is always a small step from what the user sees.
+    fn adjust(&mut self, scope: &str, col: &str, current: usize, delta: i32) -> usize {
+        let base = self
+            .get(scope, col)
+            .unwrap_or(current)
+            .clamp(MIN_CELL_WIDTH, COL_W_MAX) as i32;
+        let next = (base + delta).clamp(MIN_CELL_WIDTH as i32, COL_W_MAX as i32) as usize;
+        self.scopes
+            .entry(scope.to_string())
+            .or_default()
+            .insert(col.to_string(), next);
+        next
+    }
+
+    /// The overrides for one scope, applied by the renderer after the natural
+    /// content widths.
+    fn overrides(&self, scope: &str) -> Option<&HashMap<String, usize>> {
+        self.scopes.get(scope)
+    }
+}
+
 // ── desktop sidebar groups (R48) ──
 
 /// One entry inside a group (or at the top of the desktop sidebar tree): either
@@ -10538,6 +10665,12 @@ struct App {
     /// when the desktop never grouped anything, in which case the tree stays
     /// exactly as it was: every connection flat.
     sidebar_layout: SidebarLayout,
+    /// R55: the raw `sidebar_layout` JSON the tree was parsed from. Kept so a
+    /// group rename / row move can patch one entry and save the whole tree back
+    /// verbatim (every desktop-only field included).
+    sidebar_layout_raw: Option<serde_json::Value>,
+    /// R55: the tree row currently being renamed in place (connection or group).
+    rename_edit: Option<RenameEdit>,
     /// R48: group ids the user collapsed this session (groups default open).
     group_closed: std::collections::HashSet<String>,
     /// The flattened visible tree rows, rebuilt whenever the tree can change.
@@ -10898,6 +11031,8 @@ struct App {
     /// 20k-row grid's widths is O(cells); caching turns the per-frame cost into
     /// a lookup.
     width_cache: Option<(u64, usize, Vec<usize>)>,
+    /// R55: session-only per-column width overrides for result grids (`<` / `>`).
+    col_width_mem: ColWidthMemory,
 
     confirm: Option<Confirm>,
 
@@ -11334,6 +11469,8 @@ impl App {
             tree_db_state: std::collections::HashMap::new(),
             tree_gen: std::collections::HashMap::new(),
             sidebar_layout: SidebarLayout::default(),
+            sidebar_layout_raw: None,
+            rename_edit: None,
             group_closed: std::collections::HashSet::new(),
             db_sizes: std::collections::HashMap::new(),
             db_size_state: std::collections::HashMap::new(),
@@ -11487,6 +11624,7 @@ impl App {
             grid_avail: 0,
             grid_epoch: 0,
             width_cache: None,
+            col_width_mem: ColWidthMemory::default(),
             confirm: None,
             loading: true,
             // The initial `ListConnections` below is the one call not spawned through
@@ -11786,12 +11924,53 @@ fn apply_op_result(app: &mut App, res: OpResult, tx: &Tx) {
             // connection list is known.
             refresh_conn_status(app, tx);
         }
-        OpResult::SidebarLayout(layout) => {
+        OpResult::SidebarLayout { layout, raw } => {
             // R48: groups come from DBX Desktop's own store. Rebuilding the tree
             // here means a desktop regrouping shows up the next time dbxt opens
             // (the session keeps its own collapse memory).
             app.sidebar_layout = *layout;
+            // R55: keep the raw tree so a group rename / row move can patch just
+            // the affected entry and save the rest verbatim.
+            app.sidebar_layout_raw = raw.map(|v| *v);
             rebuild_side_rows(app);
+        }
+        // R55: a sidebar tree write finished. A failure must not look saved, so
+        // it is surfaced and the tree is reloaded from the store.
+        OpResult::SidebarLayoutSaved(err) => match err {
+            None => app.status = t("✓ 已保存侧栏布局").into(),
+            Some(e) => {
+                app.status = tf("✗ 保存侧栏布局失败：{}", &[&e]);
+                app.spawn(tx, Op::SidebarLayout);
+            }
+        },
+        // R55: a connection rename landed. Merge it in place (like a copy) so
+        // the browse view and the tree keep their position, and update the
+        // active config when the renamed row is the one in use.
+        OpResult::ConnRenamed(cfg) => {
+            let id = cfg.id.clone();
+            let name = cfg.name.clone();
+            // Remember the node under the cursor so a name-driven re-sort keeps
+            // the cursor on the renamed root.
+            let hit = app
+                .side_rows
+                .get(app.side_sel)
+                .and_then(|r| side_row_hit(app, r));
+            match app.connections.iter().position(|c| c.id == id) {
+                Some(i) => app.connections[i] = *cfg,
+                None => app.connections.push(*cfg),
+            }
+            sort_connection_list(&mut app.connections, app.conn_sort);
+            if app.selected.as_ref().is_some_and(|c| c.id == id) {
+                app.selected = app.connections.iter().find(|c| c.id == id).cloned();
+            }
+            rebuild_side_rows(app);
+            if let Some(h) = hit {
+                if let Some(pos) = find_side_hit(app, &app.side_rows, &h) {
+                    app.side_sel = pos;
+                    side_mirror_table(app);
+                }
+            }
+            app.status = tf("✓ 已重命名连接 {}", &[&name]);
         }
         OpResult::ConnDeleted { id, name } => {
             app.connections.retain(|c| c.id != id);
@@ -13587,6 +13766,8 @@ fn reset_overlays_for_backend_switch(app: &mut App) {
     app.row_popup = None;
     app.error_popup = None;
     app.pinned_result = None;
+    // R55: cancel an in-place tree rename on a backend switch.
+    app.rename_edit = None;
 }
 
 /// True when quitting would discard unrun work: the editor holds SQL that was
@@ -13838,6 +14019,13 @@ fn run_mongo_action(app: &mut App, tx: &Tx, mc: MongoConfirm) {
 }
 
 fn browse_key(app: &mut App, tx: &Tx, k: KeyEvent) {
+    // R55: while a tree row is being renamed in place the field owns the
+    // keyboard — a plain text field, so no global shortcut may steal a letter
+    // (pressing `q` must type `q`, not quit).
+    if app.rename_edit.is_some() {
+        rename_edit_key(app, tx, k);
+        return;
+    }
     // Overlays are modal, most-specific first. Esc always closes the current one.
     if app.help_open {
         help_key(app, k);
@@ -15050,6 +15238,18 @@ fn sidebar_key(app: &mut App, tx: &Tx, k: KeyEvent) {
             }
         }
     }
+    // R55: Shift+↑/↓ reorders the row under the cursor within its sibling list
+    // — the terminal twin of dragging a row in a GUI tree. Only rows with an
+    // explicit persisted order can move (a node inside a desktop group, or a
+    // top-level group); the tree cursor follows the row so a held key walks it.
+    if k.modifiers.contains(KeyModifiers::SHIFT)
+        && !k.modifiers.contains(KeyModifiers::CONTROL)
+        && matches!(k.code, KeyCode::Up | KeyCode::Down)
+    {
+        let dir = if k.code == KeyCode::Up { -1 } else { 1 };
+        move_side_row(app, tx, dir);
+        return;
+    }
     match k.code {
         KeyCode::Tab => app.focus = Focus::Editor,
         KeyCode::Char('c') => {
@@ -15062,6 +15262,17 @@ fn sidebar_key(app: &mut App, tx: &Tx, k: KeyEvent) {
         // SSH tunnel included) and show the new root immediately (R45).
         KeyCode::Char('Y') => copy_connection_at_cursor(app, tx),
         KeyCode::Char('o') => back_to_picker(app),
+        // R55: `r` on a connection root / group row renames it in place (Enter
+        // saves, Esc cancels). On every other row the long-standing meaning —
+        // open the selected table's structure — is unchanged.
+        KeyCode::Char('r')
+            if matches!(
+                app.side_rows.get(app.side_sel),
+                Some(SideRow::Conn { .. }) | Some(SideRow::Group { .. })
+            ) =>
+        {
+            open_rename_edit(app);
+        }
         KeyCode::Char('r') => load_structure(app, tx),
         // `s` — on a database row: lazily fetch that database's size (R45).
         // Everywhere else: cycle the sidebar order (name → type TABLE/VIEW).
@@ -18275,6 +18486,390 @@ fn tree_search_key(app: &mut App, k: KeyEvent) {
     }
 }
 
+// ── R55: in-place rename of a tree row ──
+
+/// Open the in-place rename for the tree row under the cursor. Works for a
+/// connection root and for a desktop group; any other row keeps its own `r`
+/// meaning (table structure).
+fn open_rename_edit(app: &mut App) {
+    let Some(row) = app.side_rows.get(app.side_sel).cloned() else {
+        return;
+    };
+    let edit = match &row {
+        SideRow::Conn { idx, .. } => side_root_cfg(app, *idx).map(|c| RenameEdit {
+            target: RenameTarget::Conn { id: c.id.clone() },
+            text: c.name.clone(),
+        }),
+        SideRow::Group { id, name, .. } => Some(RenameEdit {
+            target: RenameTarget::Group { id: id.clone() },
+            text: name.clone(),
+        }),
+        _ => None,
+    };
+    match edit {
+        Some(edit) => {
+            let label = match edit.target {
+                RenameTarget::Conn { .. } => t("连接"),
+                RenameTarget::Group { .. } => t("分组"),
+            };
+            app.rename_edit = Some(edit);
+            app.status = tf("重命名{}：改好后 Enter 保存 · Esc 取消", &[&label]);
+        }
+        None => app.status = t("把光标移到连接或分组行上再按 r 重命名").into(),
+    }
+}
+
+/// Key handling while a tree row is being renamed. A plain text field: append /
+/// Backspace edit, Ctrl-U clears, Enter saves and Esc cancels. Any other key is
+/// swallowed so a global shortcut (`q`, `j`, …) cannot fire mid-edit.
+fn rename_edit_key(app: &mut App, tx: &Tx, k: KeyEvent) {
+    if k.modifiers.contains(KeyModifiers::CONTROL) && k.code == KeyCode::Char('u') {
+        if let Some(e) = app.rename_edit.as_mut() {
+            e.text.clear();
+        }
+        return;
+    }
+    match k.code {
+        KeyCode::Enter => commit_rename(app, tx),
+        KeyCode::Esc => {
+            app.rename_edit = None;
+            app.status = t("已取消重命名").into();
+        }
+        KeyCode::Backspace => {
+            if let Some(e) = app.rename_edit.as_mut() {
+                e.text.pop();
+            }
+        }
+        KeyCode::Char(c)
+            if !k.modifiers.contains(KeyModifiers::CONTROL)
+                && !k.modifiers.contains(KeyModifiers::ALT)
+                && !c.is_ascii_control() =>
+        {
+            if let Some(e) = app.rename_edit.as_mut() {
+                // Cap the buffer well above the save-time limit so the length
+                // check can still explain itself instead of silently dropping
+                // keys.
+                if e.text.chars().count() < 256 {
+                    e.text.push(c);
+                }
+            }
+        }
+        _ => {}
+    }
+}
+
+/// Validate a rename buffer: trimmed, non-empty and within the length cap.
+/// Returns the cleaned name or a user-facing error (bilingual via `t` / `tf`).
+fn validate_rename_name(text: &str) -> Result<String, String> {
+    let name = text.trim().to_string();
+    if name.is_empty() {
+        return Err(t("✗ 名称不能为空").into());
+    }
+    if name.chars().count() > MAX_CONN_NAME_LEN {
+        return Err(tf("✗ 名称过长（最多 {} 字符）", &[&(MAX_CONN_NAME_LEN)]));
+    }
+    Ok(name)
+}
+
+/// Validate and apply the in-place rename. A connection is saved with a
+/// single-row store upsert (`Op::RenameConn`); a group patches only its name in
+/// the raw sidebar tree, which is then persisted as a whole via the kernel store.
+fn commit_rename(app: &mut App, tx: &Tx) {
+    let Some(edit) = app.rename_edit.take() else {
+        return;
+    };
+    let name = match validate_rename_name(&edit.text) {
+        Ok(name) => name,
+        Err(e) => {
+            app.status = e;
+            app.rename_edit = Some(edit);
+            return;
+        }
+    };
+    match &edit.target {
+        RenameTarget::Conn { id } => {
+            let Some(mut cfg) = app.connections.iter().find(|c| &c.id == id).cloned() else {
+                app.status = t("✗ 连接已不存在").into();
+                return;
+            };
+            if cfg.name == name {
+                app.status = tf("连接名未变：{}", &[&name]);
+                return;
+            }
+            cfg.name = name.clone();
+            app.status = tf("重命名连接 → {}…", &[&name]);
+            app.spawn(tx, Op::RenameConn(Box::new(cfg)));
+        }
+        RenameTarget::Group { id } => {
+            let Some(mut raw) = app.sidebar_layout_raw.clone() else {
+                app.status = t("✗ 没有可保存的桌面分组布局").into();
+                return;
+            };
+            if !patch_group_name(&mut raw, id, &name) {
+                app.status = t("✗ 分组已不存在").into();
+                return;
+            }
+            app.sidebar_layout = parse_sidebar_layout(&raw);
+            app.sidebar_layout_raw = Some(raw.clone());
+            rebuild_side_rows(app);
+            app.status = tf("已重命名分组为 {}", &[&name]);
+            app.spawn(tx, Op::SaveSidebarLayout(Box::new(raw)));
+        }
+    }
+}
+
+/// Patch one group's display name inside the raw `sidebar_layout` metadata,
+/// leaving every other desktop field untouched.
+fn patch_group_name(raw: &mut serde_json::Value, id: &str, name: &str) -> bool {
+    let Some(groups) = raw.get_mut("groups").and_then(|g| g.as_array_mut()) else {
+        return false;
+    };
+    for g in groups {
+        if g.get("id").and_then(|v| v.as_str()) == Some(id) {
+            g["name"] = serde_json::Value::String(name.to_string());
+            return true;
+        }
+    }
+    false
+}
+
+// ── R55: reorder a tree row (Shift+↑/↓) ──
+
+/// One node in the raw desktop layout, used as a move target.
+#[derive(Clone, Debug, PartialEq)]
+enum LayoutTarget {
+    Group(String),
+    Conn(String),
+}
+
+/// True when a connection id appears inside some group (at any nesting depth).
+/// A top-level connection is not part of the persisted order — it is drawn flat
+/// from the picker — so it has nothing to reorder.
+fn layout_conn_is_grouped(layout: &SidebarLayout, id: &str) -> bool {
+    fn in_nodes(nodes: &[LayoutNode], id: &str) -> bool {
+        nodes.iter().any(|n| match n {
+            LayoutNode::Conn(c) => c == id,
+            LayoutNode::Group(g) => in_nodes(&g.nodes, id),
+        })
+    }
+    layout.groups.iter().any(|g| in_nodes(&g.nodes, id))
+}
+
+fn layout_entry_matches(entry: &serde_json::Value, target: &LayoutTarget) -> bool {
+    let ty = entry.get("type").and_then(|v| v.as_str()).unwrap_or("");
+    match target {
+        LayoutTarget::Group(id) => {
+            ty == "group" && entry.get("id").and_then(|v| v.as_str()) == Some(id)
+        }
+        LayoutTarget::Conn(id) => {
+            ty == "connection" && entry.get("id").and_then(|v| v.as_str()) == Some(id)
+        }
+    }
+}
+
+/// Swap the entry matching `target` with the previous (`dir < 0`) / next
+/// (`dir > 0`) sibling in one entry array. At the top level only groups take
+/// part in the persisted order, so a group swaps with the nearest other group;
+/// inside a group every sibling (connection or nested group) is movable.
+fn swap_entry_in_array(
+    entries: &mut [serde_json::Value],
+    target: &LayoutTarget,
+    dir: i32,
+    top_level: bool,
+) -> bool {
+    let Some(i) = entries.iter().position(|e| layout_entry_matches(e, target)) else {
+        return false;
+    };
+    let candidates: Vec<usize> = if top_level {
+        (0..entries.len())
+            .filter(|&k| entries[k].get("type").and_then(|v| v.as_str()) == Some("group"))
+            .collect()
+    } else {
+        (0..entries.len()).collect()
+    };
+    let Some(pos) = candidates.iter().position(|&k| k == i) else {
+        return false;
+    };
+    let nb = if dir < 0 {
+        pos.checked_sub(1)
+    } else {
+        Some(pos + 1).filter(|p| *p < candidates.len())
+    };
+    match nb {
+        Some(p) => {
+            entries.swap(i, candidates[p]);
+            true
+        }
+        None => false,
+    }
+}
+
+/// Depth-first through the raw layout until the array holding `target` is found,
+/// then swap within it. Handles the modern `children` tree, the legacy flat
+/// `connectionIds` list, and top-level groups in `order`.
+fn swap_in_layout(raw: &mut serde_json::Value, target: &LayoutTarget, dir: i32) -> bool {
+    /// Try each group's member list, then recurse into nested groups.
+    fn walk(entries: &mut [serde_json::Value], target: &LayoutTarget, dir: i32) -> bool {
+        for e in entries.iter_mut() {
+            if e.get("type").and_then(|v| v.as_str()) != Some("group") {
+                continue;
+            }
+            if let Some(children) = e.get_mut("children").and_then(|c| c.as_array_mut()) {
+                if swap_entry_in_array(children, target, dir, false) || walk(children, target, dir)
+                {
+                    return true;
+                }
+            } else if let LayoutTarget::Conn(id) = target {
+                if let Some(ids) = e.get_mut("connectionIds").and_then(|c| c.as_array_mut()) {
+                    if let Some(i) = ids.iter().position(|v| v.as_str() == Some(id.as_str())) {
+                        let j = if dir < 0 {
+                            i.checked_sub(1)
+                        } else {
+                            Some(i + 1).filter(|j| *j < ids.len())
+                        };
+                        if let Some(j) = j {
+                            ids.swap(i, j);
+                            return true;
+                        }
+                        return false;
+                    }
+                }
+            }
+        }
+        false
+    }
+    let Some(order) = raw.get_mut("order").and_then(|o| o.as_array_mut()) else {
+        return false;
+    };
+    // Top level: a group swaps with the nearest other top-level group; if it is
+    // already at that end the move reports failure (walk must not then swap it
+    // past a bare connection entry, which the tree does not draw in place).
+    if swap_entry_in_array(order, target, dir, true) {
+        return true;
+    }
+    walk(order, target, dir)
+}
+
+/// Shift+↑/↓ on a tree row: move it one slot within its sibling list, re-parse
+/// and persist the desktop tree. The tree cursor follows the row.
+fn move_side_row(app: &mut App, tx: &Tx, dir: i32) {
+    let Some(row) = app.side_rows.get(app.side_sel).cloned() else {
+        return;
+    };
+    let (target, label) = match &row {
+        SideRow::Conn { idx, .. } => {
+            let Some(c) = side_root_cfg(app, *idx) else {
+                return;
+            };
+            (LayoutTarget::Conn(c.id.clone()), c.name.clone())
+        }
+        SideRow::Group { id, name, .. } => (LayoutTarget::Group(id.clone()), name.clone()),
+        _ => {
+            app.status = t("Shift+↑/↓ 只能移动连接根或分组行").into();
+            return;
+        }
+    };
+    // A top-level connection has no persisted order (it follows the picker's
+    // sort), so point at the fix instead of silently swapping nothing.
+    if let LayoutTarget::Conn(id) = &target {
+        if !layout_conn_is_grouped(&app.sidebar_layout, id) {
+            app.status = t("顶层未分组连接按名称排序；先放进分组再调整顺序").into();
+            return;
+        }
+    }
+    let Some(mut raw) = app.sidebar_layout_raw.clone() else {
+        app.status = t("✗ 没有可调整的桌面分组布局").into();
+        return;
+    };
+    if !swap_in_layout(&mut raw, &target, dir) {
+        app.status = t("已经在同层的最上 / 最下").into();
+        return;
+    }
+    app.sidebar_layout = parse_sidebar_layout(&raw);
+    app.sidebar_layout_raw = Some(raw.clone());
+    rebuild_side_rows(app);
+    let hit = match &target {
+        LayoutTarget::Conn(id) => SideHit::Conn(id.clone()),
+        LayoutTarget::Group(id) => SideHit::Group(id.clone()),
+    };
+    if let Some(pos) = find_side_hit(app, &app.side_rows, &hit) {
+        app.side_sel = pos;
+        side_mirror_table(app);
+    }
+    let arrow = if dir < 0 { "↑" } else { "↓" };
+    app.status = tf("已移动 {} {}", &[&label, &arrow]);
+    app.spawn(tx, Op::SaveSidebarLayout(Box::new(raw)));
+}
+
+// ── R55: session column-width memory (`<` / `>`) ──
+
+/// Scope a manual column-width override is remembered under. A browsed table
+/// keys on connection + database + schema + table (stable across page turns and
+/// re-queries); every other result grid shares one bucket per connection.
+fn col_width_scope(app: &App) -> String {
+    let conn = app
+        .selected
+        .as_ref()
+        .map(|c| c.id.clone())
+        .unwrap_or_default();
+    if app.grid_kind == GridKind::TableData {
+        if let Some(ps) = &app.page_state {
+            return format!(
+                "t\u{0}{conn}\u{0}{}\u{0}{}\u{0}{}",
+                app.current_db(),
+                ps.schema,
+                ps.table
+            );
+        }
+    }
+    format!("q\u{0}{conn}")
+}
+
+/// `<` / `>` on the focused result column: widen / narrow it, remembered for
+/// the session. Never persisted.
+fn adjust_col_width(app: &mut App, delta: i32) {
+    let Some(grid) = active_grid(app) else {
+        app.status = t("没有可调整列宽的结果").into();
+        return;
+    };
+    // The drilled script list has no grid column under the cursor.
+    if app.script.as_ref().is_some_and(|s| s.drilled.is_none()) {
+        app.status = t("展开一条语句结果后再调列宽").into();
+        return;
+    }
+    let Some(name) = grid.columns.get(app.col_cursor).cloned() else {
+        return;
+    };
+    let current = app
+        .grid_widths
+        .get(app.col_cursor)
+        .copied()
+        .unwrap_or(MIN_CELL_WIDTH);
+    let scope = col_width_scope(app);
+    let next = app.col_width_mem.adjust(&scope, &name, current, delta);
+    let disp = fix_double_encoding(&name);
+    app.status = tf(
+        "列宽 {} → {} 格 · 会话内记忆（< 收窄 / > 加宽）",
+        &[&disp, &next],
+    );
+}
+
+/// Apply the session overrides to the natural widths of `grid`, in place.
+fn apply_col_width_overrides(app: &App, grid: &Grid, widths: &mut [usize]) {
+    let scope = col_width_scope(app);
+    let Some(map) = app.col_width_mem.overrides(&scope) else {
+        return;
+    };
+    for (ci, name) in grid.columns.iter().enumerate() {
+        if ci >= widths.len() {
+            break;
+        }
+        if let Some(w) = map.get(name) {
+            widths[ci] = (*w).clamp(MIN_CELL_WIDTH, COL_W_MAX);
+        }
+    }
+}
+
 /// Rebuild the flattened tree and keep the cursor in sync. An external move of
 /// `table_list` (first-letter jump, recent tables, filter Enter, count jump, a
 /// global-search hit) drags the tree cursor onto that table; a tree move drags
@@ -20296,6 +20891,11 @@ fn preview_key(app: &mut App, tx: &Tx, k: KeyEvent) {
         KeyCode::Char('*') => open_col_filter(app),
         // `|` jumps straight to a column by number or name prefix (wide tables).
         KeyCode::Char('|') => open_col_jump(app),
+        // R55: `<` / `>` narrow / widen the focused column, remembered for the
+        // session per table (never persisted). The terminal twin of dragging a
+        // column border.
+        KeyCode::Char('<') => adjust_col_width(app, -2),
+        KeyCode::Char('>') => adjust_col_width(app, 2),
         // `y` in the script *list* copies the focused statement's whole result
         // as CSV (the same format Ctrl-Y export leads with, R22); in a grid it
         // keeps copying the focused row as an INSERT statement.
@@ -30710,6 +31310,8 @@ enum FooterView {
     DbPicker,
     RedisPrompt,
     MongoDoc,
+    /// R55: an in-place tree-row rename owns the keyboard.
+    Rename,
     TablePrompt,
     HistoryFilter,
     History,
@@ -30764,6 +31366,8 @@ fn footer_ctx_inner(app: &App, include_help: bool) -> FooterCtx {
         FooterView::EditDialog
     } else if app.history_confirm.is_some() {
         FooterView::Confirm
+    } else if app.rename_edit.is_some() {
+        FooterView::Rename
     } else if include_help && app.help_open {
         FooterView::Help
     } else if include_help && app.help_mini {
@@ -30891,6 +31495,11 @@ fn footer_hints_ctx(ctx: FooterCtx) -> Vec<Hint> {
     let mut v: Vec<Hint> = match ctx.view {
         FooterView::Help => vec![("↑↓", t("滚动")), ("Esc", t("关闭"))],
         FooterView::HelpMini => vec![("Enter/?", t("全部键位")), ("Esc", t("关闭"))],
+        FooterView::Rename => vec![
+            ("Enter", t("保存")),
+            ("Esc", t("取消")),
+            ("Ctrl-U", t("清空")),
+        ],
         // R20–R22 overlays: import / export / Redis input dialogs. Without
         // these arms the footer fell through to the page's group while an
         // overlay owned the keyboard.
@@ -31134,7 +31743,8 @@ fn footer_hints_ctx(ctx: FooterCtx) -> Vec<Hint> {
                 ("a-z", t("过滤")),
                 ("f", t("搜索")),
                 ("Enter", t("浏览")),
-                ("r", t("结构")),
+                ("r", t("结构/改名")),
+                ("⇧↑↓", t("移动")),
                 ("s", t("排序")),
                 ("x", t("断开连接")),
                 ("Alt+a-z", t("首字母跳")),
@@ -31937,11 +32547,14 @@ fn render_grid(
     // them per displayed grid (and width cap) so scrolling 20k rows is a lookup,
     // not a rescan. The drilled-script grid is rebuilt per frame, so it skips
     // the cache.
-    let widths: Vec<usize> = if cache {
+    let mut widths: Vec<usize> = if cache {
         app.column_widths(grid, max_cell)
     } else {
         natural_widths(grid, max_cell)
     };
+    // R55: a session column-width override wins over the natural width, so a
+    // manual `<` / `>` adjustment survives page turns and re-queries.
+    apply_col_width_overrides(app, grid, &mut widths);
     let frozen =
         effective_frozen_widths(app.freeze_first, ncols, &widths, gutter as usize, inner_w);
     let left_w: usize = gutter as usize
@@ -32911,10 +33524,24 @@ fn side_row_line(
             ));
             let badge = format!(" [{count}]");
             let name_w = inner.saturating_sub(disp_width(&badge));
-            spans.push(Span::styled(
-                truncate_disp(name, name_w),
-                mk(Style::default().add_modifier(Modifier::BOLD)),
-            ));
+            // R55: while this group is being renamed, draw the live edit buffer
+            // (with a caret) in place of the name.
+            let editing = app
+                .rename_edit
+                .as_ref()
+                .filter(|e| matches!(&e.target, RenameTarget::Group { id: gid } if gid == id));
+            match editing {
+                Some(e) => spans.push(Span::styled(
+                    format!("{}▏", e.text),
+                    mk(Style::default()
+                        .fg(Color::Yellow)
+                        .add_modifier(Modifier::BOLD)),
+                )),
+                None => spans.push(Span::styled(
+                    truncate_disp(name, name_w),
+                    mk(Style::default().add_modifier(Modifier::BOLD)),
+                )),
+            }
             spans.push(Span::styled(
                 badge,
                 mk(Style::default().fg(Color::DarkGray)),
@@ -32924,14 +33551,15 @@ fn side_row_line(
             let _ = id;
         }
         SideRow::Conn { idx, .. } => {
-            let (name, color, open, ro) = match side_root_cfg(app, *idx) {
+            let (cid, name, color, open, ro) = match side_root_cfg(app, *idx) {
                 Some(c) => (
+                    c.id.clone(),
                     c.name.clone(),
                     connection_color(c),
                     side_conn_open(app, *idx),
                     c.read_only,
                 ),
-                None => (String::new(), Color::Gray, false, false),
+                None => (String::new(), String::new(), Color::Gray, false, false),
             };
             let status = side_conn_status(app, *idx);
             spans.push(Span::styled(
@@ -32952,6 +33580,21 @@ fn side_row_line(
                     "🔒 ".to_string(),
                     mk(Style::default().fg(color)),
                 ));
+            }
+            // R55: while this root is being renamed, draw the live edit buffer
+            // (with a caret) instead of the name.
+            let editing = app
+                .rename_edit
+                .as_ref()
+                .filter(|e| matches!(&e.target, RenameTarget::Conn { id } if *id == cid));
+            if let Some(e) = editing {
+                spans.push(Span::styled(
+                    format!("{}▏", e.text),
+                    mk(Style::default()
+                        .fg(Color::Yellow)
+                        .add_modifier(Modifier::BOLD)),
+                ));
+                return Line::from(spans);
             }
             let name_w = inner.saturating_sub(if ro { 2 } else { 0 });
             // A disconnected root's name is muted grey so it cannot be mistaken
@@ -36838,6 +37481,14 @@ const HELP_ROWS: &[(&str, &str)] = &[
     ),
     ("t", "最近表浮层（Enter 直达）"),
     ("r", "表结构（字段 + DDL）"),
+    (
+        "r（连接根 / 分组行）",
+        "就地重命名：改好后 Enter 保存、Esc 取消、Ctrl-U 清空（空 / 超长会提示）",
+    ),
+    (
+        "Shift+↑/↓",
+        "在同一层内上 / 下移动连接或分组（改桌面分组顺序并写回 sidebar_layout；顶层未分组连接按名称排序）",
+    ),
     ("I", "导入 CSV 到当前表（预览 + 追加/覆盖确认）"),
     (
         "d",
@@ -36923,6 +37574,10 @@ const HELP_ROWS: &[(&str, &str)] = &[
     (
         "w / Alt-C",
         "紧凑列宽 开 / 关（窄屏默认自动开，按 库.表 记住）",
+    ),
+    (
+        "< / >",
+        "收窄 / 加宽当前列，会话内记忆（翻页 / 重新查询不丢，不跨会话持久化）",
     ),
     (
         "c / Alt-V",
@@ -43534,6 +44189,252 @@ mod tests {
         );
         assert!(app.filter_prompt.is_none(), "x must not open the filter");
         assert!(app.table_filter.is_empty(), "x must not seed the filter");
+    }
+
+    // ── R55: tree rename validation / reorder / column-width memory ──
+
+    fn json(s: &str) -> serde_json::Value {
+        serde_json::from_str(s).unwrap()
+    }
+
+    /// A rename buffer is trimmed, rejected when empty or over the cap, and the
+    /// two failure messages have English translations (bilingual errors).
+    #[test]
+    fn rename_name_validation_and_bilingual_errors() {
+        assert!(validate_rename_name("   ").is_err());
+        assert!(validate_rename_name(&"x".repeat(MAX_CONN_NAME_LEN + 1)).is_err());
+        assert_eq!(validate_rename_name("  prod  ").unwrap(), "prod");
+        assert!(validate_rename_name(&"x".repeat(MAX_CONN_NAME_LEN)).is_ok());
+        assert_eq!(
+            ui_text::t_lang("✗ 名称不能为空", ui_text::Lang::En),
+            "✗ name cannot be empty"
+        );
+        assert!(ui_text::t_lang("✗ 名称过长（最多 {} 字符）", ui_text::Lang::En).contains("{}"));
+    }
+
+    /// R55: a grouped connection swaps with its previous sibling inside the
+    /// group's `children` array, and `parse_sidebar_layout` reflects the new
+    /// order; a move past the top of the list reports failure.
+    #[test]
+    fn layout_swap_moves_grouped_connection_up_and_down() {
+        let mut raw = json(
+            r#"{
+                "groups":[{"id":"g1","name":"prod"}],
+                "order":[{"type":"group","id":"g1","children":[
+                    {"type":"connection","id":"c1"},
+                    {"type":"connection","id":"c2"}
+                ]}]
+            }"#,
+        );
+        let target = LayoutTarget::Conn("c2".into());
+        assert!(swap_in_layout(&mut raw, &target, -1));
+        let parsed = parse_sidebar_layout(&raw);
+        assert_eq!(
+            parsed.groups[0].nodes,
+            vec![LayoutNode::Conn("c2".into()), LayoutNode::Conn("c1".into())]
+        );
+        // Already at the top: another up is a no-op that reports failure.
+        assert!(!swap_in_layout(&mut raw, &target, -1));
+        // Down brings it back to the end.
+        assert!(swap_in_layout(&mut raw, &target, 1));
+        assert_eq!(
+            parse_sidebar_layout(&raw).groups[0].nodes,
+            vec![LayoutNode::Conn("c1".into()), LayoutNode::Conn("c2".into())]
+        );
+    }
+
+    /// R55: a nested group moves within its parent's `children`, top-level
+    /// groups move only among other top-level groups (never past a bare
+    /// connection entry), and ungrouped connections are not movable at all.
+    #[test]
+    fn layout_swap_handles_nested_groups_and_top_level() {
+        let mut raw = json(
+            r#"{
+                "groups":[
+                    {"id":"g1","name":"prod"},
+                    {"id":"g2","name":"core"},
+                    {"id":"g3","name":"archive"}
+                ],
+                "order":[
+                    {"type":"group","id":"g1","children":[
+                        {"type":"connection","id":"c1"},
+                        {"type":"group","id":"g2","children":[{"type":"connection","id":"c2"}]}
+                    ]},
+                    {"type":"connection","id":"c9"},
+                    {"type":"group","id":"g3","children":[{"type":"connection","id":"c3"}]}
+                ]
+            }"#,
+        );
+        // A nested group swaps with its previous sibling (the connection c1).
+        assert!(swap_in_layout(
+            &mut raw,
+            &LayoutTarget::Group("g2".into()),
+            -1
+        ));
+        let g1 = &parse_sidebar_layout(&raw).groups[0];
+        assert!(matches!(g1.nodes[0], LayoutNode::Group(ref g) if g.id == "g2"));
+        // Top-level g3 swaps with the nearest top-level group (g1); the bare
+        // connection entry c9 is skipped over, not swapped with.
+        assert!(swap_in_layout(
+            &mut raw,
+            &LayoutTarget::Group("g3".into()),
+            -1
+        ));
+        let order = raw["order"].as_array().unwrap();
+        assert_eq!(order[0]["id"], "g3");
+        assert_eq!(order[1]["id"], "c9");
+        assert_eq!(order[2]["id"], "g1");
+        // g3 is now the first top-level group: no further up move.
+        assert!(!swap_in_layout(
+            &mut raw,
+            &LayoutTarget::Group("g3".into()),
+            -1
+        ));
+        // An ungrouped connection is not part of any group's member list.
+        assert!(!swap_in_layout(
+            &mut raw,
+            &LayoutTarget::Conn("c9".into()),
+            -1
+        ));
+    }
+
+    /// R55: the legacy flat `connectionIds` form can be reordered too.
+    #[test]
+    fn layout_swap_handles_legacy_connection_ids() {
+        let mut raw = json(
+            r#"{
+                "groups":[{"id":"g1","name":"prod"}],
+                "order":[{"type":"group","id":"g1","connectionIds":["c1","c2"]}]
+            }"#,
+        );
+        assert!(swap_in_layout(
+            &mut raw,
+            &LayoutTarget::Conn("c2".into()),
+            -1
+        ));
+        let ids = raw["order"][0]["connectionIds"].as_array().unwrap();
+        assert_eq!(ids[0], "c2");
+        assert_eq!(ids[1], "c1");
+    }
+
+    /// R55: `move_side_row` re-parses the tree, keeps the cursor on the moved
+    /// connection, and refuses a top-level ungrouped connection with a hint.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn move_side_row_updates_tree_and_cursor() {
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel::<OpResult>();
+        let mut app = tree_app();
+        let raw = json(
+            r#"{
+                "groups":[{"id":"g1","name":"prod"}],
+                "order":[{"type":"group","id":"g1","children":[
+                    {"type":"connection","id":"id-mysql"},
+                    {"type":"connection","id":"id-postgres"}
+                ]}]
+            }"#,
+        );
+        app.sidebar_layout = parse_sidebar_layout(&raw);
+        app.sidebar_layout_raw = Some(raw);
+        rebuild_side_rows(&mut app);
+        let pos = app
+            .side_rows
+            .iter()
+            .position(|r| matches!(r, SideRow::Conn { idx: 1, .. }))
+            .unwrap();
+        app.side_sel = pos;
+        move_side_row(&mut app, &tx, -1);
+        assert_eq!(
+            app.sidebar_layout.groups[0].nodes,
+            vec![
+                LayoutNode::Conn("id-postgres".into()),
+                LayoutNode::Conn("id-mysql".into())
+            ]
+        );
+        assert!(matches!(
+            app.side_rows[app.side_sel],
+            SideRow::Conn { idx: 1, .. }
+        ));
+        // With no groups at all, a connection cannot be reordered.
+        let mut flat = tree_app();
+        rebuild_side_rows(&mut flat);
+        flat.side_sel = flat
+            .side_rows
+            .iter()
+            .position(|r| matches!(r, SideRow::Conn { idx: 1, .. }))
+            .unwrap();
+        move_side_row(&mut flat, &tx, -1);
+        assert!(flat.status.contains("分组"), "{}", flat.status);
+    }
+
+    /// R55: a rename buffers the row in place — the rendered tree line carries
+    /// the edit text and a caret instead of the old name.
+    #[test]
+    fn rename_renders_inline_on_the_row() {
+        let mut app = tree_app();
+        app.rename_edit = Some(RenameEdit {
+            target: RenameTarget::Conn {
+                id: "id-mysql".into(),
+            },
+            text: "new-name".into(),
+        });
+        rebuild_side_rows(&mut app);
+        let row = app
+            .side_rows
+            .iter()
+            .find(|r| matches!(r, SideRow::Conn { idx: 0, .. }))
+            .cloned()
+            .unwrap();
+        let line = side_row_line(&app, &row, true, "", 60);
+        let text: String = line.spans.iter().map(|s| s.content.as_ref()).collect();
+        assert!(text.contains("new-name▏"), "{text}");
+    }
+
+    /// R55: the session column-width memory widens / narrows from the current
+    /// width, clamps at both ends, and keeps scopes and columns independent.
+    #[test]
+    fn column_width_memory_clamps_and_scopes() {
+        let mut mem = ColWidthMemory::default();
+        let scope = "t\u{0}c1\u{0}db\u{0}\u{0}orders";
+        assert_eq!(mem.get(scope, "id"), None);
+        // First adjustment starts from what is on screen.
+        assert_eq!(mem.adjust(scope, "id", 10, 4), 14);
+        assert_eq!(mem.get(scope, "id"), Some(14));
+        assert_eq!(mem.adjust(scope, "id", 14, -100), MIN_CELL_WIDTH);
+        assert_eq!(mem.adjust(scope, "id", MIN_CELL_WIDTH, 1000), COL_W_MAX);
+        // A different column and a different scope are untouched.
+        assert_eq!(mem.get(scope, "name"), None);
+        assert_eq!(mem.get("other", "id"), None);
+        assert_eq!(mem.adjust(scope, "name", 8, 2), 10);
+        assert_eq!(mem.get(scope, "id"), Some(COL_W_MAX));
+    }
+
+    /// R55: the width scope is stable across a page turn on the same table, and
+    /// differs for another table / a plain query result.
+    #[test]
+    fn col_width_scope_is_stable_across_pages() {
+        let mut app = tree_app();
+        app.grid_kind = GridKind::TableData;
+        app.schema = String::new();
+        let page_state = |page: usize, table: &str| PageState {
+            table: table.into(),
+            schema: String::new(),
+            table_type: Some("TABLE".into()),
+            page,
+            page_size: PAGE_SIZE,
+            total: None,
+            total_lower_bound: false,
+            has_next: false,
+            filter: String::new(),
+            order_by: None,
+            keyset: None,
+        };
+        app.page_state = Some(page_state(0, "orders"));
+        let a = col_width_scope(&app);
+        app.page_state = Some(page_state(3, "orders"));
+        assert_eq!(a, col_width_scope(&app), "a page turn keeps the scope");
+        app.page_state = Some(page_state(0, "users"));
+        assert_ne!(a, col_width_scope(&app), "another table is another scope");
+        app.grid_kind = GridKind::Query;
+        assert!(col_width_scope(&app).starts_with("q\u{0}"));
     }
 
     // ── R48: pinned result pane ──

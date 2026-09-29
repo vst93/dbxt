@@ -3070,6 +3070,56 @@ fn en_of(zh: &'static str) -> Option<&'static str> {
         }
         "s（库行）" => Some("s (db row)"),
         "尺寸列" => Some("size column"),
+        // R55: in-place tree rename / reorder and session column widths.
+        "重命名{}：改好后 Enter 保存 · Esc 取消" => {
+            Some("Rename {}: edit, then Enter to save · Esc to cancel")
+        }
+        "把光标移到连接或分组行上再按 r 重命名" => {
+            Some("Move the cursor onto a connection or group row, then press r to rename")
+        }
+        "已取消重命名" => Some("rename cancelled"),
+        "✗ 名称不能为空" => Some("✗ name cannot be empty"),
+        "✗ 名称过长（最多 {} 字符）" => {
+            Some("✗ name too long (at most {} characters)")
+        }
+        "✗ 连接已不存在" => Some("✗ connection no longer exists"),
+        "连接名未变：{}" => Some("connection name unchanged: {}"),
+        "重命名连接 → {}…" => Some("renaming connection → {}…"),
+        "✗ 没有可保存的桌面分组布局" => Some("✗ no desktop group layout to save"),
+        "✗ 分组已不存在" => Some("✗ group no longer exists"),
+        "已重命名分组为 {}" => Some("renamed group to {}"),
+        "Shift+↑/↓ 只能移动连接根或分组行" => {
+            Some("Shift+↑/↓ only moves a connection root or a group row")
+        }
+        "顶层未分组连接按名称排序；先放进分组再调整顺序" => {
+            Some("top-level ungrouped connections sort by name; put it in a group before reordering")
+        }
+        "✗ 没有可调整的桌面分组布局" => Some("✗ no desktop group layout to reorder"),
+        "已经在同层的最上 / 最下" => Some("already at the top / bottom of its level"),
+        "已移动 {} {}" => Some("moved {} {}"),
+        "没有可调整列宽的结果" => Some("no result to resize"),
+        "展开一条语句结果后再调列宽" => {
+            Some("open a statement's result before resizing columns")
+        }
+        "列宽 {} → {} 格 · 会话内记忆（< 收窄 / > 加宽）" => {
+            Some("column {} → {} cells · remembered for this session (< narrow / > widen)")
+        }
+        "清空" => Some("clear"),
+        "分组" => Some("group"),
+        "结构/改名" => Some("structure/rename"),
+        "✓ 已保存侧栏布局" => Some("✓ sidebar layout saved"),
+        "✗ 保存侧栏布局失败：{}" => Some("✗ failed to save sidebar layout: {}"),
+        "✓ 已重命名连接 {}" => Some("✓ renamed connection {}"),
+        "r（连接根 / 分组行）" => Some("r (connection root / group row)"),
+        "就地重命名：改好后 Enter 保存、Esc 取消、Ctrl-U 清空（空 / 超长会提示）" => {
+            Some("rename in place: edit, then Enter to save, Esc to cancel, Ctrl-U to clear (empty / over-long is rejected)")
+        }
+        "在同一层内上 / 下移动连接或分组（改桌面分组顺序并写回 sidebar_layout；顶层未分组连接按名称排序）" => {
+            Some("move a connection or group up / down within its level (rewrites the desktop group order and saves sidebar_layout; top-level ungrouped connections sort by name)")
+        }
+        "收窄 / 加宽当前列，会话内记忆（翻页 / 重新查询不丢，不跨会话持久化）" => {
+            Some("narrow / widen the focused column, remembered for this session (survives paging / re-querying; not persisted across launches)")
+        }
         _ => None,
     }
 }
