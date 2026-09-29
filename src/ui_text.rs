@@ -547,7 +547,7 @@ pub static ALL_KEYS: &[&str] = &[
     "树",
     "树 {}/{}",
     "折叠/展开",
-    "表名. 后只补该表列名；FROM/JOIN 后优先表名；WHERE/ON 后优先列名",
+    "表名. 后只补该表列名；FROM/JOIN 后只补表名；WHERE/ON 后只补列名",
     "表结构尚未加载，稍后重试",
     "表结构视图不支持搜索",
     "表结构视图没有可复制的数据行",
@@ -1065,11 +1065,49 @@ pub static ALL_KEYS: &[&str] = &[
     "聚焦并把光标放到点击处（含横滚偏移；点在文本下方 = 跳文末）",
     "纵向滚行；Shift/Alt/Ctrl+滚轮 或左右滑动 = 横滚列",
     "整行详情（纵向，含隐藏列；看某一行从这里进；结果区双击行同效）",
+    // R48: pinned results pane / column-structure popup / desktop groups
+    "📌 已解除钉住",
+    "无可钉住的结果（先打开一张表或执行查询）",
+    "无可钉住的结果",
+    "📌 已钉住结果区 · 切换表/库仍显示 · Alt-F 解除",
+    "g… d=表结构 t=表数据 v=定位值 c=列结构",
+    "无可显示的列（先打开一张表或执行查询）",
+    " 列结构 · {} · {} 列 · j/k 滚动 · Esc 关 ",
+    " 列结构 · j/k · Esc ",
 ];
 
 /// The Chinese → English table. Keys must match the source literals exactly.
 fn en_of(zh: &'static str) -> Option<&'static str> {
     match zh {
+        // ── R48: pinned results pane / zc column-structure popup ──
+        "📌 已解除钉住" => Some("📌 Unpinned"),
+        "无可钉住的结果（先打开一张表或执行查询）" => {
+            Some("Nothing to pin (open a table or run a query first)")
+        }
+        "无可钉住的结果" => Some("Nothing to pin"),
+        "📌 已钉住结果区 · 切换表/库仍显示 · Alt-F 解除" => Some(
+            "📌 Results pinned · stays visible after switching tables/DBs · Alt-F to unpin",
+        ),
+        "g… d=表结构 t=表数据 v=定位值 c=列结构" => {
+            Some("g… d=structure t=data v=locate c=columns")
+        }
+        "无可显示的列（先打开一张表或执行查询）" => {
+            Some("No columns to show (open a table or run a query first)")
+        }
+        " 列结构 · {} · {} 列 · j/k 滚动 · Esc 关 " => {
+            Some(" Columns · {} · {} · j/k scroll · Esc close ")
+        }
+        " 列结构 · j/k · Esc " => Some(" Columns · j/k · Esc "),
+        "分组节点" => Some("group node"),
+        "DBX 桌面的连接分组（▾ 组名 [n]）；h l / ← → 折叠展开，会话内记忆；无分组则平铺" => Some(
+            "DBX Desktop connection groups (▾ name [n]); h l / ← → fold and unfold, remembered for the session; a layout with no groups stays flat",
+        ),
+        "列结构弹层：列名 / 类型 / 可空 / 注释（缓存元数据，不额外查库）" => Some(
+            "Column-structure popup: name / type / nullable / comment (cached metadata, no extra query)",
+        ),
+        "钉住 / 解除当前结果区（钉住后切换表/库仍显示，上下对照）" => Some(
+            "Pin / unpin the current results pane (a pinned grid stays visible after switching tables/DBs, for up-and-down comparison)",
+        ),
         // ── R47b connection status / manual disconnect ──
         "断开连接" => Some("disconnect"),
         "断开选中连接（关闭连接池，未提交手动事务回滚；配置保留，可重连）" => Some(
@@ -1999,7 +2037,7 @@ fn en_of(zh: &'static str) -> Option<&'static str> {
         "树" => Some("tree"),
         "树 {}/{}" => Some("tree {}/{}"),
         "折叠/展开" => Some("collapse/expand"),
-        "表名. 后只补该表列名；FROM/JOIN 后优先表名；WHERE/ON 后优先列名" => Some("After table.: only that table's columns; after FROM/JOIN: tables first; after WHERE/ON: columns first"),
+        "表名. 后只补该表列名；FROM/JOIN 后只补表名；WHERE/ON 后只补列名" => Some("After table.: only that table's columns; after FROM/JOIN: only tables; after WHERE/ON: only columns"),
         "表结构尚未加载，稍后重试" => Some("Table structure not loaded yet, try again later"),
         "表结构视图不支持搜索" => Some("Structure view does not support search"),
         "表结构视图没有可复制的数据行" => Some("Structure view has no data row to copy"),

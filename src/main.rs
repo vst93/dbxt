@@ -3531,6 +3531,17 @@ struct ScriptView {
     drilled: Option<usize>,
 }
 
+/// A frozen snapshot of the results pane (R48). `Alt-F` in the results pane
+/// pins the current grid so it keeps showing above whatever comes next: switch
+/// to another table / database and the pinned grid stays on top for an up/down
+/// comparison. Pressing `Alt-F` again releases it.
+#[derive(Clone)]
+struct PinnedResult {
+    title: String,
+    grid: Grid,
+    kind: GridKind,
+}
+
 /// One saved query result the user can flip back to with `[` / `]` (DBX keeps
 /// a result tab per run; this is the TUI equivalent for query results).
 #[derive(Clone)]
@@ -4153,7 +4164,7 @@ struct RedisPrompt {
 
 /// SQL prefix-completion popup in the editor (Alt-/). Tab / Enter accept,
 /// Esc cancels; typing keeps refining the candidate list.
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 struct CompletionItem {
     text: String,
     /// `T` table, `C` column, `K` keyword — shown in the popup.
@@ -5479,6 +5490,10 @@ struct SearchHit {
 
 enum Op {
     ListConnections,
+    /// R48: DBX Desktop's persisted sidebar groups (`sidebar_layout.layout_json`).
+    /// A read-only store query that never touches a database connection; an
+    /// unreadable / missing table degrades to the flat list.
+    SidebarLayout,
     /// Enumerate a connection's databases. The id is [`App::conn_gen`], bumped on
     /// every switch so a slow reply for the connection the user just left is
     /// dropped instead of overwriting the new one's list.
@@ -5731,6 +5746,8 @@ impl Op {
 
 enum OpResult {
     Connections(Vec<ConnectionConfig>),
+    /// R48: the parsed desktop sidebar groups (empty = flat list).
+    SidebarLayout(Box<SidebarLayout>),
     /// A saved connection was removed (id + name for the status line).
     ConnDeleted { id: String, name: String },
     Databases {
@@ -6344,6 +6361,21 @@ async fn run_op(backend: &LocalBackend, op: Op, tx: &Tx) -> OpResult {
             Ok(cs) => OpResult::Connections(cs),
             Err(e) => OpResult::Error(format!("load connections: {e}")),
         },
+        // R48: read the desktop sidebar tree. A missing table (a store the
+        // desktop never wrote) or an unreadable value is not an error — it just
+        // means “no groups”, so the tree stays flat.
+        Op::SidebarLayout => {
+            let layout = backend
+                .state()
+                .storage
+                .load_sidebar_layout()
+                .await
+                .ok()
+                .flatten()
+                .map(|v| parse_sidebar_layout(&v))
+                .unwrap_or_default();
+            OpResult::SidebarLayout(Box::new(layout))
+        }
         Op::Databases(cfg, gen) => match backend.list_databases(&cfg).await {
             Ok(dbs) if !dbs.is_empty() => OpResult::Databases {
                 databases: dbs,
@@ -9527,22 +9559,137 @@ enum NavEntry {
 
 /// One visible row of the sidebar connection tree (R43). The sidebar used to be
 /// a flat connection header + database row + table list; it is now a real tree:
-/// connection → database → table, with the same rows navigable by one cursor.
+/// group → connection → database → table, with the same rows navigable by one
+/// cursor. `depth` counts the ancestor *groups* (0 when a node is not inside a
+/// group), so R48's nested desktop groups indent the whole subtree under them.
 #[derive(Clone, PartialEq, Debug)]
 enum SideRow {
+    /// R48: a desktop sidebar group (`▾ name [n]`). `count` is the number of
+    /// live connections inside it (nested groups included).
+    Group { id: String, name: String, depth: usize, count: usize, open: bool },
     /// A connection root (every saved connection is a root).
-    Conn { idx: usize },
+    Conn { idx: usize, depth: usize },
     /// A non-current connection's database list is being fetched.
-    ConnLoading { idx: usize },
+    ConnLoading { idx: usize, depth: usize },
     /// A non-current connection's database list could not be fetched.
-    ConnError { idx: usize, msg: String },
+    ConnError { idx: usize, msg: String, depth: usize },
     /// A database under a connection. `idx` is the connection's index.
-    Db { idx: usize, db: String },
+    Db { idx: usize, db: String, depth: usize },
     /// A table / collection under the current connection's current database.
-    /// `table` indexes `App::tables`; `depth` is 2 with a database layer, 1 when
-    /// tables hang directly under the connection (SQLite and friends).
+    /// `table` indexes `App::tables`.
     Table { idx: usize, table: usize, depth: usize },
 }
+
+// ── desktop sidebar groups (R48) ──
+
+/// One entry inside a group (or at the top of the desktop sidebar tree): either
+/// a nested group or a connection id. The order is the desktop's own order, so
+/// the dbxt tree mirrors it exactly (a group may hold `conn A`, `group B`,
+/// `conn C` in any interleaving).
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum LayoutNode {
+    Group(LayoutGroup),
+    Conn(String),
+}
+
+/// One group in DBX Desktop's persisted sidebar tree, parsed from
+/// `sidebar_layout.layout_json`.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+struct LayoutGroup {
+    id: String,
+    name: String,
+    /// Members (nested groups and connections) in desktop order.
+    nodes: Vec<LayoutNode>,
+}
+
+/// The parsed desktop sidebar tree. Empty = no grouping: every connection is
+/// shown flat, exactly as before this round.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+struct SidebarLayout {
+    /// Top-level groups, in desktop order. Ungrouped connections are not stored
+    /// here — they are drawn flat from `App::connections`, after the groups.
+    groups: Vec<LayoutGroup>,
+}
+
+/// Parse `sidebar_layout.layout_json` into [`SidebarLayout`]. Only `groups`
+/// (metadata) and `order` (the tree) matter; every other desktop field is
+/// ignored. Parsed by hand from `serde_json::Value` rather than through a
+/// derive: `serde` is only a transitive dependency of this crate (it depends on
+/// `serde_json`), and the round's rule is not to touch the dependency set. A
+/// malformed tree, an unknown group id, or a non-JSON value degrades to the
+/// empty layout (flat list), so a corrupt desktop file never breaks the sidebar.
+/// Semantics mirror DBX's own `mcp_policy::connection_group_paths`.
+fn parse_sidebar_layout(value: &serde_json::Value) -> SidebarLayout {
+    let Some(obj) = value.as_object() else {
+        return SidebarLayout::default();
+    };
+    // Group metadata: id → display name.
+    let mut names: HashMap<String, String> = HashMap::new();
+    if let Some(groups) = obj.get("groups").and_then(|v| v.as_array()) {
+        for g in groups {
+            let (Some(id), Some(name)) = (
+                g.get("id").and_then(|v| v.as_str()),
+                g.get("name").and_then(|v| v.as_str()),
+            ) else {
+                return SidebarLayout::default();
+            };
+            names.insert(id.to_string(), name.to_string());
+        }
+    }
+    let Some(order) = obj.get("order").and_then(|v| v.as_array()) else {
+        // No `order` at all is a valid “no groups” layout (an empty sidebar).
+        return SidebarLayout::default();
+    };
+    let mut out = SidebarLayout::default();
+    for entry in order {
+        if entry.get("type").and_then(|v| v.as_str()) != Some("group") {
+            // A top-level connection: drawn flat from `App::connections`.
+            continue;
+        }
+        match build_layout_group(entry, &names) {
+            Some(group) => out.groups.push(group),
+            // A group with no metadata is structurally invalid: fall back to the
+            // flat list rather than guessing a name.
+            None => return SidebarLayout::default(),
+        }
+    }
+    out
+}
+
+/// Build one group entry (and, recursively, its members). `children` and the
+/// legacy flat `connectionIds` are both accepted; `children` (when present)
+/// wins, matching DBX's parser. Members keep their desktop order.
+fn build_layout_group(
+    entry: &serde_json::Value,
+    names: &HashMap<String, String>,
+) -> Option<LayoutGroup> {
+    let id = entry.get("id").and_then(|v| v.as_str())?;
+    let name = names.get(id)?.clone();
+    let mut group = LayoutGroup {
+        id: id.to_string(),
+        name,
+        nodes: Vec::new(),
+    };
+    if let Some(children) = entry.get("children").and_then(|v| v.as_array()) {
+        for child in children {
+            match child.get("type").and_then(|v| v.as_str()) {
+                Some("group") => {
+                    group.nodes.push(LayoutNode::Group(build_layout_group(child, names)?))
+                }
+                Some("connection") => group
+                    .nodes
+                    .push(LayoutNode::Conn(child.get("id").and_then(|v| v.as_str())?.to_string())),
+                _ => return None,
+            }
+        }
+    } else if let Some(ids) = entry.get("connectionIds").and_then(|v| v.as_array()) {
+        for id in ids {
+            group.nodes.push(LayoutNode::Conn(id.as_str()?.to_string()));
+        }
+    }
+    Some(group)
+}
+
 
 /// Per-connection state of the sidebar tree's lazy database fetch.
 #[derive(Clone, PartialEq, Debug)]
@@ -9744,6 +9891,12 @@ struct App {
     tree_db_state: std::collections::HashMap<String, TreeDbState>,
     /// Monotonic request id per connection, so a stale reply is dropped.
     tree_gen: std::collections::HashMap<String, u64>,
+    /// R48: DBX Desktop's sidebar groups (parsed from `sidebar_layout`). Empty
+    /// when the desktop never grouped anything, in which case the tree stays
+    /// exactly as it was: every connection flat.
+    sidebar_layout: SidebarLayout,
+    /// R48: group ids the user collapsed this session (groups default open).
+    group_closed: std::collections::HashSet<String>,
     /// The flattened visible tree rows, rebuilt whenever the tree can change.
     side_rows: Vec<SideRow>,
     /// Cursor into `side_rows` (the sidebar's single selection).
@@ -9848,6 +10001,11 @@ struct App {
     col_hidden: HashSet<String>,
     col_picker_open: bool,
     col_picker_list: ListState,
+    /// R48: the `gc` column-structure popup (name / type / nullable / comment
+    /// from the cached `table_meta`, no extra query). `cols_popup_scroll` is the
+    /// top visible line.
+    cols_popup_open: bool,
+    cols_popup_scroll: u16,
     /// The unfiltered grid backing the filtered `grid` (needed to re-show a
     /// hidden column without re-querying).
     grid_full: Option<Grid>,
@@ -10025,6 +10183,8 @@ struct App {
     // successive query results, switchable with `[` / `]`
     result_tabs: Vec<ResultTab>,
     result_tab: usize,
+    /// R48: a pinned results-pane snapshot drawn above the live grid (`Alt-F`).
+    pinned_result: Option<PinnedResult>,
     // the last query that hit the row cap, for `Ctrl-N` "load more"
     query_more: Option<(String, usize)>,
 
@@ -10510,6 +10670,8 @@ impl App {
             tree_dbs: std::collections::HashMap::new(),
             tree_db_state: std::collections::HashMap::new(),
             tree_gen: std::collections::HashMap::new(),
+            sidebar_layout: SidebarLayout::default(),
+            group_closed: std::collections::HashSet::new(),
             db_sizes: std::collections::HashMap::new(),
             db_size_state: std::collections::HashMap::new(),
             db_size_gen: std::collections::HashMap::new(),
@@ -10559,6 +10721,8 @@ impl App {
             col_hidden: HashSet::new(),
             col_picker_open: false,
             col_picker_list: ListState::default(),
+            cols_popup_open: false,
+            cols_popup_scroll: 0,
             grid_full: None,
             recent_tables: Vec::new(),
             recent_open: false,
@@ -10630,6 +10794,7 @@ impl App {
             trace_path,
             last_event: None,
             result_tabs: Vec::new(),
+            pinned_result: None,
             result_tab: 0,
             query_more: None,
             snippet_open: false,
@@ -10774,6 +10939,8 @@ async fn run_app(mut terminal: ratatui::DefaultTerminal, backend: Arc<LocalBacke
 
     // Pre-counted by `pending_ops: 1` in the initializer above.
     spawn_op(&backend, &tx, Op::ListConnections);
+    // R48: the desktop sidebar groups load in parallel with the connection list.
+    spawn_op(&backend, &tx, Op::SidebarLayout);
 
     while !app.quit {
         terminal.draw(|f| ui(f, &mut app))?;
@@ -10946,6 +11113,13 @@ fn apply_op_result(app: &mut App, res: OpResult, tx: &Tx) {
             // R47b: seed the tree's liveness cache from the kernel now that the
             // connection list is known.
             refresh_conn_status(app, tx);
+        }
+        OpResult::SidebarLayout(layout) => {
+            // R48: groups come from DBX Desktop's own store. Rebuilding the tree
+            // here means a desktop regrouping shows up the next time dbxt opens
+            // (the session keeps its own collapse memory).
+            app.sidebar_layout = *layout;
+            rebuild_side_rows(app);
         }
         OpResult::ConnDeleted { id, name } => {
             app.connections.retain(|c| c.id != id);
@@ -11848,6 +12022,7 @@ fn apply_op_result(app: &mut App, res: OpResult, tx: &Tx) {
             app.picker_open = true;
             app.loading = true;
             app.spawn(tx, Op::ListConnections);
+            app.spawn(tx, Op::SidebarLayout);
         }
         OpResult::ConnCopied(cfg) => {
             // Merge the twin in place (like an import) so the browse view and
@@ -11862,7 +12037,7 @@ fn apply_op_result(app: &mut App, res: OpResult, tx: &Tx) {
             sort_connection_list(&mut app.connections, app.conn_sort);
             rebuild_side_rows(app);
             if let Some(pos) = app.side_rows.iter().position(|r| {
-                matches!(r, SideRow::Conn { idx }
+                matches!(r, SideRow::Conn { idx, .. }
                     if side_root_cfg(app, *idx).is_some_and(|c| c.id == id))
             }) {
                 app.side_sel = pos;
@@ -12575,6 +12750,7 @@ fn reset_overlays_for_backend_switch(app: &mut App) {
     app.export_pending = None;
     app.recent_open = false;
     app.col_picker_open = false;
+    app.cols_popup_open = false;
     app.snippet_open = false;
     app.snippet_name = None;
     app.completion = None;
@@ -12597,6 +12773,7 @@ fn reset_overlays_for_backend_switch(app: &mut App) {
     app.cell_popup = None;
     app.row_popup = None;
     app.error_popup = None;
+    app.pinned_result = None;
 }
 
 /// True when quitting would discard unrun work: the editor holds SQL that was
@@ -13042,6 +13219,12 @@ fn browse_key(app: &mut App, tx: &Tx, k: KeyEvent) {
         return;
     }
 
+    // R48: the `gc` column-structure popup is modal too.
+    if app.cols_popup_open {
+        cols_popup_key(app, k);
+        return;
+    }
+
     // Ctrl-Shift view controls (mobile efficiency). Handled before the pane
     // handlers so a Shift is never dropped by the Ctrl-letter blocks below.
     if k.modifiers.contains(KeyModifiers::CONTROL) && k.modifiers.contains(KeyModifiers::SHIFT) {
@@ -13062,9 +13245,9 @@ fn browse_key(app: &mut App, tx: &Tx, k: KeyEvent) {
         }
     }
 
-    // The `g` chord (`gd` / `gt` / `gv`) is resolved before the global `?` / `d`
-    // shortcuts: `gd` reaches the results pane instead of opening the database
-    // picker, and any other key clears a stale pending `g`.
+    // The `g` chord (`gd` / `gt` / `gv` / `gc`) is resolved before the global `?`
+    // / `d` shortcuts: `gd` reaches the results pane instead of opening the
+    // database picker, and any other key clears a stale pending `g`.
     if app.pending_g {
         match k.code {
             // `gg` (go to top, R42) is resolved in the results pane too, so the
@@ -13072,6 +13255,7 @@ fn browse_key(app: &mut App, tx: &Tx, k: KeyEvent) {
             KeyCode::Char('d')
             | KeyCode::Char('t')
             | KeyCode::Char('v')
+            | KeyCode::Char('c')
             | KeyCode::Char('g')
                 if k.modifiers.is_empty() =>
             {
@@ -14104,7 +14288,7 @@ fn sidebar_key(app: &mut App, tx: &Tx, k: KeyEvent) {
         KeyCode::Char('x')
             if matches!(app.side_rows.get(app.side_sel), Some(SideRow::Conn { .. })) =>
         {
-            if let Some(SideRow::Conn { idx }) = app.side_rows.get(app.side_sel).cloned() {
+            if let Some(SideRow::Conn { idx, .. }) = app.side_rows.get(app.side_sel).cloned() {
                 request_disconnect(app, idx);
             }
         }
@@ -15211,6 +15395,7 @@ fn activate_connection(
     app.tables_all.clear();
     app.table_list = ListState::default();
     app.clear_grid();
+    app.pinned_result = None;
     app.script = None;
     app.ddl = None;
     app.page_state = None;
@@ -15254,7 +15439,7 @@ fn activate_connection(
     if let Some(pos) = app
         .side_rows
         .iter()
-        .position(|r| matches!(r, SideRow::Conn { idx } if side_is_active(app, *idx)))
+        .position(|r| matches!(r, SideRow::Conn { idx, .. } if side_is_active(app, *idx)))
     {
         app.side_sel = pos;
         side_mirror_table(app);
@@ -16423,7 +16608,7 @@ fn sidebar_click(app: &mut App, tx: &Tx, x: u16, y: u16) {
 /// True when the tree row draws a `▸` / `▾` expander that can be clicked
 /// (connections and databases have children; tables are leaves).
 fn side_row_has_tri(row: &SideRow) -> bool {
-    matches!(row, SideRow::Conn { .. } | SideRow::Db { .. })
+    matches!(row, SideRow::Group { .. } | SideRow::Conn { .. } | SideRow::Db { .. })
 }
 
 /// The two columns the expander occupies on a tree row, relative to the
@@ -16442,8 +16627,14 @@ fn side_tri_cols(row: &SideRow) -> Option<std::ops::Range<u16>> {
 /// on the triangle folds exactly what the glyph promises.
 fn side_row_open(app: &App, row: &SideRow) -> bool {
     match row {
-        SideRow::Conn { idx } => side_conn_open(app, *idx),
-        SideRow::Db { idx, db } => {
+        SideRow::Group { id, open, .. } => {
+            // The stored `open` flag and the session collapse set must agree;
+            // they do because the set is the single source of truth.
+            let _ = open;
+            !app.group_closed.contains(id)
+        }
+        SideRow::Conn { idx, .. } => side_conn_open(app, *idx),
+        SideRow::Db { idx, db, .. } => {
             side_is_active(app, *idx)
                 && *db == app.current_db()
                 && side_root_cfg(app, *idx)
@@ -16588,7 +16779,7 @@ fn side_focus_nearest_root(app: &mut App, from_id: &str) {
         .iter()
         .enumerate()
         .filter(|(_, r)| match r {
-            SideRow::Conn { idx } => Some(*idx) != from_idx,
+            SideRow::Conn { idx, .. } => Some(*idx) != from_idx,
             _ => false,
         })
         .map(|(i, _)| i)
@@ -16612,103 +16803,233 @@ fn db_node_key(conn_id: &str, db: &str) -> String {
 /// `h` (collapse / step to parent) and the indent.
 fn side_row_depth(r: &SideRow) -> usize {
     match r {
-        SideRow::Conn { .. } => 0,
-        SideRow::ConnLoading { .. } | SideRow::ConnError { .. } | SideRow::Db { .. } => 1,
-        SideRow::Table { depth, .. } => *depth,
+        SideRow::Group { depth, .. }
+        | SideRow::Conn { depth, .. }
+        | SideRow::ConnLoading { depth, .. }
+        | SideRow::ConnError { depth, .. }
+        | SideRow::Db { depth, .. }
+        | SideRow::Table { depth, .. } => *depth,
     }
 }
 
 /// Build the visible sidebar tree rows. Pure over `app`, so navigation, click
 /// hit-testing and rendering all agree on what is on screen.
 ///
-/// Every saved connection is a root. The active connection is expanded on
-/// switch, so its databases (or, for engines without a database layer, its
-/// tables) show immediately; its active database reveals the tables. Other
-/// connections expand on demand and lazily load their database list, so a
-/// failure shows an error row instead of breaking the tree.
+/// R48: DBX Desktop's groups come first, in desktop order, with their
+/// connections nested (and nested groups indented). Connections the layout does
+/// not mention stay flat after the groups, in the picker's own order. Every
+/// connection is still a root: the active one expands on switch, so its
+/// databases (or, for engines without a database layer, its tables) show
+/// immediately; other connections expand on demand and lazily load their
+/// database list, so a failure shows an error row instead of breaking the tree.
 fn compute_side_rows(app: &App) -> Vec<SideRow> {
     let mut rows = Vec::new();
     if app.selected.is_none() {
         return rows;
     }
     let needle = app.table_filter.trim().to_lowercase();
+    let mut placed: HashSet<usize> = HashSet::new();
+    for group in &app.sidebar_layout.groups {
+        rows.extend(build_group_rows(app, group, 0, &needle, &mut placed));
+    }
     for idx in 0..side_root_count(app) {
-        let Some(c) = side_root_cfg(app, idx) else {
-            continue;
-        };
-        let is_active = side_is_active(app, idx);
-        // The root is always visible: the tree keeps its anchors even when a
-        // filter hides everything below them.
-        rows.push(SideRow::Conn { idx });
-        if !side_conn_open(app, idx) {
+        if placed.contains(&idx) {
             continue;
         }
-        if is_active {
-            if app.databases.is_empty() {
-                // No database layer (SQLite / a test fixture): tables hang
-                // directly under the connection.
-                for ti in 0..app.tables.len() {
-                    rows.push(SideRow::Table {
-                        idx,
-                        table: ti,
-                        depth: 1,
-                    });
-                }
-            } else {
-                let cur_db = app.current_db();
-                for db in &app.databases {
-                    let is_cur_db = *db == cur_db;
-                    // A filter keeps a database row when its name matches or it
-                    // is the active one with visible tables; ancestors of a
-                    // match survive, which is the whole point of a tree filter.
-                    if !needle.is_empty()
-                        && !db.to_lowercase().contains(&needle)
-                        && !(is_cur_db && !app.tables.is_empty())
-                    {
-                        continue;
-                    }
-                    rows.push(SideRow::Db {
-                        idx,
-                        db: db.clone(),
-                    });
-                    if is_cur_db && !app.tree_db_closed.contains(&db_node_key(&c.id, db)) {
-                        for ti in 0..app.tables.len() {
-                            rows.push(SideRow::Table {
-                                idx,
-                                table: ti,
-                                depth: 2,
-                            });
-                        }
-                    }
-                }
+        push_conn_subtree(app, idx, 0, &needle, false, &mut rows);
+    }
+    rows
+}
+
+/// Resolve a connection id from the desktop layout to a tree-root index (a
+/// saved connection, or the synthetic active root). `None` for a deleted
+/// connection, which is simply skipped.
+fn side_root_index_for_id(app: &App, id: &str) -> Option<usize> {
+    if let Some(i) = app.connections.iter().position(|c| c.id == id) {
+        return Some(i);
+    }
+    if side_root_count(app) > app.connections.len()
+        && app.selected.as_ref().is_some_and(|c| c.id == id)
+    {
+        return Some(app.connections.len());
+    }
+    None
+}
+
+/// Number of live connections a group holds, nested groups included. Counts
+/// only connections that still exist, so the `[n]` badge matches the tree.
+fn layout_group_count(app: &App, group: &LayoutGroup) -> usize {
+    group
+        .nodes
+        .iter()
+        .map(|node| match node {
+            LayoutNode::Conn(id) => usize::from(side_root_index_for_id(app, id).is_some()),
+            LayoutNode::Group(sub) => layout_group_count(app, sub),
+        })
+        .sum()
+}
+
+/// True when a *grouped* connection should be shown under an active filter. The
+/// active connection is always kept (it is the user's working anchor); every
+/// other one has to match by name or by a loaded database name. A group whose
+/// connections all miss is hidden with them, which is what “组内连接命中即整组
+/// 可见” means in practice.
+fn conn_matches_filter(app: &App, idx: usize, needle: &str) -> bool {
+    if side_is_active(app, idx) {
+        return true;
+    }
+    let Some(c) = side_root_cfg(app, idx) else {
+        return false;
+    };
+    if c.name.to_lowercase().contains(needle) {
+        return true;
+    }
+    app.tree_dbs
+        .get(&c.id)
+        .is_some_and(|dbs| dbs.iter().any(|d| d.to_lowercase().contains(needle)))
+}
+
+/// Flatten one desktop group (and its nested groups) into tree rows, following
+/// the group's own member order. The group header is emitted only when the
+/// group has at least one visible connection under the active filter; `placed`
+/// guards against a connection listed twice.
+fn build_group_rows(
+    app: &App,
+    group: &LayoutGroup,
+    depth: usize,
+    needle: &str,
+    placed: &mut HashSet<usize>,
+) -> Vec<SideRow> {
+    let mut inner: Vec<SideRow> = Vec::new();
+    for node in &group.nodes {
+        match node {
+            LayoutNode::Group(sub) => {
+                inner.extend(build_group_rows(app, sub, depth + 1, needle, placed))
             }
-        } else {
-            match app.tree_db_state.get(&c.id) {
-                Some(TreeDbState::Loading) => rows.push(SideRow::ConnLoading { idx }),
-                Some(TreeDbState::Error(msg)) => rows.push(SideRow::ConnError {
-                    idx,
-                    msg: msg.clone(),
-                }),
-                _ => match app.tree_dbs.get(&c.id) {
-                    Some(dbs) => {
-                        for db in dbs {
-                            if !needle.is_empty() && !db.to_lowercase().contains(&needle) {
-                                continue;
-                            }
-                            rows.push(SideRow::Db {
-                                idx,
-                                db: db.clone(),
-                            });
-                        }
-                    }
-                    // Not fetched yet (or a synthetic root): a loading row stands
-                    // in until the lazy list arrives.
-                    None => rows.push(SideRow::ConnLoading { idx }),
-                },
+            LayoutNode::Conn(cid) => {
+                let Some(idx) = side_root_index_for_id(app, cid) else {
+                    continue;
+                };
+                if !placed.insert(idx) {
+                    continue;
+                }
+                push_conn_subtree(app, idx, depth + 1, needle, true, &mut inner);
             }
         }
     }
-    rows
+    // A group with no live connections (every member deleted, or an empty
+    // desktop group) is pure noise in a terminal: draw nothing for it.
+    let count = layout_group_count(app, group);
+    if count == 0 {
+        return Vec::new();
+    }
+    if !needle.is_empty() && inner.is_empty() {
+        return Vec::new();
+    }
+    let open = !app.group_closed.contains(&group.id);
+    let mut out = Vec::with_capacity(inner.len() + 1);
+    out.push(SideRow::Group {
+        id: group.id.clone(),
+        name: group.name.clone(),
+        depth,
+        count,
+        open,
+    });
+    if open {
+        out.extend(inner);
+    }
+    out
+}
+
+/// Append one connection root and, when it is open, its databases / tables (or
+/// the lazy-loading placeholder). `grouped` connections are subject to the
+/// active filter; ungrouped roots stay as anchors, as they were before R48.
+fn push_conn_subtree(
+    app: &App,
+    idx: usize,
+    depth: usize,
+    needle: &str,
+    grouped: bool,
+    rows: &mut Vec<SideRow>,
+) {
+    let Some(c) = side_root_cfg(app, idx) else {
+        return;
+    };
+    if grouped && !needle.is_empty() && !conn_matches_filter(app, idx, needle) {
+        return;
+    }
+    let is_active = side_is_active(app, idx);
+    rows.push(SideRow::Conn { idx, depth });
+    if !side_conn_open(app, idx) {
+        return;
+    }
+    if is_active {
+        if app.databases.is_empty() {
+            // No database layer (SQLite / a test fixture): tables hang
+            // directly under the connection.
+            for ti in 0..app.tables.len() {
+                rows.push(SideRow::Table {
+                    idx,
+                    table: ti,
+                    depth: depth + 1,
+                });
+            }
+        } else {
+            let cur_db = app.current_db();
+            for db in &app.databases {
+                let is_cur_db = *db == cur_db;
+                // A filter keeps a database row when its name matches or it
+                // is the active one with visible tables; ancestors of a
+                // match survive, which is the whole point of a tree filter.
+                if !needle.is_empty()
+                    && !db.to_lowercase().contains(needle)
+                    && !(is_cur_db && !app.tables.is_empty())
+                {
+                    continue;
+                }
+                rows.push(SideRow::Db {
+                    idx,
+                    db: db.clone(),
+                    depth: depth + 1,
+                });
+                if is_cur_db && !app.tree_db_closed.contains(&db_node_key(&c.id, db)) {
+                    for ti in 0..app.tables.len() {
+                        rows.push(SideRow::Table {
+                            idx,
+                            table: ti,
+                            depth: depth + 2,
+                        });
+                    }
+                }
+            }
+        }
+    } else {
+        match app.tree_db_state.get(&c.id) {
+            Some(TreeDbState::Loading) => rows.push(SideRow::ConnLoading { idx, depth }),
+            Some(TreeDbState::Error(msg)) => rows.push(SideRow::ConnError {
+                idx,
+                msg: msg.clone(),
+                depth,
+            }),
+            _ => match app.tree_dbs.get(&c.id) {
+                Some(dbs) => {
+                    for db in dbs {
+                        if !needle.is_empty() && !db.to_lowercase().contains(needle) {
+                            continue;
+                        }
+                        rows.push(SideRow::Db {
+                            idx,
+                            db: db.clone(),
+                            depth: depth + 1,
+                        });
+                    }
+                }
+                // Not fetched yet (or a synthetic root): a loading row stands
+                // in until the lazy list arrives.
+                None => rows.push(SideRow::ConnLoading { idx, depth }),
+            },
+        }
+    }
 }
 
 /// Rebuild the flattened tree and keep the cursor in sync. An external move of
@@ -16791,14 +17112,22 @@ fn side_expand(app: &mut App, tx: &Tx) {
         return;
     };
     match row {
-        SideRow::Conn { idx } => {
+        SideRow::Group { id, .. } => {
+            if app.group_closed.contains(&id) {
+                app.group_closed.remove(&id);
+                rebuild_side_rows(app);
+            } else {
+                side_step(app, 1, true);
+            }
+        }
+        SideRow::Conn { idx, .. } => {
             if side_conn_open(app, idx) {
                 side_step(app, 1, true);
             } else {
                 expand_conn(app, tx, idx);
             }
         }
-        SideRow::Db { idx, db } => {
+        SideRow::Db { idx, db, .. } => {
             // Only the active connection's *current* database can reveal tables;
             // any other database node selects it (switching connection when
             // needed).
@@ -16825,7 +17154,15 @@ fn side_collapse(app: &mut App) {
         return;
     };
     match row {
-        SideRow::Conn { idx } => {
+        SideRow::Group { id, .. } => {
+            if !app.group_closed.contains(&id) {
+                app.group_closed.insert(id);
+                rebuild_side_rows(app);
+            } else {
+                side_focus_parent(app);
+            }
+        }
+        SideRow::Conn { idx, .. } => {
             let id = side_root_cfg(app, idx).map(|c| c.id.clone()).unwrap_or_default();
             if side_conn_open(app, idx) {
                 if side_is_active(app, idx) {
@@ -16836,7 +17173,7 @@ fn side_collapse(app: &mut App) {
                 rebuild_side_rows(app);
             }
         }
-        SideRow::Db { idx, db } => {
+        SideRow::Db { idx, db, .. } => {
             if side_is_active(app, idx) && db == app.current_db() {
                 let id = side_root_cfg(app, idx).map(|c| c.id.clone()).unwrap_or_default();
                 let key = db_node_key(&id, &db);
@@ -16941,7 +17278,7 @@ fn request_disconnect(app: &mut App, idx: usize) {
 /// per-table row estimates, cached for the session (R45). This is the *only*
 /// trigger — nothing scans sizes on startup or automatically.
 fn request_db_size(app: &mut App, tx: &Tx) {
-    let Some(SideRow::Db { idx, db }) = app.side_rows.get(app.side_sel).cloned() else {
+    let Some(SideRow::Db { idx, db, .. }) = app.side_rows.get(app.side_sel).cloned() else {
         app.status = t("把光标移到库行上再按 s 查尺寸").into();
         return;
     };
@@ -17008,7 +17345,15 @@ fn side_activate(app: &mut App, tx: &Tx) {
         return;
     };
     match row {
-        SideRow::Conn { idx } => {
+        SideRow::Group { id, .. } => {
+            if app.group_closed.contains(&id) {
+                app.group_closed.remove(&id);
+            } else {
+                app.group_closed.insert(id);
+            }
+            rebuild_side_rows(app);
+        }
+        SideRow::Conn { idx, .. } => {
             let id = side_root_cfg(app, idx).map(|c| c.id.clone()).unwrap_or_default();
             if side_is_active(app, idx) {
                 if side_conn_open(app, idx) {
@@ -17024,7 +17369,7 @@ fn side_activate(app: &mut App, tx: &Tx) {
                 app.tree_conn_open.insert(id);
             }
         }
-        SideRow::Db { idx, db } => {
+        SideRow::Db { idx, db, .. } => {
             if side_is_active(app, idx) {
                 let id = side_root_cfg(app, idx).map(|c| c.id.clone()).unwrap_or_default();
                 app.tree_db_closed.remove(&db_node_key(&id, &db));
@@ -18335,6 +18680,14 @@ fn preview_key(app: &mut App, tx: &Tx, k: KeyEvent) {
         }
         return;
     }
+    // R48: Alt-F pins / unpins the results pane. It is free in the grid — the
+    // editor owns Alt-F for SQL formatting, so the two never collide.
+    if k.modifiers.contains(KeyModifiers::ALT)
+        && matches!(k.code, KeyCode::Char('f') | KeyCode::Char('F'))
+    {
+        toggle_pin_results(app);
+        return;
+    }
     let screen = viewport_rows(app) as u16;
     let ddl = app.struct_view == StructView::Ddl && app.ddl.is_some();
     // Vim-style count prefix and the `g` chord are handled before the search /
@@ -18372,6 +18725,14 @@ fn preview_key(app: &mut App, tx: &Tx, k: KeyEvent) {
             KeyCode::Char('v') if k.modifiers.is_empty() => {
                 app.pending_g = false;
                 open_locate(app);
+                return;
+            }
+            // `gc` — R48: a quick column-structure popup (name / type /
+            // nullable / comment) from the cached metadata, without leaving the
+            // grid for the full `gd` structure view.
+            KeyCode::Char('c') if k.modifiers.is_empty() => {
+                app.pending_g = false;
+                open_cols_popup(app);
                 return;
             }
             // `gg` — vim's "go to top" (R42): a real console motion for the
@@ -18451,7 +18812,7 @@ fn preview_key(app: &mut App, tx: &Tx, k: KeyEvent) {
         // `g` starts the `gd` (goto structure) / `gt` (goto data) chord.
         KeyCode::Char('g') => {
             app.pending_g = true;
-            app.status = t("g… d=表结构 t=表数据 v=定位值").into();
+            app.status = t("g… d=表结构 t=表数据 v=定位值 c=列结构").into();
         }
         KeyCode::Char('s') => sort_column(app, tx, false),
         KeyCode::Char('f') => open_filter_prompt(app),
@@ -19274,6 +19635,70 @@ fn col_picker_key(app: &mut App, k: KeyEvent) {
 
 /// Space in the column picker: hide / show the highlighted column. The last
 /// visible column can never be hidden.
+/// R48 `gc`: open the column-structure popup. It lists the columns already
+/// cached for the open table (`table_meta`, read from information_schema when
+/// the table was loaded) — no extra query. A query result has no table metadata,
+/// so its grid columns are shown by name only.
+fn open_cols_popup(app: &mut App) {
+    if cols_popup_lines_for(app).is_empty() {
+        app.status = t("无可显示的列（先打开一张表或执行查询）").into();
+        return;
+    }
+    app.cols_popup_open = true;
+    app.cols_popup_scroll = 0;
+}
+
+/// One line per column: `name  type  PK / NOT NULL  · comment`. Empty when there
+/// is neither table metadata nor a grid.
+fn cols_popup_lines_for(app: &App) -> Vec<String> {
+    if let Some(meta) = &app.table_meta {
+        if !meta.columns.is_empty() {
+            return meta
+                .columns
+                .iter()
+                .map(|c| {
+                    let mut s = format!(
+                        "{}  {}",
+                        fix_double_encoding(&c.name),
+                        c.data_type
+                    );
+                    if c.is_primary_key {
+                        s.push_str("  PK");
+                    }
+                    if !c.is_nullable {
+                        s.push_str("  NOT NULL");
+                    }
+                    if let Some(cm) = c.comment.as_deref().filter(|c| !c.is_empty()) {
+                        s.push_str(&format!("  · {cm}"));
+                    }
+                    s
+                })
+                .collect();
+        }
+    }
+    match full_grid(app) {
+        Some(g) if !g.columns.is_empty() => {
+            g.columns.iter().map(|c| fix_double_encoding(c)).collect()
+        }
+        _ => Vec::new(),
+    }
+}
+
+fn cols_popup_key(app: &mut App, k: KeyEvent) {
+    match k.code {
+        KeyCode::Esc | KeyCode::Char('q') | KeyCode::Char('c') => app.cols_popup_open = false,
+        KeyCode::Up | KeyCode::Char('k') => {
+            app.cols_popup_scroll = app.cols_popup_scroll.saturating_sub(1)
+        }
+        KeyCode::Down | KeyCode::Char('j') => {
+            app.cols_popup_scroll = app.cols_popup_scroll.saturating_add(1)
+        }
+        KeyCode::PageUp => app.cols_popup_scroll = app.cols_popup_scroll.saturating_sub(8),
+        KeyCode::PageDown => app.cols_popup_scroll = app.cols_popup_scroll.saturating_add(8),
+        _ => {}
+    }
+}
+
 fn toggle_col_visible(app: &mut App) {
     let Some(grid) = app.grid_full.clone() else {
         return;
@@ -22300,14 +22725,15 @@ fn completion_candidates(app: &App, ctx: &CompCtx, partial: &str) -> Vec<Complet
             push_names(&mut out, &mut seen, &qcols, 'C', &needle);
         }
         CompCtx::TableList => {
+            // R48: after FROM / JOIN / INTO the candidate list is tables only —
+            // a column or a keyword there is almost always a typo, and the
+            // narrower list is faster to scan on a phone.
             push_names(&mut out, &mut seen, &tables, 'T', &needle);
-            push_names(&mut out, &mut seen, &cols, 'C', &needle);
-            push_names(&mut out, &mut seen, &keywords, 'K', &needle);
         }
         CompCtx::Column => {
+            // R48: after WHERE / ON / SET / SELECT (and after `(`) only columns
+            // are offered.
             push_names(&mut out, &mut seen, &cols, 'C', &needle);
-            push_names(&mut out, &mut seen, &tables, 'T', &needle);
-            push_names(&mut out, &mut seen, &keywords, 'K', &needle);
         }
         CompCtx::Any => {
             push_names(&mut out, &mut seen, &cols, 'C', &needle);
@@ -22315,7 +22741,10 @@ fn completion_candidates(app: &App, ctx: &CompCtx, partial: &str) -> Vec<Complet
             push_names(&mut out, &mut seen, &keywords, 'K', &needle);
         }
     }
-    out.truncate(8);
+    // R48: a narrow phone terminal keeps the popup short (one column, 5 items)
+    // so it never covers the SQL being typed; a normal terminal shows 8.
+    let cap = if app.term_w > 0 && app.term_w < 40 { 5 } else { 8 };
+    out.truncate(cap);
     out
 }
 
@@ -25799,6 +26228,33 @@ fn switch_result_tab(app: &mut App, delta: i32) {
     app.status = tf("结果 {}/{}", &[&(app.result_tab + 1), &(app.result_tabs.len())]);
 }
 
+/// `Alt-F` in the results pane (R48): pin / unpin the current grid. A pinned
+/// grid keeps showing in a strip above the live one, so switching to another
+/// table / database lets the two be compared up-and-down. Only data grids make
+/// sense to pin; an empty pane or a script list reports why.
+fn toggle_pin_results(app: &mut App) {
+    if app.pinned_result.is_some() {
+        app.pinned_result = None;
+        app.status = t("📌 已解除钉住").into();
+        return;
+    }
+    let Some(grid) = app.grid.clone() else {
+        app.status = t("无可钉住的结果（先打开一张表或执行查询）").into();
+        return;
+    };
+    if grid.columns.is_empty() {
+        app.status = t("无可钉住的结果").into();
+        return;
+    }
+    let title = grid_title(app);
+    app.pinned_result = Some(PinnedResult {
+        title,
+        grid,
+        kind: app.grid_kind,
+    });
+    app.status = t("📌 已钉住结果区 · 切换表/库仍显示 · Alt-F 解除").into();
+}
+
 /// `Ctrl-P`: run the editor's SQL through the dialect's EXPLAIN.
 fn explain_current(app: &mut App, tx: &Tx) {
     let Some(cfg) = app.selected.clone() else {
@@ -27420,7 +27876,7 @@ fn copy_connection_name(base: &str, existing: &[String]) -> String {
 /// (no form), keeping its password and SSH tunnel, and show the new root as soon
 /// as the save lands. Built for test / prod twins that differ only by host (R45).
 fn copy_connection_at_cursor(app: &mut App, tx: &Tx) {
-    let Some(SideRow::Conn { idx }) = app.side_rows.get(app.side_sel).cloned() else {
+    let Some(SideRow::Conn { idx, .. }) = app.side_rows.get(app.side_sel).cloned() else {
         app.status = t("把光标移到连接行上再按 Y 复制").into();
         return;
     };
@@ -27492,6 +27948,9 @@ fn ui(f: &mut Frame, app: &mut App) {
     // Overlays are drawn lowest-precedence first so the topmost one on screen is
     // the one the key router actually owns (see `footer_ctx`, which lists the
     // same order).
+    if app.cols_popup_open {
+        render_cols_popup(f, f.area(), app);
+    }
     if app.col_picker_open {
         render_col_picker(f, f.area(), app);
     }
@@ -28825,6 +29284,38 @@ fn render_results_pane(f: &mut Frame, area: Rect, app: &mut App) {
             return;
         }
     }
+    // R48: a pinned grid keeps an up-and-down comparison visible above the live
+    // pane. Only on SQL data grids, and only when there is room for both.
+    let area = if app.backend_kind == Backend::Sql {
+        match app.pinned_result.clone() {
+            Some(pin) if area.height >= 8 && area.width >= 12 => {
+                let ph = (area.height / 3).clamp(4, 7).min(area.height.saturating_sub(4));
+                let top = Rect { height: ph, ..area };
+                let bottom = Rect {
+                    y: area.y + ph,
+                    height: area.height - ph,
+                    ..area
+                };
+                let title = format!(
+                    " 📌 {} ",
+                    truncate_disp(&pin.title, area.width.saturating_sub(6) as usize)
+                );
+                // The pinned render writes app's scroll/grid caches for its own
+                // widths; restore the column offset so the live pane below keeps
+                // its place (the live render recomputes everything else).
+                let saved_offset = app.col_offset;
+                let saved_focus = app.focus;
+                app.focus = Focus::Sidebar;
+                render_grid(f, top, app, &pin.grid, pin.kind, &title, false);
+                app.col_offset = saved_offset;
+                app.focus = saved_focus;
+                bottom
+            }
+            _ => area,
+        }
+    } else {
+        area
+    };
     if app.grid.is_some() {
         let title = grid_title(app);
         // Move the grid out instead of deep-cloning it every frame: a 20k-row
@@ -29970,7 +30461,27 @@ fn side_row_line(
     let inner = (area_w as usize).saturating_sub(2 + indent.len()).max(4);
     let mut spans: Vec<Span> = vec![Span::styled(indent, mk(Style::default()))];
     match row {
-        SideRow::Conn { idx } => {
+        SideRow::Group { id, name, depth: _, count, open } => {
+            spans.push(Span::styled(
+                if *open { "▾ " } else { "▸ " }.to_string(),
+                mk(Style::default().fg(Color::DarkGray)),
+            ));
+            spans.push(Span::styled("📁 ".to_string(), mk(Style::default().fg(Color::Yellow))));
+            let badge = format!(" [{count}]");
+            let name_w = inner.saturating_sub(disp_width(&badge));
+            spans.push(Span::styled(
+                truncate_disp(name, name_w),
+                mk(Style::default().add_modifier(Modifier::BOLD)),
+            ));
+            spans.push(Span::styled(
+                badge,
+                mk(Style::default().fg(Color::DarkGray)),
+            ));
+            // The group's fold memory is keyed by id, so a filter that hides
+            // then reveals it keeps the user's choice.
+            let _ = id;
+        }
+        SideRow::Conn { idx, .. } => {
             let (name, color, open, ro) = match side_root_cfg(app, *idx) {
                 Some(c) => (
                     c.name.clone(),
@@ -30025,7 +30536,7 @@ fn side_row_line(
                 mk(Style::default().fg(Color::Red)),
             ));
         }
-        SideRow::Db { idx, db } => {
+        SideRow::Db { idx, db, .. } => {
             let is_cur = side_is_active(app, *idx);
             let is_cur_db = is_cur && *db == app.current_db();
             let open = is_cur_db
@@ -30726,6 +31237,68 @@ fn render_snippets(f: &mut Frame, area: Rect, app: &mut App) {
 
 /// Ctrl-Shift-H column-visibility overlay: space toggles the highlighted column,
 /// `a` shows all, `x` keeps only the first. Changes apply live behind the popup.
+/// R48 `gc`: the column-structure mini popup. A compact, scrollable list of the
+/// open table's columns (name / type / PK / NOT NULL / comment) drawn over the
+/// results pane, so the columns can be checked while writing SQL without
+/// switching to the full `gd` structure view. On a narrow screen it uses the
+/// full width; otherwise it caps at 72 columns.
+fn render_cols_popup(f: &mut Frame, area: Rect, app: &mut App) {
+    let lines = cols_popup_lines_for(app);
+    if lines.is_empty() {
+        app.cols_popup_open = false;
+        return;
+    }
+    let w = if area.width < 48 {
+        area.width
+    } else {
+        area.width.min(72)
+    };
+    let (y, h) = overlay_list_box(lines.len(), area);
+    let x = area.x + (area.width.saturating_sub(w)) / 2;
+    let box_area = Rect {
+        x,
+        y,
+        width: w,
+        height: h,
+    };
+    f.render_widget(Clear, box_area);
+    let inner_h = h.saturating_sub(2) as usize;
+    let max_scroll = lines.len().saturating_sub(inner_h) as u16;
+    if app.cols_popup_scroll > max_scroll {
+        app.cols_popup_scroll = max_scroll;
+    }
+    let table = app
+        .table_meta
+        .as_ref()
+        .map(|m| fix_double_encoding(&m.table))
+        .unwrap_or_default();
+    let full = tf(
+        " 列结构 · {} · {} 列 · j/k 滚动 · Esc 关 ",
+        &[&table, &lines.len()],
+    );
+    let items: Vec<Line> = lines
+        .iter()
+        .map(|l| {
+            Line::from(vec![Span::styled(
+                truncate_disp(l, box_area.width.saturating_sub(3) as usize),
+                Style::default(),
+            )])
+        })
+        .collect();
+    f.render_widget(
+        Paragraph::new(items)
+            .block(
+                Block::default()
+                    .borders(Borders::ALL)
+                    .title(fit_title(&full, t(" 列结构 · j/k · Esc "), box_area.width))
+                    .border_set(border::ROUNDED)
+                    .border_style(Style::default().fg(Color::Cyan)),
+            )
+            .scroll((app.cols_popup_scroll, 0)),
+        box_area,
+    );
+}
+
 fn render_col_picker(f: &mut Frame, area: Rect, app: &mut App) {
     let Some(grid) = app.grid_full.clone() else {
         return;
@@ -33579,6 +34152,7 @@ const HELP_ROWS: &[(&str, &str)] = &[
     ("状态点（连接根）", "● 活跃（可查）/ ○ 已断开 / ◐ 连接中；沿用连接色，形状区分（色盲友好）"),
     ("x（连接根）", "断开连接：关闭连接池（未提交手动事务回滚）；树保留灰根，展开可重连"),
     ("尺寸列", "库大小 / 表行数估计右对齐；终端 <56 列自动隐藏"),
+    ("分组节点", "DBX 桌面的连接分组（▾ 组名 [n]）；h l / ← → 折叠展开，会话内记忆；无分组则平铺"),
     ("Alt+a-z · ; ,", "首字母跳：跳到以该字母开头的下一张表；; , 前后循环（与过滤互斥）"),
     ("t", "最近表浮层（Enter 直达）"),
     ("r", "表结构（字段 + DDL）"),
@@ -33631,6 +34205,8 @@ const HELP_ROWS: &[(&str, &str)] = &[
     ("Alt-R", "最近表直达浮层"),
     ("t", "字段 ↔ DDL（表结构）"),
     ("g d / g t", "跳表结构视图 / 回表数据"),
+    ("g c", "列结构弹层：列名 / 类型 / 可空 / 注释（缓存元数据，不额外查库）"),
+    ("Alt-F", "钉住 / 解除当前结果区（钉住后切换表/库仍显示，上下对照）"),
     ("g v", "定位值（排序列 / 主键列，不隐藏行）"),
     ("Esc", "收起结果 / 关闭浮层"),
     ("— 行详情浮层（Enter / o）—", ""),
@@ -33694,7 +34270,7 @@ const HELP_ROWS: &[(&str, &str)] = &[
     ("进度 / 中止", "状态栏显示 行数/块数/速率；Esc 中止（已提交批次保留）"),
     ("大表防护", "源预估 ≥100 万行需再按 Enter 确认；单批失败重试 1 次"),
     ("完成汇总", "g 复制摘要 · b 浏览目标表（同连接/库时）· Esc 关闭"),
-    ("补全上下文", "表名. 后只补该表列名；FROM/JOIN 后优先表名；WHERE/ON 后优先列名"),
+    ("补全上下文", "表名. 后只补该表列名；FROM/JOIN 后只补表名；WHERE/ON 后只补列名"),
     ("↑ ↓", "历史（首行 / 末行）"),
     ("Esc", "回到侧栏"),
     ("[ ]", "Redis 逻辑库"),
@@ -35650,6 +36226,7 @@ mod tests {
             app.row_popup = None;
             app.db_picker_open = false;
             app.col_picker_open = false;
+            app.cols_popup_open = false;
             app.recent_open = false;
             app.history_open = false;
             app.history_filter = None;
@@ -37123,11 +37700,12 @@ mod tests {
 
     #[test]
     fn tree_expander_columns_follow_the_depth() {
-        assert_eq!(side_tri_cols(&SideRow::Conn { idx: 0 }), Some(0..2));
+        assert_eq!(side_tri_cols(&SideRow::Conn { idx: 0, depth: 0 }), Some(0..2));
         assert_eq!(
             side_tri_cols(&SideRow::Db {
                 idx: 0,
-                db: "shop".into()
+                db: "shop".into(),
+                depth: 1,
             }),
             Some(2..4)
         );
@@ -37140,7 +37718,7 @@ mod tests {
             }),
             None
         );
-        assert!(!side_row_has_tri(&SideRow::ConnLoading { idx: 0 }));
+        assert!(!side_row_has_tri(&SideRow::ConnLoading { idx: 0, depth: 1 }));
     }
 
     /// A drawn query grid, with `rects` populated, ready for a mouse event.
@@ -38702,14 +39280,273 @@ mod tests {
     fn sidebar_tree_nests_database_and_table_levels() {
         let app = tree_app();
         let rows = compute_side_rows(&app);
-        assert_eq!(rows[0], SideRow::Conn { idx: 0 });
-        assert!(matches!(&rows[1], SideRow::Db { idx: 0, db } if db == "shop"));
+        assert_eq!(rows[0], SideRow::Conn { idx: 0, depth: 0 });
+        assert!(matches!(&rows[1], SideRow::Db { idx: 0, db, .. } if db == "shop"));
         assert!(matches!(&rows[2], SideRow::Table { table: 0, depth: 2, .. }));
         assert!(matches!(&rows[3], SideRow::Table { table: 1, depth: 2, .. }));
-        assert!(matches!(&rows[4], SideRow::Db { idx: 0, db } if db == "logs"));
+        assert!(matches!(&rows[4], SideRow::Db { idx: 0, db, .. } if db == "logs"));
         // The second connection is a collapsed root.
-        assert_eq!(rows[5], SideRow::Conn { idx: 1 });
+        assert_eq!(rows[5], SideRow::Conn { idx: 1, depth: 0 });
         assert_eq!(rows.len(), 6);
+    }
+
+    // ── R48: DBX Desktop sidebar groups ──
+
+    fn group(id: &str, name: &str, nodes: Vec<LayoutNode>) -> LayoutGroup {
+        LayoutGroup { id: id.into(), name: name.into(), nodes }
+    }
+
+    /// R48: the desktop `sidebar_layout` JSON parses nested groups, the legacy
+    /// flat `connectionIds`, and keeps every member in the desktop's own order.
+    #[test]
+    fn parse_sidebar_layout_reads_groups_and_legacy_ids() {
+        let layout: serde_json::Value = serde_json::from_str(
+            r#"{
+                "groups": [
+                    {"id":"g1","name":"生产"},
+                    {"id":"g2","name":"核心"},
+                    {"id":"g3","name":"归档"}
+                ],
+                "order": [
+                    {"type":"group","id":"g1","children":[
+                        {"type":"connection","id":"c1"},
+                        {"type":"group","id":"g2","children":[{"type":"connection","id":"c2"}]}
+                    ]},
+                    {"type":"connection","id":"c9"},
+                    {"type":"group","id":"g3","connectionIds":["c3"]}
+                ]
+            }"#,
+        )
+        .unwrap();
+        let parsed = parse_sidebar_layout(&layout);
+        // Only top-level groups; the bare `c9` stays flat.
+        assert_eq!(parsed.groups.len(), 2);
+        let g1 = &parsed.groups[0];
+        assert_eq!((g1.id.as_str(), g1.name.as_str()), ("g1", "生产"));
+        assert_eq!(g1.nodes[0], LayoutNode::Conn("c1".into()));
+        match &g1.nodes[1] {
+            LayoutNode::Group(g2) => {
+                assert_eq!(g2.name, "核心");
+                assert_eq!(g2.nodes, vec![LayoutNode::Conn("c2".into())]);
+            }
+            other => panic!("expected a nested group, got {other:?}"),
+        }
+        // The legacy `connectionIds` form is still read.
+        assert_eq!(parsed.groups[1].nodes, vec![LayoutNode::Conn("c3".into())]);
+    }
+
+    /// R48: a broken layout — bad JSON, a missing group name, an unknown group
+    /// id, or an unknown child type — degrades to the flat list instead of
+    /// breaking the sidebar.
+    #[test]
+    fn parse_sidebar_layout_degrades_to_flat() {
+        let bad = [
+            "not json at all",
+            "[1, 2, 3]",
+            r#"{"groups":[{"id":"g1"}],"order":[]}"#,
+            r#"{"groups":[],"order":[{"type":"group","id":"missing"}]}"#,
+            r#"{"groups":[{"id":"g1","name":"x"}],"order":[{"type":"group","id":"g1","children":[{"type":"bogus"}]}]}"#,
+        ];
+        for raw in bad {
+            let v: serde_json::Value =
+                serde_json::from_str(raw).unwrap_or(serde_json::Value::Null);
+            assert!(parse_sidebar_layout(&v).groups.is_empty(), "should degrade: {raw}");
+        }
+        assert!(parse_sidebar_layout(&serde_json::Value::Null).groups.is_empty());
+    }
+
+    /// R48: desktop groups render as `▾ 组名 [n]` nodes with their members
+    /// nested in desktop order, and the `[n]` badge counts live connections
+    /// (nested groups included).
+    #[test]
+    fn sidebar_groups_nest_connections_in_desktop_order() {
+        let mut app = tree_app();
+        let c1 = app.connections[0].id.clone();
+        let c2 = app.connections[1].id.clone();
+        app.sidebar_layout = SidebarLayout {
+            groups: vec![group(
+                "g1",
+                "生产",
+                vec![
+                    LayoutNode::Conn(c2.clone()),
+                    LayoutNode::Group(group("g2", "核心", vec![LayoutNode::Conn(c1.clone())])),
+                ],
+            )],
+        };
+        let rows = compute_side_rows(&app);
+        assert!(matches!(
+            &rows[0],
+            SideRow::Group { name, depth: 0, count: 2, open: true, .. } if name == "生产"
+        ));
+        // The desktop order is respected: `c2` first, then the nested group.
+        assert!(matches!(&rows[1], SideRow::Conn { idx: 1, depth: 1 }));
+        assert!(matches!(
+            &rows[2],
+            SideRow::Group { name, depth: 1, count: 1, .. } if name == "核心"
+        ));
+        assert!(matches!(&rows[3], SideRow::Conn { idx: 0, depth: 2 }));
+        // The active connection's subtree is indented below its group.
+        assert!(matches!(&rows[4], SideRow::Db { idx: 0, db, depth: 3 } if db == "shop"));
+        assert!(matches!(&rows[5], SideRow::Table { table: 0, depth: 4, .. }));
+    }
+
+    /// R48: a group with no live member (or none matching the filter) draws
+    /// nothing, and its connections do not reappear in the flat tail.
+    #[test]
+    fn sidebar_group_hides_when_no_member_matches() {
+        let mut app = tree_app();
+        let c2 = app.connections[1].id.clone();
+        app.sidebar_layout = SidebarLayout {
+            groups: vec![group("g1", "生产", vec![LayoutNode::Conn(c2.clone())])],
+        };
+        // No filter: the group and its (collapsed) connection are both visible,
+        // and the ungrouped active connection stays flat after them.
+        let rows = compute_side_rows(&app);
+        assert_eq!(rows.iter().filter(|r| matches!(r, SideRow::Group { .. })).count(), 1);
+        assert!(rows.iter().any(|r| matches!(r, SideRow::Conn { idx: 1, .. })));
+        assert!(rows.iter().any(|r| matches!(r, SideRow::Conn { idx: 0, .. })));
+        // A filter the grouped connection does not match hides the whole group.
+        app.table_filter = "zzz".into();
+        let rows = compute_side_rows(&app);
+        assert_eq!(rows.iter().filter(|r| matches!(r, SideRow::Group { .. })).count(), 0);
+        assert!(!rows.iter().any(|r| matches!(r, SideRow::Conn { idx: 1, .. })));
+        assert!(rows.iter().any(|r| matches!(r, SideRow::Conn { idx: 0, .. })));
+        // A member hit keeps the group (and only that member) visible.
+        app.table_filter = "postgres".into();
+        let rows = compute_side_rows(&app);
+        assert_eq!(rows.iter().filter(|r| matches!(r, SideRow::Group { .. })).count(), 1);
+        assert!(rows.iter().any(|r| matches!(r, SideRow::Conn { idx: 1, .. })));
+    }
+
+    /// R48: `h` folds a group and the fold is remembered for the session; `l`
+    /// unfolds it again.
+    #[test]
+    fn sidebar_group_fold_is_remembered() {
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel::<OpResult>();
+        let mut app = tree_app();
+        let c1 = app.connections[0].id.clone();
+        app.sidebar_layout = SidebarLayout {
+            groups: vec![group("g1", "生产", vec![LayoutNode::Conn(c1)])],
+        };
+        rebuild_side_rows(&mut app);
+        let gi = app
+            .side_rows
+            .iter()
+            .position(|r| matches!(r, SideRow::Group { .. }))
+            .unwrap();
+        app.side_sel = gi;
+        side_collapse(&mut app);
+        assert!(app.group_closed.contains("g1"));
+        assert!(
+            !app.side_rows.iter().any(|r| matches!(r, SideRow::Conn { idx: 0, .. })),
+            "a folded group hides its connections"
+        );
+        side_expand(&mut app, &tx);
+        assert!(!app.group_closed.contains("g1"));
+        assert!(app.side_rows.iter().any(|r| matches!(r, SideRow::Conn { idx: 0, .. })));
+    }
+
+    // ── R48: pinned result pane ──
+
+    /// R48: `Alt-F` (results pane) toggles a pin; the pinned grid survives a
+    /// live-grid clear (a table switch) and is drawn with a 📌 header above the
+    /// live pane at 42×22 without panicking.
+    #[test]
+    fn pin_results_survives_a_table_switch_and_renders() {
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel::<OpResult>();
+        let mut app = test_app();
+        app.picker_open = false;
+        app.selected = Some(test_conn("mysql"));
+        app.backend_kind = Backend::Sql;
+        app.grid_kind = GridKind::TableData;
+        app.set_grid(sample_grid());
+        app.focus = Focus::Preview;
+        // Alt-F in the results pane pins; it is free there (the editor keeps
+        // Alt-F for SQL formatting).
+        preview_key(&mut app, &tx, KeyEvent::new(KeyCode::Char('f'), KeyModifiers::ALT));
+        assert!(app.pinned_result.is_some(), "Alt-F should pin the grid");
+        // Switching table clears the live grid, but the pinned snapshot stays.
+        app.clear_grid();
+        assert!(app.pinned_result.is_some(), "a table switch must not drop the pin");
+        let rows = draw(&mut app, 42, 22);
+        assert!(rows.iter().any(|r| r.contains("📌")), "pin marker missing: {rows:?}");
+        // A second Alt-F releases it.
+        preview_key(&mut app, &tx, KeyEvent::new(KeyCode::Char('f'), KeyModifiers::ALT));
+        assert!(app.pinned_result.is_none());
+    }
+
+    /// R48: pinning an empty pane reports why instead of pinning nothing.
+    #[test]
+    fn pin_results_without_a_grid_reports() {
+        let mut app = test_app();
+        app.grid_kind = GridKind::Query;
+        app.clear_grid();
+        toggle_pin_results(&mut app);
+        assert!(app.pinned_result.is_none());
+    }
+
+    // ── R48: `gc` column-structure popup ──
+
+    /// R48: the `g c` chord opens the column-structure popup from the results
+    /// pane (and only the chord — a bare `c` still opens column visibility).
+    #[test]
+    fn gc_chord_opens_the_column_popup() {
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel::<OpResult>();
+        let mut app = test_app();
+        app.picker_open = false;
+        app.selected = Some(test_conn("mysql"));
+        app.backend_kind = Backend::Sql;
+        app.grid_kind = GridKind::TableData;
+        app.set_grid(sample_grid());
+        app.table_meta = Some(TableMeta {
+            table: "orders".into(),
+            schema: String::new(),
+            columns: vec![pk_col("id", "bigint")],
+        });
+        app.focus = Focus::Preview;
+        key(&mut app, &tx, KeyEvent::new(KeyCode::Char('g'), KeyModifiers::NONE));
+        assert!(app.pending_g, "g should arm the chord");
+        key(&mut app, &tx, KeyEvent::new(KeyCode::Char('c'), KeyModifiers::NONE));
+        assert!(app.cols_popup_open, "g c should open the column popup");
+        assert!(!app.col_picker_open, "g c must not open column visibility");
+    }
+
+    /// R48: `gc` opens a mini overlay from the cached `table_meta` (name / type /
+    /// nullable / key / comment) — no extra query — and it renders at 42×22.
+    #[test]
+    fn cols_popup_lists_cached_metadata() {
+        let mut app = test_app();
+        app.picker_open = false;
+        app.selected = Some(test_conn("mysql"));
+        app.backend_kind = Backend::Sql;
+        app.grid_kind = GridKind::TableData;
+        app.set_grid(sample_grid());
+        app.table_meta = Some(TableMeta {
+            table: "orders".into(),
+            schema: String::new(),
+            columns: vec![pk_col("id", "bigint"), col_info("note", "text")],
+        });
+        open_cols_popup(&mut app);
+        assert!(app.cols_popup_open);
+        let rows = draw(&mut app, 42, 22);
+        let joined = rows.join("\n");
+        assert!(joined.contains("id") && joined.contains("bigint"), "{joined}");
+        assert!(joined.contains("PK"), "primary-key mark missing: {joined}");
+        // A query result has no `table_meta`: the grid columns stand in.
+        app.cols_popup_open = false;
+        app.table_meta = None;
+        open_cols_popup(&mut app);
+        assert!(app.cols_popup_open);
+        let rows = draw(&mut app, 42, 22);
+        assert!(rows.join("\n").contains("column_0"));
+        // Esc closes it.
+        cols_popup_key(&mut app, KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+        assert!(!app.cols_popup_open);
+        // With neither metadata nor a grid there is nothing to open.
+        app.cols_popup_open = false;
+        app.clear_grid();
+        open_cols_popup(&mut app);
+        assert!(!app.cols_popup_open);
     }
 
     /// R43: the tree cursor walks tables, `h` collapses the active database
@@ -38796,7 +39633,7 @@ mod tests {
         let dbs: Vec<&str> = rows
             .iter()
             .filter_map(|r| match r {
-                SideRow::Db { idx: 1, db } => Some(db.as_str()),
+                SideRow::Db { idx: 1, db, .. } => Some(db.as_str()),
                 _ => None,
             })
             .collect();
@@ -38911,7 +39748,7 @@ mod tests {
             app.side_sel = app
                 .side_rows
                 .iter()
-                .position(|r| matches!(r, SideRow::Conn { idx: 0 }))
+                .position(|r| matches!(r, SideRow::Conn { idx: 0, .. }))
                 .unwrap();
             apply_op_result(
                 &mut app,
@@ -38926,12 +39763,12 @@ mod tests {
             assert!(app.tree_conn_closed.contains(&c1), "the root collapsed");
             assert!(app.databases.is_empty(), "the dead pool's browse state is gone");
             // The cursor landed on the sibling root, not the dead one.
-            assert!(matches!(app.side_rows[app.side_sel], SideRow::Conn { idx: 1 }));
+            assert!(matches!(app.side_rows[app.side_sel], SideRow::Conn { idx: 1, .. }));
             // Re-expanding the dead root reconnects (marks it connecting).
             let idx = app
                 .side_rows
                 .iter()
-                .position(|r| matches!(r, SideRow::Conn { idx: 0 }))
+                .position(|r| matches!(r, SideRow::Conn { idx: 0, .. }))
                 .unwrap();
             app.side_sel = idx;
             side_expand(&mut app, &tx);
@@ -38966,7 +39803,7 @@ mod tests {
             let rows = compute_side_rows(&app);
             assert!(
                 rows.iter()
-                    .any(|r| matches!(r, SideRow::Db { idx: 1, db } if db == "analytics")),
+                    .any(|r| matches!(r, SideRow::Db { idx: 1, db, .. } if db == "analytics")),
                 "the cached sibling list stays visible"
             );
             assert!(
@@ -38991,7 +39828,7 @@ mod tests {
             let idx = app
                 .side_rows
                 .iter()
-                .position(|r| matches!(r, SideRow::Conn { idx: 1 }))
+                .position(|r| matches!(r, SideRow::Conn { idx: 1, .. }))
                 .unwrap();
             app.side_sel = idx;
             side_expand(&mut app, &tx);
@@ -39373,6 +40210,7 @@ mod tests {
         let db_row = SideRow::Db {
             idx: 0,
             db: "shop".into(),
+            depth: 1,
         };
         let table_row = SideRow::Table {
             idx: 0,
@@ -41403,6 +42241,39 @@ mod tests {
             completion_context(&end("select * from [users].")).0,
             CompCtx::Qualified("users".into())
         );
+    }
+
+    /// R48: the candidate list is scoped by context — tables only after FROM,
+    /// columns only after WHERE / ON — and a narrow terminal caps it at five.
+    #[test]
+    fn completion_candidates_are_context_scoped() {
+        let mut app = test_app();
+        app.tables_all = vec![table_info("users", "TABLE"), table_info("orders", "TABLE")];
+        app.table_meta = Some(TableMeta {
+            table: "users".into(),
+            schema: String::new(),
+            columns: vec![col_info("id", "int"), col_info("name", "text")],
+        });
+        // After FROM: only tables (no columns, no keywords).
+        let from = completion_candidates(&app, &CompCtx::TableList, "");
+        assert!(from.iter().all(|i| i.kind == 'T'), "{from:?}");
+        assert!(from.iter().any(|i| i.text == "users"));
+        assert!(!from.iter().any(|i| i.text == "SELECT"), "{from:?}");
+        // After WHERE / ON: only columns.
+        let col = completion_candidates(&app, &CompCtx::Column, "");
+        assert!(col.iter().all(|i| i.kind == 'C'), "{col:?}");
+        assert!(col.iter().any(|i| i.text == "id"));
+        // The catch-all context still mixes columns / tables / keywords.
+        let any = completion_candidates(&app, &CompCtx::Any, "");
+        assert!(any.iter().any(|i| i.kind == 'K'), "{any:?}");
+        // A narrow terminal keeps at most five candidates.
+        app.tables_all = (0..40)
+            .map(|i| table_info(&format!("t{i:02}"), "TABLE"))
+            .collect();
+        app.term_w = 36;
+        assert_eq!(completion_candidates(&app, &CompCtx::TableList, "").len(), 5);
+        app.term_w = 120;
+        assert_eq!(completion_candidates(&app, &CompCtx::TableList, "").len(), 8);
     }
 
     // ── R15: wheel modifier encodings, footer layout, bilingual UI ──
