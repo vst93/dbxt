@@ -7115,8 +7115,9 @@ async fn run_op(backend: &LocalBackend, op: Op, tx: &Tx) -> OpResult {
                 keyset_asc,
                 &seek,
             );
+            let query_timeout = cfg.effective_query_timeout_secs();
             match backend
-                .execute_query(&cfg, &db, &sql, Some(page_size + 1), Some(60))
+                .execute_query(&cfg, &db, &sql, Some(page_size + 1), Some(query_timeout))
                 .await
             {
                 Ok(r) => {
@@ -7173,7 +7174,10 @@ async fn run_op(backend: &LocalBackend, op: Op, tx: &Tx) -> OpResult {
                         gen,
                     }
                 }
-                Err(e) => OpResult::Error(format!("table data: {e}")),
+                Err(e) => OpResult::Error(format!(
+                    "table data: {}",
+                    query_error_text(&e, query_timeout)
+                )),
             }
         }
         Op::TableColumns(cfg, db, schema, table) => {
@@ -7200,6 +7204,9 @@ async fn run_op(backend: &LocalBackend, op: Op, tx: &Tx) -> OpResult {
         }
         Op::Query(cfg, db, sql, cap, origin) => {
             let cap = cap.max(1);
+            // R58: the connection's own limit drives the driver-side timeout, so
+            // a form-set 30 s bounds the query instead of the old fixed 60 s.
+            let timeout = cfg.effective_query_timeout_secs();
             // Record only a fresh run, never a `Ctrl-N` load-more (which re-runs
             // the same statement with a higher cap and would duplicate it).
             let record = cap <= QUERY_MAX_ROWS;
@@ -7207,7 +7214,7 @@ async fn run_op(backend: &LocalBackend, op: Op, tx: &Tx) -> OpResult {
             if statements.len() > 1 {
                 let options = QueryExecutionOptions {
                     max_rows: Some(cap),
-                    timeout_secs: Some(60),
+                    timeout_secs: Some(timeout),
                     ..Default::default()
                 };
                 match backend.execute_batch(&cfg, &db, None, &sql, options).await {
@@ -7232,12 +7239,12 @@ async fn run_op(backend: &LocalBackend, op: Op, tx: &Tx) -> OpResult {
                             record_history(backend, &cfg, &db, &sql, Some(e.clone()), 0, origin)
                                 .await;
                         }
-                        OpResult::Error(format!("script: {e}"))
+                        OpResult::Error(format!("script: {}", query_error_text(&e, timeout)))
                     }
                 }
             } else {
                 match backend
-                    .execute_query(&cfg, &db, &sql, Some(cap), Some(60))
+                    .execute_query(&cfg, &db, &sql, Some(cap), Some(timeout))
                     .await
                 {
                     Ok(r) => {
@@ -7260,7 +7267,7 @@ async fn run_op(backend: &LocalBackend, op: Op, tx: &Tx) -> OpResult {
                             record_history(backend, &cfg, &db, &sql, Some(e.clone()), 0, origin)
                                 .await;
                         }
-                        OpResult::Error(format!("query: {e}"))
+                        OpResult::Error(format!("query: {}", query_error_text(&e, timeout)))
                     }
                 }
             }
@@ -9397,6 +9404,10 @@ enum FormRow {
     Username,
     Password,
     Database,
+    /// R58: per-connection query timeout in seconds (empty = kernel default,
+    /// `0` = no limit). Mapped to `ConnectionConfig::query_timeout_secs` and, on
+    /// PostgreSQL, to a `statement_timeout` connection option.
+    QueryTimeout,
     Ssl,
     /// Hard-block every write statement on this connection (safety valve).
     ReadOnly,
@@ -9425,6 +9436,9 @@ struct ConnForm {
     username: String,
     password: String,
     database: String,
+    /// R58: query timeout field text. Empty means "inherit the kernel default
+    /// (60 s)"; `0` means unlimited; a positive number is used verbatim.
+    query_timeout: String,
     ssl: bool,
     /// Read-only connection flag (kernel `ConnectionConfig::read_only`).
     read_only: bool,
@@ -9466,6 +9480,7 @@ impl Default for ConnForm {
             username: String::new(),
             password: String::new(),
             database: String::new(),
+            query_timeout: String::new(),
             ssl: false,
             read_only: false,
             color: String::new(),
@@ -9555,6 +9570,135 @@ fn normalize_conn_color(raw: &str) -> Result<Option<String>, ()> {
         "#{}",
         v.trim_start_matches('#').to_ascii_lowercase()
     )))
+}
+
+/// R58: hard ceiling for a per-connection query timeout (one day). Anything
+/// larger is almost certainly a typo and would make the setting useless.
+const MAX_QUERY_TIMEOUT_SECS: u64 = 86_400;
+
+/// R58: parse the connection form's query-timeout field. `Ok(None)` means the
+/// field is blank and the saved / kernel default (60 s) applies; `Ok(Some(0))`
+/// means unlimited; `Ok(Some(n))` is a finite limit. `Err(())` is a user error
+/// (non-numeric or over [`MAX_QUERY_TIMEOUT_SECS`]).
+fn parse_query_timeout(raw: &str) -> Result<Option<u64>, ()> {
+    let s = raw.trim();
+    if s.is_empty() {
+        return Ok(None);
+    }
+    let secs: u64 = s.parse().map_err(|_| ())?;
+    if secs > MAX_QUERY_TIMEOUT_SECS {
+        return Err(());
+    }
+    Ok(Some(secs))
+}
+
+/// R58: apply the connection form's query-timeout field to a config. A blank
+/// field keeps the kernel default (60 s); `0` disables the limit. On engines
+/// whose URL builder reaches `tokio_postgres`, the limit is also mirrored into
+/// the `statement_timeout` connection option so every pooled session enforces it
+/// server-side (`SHOW statement_timeout` reflects it) with no per-query `SET`.
+/// Pure so the mapping is unit-testable.
+fn apply_form_query_timeout(cfg: &mut ConnectionConfig, field: &str) -> Result<(), ()> {
+    let secs = parse_query_timeout(field)?
+        .unwrap_or_else(dbx_core::models::connection::default_query_timeout_secs);
+    cfg.query_timeout_secs = secs;
+    if postgres_url_params_engine(cfg.db_type.as_str()) {
+        cfg.url_params =
+            with_pg_statement_timeout(cfg.url_params.as_deref(), Some(secs.saturating_mul(1000)));
+    }
+    Ok(())
+}
+
+/// The engines whose kernel URL builder passes `url_params` through to
+/// `tokio_postgres` (Postgres / Redshift / CockroachDB). GaussDB, Kingbase, DM
+/// and friends use their own driver scheme and would ignore an `options` entry.
+fn postgres_url_params_engine(db_type: &str) -> bool {
+    matches!(
+        db_type.to_ascii_lowercase().as_str(),
+        "postgres" | "postgresql" | "redshift" | "cockroachdb"
+    )
+}
+
+/// Decode a `%XX`-escaped URL parameter value. `+` is left literal (libpq-style
+/// URLs use `%20`), and a stray `%` is kept as-is.
+fn percent_decode_url_value(input: &str) -> String {
+    fn hex(b: u8) -> Option<u8> {
+        match b {
+            b'0'..=b'9' => Some(b - b'0'),
+            b'a'..=b'f' => Some(b - b'a' + 10),
+            b'A'..=b'F' => Some(b - b'A' + 10),
+            _ => None,
+        }
+    }
+    let bytes = input.as_bytes();
+    let mut out: Vec<u8> = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'%' && i + 2 < bytes.len() {
+            if let (Some(h), Some(l)) = (hex(bytes[i + 1]), hex(bytes[i + 2])) {
+                out.push(h * 16 + l);
+                i += 3;
+                continue;
+            }
+        }
+        out.push(bytes[i]);
+        i += 1;
+    }
+    String::from_utf8_lossy(&out).into_owned()
+}
+
+/// R58: set (or clear) `statement_timeout` inside a PostgreSQL `url_params`
+/// string, leaving every other parameter and `-c` option untouched.
+///
+/// The kernel's `options` URL parameter is the one connection-level channel that
+/// reaches `tokio_postgres` — it becomes the session's `options` startup
+/// argument, so `SHOW statement_timeout` reflects it on every pooled session
+/// without a per-query `SET`. `Some(ms)` writes `-c statement_timeout=<ms>`
+/// (`0` = unlimited); `None` drops any existing `statement_timeout` pair while
+/// preserving the rest of the options — an all-empty result becomes `None`.
+fn with_pg_statement_timeout(params: Option<&str>, millis: Option<u64>) -> Option<String> {
+    let raw = params.unwrap_or("").trim().trim_start_matches('?');
+    let mut kept: Vec<String> = Vec::new();
+    let mut option_tokens: Vec<String> = Vec::new();
+    for part in raw.split('&').filter(|p| !p.trim().is_empty()) {
+        let (key, value) = part.split_once('=').unwrap_or((part, ""));
+        if !key.eq_ignore_ascii_case("options") {
+            kept.push(part.to_string());
+            continue;
+        }
+        let decoded = percent_decode_url_value(value);
+        let tokens: Vec<&str> = decoded.split_whitespace().collect();
+        let mut i = 0;
+        while i < tokens.len() {
+            let is_pair = tokens[i] == "-c"
+                && tokens
+                    .get(i + 1)
+                    .is_some_and(|t| t.to_ascii_lowercase().starts_with("statement_timeout="));
+            if is_pair {
+                i += 2;
+                continue;
+            }
+            option_tokens.push(tokens[i].to_string());
+            i += 1;
+        }
+    }
+    if let Some(ms) = millis {
+        option_tokens.push("-c".to_string());
+        option_tokens.push(format!("statement_timeout={ms}"));
+    }
+    if option_tokens.is_empty() {
+        return if kept.is_empty() {
+            None
+        } else {
+            Some(kept.join("&"))
+        };
+    }
+    let base = kept.join("&");
+    Some(dbx_core::connection::upsert_connection_url_param(
+        Some(&base),
+        "options",
+        &option_tokens.join(" "),
+    ))
 }
 
 /// Order the connection picker `s` cycles through.
@@ -9688,6 +9832,7 @@ fn form_rows(f: &ConnForm) -> Vec<(FormRow, &'static str)> {
         (FormRow::Username, "username"),
         (FormRow::Password, "password"),
         (FormRow::Database, "database"),
+        (FormRow::QueryTimeout, "query_timeout"),
         (FormRow::Ssl, "ssl"),
         (FormRow::ReadOnly, "read_only"),
         (FormRow::Color, "color"),
@@ -9720,6 +9865,7 @@ fn form_label_short(label: &'static str) -> &'static str {
         "username" => "user",
         "password" => "pass",
         "database" => "db",
+        "query_timeout" => "timeout",
         "ssh_tunnel" => "ssh",
         "ssh_host" => "ssh.host",
         "ssh_port" => "ssh.port",
@@ -9744,6 +9890,7 @@ fn form_text_mut(f: &mut ConnForm, row: FormRow) -> Option<&mut String> {
         FormRow::Username => Some(&mut f.username),
         FormRow::Password => Some(&mut f.password),
         FormRow::Database => Some(&mut f.database),
+        FormRow::QueryTimeout => Some(&mut f.query_timeout),
         FormRow::Color => Some(&mut f.color),
         FormRow::SshHost => Some(&mut f.ssh_host),
         FormRow::SshPort => Some(&mut f.ssh_port),
@@ -9817,6 +9964,17 @@ fn form_from_connection(cfg: &ConnectionConfig, name: String, edit_id: Option<St
         username: cfg.username.clone(),
         password: cfg.password.clone(),
         database: cfg.database.clone().unwrap_or_default(),
+        // R58: an unset default (60 s) renders as an empty "inherit" field; an
+        // explicit 0 (DBX's "no limit") or any custom value round-trips.
+        query_timeout: if cfg.query_timeout_secs == 0 {
+            "0".into()
+        } else if cfg.query_timeout_secs
+            == dbx_core::models::connection::default_query_timeout_secs()
+        {
+            String::new()
+        } else {
+            cfg.query_timeout_secs.to_string()
+        },
         ssl: cfg.ssl,
         read_only: cfg.read_only,
         color: cfg.color.clone().unwrap_or_default(),
@@ -16293,7 +16451,7 @@ fn natural_width(grid: &Grid, ci: usize, max_cell: usize) -> usize {
     let mut w = disp_width(grid.columns.get(ci).map(String::as_str).unwrap_or(""));
     for row in &grid.rows {
         if let Some(v) = row.get(ci) {
-            let cw = disp_width(v.text());
+            let cw = cell_text_width(v);
             if cw > w {
                 w = cw;
             }
@@ -16310,7 +16468,7 @@ fn natural_widths(grid: &Grid, max_cell: usize) -> Vec<usize> {
     for row in &grid.rows {
         for (ci, w) in widths.iter_mut().enumerate() {
             if let Some(v) = row.get(ci) {
-                let cw = disp_width(v.text());
+                let cw = cell_text_width(v);
                 if cw > *w {
                     *w = cw;
                 }
@@ -16904,6 +17062,37 @@ fn humanize_backend_error(error: &str) -> String {
     secret_store_error_hint(error)
         .map(str::to_string)
         .unwrap_or_else(|| error.to_string())
+}
+
+/// R58: true when a query error is a timeout rather than a real SQL / data
+/// error. Covers the kernel's client-side cancel ("Query timed out after N
+/// seconds"), a PostgreSQL server `statement_timeout`, and MySQL's
+/// `max_execution_time` interrupt. Shared so the `Op::Query` path can rewrite a
+/// raw driver message into a readable hint.
+fn is_query_timeout_error(error: &str) -> bool {
+    let l = error.to_ascii_lowercase();
+    l.contains("query timed out after")
+        || l.contains("canceling statement due to statement timeout")
+        || l.contains("cancelling statement due to statement timeout")
+        || l.contains("statement timeout")
+        || l.contains("maximum statement execution time exceeded")
+        || l.contains("max_execution_time")
+        || l.contains("query execution was interrupted")
+}
+
+/// R58: a readable, bilingual timeout message. `timeout_secs == 0` means the
+/// connection has no limit, so a timeout there is generic (a driver / watchdog
+/// bound), otherwise the configured limit is named and the user is told how to
+/// react. Non-timeout errors pass through unchanged.
+fn query_error_text(error: &str, timeout_secs: u64) -> String {
+    if !is_query_timeout_error(error) {
+        return error.to_string();
+    }
+    if timeout_secs > 0 {
+        tf("查询超时（{}s），可调大超时或优化语句", &[&timeout_secs])
+    } else {
+        t("查询超时，可调大超时或优化语句").to_string()
+    }
 }
 
 /// Human-readable text for a best-effort host-key notice.
@@ -19902,6 +20091,47 @@ fn editor_display_col(line: &str, col: usize) -> usize {
     w
 }
 
+/// Outcome of an editor undo, so the caller can name what happened.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum EditorUndo {
+    /// Undid a pending Alt-F reformat via the R57 snapshot.
+    Reformatted,
+    /// Undid one step through tui-textarea's own history.
+    History,
+    /// Nothing left to undo.
+    None,
+}
+
+/// R58: undo one editor step. A pending Alt-F reformat (`editor_undo` snapshot)
+/// is undone in one gesture; otherwise tui-textarea's own history is used.
+/// tui-textarea leaves Ctrl-Z unbound, so R58 wires it (Ctrl-U stays for muscle
+/// memory). The return value lets the caller flash a truthful status instead of
+/// a silent no-op.
+fn editor_undo_step(app: &mut App) -> EditorUndo {
+    if let Some(prev) = app.editor_undo.take() {
+        app.set_editor_text(&prev);
+        EditorUndo::Reformatted
+    } else if app.editor.undo() {
+        EditorUndo::History
+    } else {
+        EditorUndo::None
+    }
+}
+
+/// R58: redo one undone edit through tui-textarea's history.
+fn editor_redo_step(app: &mut App) -> bool {
+    app.editor.redo()
+}
+
+/// Status text for an undo outcome, kept beside the step so they never drift.
+fn editor_undo_status(outcome: EditorUndo) -> &'static str {
+    match outcome {
+        EditorUndo::Reformatted => t("已撤销格式化"),
+        EditorUndo::History => t("已撤销"),
+        EditorUndo::None => t("没有可撤销的"),
+    }
+}
+
 fn editor_key(app: &mut App, tx: &Tx, k: KeyEvent) {
     // The completion popup owns the keyboard while it is open: Tab / Enter
     // accept, Esc cancels, arrows move, anything else keeps typing (and refines
@@ -19942,16 +20172,44 @@ fn editor_key(app: &mut App, tx: &Tx, k: KeyEvent) {
         (KeyModifiers::ALT, KeyCode::Up) => {
             jump_statement(app, -1);
         }
-        // Ctrl-U: undo the last Alt-F reformat in one step; with no reformat to
-        // undo it falls back to the editor's own undo history (tui-textarea),
-        // which has no default key binding of its own.
+        // Ctrl-Z / Ctrl-U: undo the last Alt-F reformat in one step (R57
+        // snapshot); with no reformat to undo it falls back to the editor's own
+        // undo history (tui-textarea, which has no default Ctrl-Z binding). R58
+        // flashes the outcome so a no-op undo is no longer silent. Ctrl-U stays
+        // as the R51 key for muscle memory.
+        (m, KeyCode::Char('z')) if m.contains(KeyModifiers::CONTROL) => {
+            app.status = editor_undo_status(editor_undo_step(app)).into();
+        }
         (m, KeyCode::Char('u')) if m.contains(KeyModifiers::CONTROL) => {
-            if let Some(prev) = app.editor_undo.take() {
-                app.set_editor_text(&prev);
-                app.status = t("已撤销格式化").into();
+            app.status = editor_undo_status(editor_undo_step(app)).into();
+        }
+        // Ctrl-Y / Ctrl-R: redo (R58). tui-textarea bound Ctrl-Y to its internal
+        // yank buffer, so Alt-Y keeps that available; Ctrl-R was already
+        // tui-textarea's redo. Both flash the outcome.
+        (m, KeyCode::Char('y')) if m.contains(KeyModifiers::CONTROL) => {
+            app.status = if editor_redo_step(app) {
+                t("已重做")
             } else {
-                app.editor.undo();
+                t("没有可重做的")
             }
+            .into();
+        }
+        (m, KeyCode::Char('r')) if m.contains(KeyModifiers::CONTROL) => {
+            app.status = if editor_redo_step(app) {
+                t("已重做")
+            } else {
+                t("没有可重做的")
+            }
+            .into();
+        }
+        // Alt-Y: the editor's internal yank/paste, freed from Ctrl-Y by R58.
+        (KeyModifiers::ALT, KeyCode::Char('y')) | (KeyModifiers::ALT, KeyCode::Char('Y')) => {
+            app.status = if app.editor.paste() {
+                t("已粘贴缓冲区")
+            } else {
+                t("粘贴缓冲区为空")
+            }
+            .into();
         }
         // `%`: vim's bracket jump. It only fires when the cursor sits on, or
         // immediately after, a `()[]{}` bracket — anywhere else `%` is typed
@@ -28067,6 +28325,7 @@ fn form_key(app: &mut App, tx: &Tx, k: KeyEvent) {
                 if let Some(s) = form_text_mut(&mut app.form, cur) {
                     match cur {
                         FormRow::Port | FormRow::SshPort if !c.is_ascii_digit() => {}
+                        FormRow::QueryTimeout if !c.is_ascii_digit() => {}
                         FormRow::DbType => s.push(c.to_ascii_lowercase()),
                         // Colour row only accepts `#` and hex digits.
                         FormRow::Color if !(c.is_ascii_hexdigit() || c == '#') => {}
@@ -28115,7 +28374,7 @@ fn form_key(app: &mut App, tx: &Tx, k: KeyEvent) {
                 }
             }
             FormRow::Save => save_form(app, tx),
-            FormRow::Port | FormRow::SshPort => {}
+            FormRow::Port | FormRow::SshPort | FormRow::QueryTimeout => {}
             _ => {
                 app.form.editing = true;
                 if let Some(s) = form_text_mut(&mut app.form, cur) {
@@ -28248,6 +28507,13 @@ fn save_form(app: &mut App, tx: &Tx) {
             return;
         }
     };
+    // R58: query timeout. Blank keeps the kernel default (60 s); `0` is DBX's
+    // "no limit"; a positive number is stored on the config and, on PostgreSQL,
+    // mirrored into the connection's `statement_timeout` option.
+    if let Err(()) = parse_query_timeout(&f.query_timeout) {
+        app.form.err = t("查询超时需为 0-86400 秒（0=不限，留空=默认）").into();
+        return;
+    }
     // Editing preserves fields the form does not expose (colour, notes, visible
     // databases, driver profile, …) by starting from the saved config.
     let mut cfg = match f
@@ -28293,6 +28559,10 @@ fn save_form(app: &mut App, tx: &Tx) {
     cfg.ssl = f.ssl;
     cfg.read_only = f.read_only;
     cfg.color = color;
+    if let Err(()) = apply_form_query_timeout(&mut cfg, &f.query_timeout) {
+        app.form.err = t("查询超时需为 0-86400 秒（0=不限，留空=默认）").into();
+        return;
+    }
     cfg.transport_layers = ssh_layer
         .into_iter()
         .map(TransportLayerConfig::Ssh)
@@ -34035,12 +34305,44 @@ fn search_hit_style() -> Style {
         .add_modifier(Modifier::BOLD)
 }
 
+/// R58: longest value shown inline in a grid cell. A longer value collapses to
+/// its first 38 display columns plus `…`, signalling that `v` (the R53 cell
+/// popup) holds the full text. Kept as a constant so the width pass and the
+/// render pass agree.
+const CELL_TEXT_MAX: usize = 40;
+
+/// R58: inline representation of a cell value. Values wider than
+/// [`CELL_TEXT_MAX`] collapse to `first 38…`; everything else is returned as-is
+/// (the caller still clamps to the column width).
+fn abbreviate_cell_text(text: &str) -> String {
+    if disp_width(text) > CELL_TEXT_MAX {
+        truncate_disp(text, CELL_TEXT_MAX - 1)
+    } else {
+        text.to_string()
+    }
+}
+
+/// R58: a cell value's contribution to its column width, capped at the inline
+/// abbreviation so a long value no longer stretches its column past what is
+/// actually drawn.
+fn cell_text_width(v: &Val) -> usize {
+    let w = disp_width(v.text());
+    if w > CELL_TEXT_MAX {
+        CELL_TEXT_MAX - 1
+    } else {
+        w
+    }
+}
+
 /// Render one cell, optionally marking it as the focused cell or highlighting a
 /// search hit.
 fn cell_widget_hl(v: &Val, w: usize, focused: bool, needle: Option<&str>) -> Cell<'static> {
     if focused {
         let (text, _) = value_display(v);
-        return Cell::from(Span::styled(truncate_disp(&text, w), focused_cell_style()));
+        return Cell::from(Span::styled(
+            truncate_disp(&abbreviate_cell_text(&text), w),
+            focused_cell_style(),
+        ));
     }
     let hit = needle.is_some_and(|n| {
         let s = match v {
@@ -34051,12 +34353,15 @@ fn cell_widget_hl(v: &Val, w: usize, focused: bool, needle: Option<&str>) -> Cel
     });
     if hit {
         let (text, _) = value_display(v);
-        return Cell::from(Span::styled(truncate_disp(&text, w), search_hit_style()));
+        return Cell::from(Span::styled(
+            truncate_disp(&abbreviate_cell_text(&text), w),
+            search_hit_style(),
+        ));
     }
     match v {
         Val::Null => Cell::from(Span::styled("NULL", null_style())),
         Val::Text(s) if s.is_empty() => Cell::from(Span::styled("''", empty_string_style())),
-        Val::Text(s) => Cell::from(Span::raw(truncate_disp(s, w))),
+        Val::Text(s) => Cell::from(Span::raw(truncate_disp(&abbreviate_cell_text(s), w))),
     }
 }
 
@@ -34899,6 +35204,16 @@ fn form_row_value(f: &ConnForm, row: FormRow) -> String {
         FormRow::Username => f.username.clone(),
         FormRow::Password => "*".repeat(f.password.chars().count()),
         FormRow::Database => f.database.clone(),
+        FormRow::QueryTimeout => {
+            let v = f.query_timeout.trim();
+            if v.is_empty() {
+                t("默认（60s）").to_string()
+            } else if v == "0" {
+                t("不限").to_string()
+            } else {
+                format!("{} s", v)
+            }
+        }
         FormRow::Ssl => if f.ssl { "y" } else { "n" }.to_string(),
         FormRow::ReadOnly => {
             if f.read_only {
@@ -34983,7 +35298,14 @@ fn render_form(f: &mut Frame, area: Rect, app: &mut App) {
             label
         };
         let is_active = i == active;
-        let mut value = form_row_value(&form, row);
+        // R58: while the query-timeout row is being edited, show its raw buffer
+        // (not the derived `30 s` / `默认（60s）` display) so the caret sits where
+        // the next digit will land.
+        let mut value = if form.editing && is_active && row == FormRow::QueryTimeout {
+            form.query_timeout.clone()
+        } else {
+            form_row_value(&form, row)
+        };
         if form.editing && is_active {
             value.push('▏');
         }
@@ -38367,8 +38689,9 @@ const HELP_ROWS: &[(&str, &str)] = &[
     ),
     ("q", "折叠 / 展开连接列表"),
     ("— 连接表单 —", ""),
-    ("↑ ↓ / Tab", "切换字段：db_type → name → host → port → user → password → database（开启 ssh_tunnel 后自动展开 SSH 段）"),
+    ("↑ ↓ / Tab", "切换字段：db_type → name → host → port → user → password → database → query_timeout（开启 ssh_tunnel 后自动展开 SSH 段）"),
     ("Enter", "编辑字段 / 切换开关 / 保存连接"),
+    ("query_timeout", "查询超时秒数：留空=默认 60s，0=不限；PostgreSQL 同时以 statement_timeout 连接选项生效（连接级，不逐条查询）"),
     ("默认端口", "选定 db_type 即带出 MySQL 3306 / PG 5432 / Redis 6379 / Mongo 27017；手动改过 port 则不覆盖"),
     ("name 留空", "保存时按 host-db_type 自动生成连接名（如 localhost-postgres）"),
     ("Space", "切换 ssh_tunnel / ssl / read_only / 登录方式"),
@@ -38632,7 +38955,15 @@ const HELP_ROWS: &[(&str, &str)] = &[
         "Alt-F",
         "格式化当前 SQL（关键字大写 / 子句换行）；再按压缩为单行",
     ),
-    ("Ctrl-U", "撤销上一次 Alt-F 格式化"),
+    (
+        "Ctrl-Z / Ctrl-U",
+        "撤销（Alt-F 格式化或编辑历史；状态栏提示已撤销 / 没有可撤销的）",
+    ),
+    (
+        "Ctrl-Y / Ctrl-R",
+        "重做上一次撤销（状态栏提示已重做 / 没有可重做的；编辑器内 Ctrl-Y 原为内部 yank，改到 Alt-Y）",
+    ),
+    ("Alt-Y", "粘贴内部 yank 缓冲区（Ctrl-K 删掉的内容）"),
     (
         "Alt-↓ / Alt-↑",
         "跳到下 / 上一条 SQL 语句开头（分号边界，注释/空语句跳过；状态栏显示 语句 i/n；当前语句高亮、其余淡化）",
@@ -50897,6 +51228,9 @@ mod tests {
             order.iter().position(|r| *r == FormRow::SshEnabled)
                 > order.iter().position(|r| *r == FormRow::Color)
         );
+        // R58: the query-timeout row sits right after `database`, before `ssl`.
+        assert_eq!(order[7], FormRow::QueryTimeout);
+        assert_eq!(order[8], FormRow::Ssl);
     }
 
     /// R51: the port field is derived from the selected database type, and a
@@ -54073,5 +54407,304 @@ mod tests {
             .expect("delete confirm opened");
         assert!(rc.reload_list);
         assert!(rc.remove_in_place.is_empty());
+    }
+
+    // ── R58: connection query timeout ──
+
+    #[test]
+    fn query_timeout_field_parsing() {
+        assert_eq!(parse_query_timeout(""), Ok(None));
+        assert_eq!(parse_query_timeout("   "), Ok(None));
+        assert_eq!(parse_query_timeout("0"), Ok(Some(0)));
+        assert_eq!(parse_query_timeout("30"), Ok(Some(30)));
+        assert_eq!(parse_query_timeout(" 45 "), Ok(Some(45)));
+        assert_eq!(parse_query_timeout("86400"), Ok(Some(86_400)));
+        assert_eq!(parse_query_timeout("abc"), Err(()));
+        assert_eq!(parse_query_timeout("-1"), Err(()));
+        assert_eq!(parse_query_timeout("86401"), Err(()));
+    }
+
+    /// The `options` value of a postgres url-params string, decoded and split.
+    fn pg_option_tokens(params: &str) -> Vec<String> {
+        params
+            .split('&')
+            .find_map(|part| {
+                let (k, v) = part.split_once('=')?;
+                k.eq_ignore_ascii_case("options")
+                    .then(|| percent_decode_url_value(v))
+            })
+            .map(|v| v.split_whitespace().map(str::to_string).collect())
+            .unwrap_or_default()
+    }
+
+    fn pg_statement_timeout(params: &str) -> Option<u64> {
+        pg_option_tokens(params)
+            .iter()
+            .find_map(|t| t.strip_prefix("statement_timeout=")?.parse().ok())
+    }
+
+    #[test]
+    fn with_pg_statement_timeout_merges_and_clears() {
+        // Sets statement_timeout while preserving other params and `-c` options.
+        let set = with_pg_statement_timeout(
+            Some("sslmode=require&options=-c%20TimeZone%3DUTC"),
+            Some(30_000),
+        )
+        .expect("url_params built");
+        assert!(set.contains("sslmode=require"));
+        assert_eq!(pg_statement_timeout(&set), Some(30_000));
+        assert!(pg_option_tokens(&set).contains(&"TimeZone=UTC".to_string()));
+
+        // Re-setting replaces the value instead of duplicating the pair.
+        let reset = with_pg_statement_timeout(Some(&set), Some(60_000)).unwrap();
+        let pairs = pg_option_tokens(&reset)
+            .iter()
+            .filter(|t| t.starts_with("statement_timeout="))
+            .count();
+        assert_eq!(pairs, 1);
+        assert_eq!(pg_statement_timeout(&reset), Some(60_000));
+
+        // Clearing drops only statement_timeout.
+        let cleared = with_pg_statement_timeout(Some(&reset), None).unwrap();
+        assert_eq!(pg_statement_timeout(&cleared), None);
+        assert!(pg_option_tokens(&cleared).contains(&"TimeZone=UTC".to_string()));
+
+        // A lone statement_timeout option disappears entirely when cleared.
+        assert_eq!(
+            with_pg_statement_timeout(Some("options=-c%20statement_timeout%3D5000"), None),
+            None
+        );
+        // No params and nothing to set stays `None`.
+        assert_eq!(with_pg_statement_timeout(None, None), None);
+    }
+
+    #[test]
+    fn form_query_timeout_maps_to_config_and_pg_option() {
+        // MySQL: the timeout lands on the config, with no url_params rewrite.
+        let mut my = test_conn("mysql");
+        apply_form_query_timeout(&mut my, "30").unwrap();
+        assert_eq!(my.query_timeout_secs, 30);
+        assert_eq!(my.url_params, None);
+
+        // Blank inherits the kernel default (60 s).
+        let mut blank = test_conn("mysql");
+        blank.query_timeout_secs = 7;
+        apply_form_query_timeout(&mut blank, "").unwrap();
+        assert_eq!(blank.query_timeout_secs, 60);
+
+        // 0 disables the limit.
+        let mut unlimited = test_conn("mysql");
+        apply_form_query_timeout(&mut unlimited, "0").unwrap();
+        assert_eq!(unlimited.query_timeout_secs, 0);
+
+        // PostgreSQL: mirrored into the connection's statement_timeout option.
+        let mut pg = test_conn("postgres");
+        apply_form_query_timeout(&mut pg, "30").unwrap();
+        assert_eq!(pg.query_timeout_secs, 30);
+        let params = pg.url_params.expect("pg gets url_params");
+        assert_eq!(pg_statement_timeout(&params), Some(30_000));
+
+        // 0 is unlimited, encoded as statement_timeout=0.
+        let mut pg0 = test_conn("postgres");
+        apply_form_query_timeout(&mut pg0, "0").unwrap();
+        assert_eq!(
+            pg_statement_timeout(&pg0.url_params.expect("url_params")),
+            Some(0)
+        );
+
+        // An invalid value bubbles up and leaves the config untouched.
+        let mut bad = test_conn("postgres");
+        assert_eq!(apply_form_query_timeout(&mut bad, "x"), Err(()));
+        assert_eq!(bad.query_timeout_secs, 60);
+        assert_eq!(bad.url_params, None);
+
+        // The form prefills a saved value, and an explicit 0 round-trips.
+        let mut saved = test_conn("postgres");
+        saved.query_timeout_secs = 25;
+        let f = form_from_connection(&saved, "n".into(), None);
+        assert_eq!(f.query_timeout, "25");
+        saved.query_timeout_secs = 0;
+        let f0 = form_from_connection(&saved, "n".into(), None);
+        assert_eq!(f0.query_timeout, "0");
+    }
+
+    #[test]
+    fn query_errors_are_rewritten_only_when_they_are_timeouts() {
+        assert_eq!(
+            query_error_text("Query timed out after 30 seconds", 30),
+            tf("查询超时（{}s），可调大超时或优化语句", &[&30])
+        );
+        assert_eq!(
+            query_error_text("canceling statement due to statement timeout", 30),
+            tf("查询超时（{}s），可调大超时或优化语句", &[&30])
+        );
+        assert_eq!(
+            query_error_text(
+                "Query execution was interrupted, maximum statement execution time exceeded",
+                30
+            ),
+            tf("查询超时（{}s），可调大超时或优化语句", &[&30])
+        );
+        // Unlimited connection: a generic timeout hint.
+        assert_eq!(
+            query_error_text("Query timed out after 5 seconds", 0),
+            t("查询超时，可调大超时或优化语句")
+        );
+        // A real SQL error passes through untouched.
+        assert_eq!(
+            query_error_text("syntax error near FROM", 30),
+            "syntax error near FROM"
+        );
+    }
+
+    // ── R58: editor undo/redo visibility ──
+
+    #[test]
+    fn editor_undo_redo_flash_state_machine() {
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel::<OpResult>();
+        let mut app = test_app();
+        app.focus = Focus::Editor;
+        app.set_editor_text("select 1");
+
+        // A fresh buffer has nothing to undo or redo: the status bar says so
+        // instead of a silent no-op.
+        editor_key(
+            &mut app,
+            &tx,
+            KeyEvent::new(KeyCode::Char('z'), KeyModifiers::CONTROL),
+        );
+        assert_eq!(app.status, t("没有可撤销的"));
+        editor_key(
+            &mut app,
+            &tx,
+            KeyEvent::new(KeyCode::Char('y'), KeyModifiers::CONTROL),
+        );
+        assert_eq!(app.status, t("没有可重做的"));
+        assert_eq!(editor_undo_step(&mut app), EditorUndo::None);
+
+        // A real edit then Ctrl-Z undoes it and Ctrl-Y redoes it.
+        app.editor.insert_str(" SELECT 2");
+        let edited = app.editor_sql();
+        editor_key(
+            &mut app,
+            &tx,
+            KeyEvent::new(KeyCode::Char('z'), KeyModifiers::CONTROL),
+        );
+        assert_eq!(app.status, t("已撤销"));
+        assert_ne!(app.editor_sql(), edited);
+        editor_key(
+            &mut app,
+            &tx,
+            KeyEvent::new(KeyCode::Char('y'), KeyModifiers::CONTROL),
+        );
+        assert_eq!(app.status, t("已重做"));
+        assert_eq!(app.editor_sql(), edited);
+
+        // Ctrl-R is the tui-textarea redo alias and shares the flash.
+        editor_key(
+            &mut app,
+            &tx,
+            KeyEvent::new(KeyCode::Char('z'), KeyModifiers::CONTROL),
+        );
+        editor_key(
+            &mut app,
+            &tx,
+            KeyEvent::new(KeyCode::Char('r'), KeyModifiers::CONTROL),
+        );
+        assert_eq!(app.editor_sql(), edited);
+
+        // A pending Alt-F reformat is undone in one step with its own notice.
+        app.set_editor_text("select a from t where x=1");
+        toggle_format_editor(&mut app);
+        assert!(app.editor_undo.is_some());
+        editor_key(
+            &mut app,
+            &tx,
+            KeyEvent::new(KeyCode::Char('z'), KeyModifiers::CONTROL),
+        );
+        assert_eq!(app.status, t("已撤销格式化"));
+        assert_eq!(app.editor_sql(), "select a from t where x=1");
+    }
+
+    // ── R58: long-cell abbreviation + NULL rendering ──
+
+    #[test]
+    fn long_cells_abbreviate_and_null_stays_grey() {
+        assert_eq!(abbreviate_cell_text("short"), "short");
+        // The 40-column boundary: exactly 40 stays, 41 collapses to `first 38…`.
+        assert_eq!(abbreviate_cell_text(&"y".repeat(40)), "y".repeat(40));
+        let ab = abbreviate_cell_text(&"y".repeat(41));
+        assert_eq!(ab, format!("{}…", "y".repeat(38)));
+        assert_eq!(ab.chars().count(), 39);
+
+        // The width pass agrees with what is drawn.
+        assert_eq!(cell_text_width(&Val::Text("short".into())), 5);
+        assert_eq!(cell_text_width(&Val::Text("z".repeat(41))), 39);
+
+        // The R53 popup keeps the full value (`value_display` is unabridged).
+        let long = Val::Text("a".repeat(60));
+        assert_eq!(value_display(&long).0, "a".repeat(60));
+
+        // NULL is already grey (R58 deliberately skips the `∅` glyph swap).
+        let (text, style) = value_display(&Val::Null);
+        assert_eq!(text, "NULL");
+        assert_eq!(style.fg, Some(Color::DarkGray));
+
+        // End to end: the grid draws the abbreviation plus the literal ellipsis.
+        let mut app = test_app();
+        app.picker_open = false;
+        app.selected = Some(test_conn("mysql"));
+        app.backend_kind = Backend::Sql;
+        app.grid_kind = GridKind::Query;
+        app.set_grid(Grid {
+            columns: vec!["c".into()],
+            rows: vec![vec![Val::Text("b".repeat(80))]],
+            note: String::new(),
+        });
+        app.focus = Focus::Preview;
+        app.sel = 0;
+        app.col_cursor = 0;
+        let screen = draw(&mut app, 110, 30);
+        let joined = screen.join("\n");
+        assert!(joined.contains(&format!("{}…", "b".repeat(38))), "{joined}");
+        assert!(
+            !joined.contains(&"b".repeat(45)),
+            "long value leaked: {joined}"
+        );
+    }
+
+    /// R58: the query-timeout row decorates an idle value (`30 s`) but shows the
+    /// raw buffer (plus the caret) while the field is being edited, so the next
+    /// digit lands where the caret is rather than after a derived unit suffix.
+    #[test]
+    fn query_timeout_row_shows_raw_buffer_while_editing() {
+        let mut app = test_app();
+        app.page = Page::NewConn;
+        app.form = ConnForm::default();
+        app.form.query_timeout = "30".into();
+        let idx = form_rows(&app.form)
+            .iter()
+            .position(|(r, _)| *r == FormRow::QueryTimeout)
+            .unwrap();
+        app.form.field = idx;
+        app.form.scroll = 0;
+
+        app.form.editing = false;
+        let idle = draw(&mut app, 60, 24).join("\n");
+        assert!(
+            idle.contains("30 s"),
+            "idle row should show the unit: {idle}"
+        );
+
+        app.form.editing = true;
+        let editing = draw(&mut app, 60, 24).join("\n");
+        assert!(
+            editing.contains("30▏"),
+            "editing row should show the raw buffer + caret: {editing}"
+        );
+        assert!(
+            !editing.contains("30 s"),
+            "editing row must not show the derived suffix: {editing}"
+        );
     }
 }

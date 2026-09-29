@@ -959,7 +959,9 @@ pub static ALL_KEYS: &[&str] = &[
     " ⚠ 删除历史确认 ",
     "查询历史面板（最近 300 条：时间 / 摘要 / 来源连接）",
     "格式化当前 SQL（关键字大写 / 子句换行）；再按压缩为单行",
-    "撤销上一次 Alt-F 格式化",
+    "撤销（Alt-F 格式化或编辑历史；状态栏提示已撤销 / 没有可撤销的）",
+    "重做上一次撤销（状态栏提示已重做 / 没有可重做的；编辑器内 Ctrl-Y 原为内部 yank，改到 Alt-Y）",
+    "粘贴内部 yank 缓冲区（Ctrl-K 删掉的内容）",
     "— 查询历史（Alt-H）—",
     "移动光标（列表即过滤视图）",
     "回填到编辑器（关面板，光标到末尾）",
@@ -1086,7 +1088,8 @@ pub static ALL_KEYS: &[&str] = &[
     "（没有匹配的列）",
     " 列结构 · j/k · Esc ",
     // R51: connection-form defaults / history counts / grid Home-End column reset
-    "切换字段：db_type → name → host → port → user → password → database（开启 ssh_tunnel 后自动展开 SSH 段）",
+    "切换字段：db_type → name → host → port → user → password → database → query_timeout（开启 ssh_tunnel 后自动展开 SSH 段）",
+    "查询超时秒数：留空=默认 60s，0=不限；PostgreSQL 同时以 statement_timeout 连接选项生效（连接级，不逐条查询）",
     "选定 db_type 即带出 MySQL 3306 / PG 5432 / Redis 6379 / Mongo 27017；手动改过 port 则不覆盖",
     "保存时按 host-db_type 自动生成连接名（如 localhost-postgres）",
     "默认端口",
@@ -2609,8 +2612,11 @@ fn en_of(zh: &'static str) -> Option<&'static str> {
         "切换字段（开启 ssh_tunnel 后自动展开 SSH 段）" => {
             Some("Move between fields (enabling ssh_tunnel expands the SSH section)")
         }
-        "切换字段：db_type → name → host → port → user → password → database（开启 ssh_tunnel 后自动展开 SSH 段）" => {
-            Some("Move between fields: db_type → name → host → port → user → password → database (enabling ssh_tunnel expands the SSH section)")
+        "切换字段：db_type → name → host → port → user → password → database → query_timeout（开启 ssh_tunnel 后自动展开 SSH 段）" => {
+            Some("Move between fields: db_type → name → host → port → user → password → database → query_timeout (enabling ssh_tunnel expands the SSH section)")
+        }
+        "查询超时秒数：留空=默认 60s，0=不限；PostgreSQL 同时以 statement_timeout 连接选项生效（连接级，不逐条查询）" => {
+            Some("Query timeout in seconds: blank = default 60s, 0 = no limit; on PostgreSQL it is also applied as a statement_timeout connection option (connection-level, not per query)")
         }
         "选定 db_type 即带出 MySQL 3306 / PG 5432 / Redis 6379 / Mongo 27017；手动改过 port 则不覆盖" => {
             Some("Picking db_type fills MySQL 3306 / PG 5432 / Redis 6379 / Mongo 27017; a hand-edited port is never overwritten")
@@ -2689,7 +2695,15 @@ fn en_of(zh: &'static str) -> Option<&'static str> {
         " ⚠ 删除历史确认 " => Some(" ⚠ Confirm history deletion "),
         "查询历史面板（最近 300 条：时间 / 摘要 / 来源连接）" => Some("Query-history panel (latest 300: time / summary / source connection)"),
         "格式化当前 SQL（关键字大写 / 子句换行）；再按压缩为单行" => Some("Format the current SQL (keywords upper-cased, clauses on their own lines); press again to compress to one line"),
-        "撤销上一次 Alt-F 格式化" => Some("Undo the last Alt-F reformat"),
+        "撤销（Alt-F 格式化或编辑历史；状态栏提示已撤销 / 没有可撤销的）" => {
+            Some("Undo (an Alt-F reformat or one edit-history step; the status bar reports undone / nothing to undo)")
+        }
+        "重做上一次撤销（状态栏提示已重做 / 没有可重做的；编辑器内 Ctrl-Y 原为内部 yank，改到 Alt-Y）" => {
+            Some("Redo the last undo (the status bar reports redone / nothing to redo; the editor's Ctrl-Y yank moved to Alt-Y)")
+        }
+        "粘贴内部 yank 缓冲区（Ctrl-K 删掉的内容）" => {
+            Some("Paste the editor's internal yank buffer (text removed by Ctrl-K)")
+        }
         "— 查询历史（Alt-H）—" => Some("— Query history (Alt-H) —"),
         "移动光标（列表即过滤视图）" => Some("Move the cursor (the list is the filtered view)"),
         "回填到编辑器（关面板，光标到末尾）" => Some("Recall into the editor (closes the panel, cursor at the end)"),
@@ -3218,6 +3232,24 @@ fn en_of(zh: &'static str) -> Option<&'static str> {
             "✓ Generated UPDATE template ({} rows · key {}) → in the editor for review, not executed",
         ),
         "-- {}：仅有主键列，无可更新列" => Some("-- {}: primary key only, no updatable column"),
+        // R58: connection query timeout + editor undo/redo visibility + cell abbreviation.
+        "默认（60s）" => Some("default (60s)"),
+        "不限" => Some("no limit"),
+        "查询超时需为 0-86400 秒（0=不限，留空=默认）" => {
+            Some("Query timeout must be 0-86400 seconds (0 = no limit, blank = default)")
+        }
+        "查询超时（{}s），可调大超时或优化语句" => {
+            Some("Query timed out ({}s) — raise the timeout or optimize the statement")
+        }
+        "查询超时，可调大超时或优化语句" => {
+            Some("Query timed out — raise the timeout or optimize the statement")
+        }
+        "已撤销" => Some("Undone"),
+        "没有可撤销的" => Some("Nothing to undo"),
+        "已重做" => Some("Redone"),
+        "没有可重做的" => Some("Nothing to redo"),
+        "已粘贴缓冲区" => Some("Pasted the yank buffer"),
+        "粘贴缓冲区为空" => Some("The yank buffer is empty"),
         _ => None,
     }
 }
