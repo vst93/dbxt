@@ -11230,6 +11230,11 @@ struct App {
     // help overlay
     help_open: bool,
     help_scroll: u16,
+    /// R60: `/` filter needle for the full `?` cheat-sheet (key or feature
+    /// name; pure client-side, never touches the database).
+    help_needle: String,
+    /// The modal input while `/` is being typed inside the help overlay.
+    help_filter: Option<TextArea<'static>>,
 
     // touch / terminal fallbacks
     //   pan_mode: vertical wheel pans columns instead of rows (for phone terminals
@@ -11894,6 +11899,8 @@ impl App {
             auto_collapse: false,
             help_open: false,
             help_scroll: 0,
+            help_needle: String::new(),
+            help_filter: None,
             pan_mode: false,
             drag_pan,
             gesture: PanGesture::default(),
@@ -21901,19 +21908,59 @@ fn open_help(app: &mut App) {
     app.help_mini = true;
     app.help_open = false;
     app.help_scroll = 0;
+    app.help_filter = None;
 }
 
 fn help_key(app: &mut App, k: KeyEvent) {
+    // While the `/` filter input owns the keyboard, every key is text (or the
+    // two ways out: Enter keeps the filter, Esc clears it).
+    if app.help_filter.is_some() {
+        help_filter_key(app, k);
+        return;
+    }
     match k.code {
         KeyCode::Esc | KeyCode::Char('q') | KeyCode::Char('?') => {
             app.help_open = false;
             app.help_mini = false;
+            app.help_needle.clear();
+            app.help_scroll = 0;
+        }
+        KeyCode::Char('/') => {
+            app.help_filter = Some(TextArea::from([app.help_needle.clone()]));
         }
         KeyCode::Up | KeyCode::Char('k') => app.help_scroll = app.help_scroll.saturating_sub(1),
         KeyCode::Down | KeyCode::Char('j') => app.help_scroll = app.help_scroll.saturating_add(1),
         KeyCode::PageUp => app.help_scroll = app.help_scroll.saturating_sub(8),
         KeyCode::PageDown => app.help_scroll = app.help_scroll.saturating_add(8),
+        KeyCode::Home => app.help_scroll = 0,
         _ => {}
+    }
+}
+
+/// The `/` filter input inside the full help overlay. Enter keeps the needle
+/// (the list stays filtered); Esc clears it and restores the full sheet.
+fn help_filter_key(app: &mut App, k: KeyEvent) {
+    match k.code {
+        KeyCode::Enter => {
+            app.help_filter = None;
+            app.help_scroll = 0;
+        }
+        KeyCode::Esc => {
+            app.help_filter = None;
+            app.help_needle.clear();
+            app.help_scroll = 0;
+        }
+        _ => {
+            if let Some(ta) = app.help_filter.as_mut() {
+                ta.input(k);
+            }
+            app.help_needle = app
+                .help_filter
+                .as_ref()
+                .and_then(|ta| ta.lines().first().cloned())
+                .unwrap_or_default();
+            app.help_scroll = 0;
+        }
     }
 }
 
@@ -21925,6 +21972,8 @@ fn help_mini_key(app: &mut App, k: KeyEvent) {
             app.help_mini = false;
             app.help_open = true;
             app.help_scroll = 0;
+            app.help_needle.clear();
+            app.help_filter = None;
         }
         KeyCode::Esc | KeyCode::Char('q') => app.help_mini = false,
         _ => {}
@@ -32771,6 +32820,7 @@ enum FooterView {
     Confirm,
     SshPrompt,
     EditDialog,
+    HelpFilter,
     Help,
     HelpMini,
     ImportReport,
@@ -32861,6 +32911,8 @@ fn footer_ctx_inner(app: &App, include_help: bool) -> FooterCtx {
         FooterView::Confirm
     } else if app.rename_edit.is_some() {
         FooterView::Rename
+    } else if include_help && app.help_open && app.help_filter.is_some() {
+        FooterView::HelpFilter
     } else if include_help && app.help_open {
         FooterView::Help
     } else if include_help && app.help_mini {
@@ -32992,7 +33044,8 @@ fn footer_ctx_inner(app: &App, include_help: bool) -> FooterCtx {
 /// rendering trims lower-priority hints when the line is narrow.
 fn footer_hints_ctx(ctx: FooterCtx) -> Vec<Hint> {
     let mut v: Vec<Hint> = match ctx.view {
-        FooterView::Help => vec![("↑↓", t("滚动")), ("Esc", t("关闭"))],
+        FooterView::HelpFilter => vec![("Enter", t("保留")), ("Esc", t("清除"))],
+        FooterView::Help => vec![("/", t("过滤")), ("↑↓", t("滚动")), ("Esc", t("关闭"))],
         FooterView::HelpMini => vec![("Enter/?", t("全部键位")), ("Esc", t("关闭"))],
         FooterView::Rename => vec![
             ("Enter", t("保存")),
@@ -39045,7 +39098,7 @@ const HELP_ROWS: &[(&str, &str)] = &[
     ("Shift+← →", "列窗口横滚一列（任意区域，按住连滚）"),
     ("Ctrl-O", "SQL 片段收藏（DBX saved_sql_files）"),
     ("Ctrl-P", "EXPLAIN 当前 SQL（SQL 后端）"),
-    ("?", "本帮助"),
+    ("?", "本帮助（面板内 / 过滤键位或功能名；上下文键位排前）"),
     (
         "DBXT_MOUSE_DEBUG=1",
         "启动时显示鼠标事件浮层（滑动无效时排查终端编码）",
@@ -39586,74 +39639,402 @@ fn help_key_width(w: u16) -> usize {
     base.min(w.saturating_sub(6) as usize)
 }
 
-fn help_overlay_lines(key_w: usize) -> Vec<Line<'static>> {
-    // Group sections are marked by a row with an empty description. A blank
-    // spacer before every section after the first makes the long list scannable
-    // without touching the data table itself.
-    let mut lines: Vec<Line<'static>> = Vec::with_capacity(HELP_ROWS.len() + 16);
+/// One display row of the `?` cheat-sheet. Section headers and blank spacers
+/// span the full width; items carry the keycap + description pair and whether
+/// they belong to the surface underneath the overlay (so they can float first).
+#[derive(Clone, Copy, PartialEq, Debug)]
+enum HelpRow {
+    Section(&'static str),
+    Blank,
+    Item {
+        key: &'static str,
+        desc: &'static str,
+        relevant: bool,
+    },
+}
+
+/// Split a keycap into comparable tokens: lowercase words plus the individual
+/// arrow glyphs, so `↑ ↓ / j k` and `↑↓` compare meaningfully.
+fn help_key_tokens(key: &str) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    let mut add = |s: &str| {
+        let s = s.to_lowercase();
+        if !s.is_empty() && !out.contains(&s) {
+            out.push(s);
+        }
+    };
+    for raw in key.split(['/', ' ', '+', ',', '·']) {
+        let t = raw.trim();
+        if t.is_empty() {
+            continue;
+        }
+        add(t);
+        for ch in t.chars() {
+            if matches!(ch, '↑' | '↓' | '←' | '→') {
+                add(&ch.to_string());
+            }
+        }
+    }
+    out
+}
+
+/// R60: the keycaps that matter on the surface underneath the help overlay,
+/// derived from the same footer hints the status bar shows (plus a few results
+/// keys the compact footer drops for width). Used to float those rows first.
+fn help_context_tokens(app: &App) -> Vec<String> {
+    let ctx = footer_ctx_inner(app, false);
+    let mut out: Vec<String> = Vec::new();
+    let push = |out: &mut Vec<String>, k: &str| {
+        for t in help_key_tokens(k) {
+            if !out.contains(&t) {
+                out.push(t);
+            }
+        }
+    };
+    // The results surface: the spec's `v / Y / *` trio leads, so the quick-access
+    // block opens on exactly the keys the user is looking at.
+    if ctx.view == FooterView::Browse && app.focus == Focus::Preview {
+        for k in ["*", "Y", "v", "y", "<", ">", "gg", "G"] {
+            push(&mut out, k);
+        }
+    }
+    for (k, _) in footer_hints_ctx(ctx) {
+        push(&mut out, k);
+    }
+    out
+}
+
+/// Case-insensitive match of the `/` needle against a row's keycap or
+/// description, in both languages (the cheat-sheet is data, so the English
+/// translation is looked up directly).
+fn help_needle_matches(needle: &str, key: &'static str, desc: &'static str) -> bool {
+    let n = needle.trim().to_lowercase();
+    if n.is_empty() {
+        return true;
+    }
+    let hit = |s: &str| s.to_lowercase().contains(&n);
+    hit(key)
+        || hit(desc)
+        || hit(ui_text::t_lang(key, ui_text::Lang::En))
+        || hit(ui_text::t_lang(desc, ui_text::Lang::En))
+}
+
+/// The unfiltered, grouped reference: sections in table order, a blank spacer
+/// before every section after the first. `tokens` marks context-relevant rows.
+fn help_grouped_rows(tokens: &[String]) -> Vec<HelpRow> {
+    let mut rows: Vec<HelpRow> = Vec::with_capacity(HELP_ROWS.len() + 16);
     let mut first_group = true;
     for (k, d) in HELP_ROWS {
         if d.is_empty() {
             if !first_group {
-                lines.push(Line::from(""));
+                rows.push(HelpRow::Blank);
             }
             first_group = false;
-            lines.push(Line::from(Span::styled(
-                t(k),
+            rows.push(HelpRow::Section(k));
+        } else {
+            let relevant = help_key_tokens(k).iter().any(|t| tokens.contains(t));
+            rows.push(HelpRow::Item {
+                key: k,
+                desc: d,
+                relevant,
+            });
+        }
+    }
+    rows
+}
+
+/// Build the cheat-sheet's display rows for the current filter + context. With
+/// no filter, a `— 当前上下文 —` quick-access section (context-relevant rows)
+/// leads the grouped reference; with a filter, a flat list of matches with the
+/// context-relevant ones first.
+fn help_rows(app: &App) -> Vec<HelpRow> {
+    let tokens = help_context_tokens(app);
+    let needle = app.help_needle.trim().to_string();
+    if !needle.is_empty() {
+        let mut rows: Vec<HelpRow> = Vec::new();
+        // Which sections the needle names directly (so “结果” lists that group).
+        let mut section_hit = false;
+        for (k, d) in HELP_ROWS {
+            if d.is_empty() {
+                section_hit = help_needle_matches(&needle, k, "");
+            } else if section_hit || help_needle_matches(&needle, k, d) {
+                let relevant = help_key_tokens(k).iter().any(|t| tokens.contains(t));
+                rows.push(HelpRow::Item {
+                    key: k,
+                    desc: d,
+                    relevant,
+                });
+            }
+        }
+        // Context-relevant matches float first (stable within each bucket).
+        rows.sort_by_key(|r| match r {
+            HelpRow::Item { relevant: true, .. } => 0,
+            _ => 1,
+        });
+        return rows;
+    }
+    let mut rows: Vec<HelpRow> = Vec::new();
+    // Quick-access section: the context's own rows, in the order the context
+    // lists its keys (so the surface's headline keys lead), deduped and capped
+    // so the first screen is the surface the user is actually on.
+    let mut quick: Vec<(&'static str, &'static str)> = Vec::new();
+    // First pass: at most two rows per context token, so a broad token like `y`
+    // cannot crowd out the surface's other headline keys.
+    'outer: for tok in &tokens {
+        let mut taken = 0;
+        for (k, d) in HELP_ROWS {
+            if d.is_empty() {
+                continue;
+            }
+            if help_key_tokens(k).contains(tok) && !quick.iter().any(|(qk, _)| qk == k) {
+                quick.push((k, d));
+                taken += 1;
+                if taken >= 2 || quick.len() >= 10 {
+                    break;
+                }
+            }
+        }
+        if quick.len() >= 10 {
+            break 'outer;
+        }
+    }
+    // Second pass: top the block up from any remaining relevant rows.
+    if quick.len() < 10 {
+        for (k, d) in HELP_ROWS {
+            if d.is_empty() {
+                continue;
+            }
+            if !quick.iter().any(|(qk, _)| qk == k)
+                && help_key_tokens(k).iter().any(|t| tokens.contains(t))
+            {
+                quick.push((k, d));
+                if quick.len() >= 10 {
+                    break;
+                }
+            }
+        }
+    }
+    if !quick.is_empty() {
+        rows.push(HelpRow::Section("— 当前上下文 —"));
+        for (k, d) in &quick {
+            rows.push(HelpRow::Item {
+                key: k,
+                desc: d,
+                relevant: true,
+            });
+        }
+        rows.push(HelpRow::Blank);
+    }
+    rows.extend(help_grouped_rows(&tokens));
+    rows
+}
+
+/// One keycap/description cell. `desc_w = None` leaves the description whole
+/// (single column); `Some(w)` truncates it to `w` columns and pads the cell to
+/// a fixed width so two-column packing lines up.
+fn help_item_spans(
+    key: &'static str,
+    desc: &'static str,
+    key_w: usize,
+    desc_w: Option<usize>,
+    relevant: bool,
+) -> Vec<Span<'static>> {
+    let key_style = if relevant {
+        Style::default()
+            .fg(Color::LightYellow)
+            .add_modifier(Modifier::BOLD)
+    } else {
+        Style::default().fg(Color::Yellow)
+    };
+    let keytext = format!("{:<key_w$}", t(key));
+    let mut spans = vec![Span::styled(keytext, key_style), Span::raw(" ")];
+    match desc_w {
+        None => spans.push(Span::raw(t(desc))),
+        Some(w) => {
+            let dtext = truncate_disp(t(desc), w);
+            let used = key_w + 1 + disp_width(&dtext);
+            spans.push(Span::raw(dtext));
+            let cell_w = key_w + 1 + w;
+            if used < cell_w {
+                spans.push(Span::raw(" ".repeat(cell_w - used)));
+            }
+        }
+    }
+    spans
+}
+
+/// Single-column render: one key/description pair per line.
+fn help_lines_single(rows: &[HelpRow], key_w: usize) -> Vec<Line<'static>> {
+    let mut lines: Vec<Line<'static>> = Vec::with_capacity(rows.len());
+    for row in rows {
+        match row {
+            HelpRow::Blank => lines.push(Line::from("")),
+            HelpRow::Section(s) => lines.push(Line::from(Span::styled(
+                t(s),
                 Style::default()
                     .fg(Color::Cyan)
                     .add_modifier(Modifier::BOLD),
-            )));
-        } else {
-            lines.push(Line::from(vec![
-                Span::styled(
-                    format!("{:<key_w$}", t(k)),
-                    Style::default().fg(Color::Yellow),
-                ),
-                Span::raw(t(d)),
-            ]));
+            ))),
+            HelpRow::Item {
+                key,
+                desc,
+                relevant,
+            } => lines.push(Line::from(help_item_spans(
+                key, desc, key_w, None, *relevant,
+            ))),
         }
     }
     lines
 }
 
+/// Two-column render (wide terminals): items pack two per line, headers and
+/// spacers span the full width so the sections stay legible.
+fn help_lines_two_col(rows: &[HelpRow], key_w: usize, col_w: usize) -> Vec<Line<'static>> {
+    let mut lines: Vec<Line<'static>> = Vec::with_capacity(rows.len() / 2 + 4);
+    let mut pending: Option<Vec<Span<'static>>> = None;
+    let flush = |pending: &mut Option<Vec<Span<'static>>>, lines: &mut Vec<Line<'static>>| {
+        if let Some(left) = pending.take() {
+            lines.push(Line::from(left));
+        }
+    };
+    for row in rows {
+        match row {
+            HelpRow::Item {
+                key,
+                desc,
+                relevant,
+            } => {
+                let cell = help_item_spans(
+                    key,
+                    desc,
+                    key_w,
+                    Some(col_w.saturating_sub(key_w + 1)),
+                    *relevant,
+                );
+                match pending.take() {
+                    None => pending = Some(cell),
+                    Some(mut left) => {
+                        left.push(Span::raw("  "));
+                        left.extend(cell);
+                        lines.push(Line::from(left));
+                    }
+                }
+            }
+            HelpRow::Section(s) => {
+                flush(&mut pending, &mut lines);
+                lines.push(Line::from(Span::styled(
+                    t(s),
+                    Style::default()
+                        .fg(Color::Cyan)
+                        .add_modifier(Modifier::BOLD),
+                )));
+            }
+            HelpRow::Blank => {
+                flush(&mut pending, &mut lines);
+                lines.push(Line::from(""));
+            }
+        }
+    }
+    flush(&mut pending, &mut lines);
+    lines
+}
+
+/// The unfiltered single-column lines, kept as the reference layout for tests
+/// and narrow terminals.
+#[cfg(test)]
+fn help_overlay_lines(key_w: usize) -> Vec<Line<'static>> {
+    help_lines_single(&help_grouped_rows(&[]), key_w)
+}
+
+/// Choose the two-column key width so a wide column keeps room for the
+/// description; falls back to a couple of characters on a very narrow one.
+fn help_two_col_key_width(base: usize, col_w: usize) -> usize {
+    base.min(col_w.saturating_sub(8)).clamp(2, 20)
+}
+
+/// R60: wide overlays pack two key/description pairs per line; narrow ones
+/// (<56 columns) fall back to a single column so long descriptions stay
+/// readable.
+fn help_two_columns(w: u16) -> bool {
+    w >= 56
+}
+
 fn render_help(f: &mut Frame, area: Rect, app: &mut App) {
     let w = help_overlay_width(area.width);
-    // Build the lines first: the group spacers mean the rendered row count is
-    // not simply `HELP_ROWS.len()`, and the box should grow to fit when the
-    // terminal is tall enough.
-    let lines = help_overlay_lines(help_key_width(w));
+    let inner_w = w.saturating_sub(2) as usize;
+    let two_col = help_two_columns(w);
+    let rows = help_rows(app);
+    let key_w = help_key_width(w);
+    let mut lines = if two_col {
+        let gutter = 2usize;
+        let col_w = (inner_w.saturating_sub(gutter)) / 2;
+        let kw = help_two_col_key_width(key_w, col_w);
+        help_lines_two_col(&rows, kw, col_w)
+    } else {
+        help_lines_single(&rows, key_w)
+    };
+    if lines.is_empty() {
+        lines.push(Line::from(Span::styled(
+            t("（没有匹配的快捷键）"),
+            Style::default().fg(Color::DarkGray),
+        )));
+    }
+    let filter_h = u16::from(app.help_filter.is_some());
     let total = lines.len();
     let max_h = area.height.saturating_sub(2).max(3);
-    let h = (total as u16 + 2).min(max_h);
+    let h = (total as u16 + 2 + filter_h).min(max_h);
     let box_area = centered_overlay(area, w, h);
     let inner_h = box_area.height.saturating_sub(2) as usize;
+    let list_h = inner_h.saturating_sub(filter_h as usize);
     f.render_widget(Clear, box_area);
-    let max_scroll = total.saturating_sub(inner_h) as u16;
+    let max_scroll = total.saturating_sub(list_h) as u16;
     let scroll = app.help_scroll.min(max_scroll);
-    let title = if box_area.width < 56 {
+    let filtered = !app.help_needle.trim().is_empty();
+    let title = if filtered {
+        fit_title(
+            &tf(
+                " 快捷键 · 过滤「{}」 {} 项 · Enter 保留 · Esc 清除 ",
+                &[&(app.help_needle), &(total)],
+            ),
+            t(" 快捷键（已过滤）· Esc "),
+            box_area.width,
+        )
+    } else if box_area.width < 56 {
         // Narrow: the footer already carries the scroll/close hints, so the
         // title only names the sheet and its position.
         tf(
             " 快捷键 · {}/{} ",
-            &[&((scroll as usize + inner_h).min(total)), &(total)],
+            &[&((scroll as usize + list_h).min(total)), &(total)],
         )
     } else {
         tf(
-            " 快捷键 · {}/{} · ↑↓ 滚动 · Esc 关闭 ",
-            &[&((scroll as usize + inner_h).min(total)), &(total)],
+            " 快捷键 · {}/{} · / 过滤 · ↑↓ 滚动 · Esc 关闭 ",
+            &[&((scroll as usize + list_h).min(total)), &(total)],
         )
     };
-    f.render_widget(
-        Paragraph::new(lines).scroll((scroll, 0)).block(
-            Block::default()
-                .borders(Borders::ALL)
-                .title(title)
-                .border_set(border::THICK)
-                .border_style(Style::default().fg(Color::Cyan)),
-        ),
-        box_area,
-    );
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .title(title)
+        .border_set(border::THICK)
+        .border_style(Style::default().fg(Color::Cyan));
+    let inner = block.inner(box_area);
+    f.render_widget(block, box_area);
+    if inner.width == 0 || inner.height == 0 {
+        return;
+    }
+    let (list_area, filter_area) = if app.help_filter.is_some() {
+        let chunks = Layout::vertical([Constraint::Min(1), Constraint::Length(1)]).split(inner);
+        (chunks[0], Some(chunks[1]))
+    } else {
+        (inner, None)
+    };
+    f.render_widget(Paragraph::new(lines).scroll((scroll, 0)), list_area);
+    if let Some(fa) = filter_area {
+        if let Some(ta) = app.help_filter.as_mut() {
+            ta.set_block(Block::default());
+            f.render_widget(&*ta, fa);
+        }
+    }
 }
 
 /// The context mini cheat-sheet: at most ten keys for the surface that owns the
@@ -41615,10 +41996,20 @@ mod tests {
             app.conn_export = None;
             app.conn_import_path = None;
             app.conn_import_plan = None;
+            app.help_filter = None;
+            app.help_needle.clear();
         };
 
         let cases: Vec<OverlayCase> = vec![
             ("help", Box::new(|a| a.help_open = true)),
+            (
+                "help-filter",
+                Box::new(|a| {
+                    a.help_open = true;
+                    a.help_needle = "y".into();
+                    a.help_filter = Some(TextArea::from(["y"]));
+                }),
+            ),
             ("help-mini", Box::new(|a| a.help_mini = true)),
             (
                 "locate-prompt",
@@ -48012,6 +48403,195 @@ mod tests {
         }
     }
 
+    /// R60: the `/` filter matches a row's keycap or its description, in either
+    /// language, case-insensitively — and rejects a genuine miss.
+    #[test]
+    fn help_filter_matches_keys_and_features_in_both_languages() {
+        // Feature-name match (Chinese).
+        assert!(help_needle_matches(
+            "收藏",
+            "f",
+            "收藏 / 取消收藏该条（同一 DBX saved_sql_files 存储）"
+        ));
+        // Feature-name match (English) against the same row's translation.
+        assert!(help_needle_matches(
+            "unfavorite",
+            "f",
+            "收藏 / 取消收藏该条（同一 DBX saved_sql_files 存储）"
+        ));
+        // Keycap match, case-insensitive.
+        assert!(help_needle_matches("ctrl-y", "Ctrl-Y", "导出当前结果"));
+        // Empty needle matches everything.
+        assert!(help_needle_matches("", "y", "复制当前行"));
+        // A miss stays a miss.
+        assert!(!help_needle_matches("zzz-no-such", "y", "复制当前行"));
+    }
+
+    /// R60: a filter result floats the surface's own keys to the top. The sort
+    /// is a stable bucket, so once an irrelevant row appears none may follow.
+    #[test]
+    fn help_filter_floats_context_keys_first() {
+        let mut app = test_app();
+        app.selected = Some(test_conn("mysql"));
+        app.picker_open = false;
+        app.focus = Focus::Preview;
+        app.help_needle = "复制".into();
+        let rows = help_rows(&app);
+        assert!(!rows.is_empty(), "expected matches for 复制");
+        assert!(
+            rows.iter().all(|r| matches!(r, HelpRow::Item { .. })),
+            "a filtered view drops section headers"
+        );
+        let mut seen_irrelevant = false;
+        for r in &rows {
+            if let HelpRow::Item { relevant, .. } = r {
+                if *relevant {
+                    assert!(
+                        !seen_irrelevant,
+                        "a relevant row followed an irrelevant one"
+                    );
+                } else {
+                    seen_irrelevant = true;
+                }
+            }
+        }
+    }
+
+    /// R60: typing a section name (e.g. 结果) surfaces that whole group, even for
+    /// rows whose key/description do not contain the word themselves.
+    #[test]
+    fn help_filter_can_name_a_whole_section() {
+        let mut app = test_app();
+        app.help_needle = "结果（表格浏览）".into();
+        let rows = help_rows(&app);
+        let keys: Vec<&str> = rows
+            .iter()
+            .filter_map(|r| match r {
+                HelpRow::Item { key, .. } => Some(*key),
+                _ => None,
+            })
+            .collect();
+        assert!(
+            keys.contains(&"大表翻页"),
+            "section match should include rows without the literal word: {keys:?}"
+        );
+    }
+
+    /// R60: an empty filter leads with a `— 当前上下文 —` quick-access section
+    /// built from the surface under the overlay.
+    #[test]
+    fn help_without_a_filter_leads_with_the_current_context() {
+        let mut app = test_app();
+        app.selected = Some(test_conn("mysql"));
+        app.picker_open = false;
+        app.focus = Focus::Preview;
+        let rows = help_rows(&app);
+        assert_eq!(rows.first(), Some(&HelpRow::Section("— 当前上下文 —")));
+        // The results keys the spec calls out must appear in that first block.
+        let quick: Vec<&str> = rows
+            .iter()
+            .take_while(|r| !matches!(r, HelpRow::Blank))
+            .filter_map(|r| match r {
+                HelpRow::Item { key, .. } => Some(*key),
+                _ => None,
+            })
+            .collect();
+        let quick_tokens: Vec<String> = quick.iter().flat_map(|k| help_key_tokens(k)).collect();
+        for needle in ["y", "v", "*"] {
+            assert!(
+                quick_tokens.contains(&needle.to_string()),
+                "context block is missing {needle:?}: {quick:?}"
+            );
+        }
+    }
+
+    /// R60: wide overlays pack two rows per line; narrow ones use one column.
+    #[test]
+    fn help_switches_between_two_columns_and_one_on_narrow_screens() {
+        assert!(help_two_columns(56));
+        assert!(help_two_columns(96));
+        assert!(!help_two_columns(55));
+        assert!(!help_two_columns(40));
+        let rows = help_grouped_rows(&[]);
+        let single = help_lines_single(&rows, 24);
+        let double = help_lines_two_col(&rows, 16, 24);
+        assert_eq!(single.len(), rows.len(), "one line per row in a column");
+        assert!(
+            double.len() < single.len(),
+            "two columns should pack more rows per line"
+        );
+        // The two-column key width never eats the whole cell.
+        assert!(help_two_col_key_width(24, 24) <= 24);
+        assert!(help_two_col_key_width(24, 10) < 10);
+    }
+
+    /// R60: `/` inside the full help opens the filter; Enter keeps the needle,
+    /// Esc clears it, and closing the sheet resets everything.
+    #[test]
+    fn help_filter_state_machine() {
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel::<OpResult>();
+        let mut app = test_app();
+        app.help_open = true;
+        key(
+            &mut app,
+            &tx,
+            KeyEvent::new(KeyCode::Char('/'), KeyModifiers::NONE),
+        );
+        assert!(app.help_filter.is_some(), "`/` opens the filter input");
+        for c in "favourite".chars() {
+            key(
+                &mut app,
+                &tx,
+                KeyEvent::new(KeyCode::Char(c), KeyModifiers::NONE),
+            );
+        }
+        assert_eq!(app.help_needle, "favourite");
+        // Enter keeps the needle and closes the input.
+        key(
+            &mut app,
+            &tx,
+            KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+        );
+        assert!(app.help_filter.is_none());
+        assert_eq!(app.help_needle, "favourite");
+        // Esc inside the input clears the needle.
+        key(
+            &mut app,
+            &tx,
+            KeyEvent::new(KeyCode::Char('/'), KeyModifiers::NONE),
+        );
+        key(
+            &mut app,
+            &tx,
+            KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE),
+        );
+        assert!(app.help_filter.is_none());
+        assert!(app.help_needle.is_empty());
+        // Closing the sheet resets the filter state.
+        app.help_needle = "y".into();
+        key(
+            &mut app,
+            &tx,
+            KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE),
+        );
+        assert!(!app.help_open);
+        assert!(app.help_needle.is_empty());
+    }
+
+    /// R60: an active sidebar / result filter counts as unrun work, so `q`
+    /// arms the two-stage quit instead of quitting outright.
+    #[test]
+    fn quit_guard_counts_active_filters_as_unrun_work() {
+        let mut app = test_app();
+        app.selected = Some(test_conn("mysql"));
+        assert!(!quit_has_unsaved(&app));
+        app.result_needle = "foo".into();
+        assert!(quit_has_unsaved(&app));
+        app.result_needle.clear();
+        app.table_filter = "bar".into();
+        assert!(quit_has_unsaved(&app));
+    }
+
     #[test]
     fn explain_uses_dialect_prefix() {
         assert_eq!(
@@ -50859,7 +51439,7 @@ mod tests {
         );
         assert_eq!(
             keys(FooterView::Help, Focus::Preview, true),
-            vec!["↑↓", "Esc", "?"]
+            vec!["/", "↑↓", "Esc", "?"]
         );
         // Each browse pane gets its own, most-relevant keys.
         let sidebar = keys(FooterView::Browse, Focus::Sidebar, true);
