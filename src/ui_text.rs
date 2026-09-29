@@ -1129,6 +1129,24 @@ pub static ALL_KEYS: &[&str] = &[
     " 列过滤 · Enter/Esc ",
     "▤{}「{}」{} 行 · ",
     "按当前列过滤：输入值只留该列含值的行（预填当前单元格，Esc 清除）",
+    // R64: in-result cell find (`\`)
+    "表结构视图不支持单元格查找",
+    "脚本列表不支持单元格查找（先 Enter 进入某条语句的结果）",
+    "没有可查找的结果",
+    "在结果单元格中查找…",
+    "已清除单元格查找",
+    "单元格查找「{}」· 无命中",
+    "输入以查找单元格…",
+    "查找「{}」· {} 命中",
+    "查找「{}」· 0 命中",
+    "查找「{}」· 命中 {}/{}",
+    "查找「{}」· {} 命中 · n/N 跳转 · Esc 清除",
+    " 查找单元格（当前页）· 大小写不敏感 · 纯客户端 ",
+    " 查找「{}」· {} 命中 · Enter 跳转 · Esc 清除 ",
+    " 查找单元格 · Enter/Esc ",
+    " 查找 {} 命中 · Enter ",
+    "查找",
+    "在结果集里查找词：命中单元格标亮（Esc 清除；/ 是隐藏不匹配行，\\ 是标亮定位）",
     "跳到下 / 上一条 SQL 语句开头（分号边界，注释/空语句跳过；状态栏显示 语句 i/n；当前语句高亮、其余淡化）",
     "表结构视图没有可复制的单元格",
     "脚本列表没有可复制的单元格（先 Enter 进入某条语句的结果）",
@@ -1285,6 +1303,36 @@ fn en_of(zh: &'static str) -> Option<&'static str> {
         ),
         "跳到下 / 上一条 SQL 语句开头（分号边界，注释/空语句跳过；状态栏显示 语句 i/n；当前语句高亮、其余淡化）" => Some(
             "Jump to the next / previous SQL statement start (semicolon-delimited; comments/empty statements skipped; the status bar shows statement i/n; the caret's statement stays lit while the rest is dimmed)",
+        ),
+        // ── R64: in-result cell find (`\`) ──
+        "表结构视图不支持单元格查找" => {
+            Some("Cell find is not available in the structure view")
+        }
+        "脚本列表不支持单元格查找（先 Enter 进入某条语句的结果）" => Some(
+            "Cell find is not available in the script list (press Enter to open a statement's result first)",
+        ),
+        "没有可查找的结果" => Some("No result to search"),
+        "在结果单元格中查找…" => Some("Find in result cells…"),
+        "已清除单元格查找" => Some("Cleared cell find"),
+        "单元格查找「{}」· 无命中" => Some("Cell find [{}] · no match"),
+        "输入以查找单元格…" => Some("Type to find a cell…"),
+        "查找「{}」· {} 命中" => Some("Find [{}] · {} matches"),
+        "查找「{}」· 0 命中" => Some("Find [{}] · 0 matches"),
+        "查找「{}」· 命中 {}/{}" => Some("Find [{}] · match {}/{}"),
+        "查找「{}」· {} 命中 · n/N 跳转 · Esc 清除" => {
+            Some("Find [{}] · {} matches · n/N jump · Esc clear")
+        }
+        " 查找单元格（当前页）· 大小写不敏感 · 纯客户端 " => Some(
+            " Find cell (current page) · case-insensitive · client-side ",
+        ),
+        " 查找「{}」· {} 命中 · Enter 跳转 · Esc 清除 " => {
+            Some(" Find [{}] · {} matches · Enter jump · Esc clear ")
+        }
+        " 查找单元格 · Enter/Esc " => Some(" Find cell · Enter/Esc "),
+        " 查找 {} 命中 · Enter " => Some(" Find {} hits · Enter "),
+        "查找" => Some("find"),
+        "在结果集里查找词：命中单元格标亮（Esc 清除；/ 是隐藏不匹配行，\\ 是标亮定位）" => Some(
+            "Find a term inside the result cells: matching cells light up (Esc clears; `/` hides non-matching rows while `\\` highlights in place)",
         ),
         // ── R48: pinned results pane / zc column-structure popup ──
         "📌 已解除钉住" => Some("📌 Unpinned"),
@@ -1718,8 +1766,8 @@ fn en_of(zh: &'static str) -> Option<&'static str> {
         "跳列：输入列号或列名前缀直达该列（宽表横滚）" => {
             Some("jump column: type a number or name prefix to reach it (wide tables)")
         }
-        "搜索结果或定位命中时：下 / 上一个命中（否则 n 翻页）" => {
-            Some("with a search or locate active: next / previous hit (otherwise n pages)")
+        "结果搜索 / 定位 / 单元格查找命中时：下 / 上一个命中（否则 n 翻页）" => {
+            Some("with a row search / locate / cell find active: next / previous hit (otherwise n pages)")
         }
         "定位值（排序列 / 主键列，不隐藏行）" => {
             Some("locate value (sort / primary-key column, rows stay visible)")

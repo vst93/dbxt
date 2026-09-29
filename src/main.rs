@@ -116,6 +116,11 @@ const DEFAULT_SEARCH_SCAN_LIMIT: usize = 1000;
 const DEFAULT_SEARCH_MAX_ROWS: u64 = 1_000_000;
 /// Cap on the number of hits the global-search overlay retains.
 const SEARCH_MAX_HITS: usize = 500;
+/// R64: cap on the matching cells the in-result `\` find keeps. The scan is
+/// client-side over the already-loaded page (never a query), so the only cost
+/// is the highlight/jump list; beyond this many matches the list stops growing
+/// and the status bar says so. `DBXT_CELL_FIND_LIMIT` overrides it.
+const DEFAULT_CELL_FIND_LIMIT: usize = 500;
 /// A `.sql` file larger than this warns before its script is executed.
 const FILE_LOAD_WARN_BYTES: u64 = 2 * 1024 * 1024;
 /// Rows fetched per chunk from each side of a data compare. Small enough to
@@ -5569,6 +5574,14 @@ fn search_scan_limit() -> usize {
     parse_positive_usize(
         std::env::var("DBXT_SEARCH_SCAN_LIMIT").ok().as_deref(),
         DEFAULT_SEARCH_SCAN_LIMIT,
+    )
+}
+
+/// R64: the active in-result cell-find hit ceiling (env override or default).
+fn cell_find_limit() -> usize {
+    parse_positive_usize(
+        std::env::var("DBXT_CELL_FIND_LIMIT").ok().as_deref(),
+        DEFAULT_CELL_FIND_LIMIT,
     )
 }
 
@@ -11202,6 +11215,21 @@ struct App {
     /// The grid column the locate searched (sort / primary-key / first), kept
     /// so `n`/`N` do not have to re-derive it after a page change.
     locate_col: Option<usize>,
+    // ── result-set cell find (`\` in the results pane, R64) ──
+    /// The modal input while `\` is being typed.
+    cell_find_prompt: Option<TextArea<'static>>,
+    /// Active cell-find needle; non-empty highlights every matching cell on the
+    /// loaded page and lets `n`/`N` step through them. Unlike `/` it never
+    /// hides a row, and unlike `gv` it searches *every* column.
+    cell_find_needle: String,
+    /// `(row, col)` of every matching cell in the *displayed* grid, in reading
+    /// order (row-major). Indices address [`App::grid`].
+    cell_find_hits: Vec<(usize, usize)>,
+    /// Index into [`App::cell_find_hits`] of the match the cursor last landed
+    /// on, so the render can paint it with the accent colour.
+    cell_find_idx: usize,
+    /// True when the hit list reached [`DEFAULT_CELL_FIND_LIMIT`] and stopped.
+    cell_find_capped: bool,
     // ── grid column jump (`|` in the results pane) ──
     /// The modal input for `|` (column number or name prefix).
     col_jump: Option<TextArea<'static>>,
@@ -11927,6 +11955,11 @@ impl App {
             locate_prompt: None,
             locate_needle: String::new(),
             locate_col: None,
+            cell_find_prompt: None,
+            cell_find_needle: String::new(),
+            cell_find_hits: Vec::new(),
+            cell_find_idx: 0,
+            cell_find_capped: false,
             col_jump: None,
             goto_prompt: None,
             last_sql: None,
@@ -12881,6 +12914,7 @@ fn apply_op_result(app: &mut App, res: OpResult, tx: &Tx) {
                 app.result_needle.clear();
                 app.result_filter = None;
                 app.clear_col_filter();
+                app.clear_cell_find();
             }
             // A statement that returned no columns is a write/DDL, and one that
             // reports affected rows (e.g. `INSERT … RETURNING`) changed data too:
@@ -12952,6 +12986,7 @@ fn apply_op_result(app: &mut App, res: OpResult, tx: &Tx) {
             // A script result replaces any grid on screen; a result-row search
             // (which only applies to a data grid) must not leak into it.
             app.result_needle.clear();
+            app.clear_cell_find();
             app.result_filter = None;
             app.clear_col_filter();
             let n = outcomes.len();
@@ -13081,6 +13116,7 @@ fn apply_op_result(app: &mut App, res: OpResult, tx: &Tx) {
             app.result_needle.clear();
             app.result_filter = None;
             app.clear_col_filter();
+            app.clear_cell_find();
             app.result_tabs.clear();
             app.result_tab = 0;
             app.grid_kind = GridKind::RedisValue;
@@ -13208,6 +13244,7 @@ fn apply_op_result(app: &mut App, res: OpResult, tx: &Tx) {
             app.result_needle.clear();
             app.result_filter = None;
             app.clear_col_filter();
+            app.clear_cell_find();
             app.result_tabs.clear();
             app.result_tab = 0;
             app.grid_kind = GridKind::MongoDocs;
@@ -14554,6 +14591,12 @@ fn browse_key(app: &mut App, tx: &Tx, k: KeyEvent) {
     // Results-specific column filter prompt (`*`) is modal too.
     if app.col_filter_prompt.is_some() {
         col_filter_key(app, k);
+        return;
+    }
+
+    // Result-set cell find prompt (`\` in the results pane) is modal too.
+    if app.cell_find_prompt.is_some() {
+        cell_find_key(app, k);
         return;
     }
 
@@ -21289,6 +21332,11 @@ fn redis_value_key(app: &mut App, tx: &Tx, k: KeyEvent) {
         }
         return;
     }
+    if k.code == KeyCode::Esc && !app.cell_find_needle.is_empty() {
+        app.clear_cell_find();
+        app.status = t("已清除单元格查找").into();
+        return;
+    }
     if k.code == KeyCode::Esc && !app.result_needle.is_empty() {
         app.result_needle.clear();
         app.rebuild_view();
@@ -21308,6 +21356,7 @@ fn redis_value_key(app: &mut App, tx: &Tx, k: KeyEvent) {
         KeyCode::Char('o') => open_row_popup(app),
         KeyCode::Char('v') => open_cell_popup(app),
         KeyCode::Char('/') => open_result_filter(app),
+        KeyCode::Char('\\') => open_cell_find(app),
         KeyCode::Char('y') => copy_redis_row(app),
         KeyCode::Char('Y') => copy_cell_value(app),
         KeyCode::Char(':') => open_goto_row(app),
@@ -21346,6 +21395,11 @@ fn mongo_docs_key(app: &mut App, tx: &Tx, k: KeyEvent) {
         }
         return;
     }
+    if k.code == KeyCode::Esc && !app.cell_find_needle.is_empty() {
+        app.clear_cell_find();
+        app.status = t("已清除单元格查找").into();
+        return;
+    }
     if k.code == KeyCode::Esc && !app.result_needle.is_empty() {
         app.result_needle.clear();
         app.rebuild_view();
@@ -21367,6 +21421,7 @@ fn mongo_docs_key(app: &mut App, tx: &Tx, k: KeyEvent) {
         KeyCode::Char('o') => open_row_popup(app),
         KeyCode::Char('v') => open_cell_popup(app),
         KeyCode::Char('/') => open_result_filter(app),
+        KeyCode::Char('\\') => open_cell_find(app),
         KeyCode::Char(':') => open_goto_row(app),
         KeyCode::Up | KeyCode::Char('k') => move_cursor(app, tx, -1),
         KeyCode::Down | KeyCode::Char('j') => move_cursor(app, tx, 1),
@@ -21909,9 +21964,9 @@ fn preview_key(app: &mut App, tx: &Tx, k: KeyEvent) {
         }
     }
     // Esc clears an active value locate, then an active column filter, then an
-    // active result search, before it does anything else. This applies to the
-    // top-level grid and to a drilled script result; only the script *list* has
-    // no search to clear.
+    // active result search, then an active cell find, before it does anything
+    // else. This applies to the top-level grid and to a drilled script result;
+    // only the script *list* has no search to clear.
     if k.code == KeyCode::Esc
         && !app.locate_needle.is_empty()
         && !ddl
@@ -21919,6 +21974,15 @@ fn preview_key(app: &mut App, tx: &Tx, k: KeyEvent) {
     {
         clear_locate(app);
         app.status = t("已清除定位").into();
+        return;
+    }
+    if k.code == KeyCode::Esc
+        && !app.cell_find_needle.is_empty()
+        && !ddl
+        && app.script.as_ref().is_none_or(|s| s.drilled.is_some())
+    {
+        app.clear_cell_find();
+        app.status = t("已清除单元格查找").into();
         return;
     }
     if k.code == KeyCode::Esc
@@ -21992,6 +22056,10 @@ fn preview_key(app: &mut App, tx: &Tx, k: KeyEvent) {
         KeyCode::Char('f') => open_filter_prompt(app),
         // `/` searches the visible result rows (filter-as-you-type).
         KeyCode::Char('/') => open_result_filter(app),
+        // R64: `\` finds a substring in *any* cell of the loaded page. Every
+        // match is highlighted and `n`/`N` step through them; client-side only,
+        // never a query.
+        KeyCode::Char('\\') => open_cell_find(app),
         // `*` filters to the focused column: type a value (pre-filled from the
         // cell under the cursor) to keep only rows whose cell contains it.
         KeyCode::Char('*') => open_col_filter(app),
@@ -22108,6 +22176,10 @@ fn preview_key(app: &mut App, tx: &Tx, k: KeyEvent) {
                 for _ in 0..times {
                     locate_move(app, 1);
                 }
+            } else if !app.cell_find_needle.trim().is_empty() {
+                for _ in 0..times {
+                    cell_find_step(app, 1);
+                }
             } else {
                 page_turn_by(app, tx, true, times);
             }
@@ -22118,6 +22190,8 @@ fn preview_key(app: &mut App, tx: &Tx, k: KeyEvent) {
                 search_move(app, -1);
             } else if !app.locate_needle.trim().is_empty() {
                 locate_move(app, -1);
+            } else if !app.cell_find_needle.trim().is_empty() {
+                cell_find_step(app, -1);
             } else {
                 app.status = t("先按 / 或 gv 搜索，再用 n/N 跳转命中").into();
             }
@@ -22447,6 +22521,7 @@ fn open_result_filter(app: &mut App) {
     // `/` and `gv` are mutually exclusive: a row filter would hide the rows a
     // value locate wants to step through, so starting one drops the other.
     clear_locate(app);
+    app.clear_cell_find();
     let mut ta = TextArea::from([app.result_needle.clone()]);
     ta.set_placeholder_text(t("搜索本页结果行…"));
     ta.move_cursor(CursorMove::End);
@@ -22549,6 +22624,7 @@ fn open_col_filter(app: &mut App) {
     // `*` and `gv` are mutually exclusive for the same reason `/` and `gv` are:
     // a value locate wants every row on screen.
     clear_locate(app);
+    app.clear_cell_find();
     // Seed from the focused cell (a huge / multi-line cell would be useless as a
     // pre-typed needle), so Enter alone re-runs "find rows like this one".
     let seed = grid
@@ -22729,6 +22805,9 @@ fn open_locate(app: &mut App) {
         app.rebuild_view();
         app.sel = 0;
     }
+    // A cell find highlights cells in place, but its hit list is keyed to the
+    // row/column layout, so a locate drops it too (they share `n`/`N`).
+    app.clear_cell_find();
     app.locate_col = Some(col);
     let mut ta = TextArea::from([app.locate_needle.clone()]);
     ta.set_placeholder_text(t("定位值（排序列 / 主键列）…"));
@@ -22830,6 +22909,179 @@ fn locate_move(app: &mut App, dir: i32) {
             &(app.sel + 1),
             &(hits.len()),
         ],
+    );
+}
+
+// ── result-set cell find (`\` in the results pane, R64) ──
+
+/// Every `(row, col)` in `grid` whose cell contains `needle` (case-insensitive
+/// substring, NULL matched as the text `null`), in reading order (row-major),
+/// capped at `limit`. Pure, so the hit set is unit-testable without a backend.
+/// Returns `(hits, capped)`: `capped` is `true` when the grid held more matches
+/// than the ceiling allowed.
+fn cell_find_hits(grid: &Grid, needle: &str, limit: usize) -> (Vec<(usize, usize)>, bool) {
+    let n = needle.trim().to_lowercase();
+    if n.is_empty() {
+        return (Vec::new(), false);
+    }
+    let mut hits: Vec<(usize, usize)> = Vec::new();
+    for (ri, row) in grid.rows.iter().enumerate() {
+        for ci in 0..grid.columns.len() {
+            if cell_matches(row, ci, &n) {
+                if hits.len() >= limit {
+                    return (hits, true);
+                }
+                hits.push((ri, ci));
+            }
+        }
+    }
+    (hits, false)
+}
+
+/// Recompute [`App::cell_find_hits`] from the grid on screen. Client-side over
+/// the already-loaded page and capped — never a query.
+fn compute_cell_find(app: &mut App) {
+    let limit = cell_find_limit();
+    let needle = app.cell_find_needle.trim().to_lowercase();
+    let (hits, capped) = if needle.is_empty() {
+        (Vec::new(), false)
+    } else {
+        match active_grid(app) {
+            Some(grid) => cell_find_hits(&grid, &needle, limit),
+            None => (Vec::new(), false),
+        }
+    };
+    app.cell_find_hits = hits;
+    app.cell_find_idx = 0;
+    app.cell_find_capped = capped;
+}
+
+/// `\` in the results pane: find a substring in *any* cell of the loaded page.
+/// Every match is highlighted; Enter jumps to the first and `n`/`N` cycle. The
+/// page is never re-fetched (zero-query), and unlike `/` no row is hidden.
+fn open_cell_find(app: &mut App) {
+    if app.grid_kind == GridKind::Columns {
+        app.status = t("表结构视图不支持单元格查找").into();
+        return;
+    }
+    if app.script.as_ref().is_some_and(|s| s.drilled.is_none()) {
+        app.status = t("脚本列表不支持单元格查找（先 Enter 进入某条语句的结果）").into();
+        return;
+    }
+    if active_grid(app).is_none() {
+        app.status = t("没有可查找的结果").into();
+        return;
+    }
+    // A cell find wants every row on screen, so an active row / column filter
+    // (which hides rows) is dropped first — the same rule `/` and `gv` follow.
+    if !app.result_needle.is_empty() {
+        app.result_needle.clear();
+        app.result_filter = None;
+        app.rebuild_view();
+        app.sel = 0;
+    }
+    if app.clear_col_filter() {
+        app.rebuild_view();
+        app.sel = 0;
+    }
+    clear_locate(app);
+    let mut ta = TextArea::from([app.cell_find_needle.clone()]);
+    ta.set_placeholder_text(t("在结果单元格中查找…"));
+    ta.move_cursor(CursorMove::End);
+    app.cell_find_prompt = Some(ta);
+}
+
+/// Prompt handler for `\`. The hits recompute as you type (live highlight, no
+/// cursor jump); Enter lands on the first match and keeps the needle for `n`/`N`,
+/// Esc clears everything.
+fn cell_find_key(app: &mut App, k: KeyEvent) {
+    match k.code {
+        KeyCode::Enter => {
+            app.cell_find_needle = app
+                .cell_find_prompt
+                .as_ref()
+                .map(|t| t.lines().join(" ").trim().to_string())
+                .unwrap_or_default();
+            app.cell_find_prompt = None;
+            compute_cell_find(app);
+            if app.cell_find_hits.is_empty() {
+                app.status = tf("单元格查找「{}」· 无命中", &[&(app.cell_find_needle)]);
+                app.cell_find_needle.clear();
+                return;
+            }
+            let (r, c) = app.cell_find_hits[0];
+            app.sel = r;
+            app.col_cursor = c;
+            app.cell_find_idx = 0;
+            // `≥n` flags a hit list that reached the scan cap (more matches were
+            // truncated), so the count is never mistaken for the exact total.
+            let shown = if app.cell_find_capped {
+                format!("≥{}", app.cell_find_hits.len())
+            } else {
+                app.cell_find_hits.len().to_string()
+            };
+            app.status = tf(
+                "查找「{}」· {} 命中 · n/N 跳转 · Esc 清除",
+                &[&(app.cell_find_needle), &(shown)],
+            );
+        }
+        KeyCode::Esc => {
+            app.clear_cell_find();
+            app.status = t("已清除单元格查找").into();
+        }
+        _ => {
+            if let Some(t) = &mut app.cell_find_prompt {
+                t.input(k);
+            }
+            app.cell_find_needle = app
+                .cell_find_prompt
+                .as_ref()
+                .map(|t| t.lines().join(" ").trim().to_string())
+                .unwrap_or_default();
+            compute_cell_find(app);
+            let n = app.cell_find_hits.len();
+            app.status = if app.cell_find_needle.trim().is_empty() {
+                t("输入以查找单元格…").into()
+            } else {
+                let shown = if app.cell_find_capped {
+                    format!("≥{n}")
+                } else {
+                    n.to_string()
+                };
+                tf("查找「{}」· {} 命中", &[&(app.cell_find_needle), &(shown)])
+            };
+        }
+    }
+}
+
+/// `n` / `N` while a cell find is active: step to the next / previous matching
+/// cell, wrapping, anchored on the cursor when it is not itself a hit. Both the
+/// row and the column cursor move, so a hit in a far-off column is revealed.
+fn cell_find_step(app: &mut App, dir: i32) {
+    let n = app.cell_find_hits.len();
+    if n == 0 {
+        app.status = tf("查找「{}」· 0 命中", &[&(app.cell_find_needle)]);
+        return;
+    }
+    let pos = (app.sel, app.col_cursor);
+    let idx = if dir > 0 {
+        app.cell_find_hits
+            .iter()
+            .position(|&h| h > pos)
+            .unwrap_or(0)
+    } else {
+        app.cell_find_hits
+            .iter()
+            .rposition(|&h| h < pos)
+            .unwrap_or(n - 1)
+    };
+    let (r, c) = app.cell_find_hits[idx];
+    app.cell_find_idx = idx;
+    app.sel = r;
+    app.col_cursor = c;
+    app.status = tf(
+        "查找「{}」· 命中 {}/{}",
+        &[&(app.cell_find_needle), &(idx + 1), &(n)],
     );
 }
 
@@ -30520,6 +30772,21 @@ impl App {
         had
     }
 
+    /// R64: drop the in-result cell-find needle, prompt and hit list. The cursor
+    /// is left where it is (matching [`clear_locate`]). Returns `true` when
+    /// something was actually cleared.
+    fn clear_cell_find(&mut self) -> bool {
+        let had = self.cell_find_prompt.is_some()
+            || !self.cell_find_needle.is_empty()
+            || !self.cell_find_hits.is_empty();
+        self.cell_find_prompt = None;
+        self.cell_find_needle.clear();
+        self.cell_find_hits.clear();
+        self.cell_find_idx = 0;
+        self.cell_find_capped = false;
+        had
+    }
+
     /// Re-apply the session column selection to the grid on screen.
     fn reapply_col_filter(&mut self) {
         self.rebuild_view();
@@ -32775,6 +33042,36 @@ fn ui(f: &mut Frame, app: &mut App) {
     if app.result_filter.is_some() {
         render_result_filter(f, f.area(), app);
     }
+    // R64: the in-result cell-find prompt (`\`). The title carries the live hit
+    // count so it is visible while typing.
+    if app.cell_find_prompt.is_some() {
+        let n = app.cell_find_hits.len();
+        // A capped hit list is shown as `≥n` so the count never reads as exact.
+        let shown = if app.cell_find_capped {
+            format!("≥{n}")
+        } else {
+            n.to_string()
+        };
+        let title = if app.cell_find_needle.trim().is_empty() {
+            t(" 查找单元格（当前页）· 大小写不敏感 · 纯客户端 ").to_string()
+        } else if n == 0 {
+            tf(
+                " 查找「{}」· 无命中 · Esc 退出 ",
+                &[&(app.cell_find_needle)],
+            )
+        } else {
+            tf(
+                " 查找「{}」· {} 命中 · Enter 跳转 · Esc 清除 ",
+                &[&(app.cell_find_needle), &(shown)],
+            )
+        };
+        let short = if app.cell_find_needle.trim().is_empty() || n == 0 {
+            t(" 查找单元格 · Enter/Esc ").to_string()
+        } else {
+            tf(" 查找 {} 命中 · Enter ", &[&(shown)])
+        };
+        render_prompt_input(f, f.area(), app.cell_find_prompt.as_mut(), &title, &short);
+    }
     // R56: the `gc` popup's column-name filter sits on top of the popup.
     if app.cols_popup_filter.is_some() {
         let (hits, total) = cols_popup_hits(app);
@@ -33843,6 +34140,7 @@ fn footer_hints_ctx(ctx: FooterCtx) -> Vec<Hint> {
                 ("y", t("复制INSERT")),
                 ("f", t("过滤")),
                 ("/", t("搜索")),
+                ("\\", t("查找")),
                 ("gv", t("定位值")),
                 ("|", t("跳列")),
                 ("gd/gt", t("结构/数据")),
@@ -34708,6 +35006,16 @@ fn render_grid(
     } else {
         Some(needle_lc.as_str())
     };
+    // R64: the active cell-find needle (`\`) highlights its matches too, and the
+    // match the cursor last landed on gets the accent colour — the grid twin of
+    // the R61 editor find.
+    let find_lc = app.cell_find_needle.trim().to_lowercase();
+    let find = if find_lc.is_empty() {
+        None
+    } else {
+        Some(find_lc.as_str())
+    };
+    let find_current = app.cell_find_hits.get(app.cell_find_idx).copied();
     // Compact (mobile) mode shares the pane among all columns so a wide table can
     // fit without horizontal scrolling; otherwise each column keeps its natural
     // content width, capped per layout.
@@ -34794,7 +35102,14 @@ fn render_grid(
         let mut cells: Vec<Cell> = vec![gutter_cell(i, i == sel)];
         for (ci, w) in widths.iter().enumerate().take(frozen) {
             cells.push(match row.get(ci) {
-                Some(v) => cell_widget_hl(v, *w, i == sel && ci == cc, needle),
+                Some(v) => cell_widget_hl(
+                    v,
+                    *w,
+                    i == sel && ci == cc,
+                    needle,
+                    find,
+                    find_current == Some((i, ci)),
+                ),
                 None => Cell::from(""),
             });
         }
@@ -34850,7 +35165,14 @@ fn render_grid(
                 let mut cells: Vec<Cell> = Vec::new();
                 for (ci, w) in widths.iter().enumerate().skip(off).take(visible) {
                     cells.push(match row.get(ci) {
-                        Some(v) => cell_widget_hl(v, *w, i == sel && ci == cc, needle),
+                        Some(v) => cell_widget_hl(
+                            v,
+                            *w,
+                            i == sel && ci == cc,
+                            needle,
+                            find,
+                            find_current == Some((i, ci)),
+                        ),
                         None => Cell::from(""),
                     });
                 }
@@ -35083,24 +35405,22 @@ fn render_columns_grid(
         let shown = fix_double_encoding(c);
         col_header_cell(&shown, disp_width(&shown), ci == cc, None, false)
     }));
-    let rows: Vec<Row> = grid
-        .rows
-        .iter()
-        .enumerate()
-        .map(|(i, row)| {
-            let mut cells = vec![gutter_cell(i, i == app.sel)];
-            cells.extend(
-                row.iter()
-                    .enumerate()
-                    .map(|(ci, v)| cell_widget_hl(v, 40, i == app.sel && ci == cc, None)),
-            );
-            let mut r = Row::new(cells);
-            if i == app.sel {
-                r = r.style(highlight_style());
-            }
-            r
-        })
-        .collect();
+    let rows: Vec<Row> =
+        grid.rows
+            .iter()
+            .enumerate()
+            .map(|(i, row)| {
+                let mut cells = vec![gutter_cell(i, i == app.sel)];
+                cells.extend(row.iter().enumerate().map(|(ci, v)| {
+                    cell_widget_hl(v, 40, i == app.sel && ci == cc, None, None, false)
+                }));
+                let mut r = Row::new(cells);
+                if i == app.sel {
+                    r = r.style(highlight_style());
+                }
+                r
+            })
+            .collect();
     let table = Table::new(rows, widths)
         .header(Row::new(header))
         .column_spacing(1)
@@ -35240,6 +35560,16 @@ fn search_hit_style() -> Style {
         .add_modifier(Modifier::BOLD)
 }
 
+/// R64: the cell the in-result find last jumped to. Same channel as
+/// [`search_hit_style`], one shade louder, so the `3/7` count and the accent
+/// cell always agree (the grid twin of the R61 editor find).
+fn find_current_style() -> Style {
+    Style::default()
+        .fg(Color::Black)
+        .bg(Color::LightGreen)
+        .add_modifier(Modifier::BOLD)
+}
+
 /// R58: longest value shown inline in a grid cell. A longer value collapses to
 /// its first 38 display columns plus `…`, signalling that `v` (the R53 cell
 /// popup) holds the full text. Kept as a constant so the width pass and the
@@ -35270,8 +35600,34 @@ fn cell_text_width(v: &Val) -> usize {
 }
 
 /// Render one cell, optionally marking it as the focused cell or highlighting a
-/// search hit.
-fn cell_widget_hl(v: &Val, w: usize, focused: bool, needle: Option<&str>) -> Cell<'static> {
+/// search hit. `needle` is the `/` row-search substring; `find` is the R64
+/// cell-find substring and `find_current` marks the match the cursor landed on
+/// (painted with the accent colour even while focused, so `n`/`N` have a clear
+/// anchor).
+fn cell_widget_hl(
+    v: &Val,
+    w: usize,
+    focused: bool,
+    needle: Option<&str>,
+    find: Option<&str>,
+    find_current: bool,
+) -> Cell<'static> {
+    let is_hit = |n: Option<&str>| {
+        n.is_some_and(|n| {
+            let s = match v {
+                Val::Null => "null",
+                Val::Text(s) => s.as_str(),
+            };
+            !n.is_empty() && s.to_lowercase().contains(n)
+        })
+    };
+    if find_current {
+        let (text, _) = value_display(v);
+        return Cell::from(Span::styled(
+            truncate_disp(&abbreviate_cell_text(&text), w),
+            find_current_style(),
+        ));
+    }
     if focused {
         let (text, _) = value_display(v);
         return Cell::from(Span::styled(
@@ -35279,14 +35635,7 @@ fn cell_widget_hl(v: &Val, w: usize, focused: bool, needle: Option<&str>) -> Cel
             focused_cell_style(),
         ));
     }
-    let hit = needle.is_some_and(|n| {
-        let s = match v {
-            Val::Null => "null",
-            Val::Text(s) => s.as_str(),
-        };
-        !n.is_empty() && s.to_lowercase().contains(n)
-    });
-    if hit {
+    if is_hit(needle) || is_hit(find) {
         let (text, _) = value_display(v);
         return Cell::from(Span::styled(
             truncate_disp(&abbreviate_cell_text(&text), w),
@@ -39896,6 +40245,10 @@ const HELP_ROWS: &[(&str, &str)] = &[
         "搜索结果行（隐藏不匹配行，输入即筛，Enter 保留，Esc 清除）",
     ),
     (
+        "\\",
+        "在结果集里查找词：命中单元格标亮（Esc 清除；/ 是隐藏不匹配行，\\ 是标亮定位）",
+    ),
+    (
         "*",
         "按当前列过滤：输入值只留该列含值的行（预填当前单元格，Esc 清除）",
     ),
@@ -39914,7 +40267,7 @@ const HELP_ROWS: &[(&str, &str)] = &[
     ),
     (
         "n / Shift-N",
-        "搜索结果或定位命中时：下 / 上一个命中（否则 n 翻页）",
+        "结果搜索 / 定位 / 单元格查找命中时：下 / 上一个命中（否则 n 翻页）",
     ),
     ("Ctrl-N", "结果被截断时加载更多行"),
     (
@@ -44811,7 +45164,7 @@ mod tests {
             .map(|row| {
                 Row::new(
                     row.iter()
-                        .map(|v| cell_widget_hl(v, 8, false, None))
+                        .map(|v| cell_widget_hl(v, 8, false, None, None, false))
                         .collect::<Vec<_>>(),
                 )
             })
@@ -51618,6 +51971,246 @@ mod tests {
         assert!(parse_col_jump(&cols, "0").is_err());
         assert!(parse_col_jump(&cols, "nope").is_err());
         assert!(parse_col_jump(&cols, "").is_err());
+    }
+
+    // ── R64 in-result cell find (`\`) ──
+
+    fn cell_find_grid() -> Grid {
+        Grid {
+            columns: vec!["id".into(), "name".into(), "city".into()],
+            rows: vec![
+                vec![
+                    Val::Text("1".into()),
+                    Val::Text("alice".into()),
+                    Val::Text("Beijing".into()),
+                ],
+                vec![
+                    Val::Text("42".into()),
+                    Val::Text("bob".into()),
+                    Val::Text("Shanghai".into()),
+                ],
+                vec![
+                    Val::Text("143".into()),
+                    Val::Text("Alice".into()),
+                    Val::Null,
+                ],
+            ],
+            note: String::new(),
+        }
+    }
+
+    #[test]
+    fn cell_find_hits_scan_every_column_in_reading_order() {
+        let grid = cell_find_grid();
+        // Case-insensitive substring across any column, row-major order.
+        assert_eq!(cell_find_hits(&grid, "ALI", 500).0, vec![(0, 1), (2, 1)]);
+        assert_eq!(
+            cell_find_hits(&grid, "a", 500).0,
+            vec![(0, 1), (1, 2), (2, 1)]
+        );
+        // NULL matches the text `null`, like the `/` row search.
+        assert_eq!(cell_find_hits(&grid, "null", 500).0, vec![(2, 2)]);
+        // An empty / whitespace needle is no search at all.
+        assert!(cell_find_hits(&grid, "", 500).0.is_empty());
+        assert!(cell_find_hits(&grid, "  ", 500).0.is_empty());
+    }
+
+    #[test]
+    fn cell_find_hits_caps_and_reports_truncation() {
+        let grid = cell_find_grid();
+        // A limit below the match count truncates and flags it.
+        let (hits, capped) = cell_find_hits(&grid, "a", 1);
+        assert_eq!(hits, vec![(0, 1)]);
+        assert!(capped, "the hit list must report truncation");
+        // A limit at/above the match count is complete and not capped.
+        let (hits, capped) = cell_find_hits(&grid, "a", 3);
+        assert_eq!(hits.len(), 3);
+        assert!(!capped);
+    }
+
+    /// `compute_cell_find` stops at the configured ceiling and records it, so the
+    /// status/title can print `≥n` instead of a count that reads as exact.
+    #[test]
+    fn compute_cell_find_stops_at_the_ceiling() {
+        let mut app = test_app();
+        app.grid_kind = GridKind::Query;
+        let rows = (0..DEFAULT_CELL_FIND_LIMIT + 50)
+            .map(|_| vec![Val::Text("hit".into())])
+            .collect();
+        app.set_grid(Grid {
+            columns: vec!["c".into()],
+            rows,
+            note: String::new(),
+        });
+        app.cell_find_needle = "hit".into();
+        compute_cell_find(&mut app);
+        assert_eq!(app.cell_find_hits.len(), DEFAULT_CELL_FIND_LIMIT);
+        assert!(
+            app.cell_find_capped,
+            "a full list must be flagged as capped"
+        );
+        // A needle with fewer matches than the ceiling is not flagged.
+        app.cell_find_needle = "zzz".into();
+        compute_cell_find(&mut app);
+        assert!(app.cell_find_hits.is_empty());
+        assert!(!app.cell_find_capped);
+    }
+
+    #[test]
+    fn cell_find_step_cycles_across_rows_and_columns() {
+        let mut app = test_app();
+        app.grid_kind = GridKind::Query;
+        app.set_grid(cell_find_grid());
+        app.cell_find_needle = "a".into();
+        compute_cell_find(&mut app);
+        assert_eq!(app.cell_find_hits, vec![(0, 1), (1, 2), (2, 1)]);
+        // From the top-left (not a hit) forward lands on the first hit.
+        app.sel = 0;
+        app.col_cursor = 0;
+        cell_find_step(&mut app, 1);
+        assert_eq!((app.sel, app.col_cursor), (0, 1));
+        assert_eq!(app.cell_find_idx, 0);
+        // Steps move down the row-major list, changing column too.
+        cell_find_step(&mut app, 1);
+        assert_eq!((app.sel, app.col_cursor), (1, 2));
+        cell_find_step(&mut app, 1);
+        assert_eq!((app.sel, app.col_cursor), (2, 1));
+        // Forward wraps to the first; backward from the first wraps to the last.
+        cell_find_step(&mut app, 1);
+        assert_eq!((app.sel, app.col_cursor), (0, 1));
+        cell_find_step(&mut app, -1);
+        assert_eq!((app.sel, app.col_cursor), (2, 1));
+        assert_eq!(app.cell_find_idx, 2);
+    }
+
+    #[test]
+    fn cell_find_prompt_enter_jumps_and_esc_clears() {
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel::<OpResult>();
+        let mut app = test_app();
+        app.picker_open = false;
+        app.grid_kind = GridKind::Query;
+        app.set_grid(cell_find_grid());
+        app.focus = Focus::Preview;
+        preview_key(
+            &mut app,
+            &tx,
+            KeyEvent::new(KeyCode::Char('\\'), KeyModifiers::NONE),
+        );
+        assert!(app.cell_find_prompt.is_some());
+        // The modal prompt receives the keystrokes and recomputes live.
+        for c in "shang".chars() {
+            key(
+                &mut app,
+                &tx,
+                KeyEvent::new(KeyCode::Char(c), KeyModifiers::NONE),
+            );
+        }
+        assert_eq!(app.cell_find_needle, "shang");
+        assert_eq!(app.cell_find_hits, vec![(1, 2)]);
+        // Enter closes the prompt, keeps the needle and lands on the hit.
+        key(
+            &mut app,
+            &tx,
+            KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+        );
+        assert!(app.cell_find_prompt.is_none());
+        assert_eq!(app.cell_find_needle, "shang");
+        assert_eq!((app.sel, app.col_cursor), (1, 2));
+        // Esc in the grid clears the whole find state.
+        preview_key(
+            &mut app,
+            &tx,
+            KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE),
+        );
+        assert!(app.cell_find_needle.is_empty());
+        assert!(app.cell_find_hits.is_empty());
+    }
+
+    /// `\` and `/` are distinct keys: `\` opens the cell find (no row hiding),
+    /// `/` still opens the row filter, and starting either drops the other.
+    #[test]
+    fn backslash_and_slash_stay_distinct_and_mutually_exclusive() {
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel::<OpResult>();
+        let mut app = test_app();
+        app.picker_open = false;
+        app.grid_kind = GridKind::Query;
+        app.set_grid(cell_find_grid());
+        app.focus = Focus::Preview;
+        // `/` opens the row filter (unchanged behaviour).
+        preview_key(
+            &mut app,
+            &tx,
+            KeyEvent::new(KeyCode::Char('/'), KeyModifiers::NONE),
+        );
+        assert!(app.result_filter.is_some());
+        app.result_needle = "alice".into();
+        app.rebuild_view();
+        assert_eq!(app.grid.as_ref().unwrap().rows.len(), 2);
+        // `\` drops the row filter so every row is visible again, then opens.
+        preview_key(
+            &mut app,
+            &tx,
+            KeyEvent::new(KeyCode::Char('\\'), KeyModifiers::NONE),
+        );
+        assert!(app.result_needle.is_empty(), "`\\` clears the row filter");
+        assert!(app.result_filter.is_none());
+        assert_eq!(app.grid.as_ref().unwrap().rows.len(), 3);
+        assert!(app.cell_find_prompt.is_some());
+        // Esc (through the modal dispatcher, as a real key press) clears it;
+        // `/` still opens the row filter afterwards.
+        key(
+            &mut app,
+            &tx,
+            KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE),
+        );
+        assert!(app.cell_find_prompt.is_none());
+        preview_key(
+            &mut app,
+            &tx,
+            KeyEvent::new(KeyCode::Char('/'), KeyModifiers::NONE),
+        );
+        assert!(app.result_filter.is_some());
+        assert!(app.cell_find_prompt.is_none());
+    }
+
+    /// The matched cells are actually painted: a non-current hit gets the yellow
+    /// search background and the current hit the light-green accent.
+    #[test]
+    fn cell_find_paints_hits_and_the_accent_match() {
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel::<OpResult>();
+        let mut app = test_app();
+        app.picker_open = false;
+        app.grid_kind = GridKind::Query;
+        app.set_grid(cell_find_grid());
+        app.focus = Focus::Preview;
+        preview_key(
+            &mut app,
+            &tx,
+            KeyEvent::new(KeyCode::Char('\\'), KeyModifiers::NONE),
+        );
+        key(
+            &mut app,
+            &tx,
+            KeyEvent::new(KeyCode::Char('a'), KeyModifiers::NONE),
+        );
+        key(
+            &mut app,
+            &tx,
+            KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+        );
+        let buf = draw_buffer(&mut app, 100, 30);
+        let results = app.rects.results;
+        let bg_count = |bg: Color| {
+            (results.x..results.x + results.width)
+                .flat_map(|x| (results.y..results.y + results.height).map(move |y| (x, y)))
+                .filter(|&(x, y)| buf.cell((x, y)).map(|c| c.bg) == Some(bg))
+                .count()
+        };
+        assert!(
+            bg_count(Color::LightGreen) >= 1,
+            "the current hit is accented"
+        );
+        assert!(bg_count(Color::Yellow) >= 1, "other hits are highlighted");
     }
 
     /// R56: `:` accepts a 1-based row number (`0` / `1` = first) or `$` / `end`
