@@ -1155,6 +1155,38 @@ pub static ALL_KEYS: &[&str] = &[
     "无主键，跳过（表达式 / 聚合 / 无主键结果不支持批量更新）",
     "✓ 已生成 UPDATE 模板（{} 行 · 主键 {}）→ 编辑器待确认，未执行",
     "-- {}：仅有主键列，无可更新列",
+    "收藏已达上限 {} 条（当前 {}），请先在列表里按 d 删除",
+    "暂无收藏 · 编辑器内 Ctrl-O 后按 s 或 Alt-S 收藏",
+    "暂无收藏 · 编辑器内 Ctrl-O 后按 s 或 Alt-S 添加",
+    "{} 个 SQL 收藏 · Enter 插入 · / 过滤 · d 删除 · s 收藏当前 · r 刷新",
+    "✗ 删除收藏失败: {}",
+    "✓ 已删除该条收藏（只删本地配置，不影响数据库）",
+    "已关闭 SQL 收藏",
+    "按名称 / SQL 内容过滤收藏 · Enter 保留 · Esc 清除",
+    "没有可删除的收藏",
+    "删除收藏确认 · Enter 执行 · Esc 取消",
+    "收藏过滤「{}」· 命中 {}",
+    "已清除收藏过滤",
+    "删除该条收藏…",
+    "已取消删除",
+    "（没有匹配的收藏）",
+    "将删除这条 SQL 收藏（只删本地配置，不影响数据库）",
+    " ⚠ 删除收藏确认 ",
+    " SQL 收藏 · {} 个 · Enter 插入 · / 过滤 · d 删除 · r 刷新 · Esc 关 ",
+    " SQL 收藏 · Enter 插入 · Esc ",
+    " SQL 收藏 · 过滤「{}」 {}/{} · Esc 关 ",
+    " SQL 收藏（已过滤）· Esc ",
+    "语句列表没有单元格可跳",
+    "没有可跳转的结果",
+    "第 {} 行 · {} 非空（跳过 {} 个空单元格）",
+    "下方没有非空单元格",
+    "上方没有非空单元格",
+    "跳到上 / 下一个非空单元格所在行（跳过 NULL / 空串，状态栏显示行号；n / p 仍为翻页）",
+    "收藏当前 SQL 为片段（编辑器内一步；等价 Ctrl-O 面板内 s）",
+    "过滤收藏：匹配名称 / SQL 文本（大小写不敏感子串）",
+    "删除选中收藏（红色确认；只删本地配置，不动数据库）",
+    "上限 100",
+    "收藏上限 100 条，满时先删再存",
 ];
 
 /// The Chinese → English table. Keys must match the source literals exactly.
@@ -3250,6 +3282,70 @@ fn en_of(zh: &'static str) -> Option<&'static str> {
         "没有可重做的" => Some("Nothing to redo"),
         "已粘贴缓冲区" => Some("Pasted the yank buffer"),
         "粘贴缓冲区为空" => Some("The yank buffer is empty"),
+        "收藏已达上限 {} 条（当前 {}），请先在列表里按 d 删除" => {
+            Some("Favourite limit {} reached ({} now) — delete some in the list with d first")
+        }
+        "暂无收藏 · 编辑器内 Ctrl-O 后按 s 或 Alt-S 收藏" => {
+            Some("No favourites yet · press s after Ctrl-O in the editor, or Alt-S")
+        }
+        "暂无收藏 · 编辑器内 Ctrl-O 后按 s 或 Alt-S 添加" => {
+            Some("No favourites yet · add one with s after Ctrl-O in the editor, or Alt-S")
+        }
+        "{} 个 SQL 收藏 · Enter 插入 · / 过滤 · d 删除 · s 收藏当前 · r 刷新" => {
+            Some("{} SQL favourites · Enter insert · / filter · d delete · s save current · r refresh")
+        }
+        "✗ 删除收藏失败: {}" => Some("✗ Failed to delete favourite: {}"),
+        "✓ 已删除该条收藏（只删本地配置，不影响数据库）" => {
+            Some("✓ Favourite deleted (local config only; database untouched)")
+        }
+        "已关闭 SQL 收藏" => Some("SQL favourites closed"),
+        "按名称 / SQL 内容过滤收藏 · Enter 保留 · Esc 清除" => {
+            Some("Filter favourites by name / SQL text · Enter keep · Esc clear")
+        }
+        "没有可删除的收藏" => Some("No favourite to delete"),
+        "删除收藏确认 · Enter 执行 · Esc 取消" => {
+            Some("Delete favourite confirmation · Enter run · Esc cancel")
+        }
+        "收藏过滤「{}」· 命中 {}" => Some("Favourite filter \"{}\" · {} hits"),
+        "已清除收藏过滤" => Some("Favourite filter cleared"),
+        "删除该条收藏…" => Some("Deleting favourite…"),
+        "已取消删除" => Some("Delete cancelled"),
+        "（没有匹配的收藏）" => Some("(no matching favourites)"),
+        "将删除这条 SQL 收藏（只删本地配置，不影响数据库）" => {
+            Some("This SQL favourite will be deleted (local config only; database untouched)")
+        }
+        " ⚠ 删除收藏确认 " => Some(" ⚠ Confirm delete favourite "),
+        " SQL 收藏 · {} 个 · Enter 插入 · / 过滤 · d 删除 · r 刷新 · Esc 关 " => {
+            Some(" SQL favourites · {} · Enter insert · / filter · d delete · r refresh · Esc close ")
+        }
+        " SQL 收藏 · Enter 插入 · Esc " => Some(" SQL favourites · Enter insert · Esc "),
+        " SQL 收藏 · 过滤「{}」 {}/{} · Esc 关 " => {
+            Some(" SQL favourites · filter \"{}\" {}/{} · Esc close ")
+        }
+        " SQL 收藏（已过滤）· Esc " => Some(" SQL favourites (filtered) · Esc "),
+        "语句列表没有单元格可跳" => Some("The statement list has no cells to jump"),
+        "没有可跳转的结果" => Some("No result rows to jump"),
+        "第 {} 行 · {} 非空（跳过 {} 个空单元格）" => {
+            Some("Row {} · {} is non-blank (skipped {} blank cell(s))")
+        }
+        "下方没有非空单元格" => Some("No non-blank cell below"),
+        "上方没有非空单元格" => Some("No non-blank cell above"),
+        "跳到上 / 下一个非空单元格所在行（跳过 NULL / 空串，状态栏显示行号；n / p 仍为翻页）" => {
+            Some("Jump to the previous / next row with a non-blank cell (skips NULL / empty; the status line shows the row; n / p still page)")
+        }
+        "收藏当前 SQL 为片段（编辑器内一步；等价 Ctrl-O 面板内 s）" => {
+            Some("Save the current SQL as a favourite (one step in the editor; same as s in the Ctrl-O list)")
+        }
+        "过滤收藏：匹配名称 / SQL 文本（大小写不敏感子串）" => {
+            Some("Filter favourites: match name / SQL text (case-insensitive substring)")
+        }
+        "删除选中收藏（红色确认；只删本地配置，不动数据库）" => {
+            Some("Delete the selected favourite (red confirmation; local config only, database untouched)")
+        }
+        "上限 100" => Some("limit 100"),
+        "收藏上限 100 条，满时先删再存" => {
+            Some("Favourite limit is 100; delete some before saving more")
+        }
         _ => None,
     }
 }

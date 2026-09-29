@@ -5782,6 +5782,26 @@ struct SearchHit {
 
 // ─── async ops ───────────────────────────────────────────────────────────────
 
+/// Hard cap on saved SQL favourites (DBX `saved_sql_files`) per connection. The
+/// list is a quick-recall surface, not a library: past 100 the `/` filter stops
+/// being enough, so a save is refused with a "delete some first" hint.
+const SNIPPET_LIMIT: usize = 100;
+
+/// True when `used` favourites already fill the list, so a new save must be
+/// refused (the caller shows a "delete some first" hint).
+fn snippet_limit_reached(used: usize) -> bool {
+    used >= SNIPPET_LIMIT
+}
+
+/// One row of the `Ctrl-O` favourites list (DBX's `saved_sql_files`): the store
+/// id (needed to delete), the display label (`folder/name`) and the SQL text.
+#[derive(Clone)]
+struct SnippetRow {
+    id: String,
+    label: String,
+    sql: String,
+}
+
 enum Op {
     ListConnections,
     /// R48: DBX Desktop's persisted sidebar groups (`sidebar_layout.layout_json`).
@@ -5935,6 +5955,10 @@ enum Op {
     Snippets(Box<ConnectionConfig>),
     /// Save the editor's SQL into DBX's `saved_sql_files` (query favourites).
     SaveSnippet(Box<ConnectionConfig>, String, String),
+    /// Delete one saved SQL favourite by id (config-store only; never the DB).
+    SnippetDelete {
+        id: String,
+    },
     DatabasesRefresh(Box<ConnectionConfig>),
     AddConn(Box<ConnectionConfig>),
     /// Copy a saved connection under a fresh id / `-copy` name (tree `Y`), so a
@@ -6235,8 +6259,14 @@ enum OpResult {
         favorited: bool,
         error: Option<String>,
     },
-    Snippets(Vec<(String, String)>),
+    Snippets(Vec<SnippetRow>),
     SnippetSaved(String),
+    SnippetDeleted {
+        id: String,
+        error: Option<String>,
+    },
+    /// A save was refused before it reached the store (e.g. the 100-item cap).
+    SnippetRejected(String),
     DatabasesRefresh(Vec<String>),
     Added(String),
     /// A connection copy (`Y` in the tree) finished; the saved twin is merged
@@ -7681,6 +7711,19 @@ async fn run_op(backend: &LocalBackend, op: Op, tx: &Tx) -> OpResult {
                             error: err,
                         }
                     } else {
+                        // Cap check before adding (the toggle-off branch above is
+                        // exempt: removing never grows the list).
+                        let used = lib
+                            .files
+                            .iter()
+                            .filter(|f| f.connection_id.is_empty() || f.connection_id == cfg.id)
+                            .count();
+                        if snippet_limit_reached(used) {
+                            return OpResult::SnippetRejected(tf(
+                                "收藏已达上限 {} 条（当前 {}），请先在列表里按 d 删除",
+                                &[&(SNIPPET_LIMIT), &(used)],
+                            ));
+                        }
                         let now = now_iso8601();
                         let file = dbx_core::saved_sql::SavedSqlFile {
                             id: Uuid::new_v4().to_string(),
@@ -7728,7 +7771,7 @@ async fn run_op(backend: &LocalBackend, op: Op, tx: &Tx) -> OpResult {
                         .find(|f| f.id == id)
                         .map(|f| f.name.clone())
                 };
-                let mut items: Vec<(String, String)> = lib
+                let mut items: Vec<SnippetRow> = lib
                     .files
                     .into_iter()
                     // Only this connection's snippets, plus unscoped ones, so the
@@ -7739,15 +7782,41 @@ async fn run_op(backend: &LocalBackend, op: Op, tx: &Tx) -> OpResult {
                             Some(folder) if !folder.is_empty() => format!("{folder}/{}", f.name),
                             _ => f.name.clone(),
                         };
-                        (label, f.sql)
+                        SnippetRow {
+                            id: f.id,
+                            label,
+                            sql: f.sql,
+                        }
                     })
                     .collect();
-                items.sort_by_key(|a| a.0.to_lowercase());
+                items.sort_by_key(|a| a.label.to_lowercase());
                 OpResult::Snippets(items)
             }
             Err(e) => OpResult::Error(format!("snippets: {e}")),
         },
+        Op::SnippetDelete { id } => {
+            match backend.state().storage.delete_saved_sql_file(&id).await {
+                Ok(()) => OpResult::SnippetDeleted { id, error: None },
+                Err(e) => OpResult::SnippetDeleted { id, error: Some(e) },
+            }
+        }
         Op::SaveSnippet(cfg, name, sql) => {
+            // Cap check up front: the favourite list is a quick-recall surface,
+            // so a save past the limit is refused before anything is written.
+            let used = match backend.state().storage.load_saved_sql_library().await {
+                Ok(lib) => lib
+                    .files
+                    .iter()
+                    .filter(|f| f.connection_id.is_empty() || f.connection_id == cfg.id)
+                    .count(),
+                Err(_) => 0,
+            };
+            if snippet_limit_reached(used) {
+                return OpResult::SnippetRejected(tf(
+                    "收藏已达上限 {} 条（当前 {}），请先在列表里按 d 删除",
+                    &[&(SNIPPET_LIMIT), &(used)],
+                ));
+            }
             let now = now_iso8601();
             let file = dbx_core::saved_sql::SavedSqlFile {
                 id: Uuid::new_v4().to_string(),
@@ -11208,7 +11277,15 @@ struct App {
     // saved-SQL snippet overlay (DBX's `saved_sql_files`)
     snippet_open: bool,
     snippet_list: ListState,
-    snippets: Vec<(String, String)>,
+    snippets: Vec<SnippetRow>,
+    /// `/` filter needle for the favourites list (name or SQL text).
+    snippet_needle: String,
+    /// The modal input while `/` is being typed.
+    snippet_filter: Option<TextArea<'static>>,
+    /// Filtered display index → index into `snippets`.
+    snippet_view: Vec<usize>,
+    /// Store id awaiting a `d` delete confirmation.
+    snippet_confirm: Option<String>,
     /// True when the snippet overlay was opened with `Alt-P` (quick paste at the
     /// cursor) instead of `Ctrl-O` (append to the editor).
     snippet_insert: bool,
@@ -11837,6 +11914,10 @@ impl App {
             snippet_open: false,
             snippet_list: ListState::default(),
             snippets: Vec::new(),
+            snippet_needle: String::new(),
+            snippet_filter: None,
+            snippet_view: Vec::new(),
+            snippet_confirm: None,
             snippet_insert: false,
             snippet_name: None,
             table_meta: None,
@@ -13180,28 +13261,43 @@ fn apply_op_result(app: &mut App, res: OpResult, tx: &Tx) {
             }
         }
         OpResult::Snippets(items) => {
-            let n = items.len();
+            let total = items.len();
             app.snippets = items;
             app.snippet_open = true;
-            app.snippet_list.select(if n == 0 { None } else { Some(0) });
+            recompute_snippet_view(app);
             // A just-saved confirmation must survive the refresh that follows it.
             if !app.status.starts_with('✓') {
-                app.status = if n == 0 {
-                    t("没有保存的 SQL 片段（可在 DBX 桌面端保存后复用）").into()
+                app.status = if total == 0 {
+                    t("暂无收藏 · 编辑器内 Ctrl-O 后按 s 或 Alt-S 收藏").into()
                 } else {
                     tf(
-                        "{} 个 SQL 片段 · Enter 插入编辑器 · s 收藏当前 SQL · r 刷新 · Esc 关闭",
-                        &[&(n)],
+                        "{} 个 SQL 收藏 · Enter 插入 · / 过滤 · d 删除 · s 收藏当前 · r 刷新",
+                        &[&(total)],
                     )
                 };
             }
         }
         OpResult::SnippetSaved(name) => {
             app.status = tf("✓ 已收藏 SQL 片段「{}」（DBX saved_sql_files）", &[&(name)]);
-            // Refresh the list so the new favourite is visible immediately.
-            if let Some(cfg) = app.selected.clone() {
-                app.spawn(tx, Op::Snippets(Box::new(cfg)));
+            // Refresh the list only when it is on screen; a save straight from
+            // the editor (Alt-S) should not pop the overlay open.
+            if app.snippet_open {
+                if let Some(cfg) = app.selected.clone() {
+                    app.spawn(tx, Op::Snippets(Box::new(cfg)));
+                }
             }
+        }
+        OpResult::SnippetDeleted { id, error } => {
+            if let Some(e) = error {
+                app.status = tf("✗ 删除收藏失败: {}", &[&e]);
+            } else {
+                app.snippets.retain(|s| s.id != id);
+                recompute_snippet_view(app);
+                app.status = t("✓ 已删除该条收藏（只删本地配置，不影响数据库）").into();
+            }
+        }
+        OpResult::SnippetRejected(msg) => {
+            app.status = format!("⚠ {msg}");
         }
         OpResult::DatabasesRefresh(dbs) => {
             if dbs.is_empty() {
@@ -13999,6 +14095,10 @@ fn reset_overlays_for_backend_switch(app: &mut App) {
     app.cols_popup_filter = None;
     app.snippet_open = false;
     app.snippet_name = None;
+    app.snippet_needle.clear();
+    app.snippet_filter = None;
+    app.snippet_view.clear();
+    app.snippet_confirm = None;
     app.completion = None;
     app.table_prompt = None;
     app.tree_search_prompt = None;
@@ -16104,6 +16204,69 @@ fn page_turn_by(app: &mut App, tx: &Tx, forward: bool, times: u32) {
         let target = ps.page.saturating_sub(times as usize);
         goto_page(app, tx, target, Some(app.sel));
     }
+}
+
+/// A grid cell counts as blank for the `}` / `{` motion when it is SQL NULL or
+/// an empty (whitespace-only) string — the two values the grid draws greyed out.
+fn cell_blank(v: &Val) -> bool {
+    match v {
+        Val::Null => true,
+        Val::Text(s) => s.trim().is_empty(),
+    }
+}
+
+/// R59: `}` / `{` in the results grid — move the row cursor to the next /
+/// previous row whose cell in the focused column is non-blank, skipping NULL and
+/// empty strings (a sparse column is otherwise a wall of blanks). The status line
+/// reports the absolute row number. `n` / `p` keep their page-turn meaning.
+fn jump_nonblank_row(app: &mut App, dir: i32) {
+    if app.struct_view == StructView::Ddl && app.ddl.is_some() {
+        return;
+    }
+    if app.script.as_ref().is_some_and(|s| s.drilled.is_none()) {
+        app.status = t("语句列表没有单元格可跳").into();
+        return;
+    }
+    let Some(grid) = active_grid(app) else {
+        app.status = t("没有可跳转的结果").into();
+        return;
+    };
+    let n = grid.rows.len();
+    if n == 0 {
+        app.status = t("没有可跳转的结果").into();
+        return;
+    }
+    let col = app.col_cursor.min(grid.columns.len().saturating_sub(1));
+    let col_name = grid
+        .columns
+        .get(col)
+        .map(|c| fix_double_encoding(c))
+        .unwrap_or_default();
+    let mut i = app.sel as i64 + dir as i64;
+    let mut skipped = 0usize;
+    while i >= 0 && (i as usize) < n {
+        let blank = grid
+            .rows
+            .get(i as usize)
+            .and_then(|r| r.get(col))
+            .is_none_or(cell_blank);
+        if !blank {
+            app.sel = i as usize;
+            let abs = cursor_abs_row(app);
+            app.status = tf(
+                "第 {} 行 · {} 非空（跳过 {} 个空单元格）",
+                &[&abs, &col_name, &skipped],
+            );
+            return;
+        }
+        skipped += 1;
+        i += dir as i64;
+    }
+    app.status = if dir > 0 {
+        t("下方没有非空单元格").into()
+    } else {
+        t("上方没有非空单元格").into()
+    };
 }
 
 fn reload_tables(app: &mut App, tx: &Tx) {
@@ -20161,6 +20324,12 @@ fn editor_key(app: &mut App, tx: &Tx, k: KeyEvent) {
         (KeyModifiers::ALT, KeyCode::Char('l')) | (KeyModifiers::ALT, KeyCode::Char('L')) => {
             open_file_load(app)
         }
+        // Alt-S: one-step favourite of the current editor SQL (the same store as
+        // Ctrl-O's list). Bare `f` cannot carry this — it is an ordinary SQL
+        // character — and bare `F` would need Shift, so the modifier key wins.
+        (KeyModifiers::ALT, KeyCode::Char('s')) | (KeyModifiers::ALT, KeyCode::Char('S')) => {
+            open_snippet_name(app)
+        }
         // R52: Alt-↓ / Alt-↑ step to the next / previous statement start in a
         // multi-statement script (semicolon-delimited, comments ignored), so a
         // long script can be inspected one statement at a time without arrowing
@@ -21419,6 +21588,11 @@ fn preview_key(app: &mut App, tx: &Tx, k: KeyEvent) {
         // R56: `:` jumps straight to a row by number (or `:$` for the last), the
         // vim `:<n>` gesture for a long grid. `gg` / `G` stay first / last.
         KeyCode::Char(':') => open_goto_row(app),
+        // R59: `}` / `{` walk to the next / previous row whose cell in the
+        // focused column is non-blank (NULL or empty string skipped), the vim
+        // paragraph motion applied to a sparse column. `n` / `p` stay page turns.
+        KeyCode::Char('}') => jump_nonblank_row(app, 1),
+        KeyCode::Char('{') => jump_nonblank_row(app, -1),
         // R55: `<` / `>` narrow / widen the focused column, remembered for the
         // session per table (never persisted). The terminal twin of dragging a
         // column border.
@@ -31672,13 +31846,21 @@ fn run_conn_import(app: &mut App, tx: &Tx, plan: &ConnImportPlan) {
     );
 }
 
-/// `Ctrl-O`: open the saved-SQL snippet overlay for the current connection.
+/// `Ctrl-O`: open the saved-SQL favourites overlay for the current connection.
 fn open_snippets(app: &mut App, tx: &Tx) {
+    app.snippet_needle.clear();
+    app.snippet_filter = None;
+    app.snippet_confirm = None;
+    app.snippet_list.select(Some(0));
     open_snippets_impl(app, tx, false);
 }
 
 /// `Alt-P`: open the same overlay but paste the chosen snippet at the cursor.
 fn open_snippets_at_cursor(app: &mut App, tx: &Tx) {
+    app.snippet_needle.clear();
+    app.snippet_filter = None;
+    app.snippet_confirm = None;
+    app.snippet_list.select(Some(0));
     open_snippets_impl(app, tx, true);
 }
 
@@ -31693,14 +31875,58 @@ fn open_snippets_impl(app: &mut App, tx: &Tx, insert_at_cursor: bool) {
     app.spawn(tx, Op::Snippets(Box::new(cfg)));
 }
 
+/// Rebuild `snippet_view` from the `/` needle (case-insensitive substring on the
+/// label or the SQL text), keeping the cursor on a valid row. The list *is* the
+/// filter view, so an empty needle shows every favourite.
+fn recompute_snippet_view(app: &mut App) {
+    let needle = app.snippet_needle.trim().to_lowercase();
+    app.snippet_view = app
+        .snippets
+        .iter()
+        .enumerate()
+        .filter(|(_, s)| {
+            needle.is_empty()
+                || s.label.to_lowercase().contains(&needle)
+                || s.sql.to_lowercase().contains(&needle)
+        })
+        .map(|(i, _)| i)
+        .collect();
+    let n = app.snippet_view.len();
+    if n == 0 {
+        app.snippet_list.select(None);
+    } else {
+        let sel = app.snippet_list.selected().unwrap_or(0).min(n - 1);
+        app.snippet_list.select(Some(sel));
+    }
+}
+
+/// The favourite under the panel cursor (indexes through the filter view).
+fn snippet_selected(app: &App) -> Option<&SnippetRow> {
+    let sel = app.snippet_list.selected()?;
+    let idx = *app.snippet_view.get(sel)?;
+    app.snippets.get(idx)
+}
+
 fn snippet_key(app: &mut App, tx: &Tx, k: KeyEvent) {
-    let n = app.snippets.len();
+    // The `/` filter and the `d` delete confirmation are modal layers on top of
+    // the list.
+    if app.snippet_filter.is_some() {
+        snippet_filter_key(app, k);
+        return;
+    }
+    if app.snippet_confirm.is_some() {
+        snippet_confirm_key(app, tx, k);
+        return;
+    }
+    let n = app.snippet_view.len();
     match k.code {
         KeyCode::Esc | KeyCode::Char('q') => {
             app.snippet_open = false;
             app.snippet_insert = false;
+            app.snippet_needle.clear();
+            app.status = t("已关闭 SQL 收藏").into();
         }
-        KeyCode::Up => {
+        KeyCode::Up | KeyCode::Char('k') => {
             let i = app
                 .snippet_list
                 .selected()
@@ -31710,7 +31936,7 @@ fn snippet_key(app: &mut App, tx: &Tx, k: KeyEvent) {
                 app.snippet_list.select(Some(i));
             }
         }
-        KeyCode::Down => {
+        KeyCode::Down | KeyCode::Char('j') => {
             let i = app
                 .snippet_list
                 .selected()
@@ -31725,29 +31951,99 @@ fn snippet_key(app: &mut App, tx: &Tx, k: KeyEvent) {
         }
         // `s`: save the editor's SQL as a new DBX favourite.
         KeyCode::Char('s') if k.modifiers.is_empty() => open_snippet_name(app),
+        // `/`: filter the list by label / SQL text (as-you-type).
+        KeyCode::Char('/') if k.modifiers.is_empty() => {
+            let mut ta = TextArea::from([app.snippet_needle.clone()]);
+            ta.move_cursor(CursorMove::End);
+            app.snippet_filter = Some(ta);
+            app.status = t("按名称 / SQL 内容过滤收藏 · Enter 保留 · Esc 清除").into();
+        }
+        // `d`: delete the focused favourite, behind a one-step confirmation.
+        KeyCode::Char('d') | KeyCode::Delete => {
+            let Some(row) = snippet_selected(app) else {
+                app.status = t("没有可删除的收藏").into();
+                return;
+            };
+            app.snippet_confirm = Some(row.id.clone());
+            app.status = t("删除收藏确认 · Enter 执行 · Esc 取消").into();
+        }
         KeyCode::Enter => {
-            if let Some(i) = app.snippet_list.selected() {
-                if let Some((name, sql)) = app.snippets.get(i).cloned() {
-                    if app.snippet_insert {
-                        // R41: drop the snippet in at the cursor (replacing the
-                        // selection when there is one) instead of appending.
-                        app.editor.insert_str(&sql);
-                        app.focus = Focus::Editor;
-                    } else {
-                        let existing = app.editor_sql();
-                        let merged = if existing.trim().is_empty() {
-                            sql
-                        } else {
-                            format!("{}\n{sql}", existing.trim_end())
-                        };
-                        app.set_editor_text(&merged);
-                        app.focus = Focus::Editor;
-                    }
-                    app.snippet_open = false;
-                    app.snippet_insert = false;
-                    app.status = tf("✓ 已插入 {}", &[&(name)]);
-                }
+            let Some(row) = snippet_selected(app).cloned() else {
+                return;
+            };
+            let name = row.label.clone();
+            let sql = row.sql.clone();
+            if app.snippet_insert {
+                // R41: drop the snippet in at the cursor (replacing the
+                // selection when there is one) instead of appending.
+                app.editor.insert_str(&sql);
+                app.focus = Focus::Editor;
+            } else {
+                let existing = app.editor_sql();
+                let merged = if existing.trim().is_empty() {
+                    sql
+                } else {
+                    format!("{}\n{sql}", existing.trim_end())
+                };
+                app.set_editor_text(&merged);
+                app.focus = Focus::Editor;
             }
+            app.snippet_open = false;
+            app.snippet_insert = false;
+            app.snippet_needle.clear();
+            app.status = tf("✓ 已插入 {}", &[&(name)]);
+        }
+        _ => {}
+    }
+}
+
+/// The `/` filter input: as-you-type narrowing, Enter keeps the needle, Esc
+/// clears it (same state machine as the history panel's filter).
+fn snippet_filter_key(app: &mut App, k: KeyEvent) {
+    match k.code {
+        KeyCode::Enter => {
+            app.snippet_filter = None;
+            app.status = tf(
+                "收藏过滤「{}」· 命中 {}",
+                &[&(app.snippet_needle), &(app.snippet_view.len())],
+            );
+        }
+        KeyCode::Esc => {
+            app.snippet_filter = None;
+            app.snippet_needle.clear();
+            recompute_snippet_view(app);
+            app.status = t("已清除收藏过滤").into();
+        }
+        _ => {
+            if let Some(ta) = app.snippet_filter.as_mut() {
+                ta.input(k);
+            }
+            app.snippet_needle = app
+                .snippet_filter
+                .as_ref()
+                .and_then(|ta| ta.lines().first().cloned())
+                .unwrap_or_default();
+            recompute_snippet_view(app);
+            if !app.snippet_view.is_empty() {
+                app.snippet_list.select(Some(0));
+            }
+        }
+    }
+}
+
+/// The `d` delete confirmation layer.
+fn snippet_confirm_key(app: &mut App, tx: &Tx, k: KeyEvent) {
+    match k.code {
+        KeyCode::Enter | KeyCode::Char('y') | KeyCode::Char('Y') => {
+            let Some(id) = app.snippet_confirm.take() else {
+                return;
+            };
+            app.status = t("删除该条收藏…").into();
+            app.spawn(tx, Op::SnippetDelete { id });
+        }
+        KeyCode::Esc | KeyCode::Char('n') | KeyCode::Char('N') => {
+            app.snippet_confirm = None;
+            app.status = t("已取消删除").into();
         }
         _ => {}
     }
@@ -32500,6 +32796,10 @@ enum FooterView {
     Completion,
     SnippetName,
     Snippets,
+    /// R59: the `/` filter input over the favourites list.
+    SnippetFilter,
+    /// R59: the `d` delete confirmation over the favourites list.
+    SnippetConfirm,
     DbPicker,
     RedisPrompt,
     MongoDoc,
@@ -32607,6 +32907,10 @@ fn footer_ctx_inner(app: &App, include_help: bool) -> FooterCtx {
         FooterView::Completion
     } else if app.snippet_name.is_some() {
         FooterView::SnippetName
+    } else if app.snippet_filter.is_some() {
+        FooterView::SnippetFilter
+    } else if app.snippet_confirm.is_some() {
+        FooterView::SnippetConfirm
     } else if app.snippet_open {
         FooterView::Snippets
     } else if app.db_picker_open {
@@ -32819,9 +33123,15 @@ fn footer_hints_ctx(ctx: FooterCtx) -> Vec<Hint> {
             ("Esc", t("取消")),
         ],
         FooterView::SnippetName => vec![("Enter", t("保存")), ("Esc", t("取消"))],
+        FooterView::SnippetFilter => vec![("Enter", t("保留")), ("Esc", t("清除"))],
+        FooterView::SnippetConfirm => {
+            vec![("Enter", t("删除")), ("Esc", t("取消"))]
+        }
         FooterView::Snippets => vec![
             ("↑↓", t("选择")),
             ("Enter", t("插入编辑器")),
+            ("/", t("过滤")),
+            ("d", t("删除")),
             ("s", t("收藏")),
             ("r", t("刷新")),
             ("Esc", t("关闭")),
@@ -35609,7 +35919,10 @@ fn render_snippets(f: &mut Frame, area: Rect, app: &mut App) {
     } else {
         60
     });
-    let (y, h) = overlay_list_box(app.snippets.len(), area);
+    let total = app.snippets.len();
+    let shown = app.snippet_view.len();
+    let filter_h = if app.snippet_filter.is_some() { 1 } else { 0 };
+    let (y, h) = overlay_list_box(shown.max(1) + filter_h, area);
     let x = area.x + (area.width.saturating_sub(w)) / 2;
     let box_area = Rect {
         x,
@@ -35618,51 +35931,127 @@ fn render_snippets(f: &mut Frame, area: Rect, app: &mut App) {
         height: h,
     };
     f.render_widget(Clear, box_area);
-    let items: Vec<ListItem> = app
-        .snippets
-        .iter()
-        .map(|(name, sql)| {
-            let head = sql
-                .lines()
-                .find(|l| !l.trim().is_empty())
-                .unwrap_or("")
-                .trim();
-            ListItem::new(Line::from(vec![
-                Span::styled(
-                    format!("{:20}", truncate_disp(name, 20)),
-                    Style::default()
-                        .fg(Color::Cyan)
-                        .add_modifier(Modifier::BOLD),
-                ),
-                Span::raw(" "),
-                Span::styled(
-                    truncate_disp(head, (box_area.width as usize).saturating_sub(24)),
-                    Style::default().fg(Color::DarkGray),
-                ),
-            ]))
+    let title = if app.snippet_needle.trim().is_empty() {
+        fit_title(
+            &tf(
+                " SQL 收藏 · {} 个 · Enter 插入 · / 过滤 · d 删除 · r 刷新 · Esc 关 ",
+                &[&total],
+            ),
+            t(" SQL 收藏 · Enter 插入 · Esc "),
+            box_area.width,
+        )
+    } else {
+        fit_title(
+            &tf(
+                " SQL 收藏 · 过滤「{}」 {}/{} · Esc 关 ",
+                &[&(app.snippet_needle), &shown, &total],
+            ),
+            t(" SQL 收藏（已过滤）· Esc "),
+            box_area.width,
+        )
+    };
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .title(Span::styled(title, Style::default().fg(Color::Cyan)))
+        .border_set(border::ROUNDED)
+        .border_style(Style::default().fg(Color::Cyan));
+    let inner = block.inner(box_area);
+    f.render_widget(block, box_area);
+    if inner.width < 4 || inner.height < 1 {
+        return;
+    }
+    let (list_area, filter_area) = if app.snippet_filter.is_some() {
+        let chunks = Layout::vertical([Constraint::Min(1), Constraint::Length(1)]).split(inner);
+        (chunks[0], Some(chunks[1]))
+    } else {
+        (inner, None)
+    };
+    let items: Vec<ListItem> = if shown == 0 {
+        let hint = if total == 0 {
+            t("暂无收藏 · 编辑器内 Ctrl-O 后按 s 或 Alt-S 添加")
+        } else {
+            t("（没有匹配的收藏）")
+        };
+        vec![ListItem::new(Line::from(Span::styled(
+            hint,
+            Style::default().fg(Color::DarkGray),
+        )))]
+    } else {
+        app.snippet_view
+            .iter()
+            .filter_map(|&i| app.snippets.get(i))
+            .map(|s| {
+                let head = s
+                    .sql
+                    .lines()
+                    .find(|l| !l.trim().is_empty())
+                    .unwrap_or("")
+                    .trim();
+                ListItem::new(Line::from(vec![
+                    Span::styled(
+                        format!("{:20}", truncate_disp(&s.label, 20)),
+                        Style::default()
+                            .fg(Color::Cyan)
+                            .add_modifier(Modifier::BOLD),
+                    ),
+                    Span::raw(" "),
+                    Span::styled(
+                        truncate_disp(head, (box_area.width as usize).saturating_sub(24)),
+                        Style::default().fg(Color::DarkGray),
+                    ),
+                ]))
+            })
+            .collect()
+    };
+    let list = List::new(items).highlight_style(
+        Style::default()
+            .bg(Color::DarkGray)
+            .add_modifier(Modifier::BOLD),
+    );
+    f.render_stateful_widget(list, list_area, &mut app.snippet_list);
+    if let Some(fa) = filter_area {
+        if let Some(ta) = app.snippet_filter.as_mut() {
+            ta.set_block(Block::default());
+            f.render_widget(&*ta, fa);
+        }
+    }
+    if app.snippet_confirm.is_some() {
+        render_snippet_confirm(f, area);
+    }
+}
+
+/// The `d` delete confirmation for a saved SQL favourite (keyboard-only, like
+/// the history delete layer; the overlay swallows mouse input anyway).
+fn render_snippet_confirm(f: &mut Frame, area: Rect) {
+    let w = area.width.saturating_sub(4).clamp(24, 64);
+    let inner_w = w.saturating_sub(2) as usize;
+    let msg = t("将删除这条 SQL 收藏（只删本地配置，不影响数据库）");
+    let mut lines: Vec<Line> = wrap_text(msg, inner_w.max(1))
+        .into_iter()
+        .map(|l| {
+            Line::from(Span::styled(
+                l,
+                Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
+            ))
         })
         .collect();
-    let list = List::new(items)
-        .block(
-            Block::default()
-                .borders(Borders::ALL)
-                .title(fit_title(
-                    &tf(
-                        " SQL 片段 · {} 个 · Enter 插入 · r 刷新 · Esc 关 ",
-                        &[&(app.snippets.len())],
-                    ),
-                    t(" SQL 片段 · Enter 插入 · Esc "),
-                    box_area.width,
-                ))
-                .border_set(border::ROUNDED)
-                .border_style(Style::default().fg(Color::Cyan)),
-        )
-        .highlight_style(
-            Style::default()
-                .bg(Color::DarkGray)
-                .add_modifier(Modifier::BOLD),
-        );
-    f.render_stateful_widget(list, box_area, &mut app.snippet_list);
+    lines.push(Line::from(""));
+    lines.push(Line::from(Span::styled(
+        t("Enter/y 执行   Esc/n 取消"),
+        Style::default().fg(Color::DarkGray),
+    )));
+    let h = (lines.len() as u16 + 2).min(area.height.max(3));
+    let box_area = centered_overlay(area, w, h);
+    f.render_widget(Clear, box_area);
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .title(Span::styled(
+            t(" ⚠ 删除收藏确认 "),
+            Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
+        ))
+        .border_set(border::THICK)
+        .border_style(Style::default().fg(Color::Red));
+    f.render_widget(Paragraph::new(lines).block(block), box_area);
 }
 
 /// Ctrl-Shift-H column-visibility overlay: space toggles the highlighted column,
@@ -38884,6 +39273,10 @@ const HELP_ROWS: &[(&str, &str)] = &[
         "跳行：输入行号直达该行，:$ 跳末行（结果 / 表 / Redis / Mongo 均可）",
     ),
     (
+        "{ }",
+        "跳到上 / 下一个非空单元格所在行（跳过 NULL / 空串，状态栏显示行号；n / p 仍为翻页）",
+    ),
+    (
         "n / Shift-N",
         "搜索结果或定位命中时：下 / 上一个命中（否则 n 翻页）",
     ),
@@ -38964,6 +39357,10 @@ const HELP_ROWS: &[(&str, &str)] = &[
         "重做上一次撤销（状态栏提示已重做 / 没有可重做的；编辑器内 Ctrl-Y 原为内部 yank，改到 Alt-Y）",
     ),
     ("Alt-Y", "粘贴内部 yank 缓冲区（Ctrl-K 删掉的内容）"),
+    (
+        "Alt-S",
+        "收藏当前 SQL 为片段（编辑器内一步；等价 Ctrl-O 面板内 s）",
+    ),
     (
         "Alt-↓ / Alt-↑",
         "跳到下 / 上一条 SQL 语句开头（分号边界，注释/空语句跳过；状态栏显示 语句 i/n；当前语句高亮、其余淡化）",
@@ -39119,6 +39516,15 @@ const HELP_ROWS: &[(&str, &str)] = &[
         "s",
         "把编辑器里的 SQL 收藏为片段（写入 DBX saved_sql_files）",
     ),
+    (
+        "/",
+        "过滤收藏：匹配名称 / SQL 文本（大小写不敏感子串）",
+    ),
+    (
+        "d / Del",
+        "删除选中收藏（红色确认；只删本地配置，不动数据库）",
+    ),
+    ("上限 100", "收藏上限 100 条，满时先删再存"),
     ("r / Esc", "刷新 / 关闭"),
     ("— 查询历史（Alt-H）—", ""),
     ("↑ ↓ / PgUp PgDn", "移动光标（列表即过滤视图）"),
@@ -41193,6 +41599,10 @@ mod tests {
             app.history_confirm = None;
             app.snippet_open = false;
             app.snippet_name = None;
+            app.snippet_needle.clear();
+            app.snippet_filter = None;
+            app.snippet_view.clear();
+            app.snippet_confirm = None;
             app.table_prompt = None;
             app.result_filter = None;
             app.locate_prompt = None;
@@ -41474,7 +41884,55 @@ mod tests {
                     });
                 }),
             ),
-            ("snippets", Box::new(|a| a.snippet_open = true)),
+            (
+                "snippets",
+                Box::new(|a| {
+                    a.snippets = vec![
+                        SnippetRow {
+                            id: "s0".into(),
+                            label: "recent.sql".into(),
+                            sql: "SELECT 1".into(),
+                        },
+                        SnippetRow {
+                            id: "s1".into(),
+                            label: "users.sql".into(),
+                            sql: "SELECT * FROM users".into(),
+                        },
+                    ];
+                    a.snippet_view = vec![0, 1];
+                    a.snippet_list.select(Some(0));
+                    a.snippet_open = true;
+                }),
+            ),
+            (
+                "snippet-filter",
+                Box::new(|a| {
+                    a.snippets = vec![SnippetRow {
+                        id: "s0".into(),
+                        label: "users.sql".into(),
+                        sql: "SELECT * FROM users".into(),
+                    }];
+                    a.snippet_view = vec![0];
+                    a.snippet_list.select(Some(0));
+                    a.snippet_open = true;
+                    a.snippet_needle = "users".into();
+                    a.snippet_filter = Some(TextArea::from(["users"]));
+                }),
+            ),
+            (
+                "snippet-confirm",
+                Box::new(|a| {
+                    a.snippets = vec![SnippetRow {
+                        id: "s0".into(),
+                        label: "users.sql".into(),
+                        sql: "SELECT * FROM users".into(),
+                    }];
+                    a.snippet_view = vec![0];
+                    a.snippet_list.select(Some(0));
+                    a.snippet_open = true;
+                    a.snippet_confirm = Some("s0".into());
+                }),
+            ),
             (
                 "snippet-name",
                 Box::new(|a| a.snippet_name = Some(TextArea::default())),
@@ -46950,6 +47408,251 @@ mod tests {
         recompute_history_view_keep(&mut app, "SELECT 3");
         assert_eq!(app.history_view, vec![0, 1, 2]);
         assert_eq!(history_fav_count(&app), 1);
+    }
+
+    // ── R59: SQL favourites (Ctrl-O list) ──
+
+    fn snippet_row(id: &str, label: &str, sql: &str) -> SnippetRow {
+        SnippetRow {
+            id: id.into(),
+            label: label.into(),
+            sql: sql.into(),
+        }
+    }
+
+    /// R59: the `/` filter matches the label or the SQL text, case-insensitively,
+    /// and the list *is* the filter view (clearing the needle restores all rows).
+    #[test]
+    fn snippet_filter_is_case_insensitive_over_label_and_sql() {
+        let mut app = test_app();
+        app.snippets = vec![
+            snippet_row("1", "users.sql", "SELECT * FROM users"),
+            snippet_row("2", "Orders.sql", "delete from orders"),
+            snippet_row("3", "misc.sql", "SELECT 1"),
+        ];
+        recompute_snippet_view(&mut app);
+        assert_eq!(app.snippet_view, vec![0, 1, 2]);
+        app.snippet_needle = "USERS".into();
+        recompute_snippet_view(&mut app);
+        assert_eq!(app.snippet_view, vec![0], "label match is case-insensitive");
+        app.snippet_needle = "orders".into();
+        recompute_snippet_view(&mut app);
+        assert_eq!(app.snippet_view, vec![1], "sql text match");
+        app.snippet_needle = "zzz".into();
+        recompute_snippet_view(&mut app);
+        assert!(app.snippet_view.is_empty());
+        assert_eq!(app.snippet_list.selected(), None);
+        app.snippet_needle.clear();
+        recompute_snippet_view(&mut app);
+        assert_eq!(app.snippet_view, vec![0, 1, 2]);
+    }
+
+    /// R59: the `/` filter state machine (open / narrow / keep / clear) and the
+    /// `d` delete confirmation (Esc cancels, Enter requests the delete).
+    #[test]
+    fn snippet_filter_state_machine_and_delete_confirm() {
+        run_rt(|| {
+            let (tx, _rx) = tokio::sync::mpsc::unbounded_channel::<OpResult>();
+            let mut app = test_app();
+            app.snippets = vec![
+                snippet_row("a", "alpha.sql", "SELECT alpha"),
+                snippet_row("b", "beta.sql", "SELECT beta"),
+            ];
+            recompute_snippet_view(&mut app);
+            app.snippet_open = true;
+            let press = |app: &mut App, code: KeyCode| {
+                snippet_key(app, &tx, KeyEvent::new(code, KeyModifiers::NONE));
+            };
+            press(&mut app, KeyCode::Char('/'));
+            assert!(app.snippet_filter.is_some());
+            for c in "beta".chars() {
+                press(&mut app, KeyCode::Char(c));
+            }
+            assert_eq!(app.snippet_needle, "beta");
+            assert_eq!(app.snippet_view, vec![1]);
+            assert_eq!(app.snippet_list.selected(), Some(0));
+            // Enter keeps the needle; Esc clears it and restores the full list.
+            press(&mut app, KeyCode::Enter);
+            assert!(app.snippet_filter.is_none());
+            assert_eq!(app.snippet_needle, "beta");
+            press(&mut app, KeyCode::Char('/'));
+            press(&mut app, KeyCode::Esc);
+            assert!(app.snippet_filter.is_none());
+            assert_eq!(app.snippet_needle, "");
+            assert_eq!(app.snippet_view, vec![0, 1]);
+
+            // `d` opens a confirmation; Esc cancels without deleting anything.
+            press(&mut app, KeyCode::Char('d'));
+            assert_eq!(app.snippet_confirm.as_deref(), Some("a"));
+            press(&mut app, KeyCode::Esc);
+            assert!(app.snippet_confirm.is_none());
+            assert_eq!(app.snippets.len(), 2);
+
+            // Enter on the confirmation hands the id to the backend op.
+            press(&mut app, KeyCode::Char('d'));
+            press(&mut app, KeyCode::Enter);
+            assert!(app.snippet_confirm.is_none());
+            assert!(app.status.contains("删除"), "status: {}", app.status);
+        });
+    }
+
+    /// R59: Enter inserts the row under the cursor of the *filtered* view, not the
+    /// raw index 0.
+    #[test]
+    fn snippet_enter_inserts_the_filtered_selection() {
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel::<OpResult>();
+        let mut app = test_app();
+        app.snippets = vec![
+            snippet_row("a", "alpha.sql", "SELECT alpha"),
+            snippet_row("b", "beta.sql", "SELECT beta"),
+        ];
+        app.snippet_needle = "beta".into();
+        recompute_snippet_view(&mut app);
+        app.snippet_open = true;
+        snippet_key(
+            &mut app,
+            &tx,
+            KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+        );
+        assert!(app.editor_sql().contains("SELECT beta"));
+        assert!(!app.snippet_open);
+    }
+
+    /// R59: the 100-item cap is a pure predicate so both save paths (the Ctrl-O
+    /// `s` prompt and Alt-S in the editor) refuse the 101st favourite.
+    #[test]
+    fn snippet_cap_refuses_the_101st_save() {
+        assert_eq!(SNIPPET_LIMIT, 100);
+        assert!(!snippet_limit_reached(0));
+        assert!(!snippet_limit_reached(SNIPPET_LIMIT - 1));
+        assert!(snippet_limit_reached(SNIPPET_LIMIT));
+        assert!(snippet_limit_reached(SNIPPET_LIMIT + 1));
+    }
+
+    /// R59: `Alt-S` in the editor opens the favourite name prompt (the one-step
+    /// save); an empty editor refuses with a hint instead.
+    #[test]
+    fn editor_alt_s_opens_the_favourite_name_prompt() {
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel::<OpResult>();
+        let mut app = test_app();
+        app.selected = Some(test_conn("mysql"));
+        app.set_editor_text("SELECT * FROM users");
+        editor_key(
+            &mut app,
+            &tx,
+            KeyEvent::new(KeyCode::Char('s'), KeyModifiers::ALT),
+        );
+        assert!(app.snippet_name.is_some());
+
+        let mut empty = test_app();
+        empty.selected = Some(test_conn("mysql"));
+        empty.set_editor_text("   ");
+        editor_key(
+            &mut empty,
+            &tx,
+            KeyEvent::new(KeyCode::Char('s'), KeyModifiers::ALT),
+        );
+        assert!(empty.snippet_name.is_none());
+    }
+
+    // ── R59: `}` / `{` non-blank row jump ──
+
+    fn blank_aware_grid() -> Grid {
+        Grid {
+            columns: vec!["id".into(), "note".into()],
+            rows: vec![
+                vec![Val::Text("1".into()), Val::Text("a".into())],
+                vec![Val::Text("2".into()), Val::Null],
+                vec![Val::Text("3".into()), Val::Text(String::new())],
+                vec![Val::Text("4".into()), Val::Text("hi".into())],
+                vec![Val::Text("5".into()), Val::Null],
+                vec![Val::Text("6".into()), Val::Text("yo".into())],
+            ],
+            note: String::new(),
+        }
+    }
+
+    /// R59: `}` / `{` walk to the next / previous non-blank cell in the focused
+    /// column, skipping NULL and empty strings, and the status line reports the
+    /// absolute row number.
+    #[test]
+    fn jump_nonblank_row_skips_null_and_empty_cells() {
+        let mut app = test_app();
+        app.grid_kind = GridKind::Query;
+        app.set_grid(blank_aware_grid());
+        app.col_cursor = 1;
+        app.sel = 0;
+        jump_nonblank_row(&mut app, 1);
+        assert_eq!(app.sel, 3, "skips rows 1 (NULL) and 2 (empty)");
+        assert!(app.status.contains("第 4 行"), "status: {}", app.status);
+        jump_nonblank_row(&mut app, 1);
+        assert_eq!(app.sel, 5);
+        // Past the last non-blank row: the cursor holds and the status says so.
+        jump_nonblank_row(&mut app, 1);
+        assert_eq!(app.sel, 5);
+        assert!(
+            app.status.contains("下方没有非空单元格"),
+            "status: {}",
+            app.status
+        );
+        // `{` walks back through the same gaps.
+        jump_nonblank_row(&mut app, -1);
+        assert_eq!(app.sel, 3);
+        jump_nonblank_row(&mut app, -1);
+        assert_eq!(app.sel, 0);
+        jump_nonblank_row(&mut app, -1);
+        assert_eq!(app.sel, 0);
+        assert!(
+            app.status.contains("上方没有非空单元格"),
+            "status: {}",
+            app.status
+        );
+    }
+
+    /// R59: a blank focused column (every cell NULL) has nowhere to jump, so the
+    /// motion is a no-op with a hint rather than a silent freeze.
+    #[test]
+    fn jump_nonblank_row_reports_an_all_blank_column() {
+        let mut app = test_app();
+        app.grid_kind = GridKind::Query;
+        let mut grid = blank_aware_grid();
+        for r in &mut grid.rows {
+            r[1] = Val::Null;
+        }
+        app.set_grid(grid);
+        app.col_cursor = 1;
+        app.sel = 0;
+        jump_nonblank_row(&mut app, 1);
+        assert_eq!(app.sel, 0);
+        assert!(
+            app.status.contains("下方没有非空单元格"),
+            "status: {}",
+            app.status
+        );
+    }
+
+    /// R59: the `}` / `{` keys are actually wired into the results-pane keymap
+    /// (not just the helper), and `n` / `p` keep their page-turn meaning.
+    #[test]
+    fn preview_key_binds_brace_jump() {
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel::<OpResult>();
+        let mut app = test_app();
+        app.grid_kind = GridKind::Query;
+        app.set_grid(blank_aware_grid());
+        app.col_cursor = 1;
+        app.sel = 0;
+        preview_key(
+            &mut app,
+            &tx,
+            KeyEvent::new(KeyCode::Char('}'), KeyModifiers::NONE),
+        );
+        assert_eq!(app.sel, 3);
+        preview_key(
+            &mut app,
+            &tx,
+            KeyEvent::new(KeyCode::Char('{'), KeyModifiers::NONE),
+        );
+        assert_eq!(app.sel, 0);
     }
 
     #[test]
