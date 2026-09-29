@@ -498,7 +498,7 @@ pub static ALL_KEYS: &[&str] = &[
     "移动表列表",
     "— 侧栏（连接树）—",
     "在 连接 → 库 → 表 树上移动（可计数：3 j 下移 3 项）",
-    "折叠 / 展开当前节点（连接节点列出库，库节点列出表）",
+    "折叠 / 展开当前节点：展开的节点收起、再按回到父层；l 打开收起的节点并进入首个子项（连接列库 / 库列表，分组同规则）",
     "打开：连接=切换并展开 · 库=切到该库 · 表=浏览数据",
     "直跳第 N 个连接 / 表（树光标跟随）",
     "过滤：命中表名 / 库名，父节点保留（Enter 打开首个命中，Esc 清除）",
@@ -1101,6 +1101,10 @@ fn en_of(zh: &'static str) -> Option<&'static str> {
         "DBX 桌面的连接分组（▾ 组名 [n]）；h l / ← → 折叠展开，会话内记忆；无分组则平铺" => Some(
             "DBX Desktop connection groups (▾ name [n]); h l / ← → fold and unfold, remembered for the session; a layout with no groups stays flat",
         ),
+        "x（分组节点）" => Some("x (group node)"),
+        "分组行无连接池：x 无动作（不会误进表过滤）" => Some(
+            "A group row has no connection pool: x does nothing (it no longer leaks into the table filter)",
+        ),
         "列结构弹层：列名 / 类型 / 可空 / 注释（缓存元数据，不额外查库）" => Some(
             "Column-structure popup: name / type / nullable / comment (cached metadata, no extra query)",
         ),
@@ -1140,6 +1144,9 @@ fn en_of(zh: &'static str) -> Option<&'static str> {
         "x（连接根）" => Some("x (connection root)"),
         "断开连接：关闭连接池（未提交手动事务回滚）；树保留灰根，展开可重连" => Some(
             "Disconnect: closes the pools (uncommitted manual transactions roll back); the tree keeps a grey root, expand to reconnect",
+        ),
+        "分组行：x 无动作（连接根上按 x 断开）" => Some(
+            "Group row: x does nothing (press x on a connection root to disconnect)",
         ),
         "点击向左/右翻一屏列（触屏可用；滚动条横滚后短暂显示，静止自动隐藏）" => Some(
             "Tap to pan one screen of columns left/right (touch-friendly; the bar shows briefly after a horizontal scroll, then auto-hides)",
@@ -1980,8 +1987,8 @@ fn en_of(zh: &'static str) -> Option<&'static str> {
         "在 连接 → 库 → 表 树上移动（可计数：3 j 下移 3 项）" => {
             Some("Walk the connection → database → table tree (count prefix: 3 j moves down 3)")
         }
-        "折叠 / 展开当前节点（连接节点列出库，库节点列出表）" => {
-            Some("Collapse / expand the current node (a connection lists databases, a database lists tables)")
+        "折叠 / 展开当前节点：展开的节点收起、再按回到父层；l 打开收起的节点并进入首个子项（连接列库 / 库列表，分组同规则）" => {
+            Some("Collapse / expand the current node: an expanded node folds, a second press climbs to the parent; l opens a collapsed node and steps into its first child (a connection lists databases / a database lists tables; groups follow the same rule)")
         }
         "打开：连接=切换并展开 · 库=切到该库 · 表=浏览数据" => {
             Some("Open: connection = switch and expand · database = switch to it · table = browse data")

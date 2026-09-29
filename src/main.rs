@@ -14876,6 +14876,14 @@ fn sidebar_key(app: &mut App, tx: &Tx, k: KeyEvent) {
                 request_disconnect(app, idx);
             }
         }
+        // R50: a group row holds no connection pool, so `x` is a no-op; the key
+        // is still *caught* so it cannot leak into the one-step type-to-filter
+        // below (which is what a plain `x` did before).
+        KeyCode::Char('x')
+            if matches!(app.side_rows.get(app.side_sel), Some(SideRow::Group { .. })) =>
+        {
+            app.status = t("分组行：x 无动作（连接根上按 x 断开）").into();
+        }
         // One-step type-to-filter (R39): any printable character that is not a
         // bound shortcut starts the filter with that character already typed,
         // so a lookup is a single keystroke instead of `/` then type.
@@ -17739,9 +17747,11 @@ fn side_focus_parent(app: &mut App) {
     }
 }
 
-/// `l` / `→`: expand the tree row under the cursor (a connection loads its
-/// databases; a database reveals its tables). On an already-expanded node it
-/// steps into the first child, vim-tree style.
+/// `l` / `→`: expand the tree row under the cursor (a group unfolds, a
+/// connection loads its databases, a database reveals its tables). On an
+/// already-expanded node it steps into its first child, vim-tree style. Every
+/// node type follows the same rule: an expanded parent walks into its first
+/// child, a collapsed parent opens in place.
 fn side_expand(app: &mut App, tx: &Tx) {
     let Some(row) = app.side_rows.get(app.side_sel).cloned() else {
         return;
@@ -17752,12 +17762,12 @@ fn side_expand(app: &mut App, tx: &Tx) {
                 app.group_closed.remove(&id);
                 rebuild_side_rows(app);
             } else {
-                side_step(app, 1, true);
+                side_step_into_child(app);
             }
         }
         SideRow::Conn { idx, .. } => {
             if side_conn_open(app, idx) {
-                side_step(app, 1, true);
+                side_step_into_child(app);
             } else {
                 expand_conn(app, tx, idx);
             }
@@ -17774,7 +17784,7 @@ fn side_expand(app: &mut App, tx: &Tx) {
                 if app.tree_db_closed.remove(&key) {
                     rebuild_side_rows(app);
                 } else {
-                    side_step(app, 1, true);
+                    side_step_into_child(app);
                 }
             } else {
                 switch_to_db(app, tx, idx, &db);
@@ -17784,8 +17794,28 @@ fn side_expand(app: &mut App, tx: &Tx) {
     }
 }
 
+/// Move the tree cursor onto the first child of the row it sits on, but only
+/// when that child is actually on screen. An expanded parent whose children are
+/// still loading (or an empty one) stays put instead of jumping to a sibling —
+/// the same rule for every node type.
+fn side_step_into_child(app: &mut App) {
+    let Some(cur) = app.side_rows.get(app.side_sel) else {
+        return;
+    };
+    let d = side_row_depth(cur);
+    if app
+        .side_rows
+        .get(app.side_sel + 1)
+        .is_some_and(|r| side_row_depth(r) > d)
+    {
+        side_step(app, 1, true);
+    }
+}
+
 /// `h` / `←`: collapse the tree row under the cursor, or step up to its parent
-/// when it is already collapsed / a leaf.
+/// when it is already collapsed / a leaf. Groups, connections, databases and
+/// tables (and nested groups) all answer `h` the same way: the first press on
+/// an expanded node folds it in place, a second press climbs to the parent.
 fn side_collapse(app: &mut App) {
     let Some(row) = app.side_rows.get(app.side_sel).cloned() else {
         return;
@@ -17800,16 +17830,21 @@ fn side_collapse(app: &mut App) {
             }
         }
         SideRow::Conn { idx, .. } => {
-            let id = side_root_cfg(app, idx)
-                .map(|c| c.id.clone())
-                .unwrap_or_default();
             if side_conn_open(app, idx) {
+                let id = side_root_cfg(app, idx)
+                    .map(|c| c.id.clone())
+                    .unwrap_or_default();
                 if side_is_active(app, idx) {
                     app.tree_conn_closed.insert(id);
                 } else {
                     app.tree_conn_open.remove(&id);
                 }
                 rebuild_side_rows(app);
+            } else {
+                // R50: an already-collapsed connection climbs to its parent,
+                // exactly like a group / database / table — it used to swallow
+                // the key.
+                side_focus_parent(app);
             }
         }
         SideRow::Db { idx, db, .. } => {
@@ -31648,6 +31683,20 @@ fn side_row_line(
         }
         spans.push(Span::styled(size, mk(Style::default().fg(Color::DarkGray))));
     }
+    // R50: a selected row fills the whole inner width so the highlight reads as
+    // one solid band instead of stopping at the last glyph. The size column
+    // already pads its own row, so this tops up whatever is still missing (and
+    // pads the rows that have no size cell at all) — never a double pad. The
+    // width is measured with `disp_width`, so wide emoji (`📁` / `▤` / `🔒`)
+    // count as the two cells they actually occupy.
+    if selected {
+        let full_w = (area_w as usize).saturating_sub(2);
+        let used: usize = spans.iter().map(|s| disp_width(&s.content)).sum();
+        let pad = full_w.saturating_sub(used);
+        if pad > 0 {
+            spans.push(Span::styled(" ".repeat(pad), mk(Style::default())));
+        }
+    }
     Line::from(spans)
 }
 
@@ -35339,7 +35388,7 @@ const HELP_ROWS: &[(&str, &str)] = &[
     ),
     (
         "h l / ← →",
-        "折叠 / 展开当前节点（连接节点列出库，库节点列出表）",
+        "折叠 / 展开当前节点：展开的节点收起、再按回到父层；l 打开收起的节点并进入首个子项（连接列库 / 库列表，分组同规则）",
     ),
     ("Enter", "打开：连接=切换并展开 · 库=切到该库 · 表=浏览数据"),
     ("1-9", "直跳第 N 个连接 / 表（树光标跟随）"),
@@ -35373,6 +35422,10 @@ const HELP_ROWS: &[(&str, &str)] = &[
     (
         "分组节点",
         "DBX 桌面的连接分组（▾ 组名 [n]）；h l / ← → 折叠展开，会话内记忆；无分组则平铺",
+    ),
+    (
+        "x（分组节点）",
+        "分组行无连接池：x 无动作（不会误进表过滤）",
     ),
     (
         "Alt+a-z · ; ,",
@@ -41349,6 +41402,253 @@ mod tests {
             .side_rows
             .iter()
             .any(|r| matches!(r, SideRow::Conn { idx: 0, .. })));
+    }
+
+    /// R50: `h` / `l` answer the same way on every node type. `l` on a collapsed
+    /// parent opens it in place and a second `l` steps into its first child; `h`
+    /// on an expanded parent folds it in place and a second `h` climbs to the
+    /// parent. Groups, connections, databases and leaf tables all agree.
+    #[test]
+    fn sidebar_h_l_state_machine_is_consistent_across_row_types() {
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel::<OpResult>();
+        let mut app = tree_app();
+        let c1 = app.connections[0].id.clone();
+        app.conn_live.insert(c1.clone(), true);
+        app.sidebar_layout = SidebarLayout {
+            groups: vec![group("g1", "生产", vec![LayoutNode::Conn(c1)])],
+        };
+        rebuild_side_rows(&mut app);
+        // rows: Group(0) Conn(1) Db·shop(2) Table·orders(3) Table·users(4) Db·logs(5)
+
+        // ── leaf table ── `l` does nothing, `h` climbs to the database.
+        let table = app.side_sel;
+        assert!(matches!(app.side_rows[table], SideRow::Table { .. }));
+        side_expand(&mut app, &tx);
+        assert_eq!(app.side_sel, table, "l on a leaf table stays put");
+        side_collapse(&mut app);
+        assert!(
+            matches!(app.side_rows[app.side_sel], SideRow::Db { .. }),
+            "h on a leaf table climbs to its database"
+        );
+
+        // ── database ── `h` folds in place, a second `h` climbs to the root.
+        side_collapse(&mut app);
+        assert!(matches!(app.side_rows[app.side_sel], SideRow::Db { .. }));
+        assert!(
+            !app.side_rows
+                .iter()
+                .any(|r| matches!(r, SideRow::Table { .. })),
+            "a folded database hides its tables"
+        );
+        side_collapse(&mut app);
+        assert!(
+            matches!(app.side_rows[app.side_sel], SideRow::Conn { .. }),
+            "h on a collapsed database climbs to the connection"
+        );
+        // `l` re-opens the folded database in place (it stays on the db row).
+        app.side_sel = app
+            .side_rows
+            .iter()
+            .position(|r| matches!(r, SideRow::Db { .. }))
+            .unwrap();
+        side_expand(&mut app, &tx);
+        assert!(matches!(app.side_rows[app.side_sel], SideRow::Db { .. }));
+        assert!(app
+            .side_rows
+            .iter()
+            .any(|r| matches!(r, SideRow::Table { .. })));
+
+        // ── connection ── `h` folds in place, a second `h` climbs to the group
+        // (the previously missing half of the state machine).
+        app.side_sel = app
+            .side_rows
+            .iter()
+            .position(|r| matches!(r, SideRow::Conn { .. }))
+            .unwrap();
+        side_collapse(&mut app);
+        assert!(app.tree_conn_closed.contains(&app.connections[0].id));
+        assert!(
+            matches!(app.side_rows[app.side_sel], SideRow::Conn { .. }),
+            "h on an open connection folds it in place"
+        );
+        side_collapse(&mut app);
+        assert!(
+            matches!(app.side_rows[app.side_sel], SideRow::Group { .. }),
+            "a second h on a collapsed connection climbs to its group"
+        );
+        // `l` on the open group steps into its first child (the connection).
+        side_expand(&mut app, &tx);
+        assert!(matches!(app.side_rows[app.side_sel], SideRow::Conn { .. }));
+        // `l` on the collapsed connection re-opens it in place.
+        side_expand(&mut app, &tx);
+        assert!(matches!(app.side_rows[app.side_sel], SideRow::Conn { .. }));
+        assert!(!app.tree_conn_closed.contains(&app.connections[0].id));
+
+        // ── group ── `h` folds in place, a second `h` has no parent (stays).
+        app.side_sel = 0;
+        side_collapse(&mut app);
+        assert!(app.group_closed.contains("g1"));
+        assert!(matches!(app.side_rows[app.side_sel], SideRow::Group { .. }));
+        side_collapse(&mut app);
+        assert!(matches!(app.side_rows[app.side_sel], SideRow::Group { .. }));
+    }
+
+    /// R50: a nested group folds with the same rule, and the root group's fold
+    /// keeps the cursor on a semantically adjacent row (the group header).
+    #[test]
+    fn sidebar_nested_group_fold_keeps_the_cursor_semantic() {
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel::<OpResult>();
+        let mut app = tree_app();
+        let c1 = app.connections[0].id.clone();
+        app.sidebar_layout = SidebarLayout {
+            groups: vec![group(
+                "outer",
+                "外层",
+                vec![LayoutNode::Group(group(
+                    "inner",
+                    "内层",
+                    vec![LayoutNode::Conn(c1)],
+                ))],
+            )],
+        };
+        rebuild_side_rows(&mut app);
+        // rows: outer(0) inner(1) Conn(2) Db…
+        assert!(matches!(&app.side_rows[0], SideRow::Group { id, depth: 0, .. } if id == "outer"));
+        assert!(matches!(&app.side_rows[1], SideRow::Group { id, depth: 1, .. } if id == "inner"));
+
+        // Fold the inner group: it stays the cursor, its grouped connection
+        // (idx 0) vanishes. The ungrouped sibling root (idx 1) stays flat.
+        app.side_sel = 1;
+        side_collapse(&mut app);
+        assert!(app.group_closed.contains("inner"));
+        assert!(matches!(&app.side_rows[app.side_sel], SideRow::Group { id, .. } if id == "inner"));
+        assert!(!app
+            .side_rows
+            .iter()
+            .any(|r| matches!(r, SideRow::Conn { idx: 0, .. })));
+        // A second `h` climbs to the outer group.
+        side_collapse(&mut app);
+        assert!(matches!(&app.side_rows[app.side_sel], SideRow::Group { id, .. } if id == "outer"));
+        // Folding the outer group leaves the cursor on its header and drops the
+        // nested group entirely.
+        side_collapse(&mut app);
+        assert!(app.group_closed.contains("outer"));
+        assert!(!app
+            .side_rows
+            .iter()
+            .any(|r| matches!(r, SideRow::Group { id, .. } if id == "inner")));
+        assert!(matches!(&app.side_rows[app.side_sel], SideRow::Group { id, .. } if id == "outer"));
+        // `l` unfolds the outer group in place; a second `l` steps into the
+        // inner group.
+        side_expand(&mut app, &tx);
+        assert!(!app.group_closed.contains("outer"));
+        assert!(matches!(&app.side_rows[app.side_sel], SideRow::Group { id, .. } if id == "outer"));
+        side_expand(&mut app, &tx);
+        assert!(matches!(&app.side_rows[app.side_sel], SideRow::Group { id, .. } if id == "inner"));
+    }
+
+    /// R50: every row type is padded with the selection background out to the
+    /// sidebar's right edge, so the highlight is one solid band. Widths are
+    /// measured with `disp_width`, so wide emoji (`📁` / `▤`) count as the two
+    /// cells they occupy and never leave a short pad.
+    #[test]
+    fn sidebar_selected_rows_pad_to_the_full_inner_width() {
+        let mut app = tree_app();
+        let c1 = app.connections[0].id.clone();
+        let c2 = app.connections[1].id.clone();
+        // Keep every name short enough that no row overflows the narrow 20-cell
+        // check, so the assertion is an exact width, not a floor.
+        app.connections[1].name = "pg".into();
+        let mut c3 = test_conn("mysql");
+        c3.id = "id-mysql3".into();
+        c3.name = "third".into();
+        let c3_id = c3.id.clone();
+        app.connections.push(c3);
+        app.sidebar_layout = SidebarLayout {
+            groups: vec![group(
+                "g1",
+                "生产环境",
+                vec![
+                    LayoutNode::Conn(c1),
+                    LayoutNode::Conn(c2.clone()),
+                    LayoutNode::Conn(c3_id.clone()),
+                ],
+            )],
+        };
+        // Give the two sibling roots an error row and a loading row so every
+        // row type is exercised.
+        app.tree_conn_open.insert(c2.clone());
+        app.tree_db_state
+            .insert(c2, TreeDbState::Error("boom".into()));
+        app.tree_conn_open.insert(c3_id.clone());
+        app.tree_db_state.insert(c3_id, TreeDbState::Loading);
+        rebuild_side_rows(&mut app);
+
+        let kind = |r: &SideRow| match r {
+            SideRow::Group { .. } => "Group",
+            SideRow::Conn { .. } => "Conn",
+            SideRow::Db { .. } => "Db",
+            SideRow::Table { .. } => "Table",
+            SideRow::ConnError { .. } => "ConnError",
+            SideRow::ConnLoading { .. } => "ConnLoading",
+        };
+        for want in ["Group", "Conn", "Db", "Table", "ConnError", "ConnLoading"] {
+            assert!(
+                app.side_rows.iter().any(|r| kind(r) == want),
+                "fixture is missing a {want} row"
+            );
+        }
+
+        for w in [110u16, 42, 20] {
+            let full_w = (w as usize) - 2;
+            for row in app.side_rows.clone() {
+                let line = side_row_line(&app, &row, true, "", w);
+                let width: usize = line.spans.iter().map(|s| disp_width(&s.content)).sum();
+                assert_eq!(
+                    width, full_w,
+                    "{w} wide: {row:?} fills {width} cells, not the {full_w}-cell row"
+                );
+                for s in &line.spans {
+                    assert_eq!(
+                        s.style.bg,
+                        Some(Color::DarkGray),
+                        "{w} wide: a gap in the selection band of {row:?}"
+                    );
+                }
+            }
+        }
+
+        // An unselected row is not padded (no background to align).
+        let unselected = side_row_line(&app, &app.side_rows[0].clone(), false, "", 110);
+        let width: usize = unselected
+            .spans
+            .iter()
+            .map(|s| disp_width(&s.content))
+            .sum();
+        assert!(width < 108, "an unselected row is not padded: {width}");
+    }
+
+    /// R50: `x` on a group row is a no-op — it must not leak into the one-step
+    /// type-to-filter (which only ever reached a *connection* root before).
+    #[test]
+    fn sidebar_x_on_a_group_row_does_not_start_the_filter() {
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel::<OpResult>();
+        let mut app = tree_app();
+        app.picker_open = false;
+        let c1 = app.connections[0].id.clone();
+        app.sidebar_layout = SidebarLayout {
+            groups: vec![group("g1", "生产", vec![LayoutNode::Conn(c1)])],
+        };
+        rebuild_side_rows(&mut app);
+        app.side_sel = 0;
+        assert!(matches!(app.side_rows[0], SideRow::Group { .. }));
+        key(
+            &mut app,
+            &tx,
+            KeyEvent::new(KeyCode::Char('x'), KeyModifiers::NONE),
+        );
+        assert!(app.filter_prompt.is_none(), "x must not open the filter");
+        assert!(app.table_filter.is_empty(), "x must not seed the filter");
     }
 
     // ── R48: pinned result pane ──
