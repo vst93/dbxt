@@ -35,7 +35,9 @@ async fn secret_store_round_trips_with_an_explicit_key_file() {
 
     // First open: write a connection carrying a password.
     {
-        let backend = LocalBackend::open(&db_path).await.expect("open with a key file");
+        let backend = LocalBackend::open(&db_path)
+            .await
+            .expect("open with a key file");
         let cfg = new_connection_config(
             "secret-1".into(),
             "secret store test".into(),
@@ -49,7 +51,10 @@ async fn secret_store_round_trips_with_an_explicit_key_file() {
             None,
         )
         .unwrap();
-        backend.add_connection_for_mcp(cfg).await.expect("save connection with a password");
+        backend
+            .add_connection_for_mcp(cfg)
+            .await
+            .expect("save connection with a password");
     }
 
     // The password must be encrypted at rest: an envelope, never the plaintext.
@@ -71,7 +76,9 @@ async fn secret_store_round_trips_with_an_explicit_key_file() {
 
     // Second open: the key file must decrypt the saved password back.
     {
-        let backend = LocalBackend::open(&db_path).await.expect("reopen with the same key file");
+        let backend = LocalBackend::open(&db_path)
+            .await
+            .expect("reopen with the same key file");
         let connections = backend.load_connections().await.expect("load connections");
         let got = connections
             .iter()

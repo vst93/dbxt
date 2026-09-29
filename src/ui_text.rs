@@ -134,7 +134,6 @@ fn render(tmpl: &str, args: &[&dyn fmt::Display]) -> String {
     out
 }
 
-
 /// Every key the table knows, for coverage tests and tooling. Keep in sync with
 /// [`en_of`] (a test asserts each entry resolves to a distinct English string).
 #[allow(dead_code)]

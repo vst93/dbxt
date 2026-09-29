@@ -4,6 +4,21 @@
 
 A keyboard-first terminal UI for databases, built on the [DBX](https://github.com/t8y2/dbx) kernel. Configure a connection once — in DBX Desktop, the DBX CLI, or dbxt itself — then use it from any terminal. One static binary: no desktop app, no daemon, no HTTP server.
 
+## What's new in 0.0.4
+
+The biggest jump since the first preview — the sidebar became a real tree, and the safety net around production connections grew up.
+
+- **Connection tree** — the sidebar is now `connection → database → table`, foldable with `h`/`l` and remembered per session (`3j`/`3k` count-prefix moves included).
+- **Desktop groups** — DBX Desktop's connection groups mirror into the tree as `▾ name [n]` nodes.
+- **Status dots + manual disconnect** — every root carries `●` live / `○` disconnected / `◐` connecting; `x` drops its pools behind a red confirmation (config untouched).
+- **Read-only connections** — one `read_only` flag refuses every write statement at a single choke point, while `SELECT` / `SHOW` / `EXPLAIN` still run.
+- **History direct-run + favourites** — `Alt-H` recalls, `Ctrl-Enter` / `p` reruns, `f` pins a favourite section above the list.
+- **Pinned results** — `Alt-F` snapshots the grid into a strip so you can compare across tables.
+- **Context-scoped completion** — `Alt-/` offers only tables after `FROM` / `JOIN`, only columns after `WHERE` / `ON` / `SELECT`.
+- **Double-click row detail** — a second click opens the row popup; confirmation buttons and tree expanders are clickable too.
+- **Auto-hiding scroll bar** — the horizontal bar appears for ~2.5 s after a scroll, then the border returns to a plain line.
+- **Quick database switch** — `d` switches MySQL databases, PostgreSQL schemas→databases, MongoDB databases and Redis logical DBs in one gesture.
+
 ## Features
 
 **Connections** — shared with DBX Desktop
@@ -218,6 +233,21 @@ Early but usable. Verified end-to-end against real MySQL 8.4, PostgreSQL 16, Red
 - [ ] Result export to XLSX, and search across pages
 - [ ] Excel (`.xlsx`) import
 - [ ] A dedicated Android/Termux build
+
+## Known issues
+
+An honest list of what is **not** there yet, so it is not discovered after a release.
+
+- **Table size metadata is MySQL / PostgreSQL only.** Pressing `s` on a database row reports *this engine does not support size query* on SQLite, DuckDB and any other engine — the sidebar size column stays empty there.
+- **Global search (`Alt-G`) is MySQL / PostgreSQL only** — it scans the `char` / `varchar` / `text` columns of every table and is not wired to other engines.
+- **No `.xlsx` import and no XLSX export** — deliberately out of scope; use CSV.
+- **Search is page-local** — `/` searches the visible rows, not the whole result set; cross-page result search is not implemented.
+- **A large export is capped by a warning, not stopped** — result sets over 10,000 rows warn before `Ctrl-Y` proceeds.
+- **Read-only detection fails closed** — a statement with an unrecognised verb counts as a write, so a rare ambiguous-but-read statement is refused by design.
+- **Redis / MongoDB are out of scope** for the `Alt-T` transfer wizard and for the `Alt-D` / `Alt-K` schema & data diff.
+- **Only the Linux x86_64 prebuilt archive has been exercised locally** — the other six build in CI but are untested.
+- **No dedicated Android/Termux artifact** — the static aarch64 build usually runs; otherwise build from source.
+- The connection tree reads the desktop group layout **once per session**, so a regrouping in DBX Desktop shows up the next time dbxt opens.
 
 ## License
 

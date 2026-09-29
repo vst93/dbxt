@@ -255,7 +255,12 @@ fn cycle_focus(app: &mut App, forward: bool) {
     let order: Vec<Focus> = if app.backend_kind == Backend::Sql {
         vec![Focus::Sidebar, Focus::Editor, Focus::Preview]
     } else {
-        vec![Focus::Sidebar, Focus::Editor, Focus::CmdInput, Focus::Preview]
+        vec![
+            Focus::Sidebar,
+            Focus::Editor,
+            Focus::CmdInput,
+            Focus::Preview,
+        ]
     };
     let next = match order.iter().position(|f| *f == app.focus) {
         Some(i) if forward => (i + 1) % order.len(),
@@ -399,7 +404,10 @@ impl TableDiff {
     }
     /// Number of changed rows (columns + indexes), for the title badge.
     fn changed(&self) -> usize {
-        self.cols.iter().filter(|c| c.mark != DiffMark::Same).count()
+        self.cols
+            .iter()
+            .filter(|c| c.mark != DiffMark::Same)
+            .count()
             + self.idx.iter().filter(|i| i.mark != DiffMark::Same).count()
     }
 }
@@ -765,7 +773,15 @@ fn norm_type_text(raw: &str) -> String {
     let (base, params) = split_type_params(&s);
     if matches!(
         base.as_str(),
-        "int" | "integer" | "bigint" | "smallint" | "tinyint" | "mediumint" | "int4" | "int8" | "int2"
+        "int"
+            | "integer"
+            | "bigint"
+            | "smallint"
+            | "tinyint"
+            | "mediumint"
+            | "int4"
+            | "int8"
+            | "int2"
     ) {
         return base;
     }
@@ -809,7 +825,11 @@ fn canonical_type(raw: &str) -> Option<String> {
         "double" => ("double", ""),
         "timestamp" | "datetime" => (
             "timestamp",
-            if rest.first() == Some(&"with") { " tz" } else { "" },
+            if rest.first() == Some(&"with") {
+                " tz"
+            } else {
+                ""
+            },
         ),
         "timestamptz" => ("timestamp", " tz"),
         "date" => ("date", ""),
@@ -1026,10 +1046,20 @@ fn render_column_attrs(c: &ColumnInfo) -> String {
     {
         s.push_str(&format!(" {cs}"));
     }
-    if let Some(col) = c.collation.as_deref().map(str::trim).filter(|v| !v.is_empty()) {
+    if let Some(col) = c
+        .collation
+        .as_deref()
+        .map(str::trim)
+        .filter(|v| !v.is_empty())
+    {
         s.push_str(&format!(" {col}"));
     }
-    if let Some(cm) = c.comment.as_deref().map(str::trim).filter(|v| !v.is_empty()) {
+    if let Some(cm) = c
+        .comment
+        .as_deref()
+        .map(str::trim)
+        .filter(|v| !v.is_empty())
+    {
         s.push_str(&format!(" COMMENT {cm}"));
     }
     s
@@ -1046,7 +1076,11 @@ fn column_changes(src: &ColumnInfo, tgt: &ColumnInfo, cross: bool) -> Vec<String
         TypeVerdict::Unknown => out.push(format!("type ? {}→{}", src.data_type, tgt.data_type)),
     }
     if src.is_nullable != tgt.is_nullable {
-        out.push(format!("null {}→{}", yn(src.is_nullable), yn(tgt.is_nullable)));
+        out.push(format!(
+            "null {}→{}",
+            yn(src.is_nullable),
+            yn(tgt.is_nullable)
+        ));
     }
     if norm_opt(&src.column_default) != norm_opt(&tgt.column_default) {
         out.push(format!(
@@ -1091,7 +1125,11 @@ fn column_changes(src: &ColumnInfo, tgt: &ColumnInfo, cross: bool) -> Vec<String
         ));
     }
     if src.is_unique != tgt.is_unique {
-        out.push(format!("unique {}→{}", yn(src.is_unique), yn(tgt.is_unique)));
+        out.push(format!(
+            "unique {}→{}",
+            yn(src.is_unique),
+            yn(tgt.is_unique)
+        ));
     }
     out
 }
@@ -1117,7 +1155,12 @@ fn index_signature(ix: &IndexInfo) -> String {
     s.push('(');
     s.push_str(&ix.columns.join(", "));
     s.push(')');
-    if let Some(f) = ix.filter.as_deref().map(str::trim).filter(|f| !f.is_empty()) {
+    if let Some(f) = ix
+        .filter
+        .as_deref()
+        .map(str::trim)
+        .filter(|f| !f.is_empty())
+    {
         s.push_str(&format!(" WHERE {f}"));
     }
     s
@@ -1139,9 +1182,11 @@ fn build_table_diff(src: DiffSide, tgt: DiffSide) -> TableDiff {
     let mut cols: Vec<ColDiffRow> = Vec::new();
     let mut used_tgt = vec![false; tgt.columns.len()];
     for sc in &src.columns {
-        match tgt.columns.iter().position(|c| {
-            c.name == sc.name || c.name.eq_ignore_ascii_case(&sc.name)
-        }) {
+        match tgt
+            .columns
+            .iter()
+            .position(|c| c.name == sc.name || c.name.eq_ignore_ascii_case(&sc.name))
+        {
             Some(ti) => {
                 used_tgt[ti] = true;
                 let tc = &tgt.columns[ti];
@@ -1195,7 +1240,11 @@ fn build_table_diff(src: DiffSide, tgt: DiffSide) -> TableDiff {
                 let ti_ix = &tgt.indexes[ti];
                 let ss = index_signature(si);
                 let ts = index_signature(ti_ix);
-                let mark = if ss == ts { DiffMark::Same } else { DiffMark::Modify };
+                let mark = if ss == ts {
+                    DiffMark::Same
+                } else {
+                    DiffMark::Modify
+                };
                 let detail = if mark == DiffMark::Same {
                     ss.clone()
                 } else {
@@ -1270,10 +1319,20 @@ fn render_column_def(c: &ColumnInfo, tgt_dt: DatabaseType, cross: bool) -> Strin
     parts.push(ty);
     let mysql = is_mysql_family(tgt_dt.as_str());
     if mysql {
-        if let Some(cs) = c.character_set.as_deref().map(str::trim).filter(|v| !v.is_empty()) {
+        if let Some(cs) = c
+            .character_set
+            .as_deref()
+            .map(str::trim)
+            .filter(|v| !v.is_empty())
+        {
             parts.push(format!("CHARACTER SET {cs}"));
         }
-        if let Some(col) = c.collation.as_deref().map(str::trim).filter(|v| !v.is_empty()) {
+        if let Some(col) = c
+            .collation
+            .as_deref()
+            .map(str::trim)
+            .filter(|v| !v.is_empty())
+        {
             parts.push(format!("COLLATE {col}"));
         }
     }
@@ -1294,7 +1353,12 @@ fn render_column_def(c: &ColumnInfo, tgt_dt: DatabaseType, cross: bool) -> Strin
                 parts.push("AUTO_INCREMENT".to_string());
             }
         }
-        if let Some(cm) = c.comment.as_deref().map(str::trim).filter(|v| !v.is_empty()) {
+        if let Some(cm) = c
+            .comment
+            .as_deref()
+            .map(str::trim)
+            .filter(|v| !v.is_empty())
+        {
             parts.push(format!("COMMENT {}", sql_literal(cm)));
         }
     }
@@ -1317,7 +1381,10 @@ fn generate_alter(diff: &TableDiff) -> String {
     let mysql = is_mysql_family(tgt_dt.as_str());
     let table = table_ref(tgt_dt, &diff.tgt.schema, &diff.tgt.table);
     let mut out = String::new();
-    out.push_str(&format!("-- {}\n", t("-- dbxt 结构对比（源 → 目标，对目标执行）")));
+    out.push_str(&format!(
+        "-- {}\n",
+        t("-- dbxt 结构对比（源 → 目标，对目标执行）")
+    ));
     out.push_str(&format!("-- source: {}\n", diff.src.label()));
     out.push_str(&format!(
         "-- target: {} ({})\n",
@@ -1325,7 +1392,10 @@ fn generate_alter(diff: &TableDiff) -> String {
         tgt_dt.as_str()
     ));
     if diff.cross {
-        out.push_str(&format!("-- {}\n", t("⚠ 跨方言：类型按常见映射转换，映射不了的请人工确认")));
+        out.push_str(&format!(
+            "-- {}\n",
+            t("⚠ 跨方言：类型按常见映射转换，映射不了的请人工确认")
+        ));
     }
     out.push('\n');
 
@@ -1340,7 +1410,12 @@ fn generate_alter(diff: &TableDiff) -> String {
                 let def = render_column_def(sc, tgt_dt, diff.cross);
                 out.push_str(&format!("ALTER TABLE {table} ADD COLUMN {def};\n"));
                 if pg {
-                    if let Some(cm) = sc.comment.as_deref().map(str::trim).filter(|v| !v.is_empty()) {
+                    if let Some(cm) = sc
+                        .comment
+                        .as_deref()
+                        .map(str::trim)
+                        .filter(|v| !v.is_empty())
+                    {
                         out.push_str(&format!(
                             "COMMENT ON COLUMN {table}.{q} IS {};\n",
                             sql_literal(cm)
@@ -1365,7 +1440,8 @@ fn generate_alter(diff: &TableDiff) -> String {
                     let def = render_column_def(sc, tgt_dt, diff.cross);
                     out.push_str(&format!("ALTER TABLE {table} MODIFY COLUMN {def};\n"));
                 } else {
-                    if compare_types(&sc.data_type, &tc.data_type, diff.cross) != TypeVerdict::Same {
+                    if compare_types(&sc.data_type, &tc.data_type, diff.cross) != TypeVerdict::Same
+                    {
                         let ty = if diff.cross {
                             map_type_to_dialect(&sc.data_type, tgt_dt)
                         } else {
@@ -1411,14 +1487,19 @@ fn generate_alter(diff: &TableDiff) -> String {
                         }
                     }
                     if pg && norm_opt(&sc.comment) != norm_opt(&tc.comment) {
-                        match sc.comment.as_deref().map(str::trim).filter(|v| !v.is_empty()) {
+                        match sc
+                            .comment
+                            .as_deref()
+                            .map(str::trim)
+                            .filter(|v| !v.is_empty())
+                        {
                             Some(cm) => out.push_str(&format!(
                                 "COMMENT ON COLUMN {table}.{q} IS {};\n",
                                 sql_literal(cm)
                             )),
-                            None => out.push_str(&format!(
-                                "COMMENT ON COLUMN {table}.{q} IS NULL;\n"
-                            )),
+                            None => {
+                                out.push_str(&format!("COMMENT ON COLUMN {table}.{q} IS NULL;\n"))
+                            }
                         }
                     }
                 }
@@ -1533,10 +1614,21 @@ fn diff_summary_text(diff: &TableDiff) -> String {
         } else {
             row.detail.clone()
         };
-        out.push_str(&format!("{} {} {}  {}\n", row.mark.sign(), t("列"), row.name, text));
+        out.push_str(&format!(
+            "{} {} {}  {}\n",
+            row.mark.sign(),
+            t("列"),
+            row.name,
+            text
+        ));
     }
     for row in diff.idx.iter().filter(|r| r.mark != DiffMark::Same) {
-        out.push_str(&format!("{} {}  {}\n", row.mark.sign(), t("索引"), row.detail));
+        out.push_str(&format!(
+            "{} {}  {}\n",
+            row.mark.sign(),
+            t("索引"),
+            row.detail
+        ));
     }
     out
 }
@@ -1617,7 +1709,8 @@ fn build_data_align(
     let mut cols: Vec<DataCol> = Vec::new();
     for sk in src_pk {
         let sc = find_col(src_cols, sk).ok_or_else(|| tf("源表主键列 {} 不在表结构中", &[sk]))?;
-        let tc = find_col(tgt_cols, sk).ok_or_else(|| tf("目标表缺少主键列 {}，无法对齐", &[sk]))?;
+        let tc =
+            find_col(tgt_cols, sk).ok_or_else(|| tf("目标表缺少主键列 {}，无法对齐", &[sk]))?;
         used.insert(col_key(&tc.name));
         cols.push(make_data_col(sc, tc, cross));
     }
@@ -1942,7 +2035,10 @@ fn generate_data_sync(cmp: &DataCompare) -> String {
     let table = table_ref(dt, &cmp.tgt_schema, &cmp.tgt_table);
     let align = &cmp.align;
     let mut out = String::new();
-    out.push_str(&format!("{}\n", t("-- dbxt 数据对比（源 → 目标，对目标执行）")));
+    out.push_str(&format!(
+        "{}\n",
+        t("-- dbxt 数据对比（源 → 目标，对目标执行）")
+    ));
     out.push_str(&format!(
         "-- {}: {} ({})\n",
         t("源"),
@@ -2303,7 +2399,10 @@ fn build_transfer_align(
     let mut pk_names = Vec::new();
     let mut pk_types = Vec::new();
     for key in src_pk {
-        if let Some(pos) = cols.iter().position(|c| col_key(&c.src_name) == col_key(key)) {
+        if let Some(pos) = cols
+            .iter()
+            .position(|c| col_key(&c.src_name) == col_key(key))
+        {
             pk_idx.push(pos);
             pk_names.push(cols[pos].src_name.clone());
             pk_types.push(cols[pos].src_type.clone());
@@ -2386,10 +2485,20 @@ fn transfer_column_def(
         // a cross-dialect copy (the target's database default is the sane
         // choice) but keep them when both sides are MySQL.
         if !cross {
-            if let Some(cs) = c.character_set.as_deref().map(str::trim).filter(|v| !v.is_empty()) {
+            if let Some(cs) = c
+                .character_set
+                .as_deref()
+                .map(str::trim)
+                .filter(|v| !v.is_empty())
+            {
                 parts.push(format!("CHARACTER SET {cs}"));
             }
-            if let Some(col) = c.collation.as_deref().map(str::trim).filter(|v| !v.is_empty()) {
+            if let Some(col) = c
+                .collation
+                .as_deref()
+                .map(str::trim)
+                .filter(|v| !v.is_empty())
+            {
                 parts.push(format!("COLLATE {col}"));
             }
         }
@@ -2414,7 +2523,12 @@ fn transfer_column_def(
         parts.push("AUTO_INCREMENT".to_string());
     }
     if mysql {
-        if let Some(cm) = c.comment.as_deref().map(str::trim).filter(|v| !v.is_empty()) {
+        if let Some(cm) = c
+            .comment
+            .as_deref()
+            .map(str::trim)
+            .filter(|v| !v.is_empty())
+        {
             parts.push(format!("COMMENT {}", sql_literal(cm)));
         }
     }
@@ -2469,7 +2583,12 @@ fn generate_transfer_create(
     // PostgreSQL keeps comments out of the DDL, as separate statements.
     if pg {
         for c in src_cols {
-            if let Some(cm) = c.comment.as_deref().map(str::trim).filter(|v| !v.is_empty()) {
+            if let Some(cm) = c
+                .comment
+                .as_deref()
+                .map(str::trim)
+                .filter(|v| !v.is_empty())
+            {
                 lines.push(format!(
                     "COMMENT ON COLUMN {tref}.{} IS {};",
                     quote_table_identifier(Some(tgt_dt), &c.name),
@@ -2530,22 +2649,14 @@ fn strip_tz_suffix(s: &str) -> Option<String> {
 /// True for the date/time families whose textual rendering may carry a timezone
 /// offset MySQL cannot parse.
 fn is_tz_prone_type(t: &str) -> bool {
-    matches!(
-        canonical_type(t).as_deref(),
-        Some("timestamp tz")
-    )
+    matches!(canonical_type(t).as_deref(), Some("timestamp tz"))
 }
 
 /// A SQL literal for one copied cell, escaped for the **target** dialect. On a
 /// cross-dialect copy a timestamp read from the source is normalised when the
 /// target is MySQL (offset stripped), so `2024-01-01 12:00:00+00` lands as a
 /// valid `DATETIME`.
-fn transfer_value_literal(
-    v: &Val,
-    src_type: &str,
-    tgt_type: &str,
-    tgt_dt: DatabaseType,
-) -> String {
+fn transfer_value_literal(v: &Val, src_type: &str, tgt_type: &str, tgt_dt: DatabaseType) -> String {
     if let Val::Text(s) = v {
         if is_mysql_family(tgt_dt.as_str())
             && is_tz_prone_type(src_type)
@@ -2576,9 +2687,7 @@ fn build_transfer_count_sql(
     } else {
         format!(" WHERE ({})", filter.trim())
     };
-    format!(
-        "SELECT COUNT(*) FROM (SELECT 1 FROM {tref}{where_clause} LIMIT {probe}) AS _dbxt_c"
-    )
+    format!("SELECT COUNT(*) FROM (SELECT 1 FROM {tref}{where_clause} LIMIT {probe}) AS _dbxt_c")
 }
 
 /// A source `SELECT … LIMIT chunk OFFSET n` used when the table has no usable
@@ -2774,7 +2883,11 @@ impl TransferWizard {
     }
     /// Parse the `LIMIT` option (`None` = no limit).
     fn limit(&self) -> Option<u64> {
-        self.limit_input.trim().parse::<u64>().ok().filter(|n| *n > 0)
+        self.limit_input
+            .trim()
+            .parse::<u64>()
+            .ok()
+            .filter(|n| *n > 0)
     }
 }
 
@@ -2793,7 +2906,13 @@ fn transfer_option_rows(w: &TransferWizard) -> Vec<(String, String)> {
         Some(n) => n.to_string(),
         None => t("(不限)").to_string(),
     };
-    let yn = |b: bool| if b { t("是").to_string() } else { t("否").to_string() };
+    let yn = |b: bool| {
+        if b {
+            t("是").to_string()
+        } else {
+            t("否").to_string()
+        }
+    };
     vec![
         (t("搬运模式").to_string(), t(w.mode.label()).to_string()),
         (t("表已存在").to_string(), t(w.conflict.label()).to_string()),
@@ -2843,11 +2962,7 @@ fn transfer_summary_text(rep: &TransferReport) -> String {
         rep.rate(),
         t("行/秒")
     ));
-    out.push_str(&format!(
-        "-- {}: {}\n",
-        t("已完成块"),
-        rep.chunks_done
-    ));
+    out.push_str(&format!("-- {}: {}\n", t("已完成块"), rep.chunks_done));
     if let Some(bp) = &rep.breakpoint {
         out.push_str(&format!("-- {}: {bp}\n", t("断点主键")));
     }
@@ -2864,7 +2979,11 @@ fn transfer_summary_text(rep: &TransferReport) -> String {
         out.push_str(&format!("-- {} {row}: {err}\n", t("跳过源行")));
     }
     if rep.skipped.len() > 20 {
-        out.push_str(&format!("-- … {} {}\n", t("其余跳过"), rep.skipped.len() - 20));
+        out.push_str(&format!(
+            "-- … {} {}\n",
+            t("其余跳过"),
+            rep.skipped.len() - 20
+        ));
     }
     for w in &rep.warnings {
         out.push_str(&format!("-- ⚠ {w}\n"));
@@ -2892,7 +3011,8 @@ impl Val {
     #[allow(dead_code)]
     fn is_null(&self) -> bool {
         matches!(self, Val::Null)
-    }}
+    }
+}
 
 fn value_to_val(v: &serde_json::Value) -> Val {
     match v {
@@ -2910,7 +3030,13 @@ fn sanitize_cell(s: &str) -> String {
         return s.to_string();
     }
     s.chars()
-        .map(|c| if c == '\n' || c == '\r' || c == '\t' { ' ' } else { c })
+        .map(|c| {
+            if c == '\n' || c == '\r' || c == '\t' {
+                ' '
+            } else {
+                c
+            }
+        })
         .collect()
 }
 
@@ -3018,7 +3144,11 @@ fn redis_value_view(v: RedisValue) -> RedisValueView {
             if *truncated {
                 note.push_str(t(" · 已截断"));
             }
-            (vec![t("value").into()], vec![vec![Val::Text(redis_blob_text(content))]], note)
+            (
+                vec![t("value").into()],
+                vec![vec![Val::Text(redis_blob_text(content))]],
+                note,
+            )
         }
         RedisValueData::Bitmap {
             content,
@@ -3035,7 +3165,11 @@ fn redis_value_view(v: RedisValue) -> RedisValueView {
             if *truncated {
                 note.push_str(t(" · 已截断"));
             }
-            (vec![t("value").into()], vec![vec![Val::Text(redis_blob_text(content))]], note)
+            (
+                vec![t("value").into()],
+                vec![vec![Val::Text(redis_blob_text(content))]],
+                note,
+            )
         }
         // kvrocks-style HyperLogLog: the raw bytes are unreadable, so only the
         // PFCOUNT cardinality estimate is shown.
@@ -3045,18 +3179,29 @@ fn redis_value_view(v: RedisValue) -> RedisValueView {
                 Some(c) => tf("基数估计 {}", &[&(c)]),
                 None => t("（不可读）").to_string(),
             };
-            (vec![t("value").into()], vec![vec![Val::Text(text)]], String::new())
+            (
+                vec![t("value").into()],
+                vec![vec![Val::Text(text)]],
+                String::new(),
+            )
         }
         RedisValueData::Json { value } => {
             row_keys.push(String::new());
-            (vec![t("value").into()], vec![vec![Val::Text(sanitize_cell(value))]], String::new())
+            (
+                vec![t("value").into()],
+                vec![vec![Val::Text(sanitize_cell(value))]],
+                String::new(),
+            )
         }
         RedisValueData::List { items, total, .. } => {
             let rows = items
                 .iter()
                 .map(|it| {
                     row_keys.push(it.index.to_string());
-                    vec![Val::Text(it.index.to_string()), Val::Text(redis_blob_text(&it.value))]
+                    vec![
+                        Val::Text(it.index.to_string()),
+                        Val::Text(redis_blob_text(&it.value)),
+                    ]
                 })
                 .collect();
             (
@@ -3086,11 +3231,7 @@ fn redis_value_view(v: RedisValue) -> RedisValueView {
                         Some(-1) | None => Val::Null,
                         Some(t) => Val::Text(format!("{t}s")),
                     };
-                    vec![
-                        Val::Text(f),
-                        Val::Text(redis_blob_text(&it.value)),
-                        ttl,
-                    ]
+                    vec![Val::Text(f), Val::Text(redis_blob_text(&it.value)), ttl]
                 })
                 .collect();
             (
@@ -3142,9 +3283,10 @@ fn redis_value_view(v: RedisValue) -> RedisValueView {
         }
         RedisValueData::Unknown { redis_type } => (
             vec![t("value").into()],
-            vec![vec![Val::Text(
-                tf("（暂不支持的类型：{}）", &[&(redis_type)]),
-            )]],
+            vec![vec![Val::Text(tf(
+                "（暂不支持的类型：{}）",
+                &[&(redis_type)],
+            ))]],
             String::new(),
         ),
     };
@@ -3191,7 +3333,10 @@ fn redis_collection_page_rows(
                 .iter()
                 .map(|it| {
                     row_keys.push(it.index.to_string());
-                    vec![Val::Text(it.index.to_string()), Val::Text(redis_blob_text(&it.value))]
+                    vec![
+                        Val::Text(it.index.to_string()),
+                        Val::Text(redis_blob_text(&it.value)),
+                    ]
                 })
                 .collect();
             (rows, row_keys, *scan_cursor)
@@ -3374,7 +3519,10 @@ fn redis_plan_batch(
             Ok(RedisBatchPlan {
                 commands: redis_batch_rename_commands(&displays, old, new),
                 typed_confirm: None,
-                summary: tf("批量前缀重命名 {} → {} · {} 个 key", &[&old, &new, &plan.len()]),
+                summary: tf(
+                    "批量前缀重命名 {} → {} · {} 个 key",
+                    &[&old, &new, &plan.len()],
+                ),
             })
         }
     }
@@ -3501,11 +3649,7 @@ fn mongo_doc_diff(old: &serde_json::Value, new: &serde_json::Value, cap: usize) 
         } else {
             "~ "
         };
-        out.push(format!(
-            "{mark}{k}: {} → {}",
-            show(before),
-            show(after)
-        ));
+        out.push(format!("{mark}{k}: {} → {}", show(before), show(after)));
         if out.len() >= cap {
             out.push(t("…（更多字段已省略）").to_string());
             break;
@@ -4351,7 +4495,7 @@ impl TuiConfig {
         // Atomic-ish: write a sibling temp file then rename so a crash never
         // leaves a half-written config behind. The pid keeps two concurrent
         // dbxt processes from fighting over the same temp path.
-        let tmp = path.with_extension(format!("{}.tmp",  std::process::id()));
+        let tmp = path.with_extension(format!("{}.tmp", std::process::id()));
         if std::fs::write(&tmp, text).is_ok() {
             let _ = std::fs::rename(&tmp, path);
         }
@@ -4547,7 +4691,10 @@ fn wrap_sql_lines(sql: &str, width: usize) -> Vec<String> {
 /// by `(`, so a function call (`count(`) can be told from a keyword (`IN (`).
 #[derive(Debug, Clone, PartialEq)]
 enum SqlTok {
-    Word { text: String, call: bool },
+    Word {
+        text: String,
+        call: bool,
+    },
     /// A string literal or quoted identifier, kept verbatim (quotes included).
     Quoted(String),
     /// A `-- …` or `/* … */` comment, kept verbatim.
@@ -4639,17 +4786,102 @@ fn sql_tokenize(sql: &str) -> Vec<SqlTok> {
 /// Words the formatter upper-cases. Function names are exempted separately via
 /// the tokenizer's `call` flag, so `count(` keeps whatever case the user typed.
 const SQL_FORMAT_KEYWORDS: &[&str] = &[
-    "ALL", "ALTER", "ANALYZE", "AND", "ANY", "ARRAY", "AS", "ASC", "BEGIN", "BETWEEN",
-    "BY", "CASCADE", "CASE", "CAST", "CHECK", "COLUMN", "COMMIT", "CONFLICT", "CONSTRAINT",
-    "CREATE", "CROSS", "DEFAULT", "DELETE", "DESC", "DISTINCT", "DO", "DROP", "ELSE", "END",
-    "EXCEPT", "EXISTS", "EXPLAIN", "FETCH", "FILTER", "FOREIGN", "FROM", "FULL", "GRANT",
-    "GROUP", "HAVING", "IF", "ILIKE", "IN", "INDEX", "INNER", "INSERT", "INTERSECT", "INTO",
-    "IS", "JOIN", "KEY", "LATERAL", "LEFT", "LIKE", "LIMIT", "NATURAL", "NEXT", "NOT",
-    "NOTHING", "NULL", "OFFSET", "ON", "ONLY", "OR", "ORDER", "OUTER", "OVER", "PARTITION",
-    "PRIMARY", "RECURSIVE", "REFERENCES", "RESTRICT", "RETURNING", "REVOKE", "RIGHT",
-    "ROLLBACK", "ROWS", "SELECT", "SET", "SIMILAR", "SOME", "TABLE", "THEN", "TOP",
-    "TRANSACTION", "TRUNCATE", "UNION", "UNIQUE", "UPDATE", "USING", "VALUES", "VIEW", "WHEN",
-    "WHERE", "WINDOW", "WITH",
+    "ALL",
+    "ALTER",
+    "ANALYZE",
+    "AND",
+    "ANY",
+    "ARRAY",
+    "AS",
+    "ASC",
+    "BEGIN",
+    "BETWEEN",
+    "BY",
+    "CASCADE",
+    "CASE",
+    "CAST",
+    "CHECK",
+    "COLUMN",
+    "COMMIT",
+    "CONFLICT",
+    "CONSTRAINT",
+    "CREATE",
+    "CROSS",
+    "DEFAULT",
+    "DELETE",
+    "DESC",
+    "DISTINCT",
+    "DO",
+    "DROP",
+    "ELSE",
+    "END",
+    "EXCEPT",
+    "EXISTS",
+    "EXPLAIN",
+    "FETCH",
+    "FILTER",
+    "FOREIGN",
+    "FROM",
+    "FULL",
+    "GRANT",
+    "GROUP",
+    "HAVING",
+    "IF",
+    "ILIKE",
+    "IN",
+    "INDEX",
+    "INNER",
+    "INSERT",
+    "INTERSECT",
+    "INTO",
+    "IS",
+    "JOIN",
+    "KEY",
+    "LATERAL",
+    "LEFT",
+    "LIKE",
+    "LIMIT",
+    "NATURAL",
+    "NEXT",
+    "NOT",
+    "NOTHING",
+    "NULL",
+    "OFFSET",
+    "ON",
+    "ONLY",
+    "OR",
+    "ORDER",
+    "OUTER",
+    "OVER",
+    "PARTITION",
+    "PRIMARY",
+    "RECURSIVE",
+    "REFERENCES",
+    "RESTRICT",
+    "RETURNING",
+    "REVOKE",
+    "RIGHT",
+    "ROLLBACK",
+    "ROWS",
+    "SELECT",
+    "SET",
+    "SIMILAR",
+    "SOME",
+    "TABLE",
+    "THEN",
+    "TOP",
+    "TRANSACTION",
+    "TRUNCATE",
+    "UNION",
+    "UNIQUE",
+    "UPDATE",
+    "USING",
+    "VALUES",
+    "VIEW",
+    "WHEN",
+    "WHERE",
+    "WINDOW",
+    "WITH",
 ];
 
 /// Break kind for a clause: `0` none, `1` top-level clause (column 0), `2` JOIN
@@ -4696,8 +4928,8 @@ const SQL_PHRASES: &[(&[&str], u8)] = &[
 fn sql_break_for_word(word_upper: &str) -> u8 {
     match word_upper {
         "SELECT" | "FROM" | "WHERE" | "HAVING" | "LIMIT" | "OFFSET" | "VALUES" | "SET"
-        | "UPDATE" | "INSERT" | "DELETE" | "CREATE" | "ALTER" | "DROP" | "WITH"
-        | "RETURNING" | "UNION" | "EXPLAIN" => BRK_TOP,
+        | "UPDATE" | "INSERT" | "DELETE" | "CREATE" | "ALTER" | "DROP" | "WITH" | "RETURNING"
+        | "UNION" | "EXPLAIN" => BRK_TOP,
         "JOIN" => BRK_JOIN,
         "ON" | "AND" | "OR" | "WHEN" | "ELSE" | "END" => BRK_SUB,
         _ => BRK_NONE,
@@ -4788,7 +5020,11 @@ fn format_sql(sql: &str) -> String {
                 // followed by `(` (`IN(`, `VALUES(`); only a real *function* name
                 // (a word that is not a keyword) keeps the user's case.
                 let is_keyword = SQL_FORMAT_KEYWORDS.contains(&upper.as_str());
-                let piece = if is_keyword { upper.as_str() } else { text.as_str() };
+                let piece = if is_keyword {
+                    upper.as_str()
+                } else {
+                    text.as_str()
+                };
                 push_sql_piece(&mut cur, piece, false, indent);
                 last_call = *call;
                 i += 1;
@@ -4944,7 +5180,10 @@ fn detect_danger(statement: &str) -> Option<String> {
         }
         "update" | "delete" => {
             if !has_keyword(&lower, "where") {
-                Some(tf("{} 没有 WHERE 子句，会作用于整张表", &[&(first.to_ascii_uppercase())]))
+                Some(tf(
+                    "{} 没有 WHERE 子句，会作用于整张表",
+                    &[&(first.to_ascii_uppercase())],
+                ))
             } else {
                 None
             }
@@ -5042,7 +5281,10 @@ fn with_main_verb(rest: &str) -> Option<String> {
             while i < chars.len() && (chars[i].is_alphanumeric() || chars[i] == '_') {
                 i += 1;
             }
-            let word: String = chars[start..i].iter().collect::<String>().to_ascii_lowercase();
+            let word: String = chars[start..i]
+                .iter()
+                .collect::<String>()
+                .to_ascii_lowercase();
             match word.as_str() {
                 "select" | "values" | "table" | "insert" | "update" | "delete" | "merge"
                 | "replace" | "call" | "execute" => return Some(word),
@@ -5183,7 +5425,10 @@ fn find_top_level_keyword(sql: &str, keyword: &str) -> Option<usize> {
             while i < chars.len() && (chars[i].is_alphanumeric() || chars[i] == '_') {
                 i += 1;
             }
-            let word: String = chars[start..i].iter().collect::<String>().to_ascii_lowercase();
+            let word: String = chars[start..i]
+                .iter()
+                .collect::<String>()
+                .to_ascii_lowercase();
             if word == keyword {
                 let byte_off: usize = chars[..i].iter().map(|c| c.len_utf8()).sum();
                 return Some(byte_off);
@@ -5365,7 +5610,7 @@ fn build_search_scan_sql(
     let pattern = sql_literal(&search_like_pattern(needle));
     let conds: Vec<String> = columns
         .iter()
-        .map(|c| format!("{} {} {} ESCAPE '!'",  q(c),  op,  pattern))
+        .map(|c| format!("{} {} {} ESCAPE '!'", q(c), op, pattern))
         .collect();
     format!(
         "SELECT * FROM {} WHERE {} LIMIT {}",
@@ -5445,7 +5690,10 @@ fn search_hit_filter(
 ) -> String {
     let q = |name: &str| quote_table_identifier(Some(db_type), name);
     let keys: Vec<&String> = if pk.is_empty() {
-        columns.iter().filter(|c| c.as_str() == matched_col).collect()
+        columns
+            .iter()
+            .filter(|c| c.as_str() == matched_col)
+            .collect()
     } else {
         pk.iter().collect()
     };
@@ -5505,11 +5753,16 @@ enum Op {
     /// R47b: refresh the cached per-connection liveness from the kernel. This is
     /// a pure registry read ([`AppState::is_connection_open`]), so checking the
     /// state can never itself open a connection.
-    ConnStatus { ids: Vec<String> },
+    ConnStatus {
+        ids: Vec<String>,
+    },
     /// R47b: manual disconnect — drain the connection's pools through the
     /// kernel's user-disconnect path, which rolls back manual-transaction
     /// sessions before closing (never a bare drain).
-    Disconnect { id: String, name: String },
+    Disconnect {
+        id: String,
+        name: String,
+    },
     /// Enumerate the schemas of one database (PostgreSQL and other
     /// schema-aware engines).
     ListSchemas(Box<ConnectionConfig>, String),
@@ -5615,7 +5868,9 @@ enum Op {
     /// plus the SQL texts already saved as favourites, in one round trip.
     HistoryPanel(Box<ConnectionConfig>),
     /// Delete one history entry by id (config-store only; never the database).
-    HistoryDelete { id: String },
+    HistoryDelete {
+        id: String,
+    },
     /// Toggle a statement in / out of DBX's `saved_sql_files` favourites.
     HistoryFavorite {
         cfg: Box<ConnectionConfig>,
@@ -5635,7 +5890,10 @@ enum Op {
     UpdateConn(Box<ConnectionConfig>),
     /// Remove a saved connection from DBX's store (config only; never touches
     /// the database's data).
-    DeleteConn { id: String, name: String },
+    DeleteConn {
+        id: String,
+        name: String,
+    },
     /// Read, decode and header-align a CSV against a table's columns, producing
     /// the preview plan.
     ImportPlan {
@@ -5749,7 +6007,10 @@ enum OpResult {
     /// R48: the parsed desktop sidebar groups (empty = flat list).
     SidebarLayout(Box<SidebarLayout>),
     /// A saved connection was removed (id + name for the status line).
-    ConnDeleted { id: String, name: String },
+    ConnDeleted {
+        id: String,
+        name: String,
+    },
     Databases {
         databases: Vec<String>,
         /// Set when the driver could not enumerate databases but the
@@ -5910,12 +6171,21 @@ enum OpResult {
         failed: Vec<String>,
     },
     /// A CSV preview plan (may carry a content error the preview displays).
-    ImportPlan { gen: u64, plan: Box<ImportPlan> },
+    ImportPlan {
+        gen: u64,
+        plan: Box<ImportPlan>,
+    },
     /// The plan could not be built (unreadable file, no columns): routed back to
     /// the path prompt.
-    ImportFailed { gen: u64, msg: String },
+    ImportFailed {
+        gen: u64,
+        msg: String,
+    },
     /// Chunk progress; does not count as the op finishing.
-    ImportProgress { done: usize, total: usize },
+    ImportProgress {
+        done: usize,
+        total: usize,
+    },
     ImportDone(Box<ImportReport>),
     /// A background file export finished (or failed). Carries the timing and
     /// byte count for the status line.
@@ -6058,7 +6328,7 @@ fn note_of(r: &dbx_core::db::QueryResult) -> String {
     if r.truncated {
         parts.push(t("已截断").into());
     }
-    parts.push(format!("{}ms",  r.execution_time_ms));
+    parts.push(format!("{}ms", r.execution_time_ms));
     parts.join(" · ")
 }
 
@@ -6143,7 +6413,10 @@ async fn resolve_ddl_schema(
          WHERE c.relname = '{}' AND pg_catalog.pg_table_is_visible(c.oid) LIMIT 1",
         table.replace('\'', "''")
     );
-    match backend.execute_query(cfg, db, &sql, Some(1), Some(10)).await {
+    match backend
+        .execute_query(cfg, db, &sql, Some(1), Some(10))
+        .await
+    {
         Ok(r) => r
             .rows
             .first()
@@ -6221,7 +6494,10 @@ fn build_table_page_query(
         order_by: order_by_effective,
         ..Default::default()
     };
-    (build_table_data_select_sql_with_database(options, false), reverse)
+    (
+        build_table_data_select_sql_with_database(options, false),
+        reverse,
+    )
 }
 
 /// The derived-table `COUNT(*)` that stops once the sample cap is reached:
@@ -6273,8 +6549,16 @@ async fn sample_row_count(
             None => exact_row_count(backend, cfg, db, schema, table, filter)
                 .await
                 .map(|n| (n, false)),
-            Some(sql) => match backend.execute_query(cfg, db, &sql, Some(1), Some(15)).await {
-                Ok(c) => match c.rows.first().and_then(|row| row.first()).and_then(count_value) {
+            Some(sql) => match backend
+                .execute_query(cfg, db, &sql, Some(1), Some(15))
+                .await
+            {
+                Ok(c) => match c
+                    .rows
+                    .first()
+                    .and_then(|row| row.first())
+                    .and_then(count_value)
+                {
                     Some(n) => Some(classify_sample(n, limit)),
                     // Should not happen, but never lose the total entirely.
                     None => exact_row_count(backend, cfg, db, schema, table, filter)
@@ -6309,7 +6593,10 @@ async fn exact_row_count(
         .execute_query(cfg, db, &sql, Some(1), Some(15))
         .await
         .ok()?;
-    c.rows.first().and_then(|row| row.first()).and_then(count_value)
+    c.rows
+        .first()
+        .and_then(|row| row.first())
+        .and_then(count_value)
 }
 
 /// One `COUNT(*)` cell, as a number.
@@ -6344,7 +6631,11 @@ fn keyset_cursor(
     };
     let first = tuple(rows.first()?);
     let last = tuple(rows.last()?);
-    if first.iter().chain(last.iter()).any(serde_json::Value::is_null) {
+    if first
+        .iter()
+        .chain(last.iter())
+        .any(serde_json::Value::is_null)
+    {
         return None;
     }
     Some(KeysetCursor {
@@ -6394,9 +6685,10 @@ async fn run_op(backend: &LocalBackend, op: Op, tx: &Tx) -> OpResult {
                     ssh_connect_error_message(&cfg, &e)
                 } else {
                     match cfg.database.as_deref() {
-                        Some(db) if !db.is_empty() => {
-                            tf("无法列举数据库（{}），仅使用配置库 {}", &[&(e), &(fix_double_encoding(db))])
-                        }
+                        Some(db) if !db.is_empty() => tf(
+                            "无法列举数据库（{}），仅使用配置库 {}",
+                            &[&(e), &(fix_double_encoding(db))],
+                        ),
                         _ => tf("无法列举数据库（{}），将使用连接默认库", &[&(e)]),
                     }
                 };
@@ -6492,8 +6784,11 @@ async fn run_op(backend: &LocalBackend, op: Op, tx: &Tx) -> OpResult {
                     .await
                 {
                     Ok(r) => {
-                        info.total_bytes =
-                            r.rows.first().and_then(|row| row.first()).and_then(json_u64);
+                        info.total_bytes = r
+                            .rows
+                            .first()
+                            .and_then(|row| row.first())
+                            .and_then(json_u64);
                     }
                     Err(e) => error = Some(e.to_string()),
                 }
@@ -6530,7 +6825,8 @@ async fn run_op(backend: &LocalBackend, op: Op, tx: &Tx) -> OpResult {
         Op::ListSchemas(cfg, db) => {
             // `list_schemas_core` is the kernel's schema enumerator; it hides
             // system schemas unless the connection opts in (`show_system_schemas`).
-            match dbx_core::schema::list_schemas_core(backend.state().as_ref(), &cfg.id, &db).await {
+            match dbx_core::schema::list_schemas_core(backend.state().as_ref(), &cfg.id, &db).await
+            {
                 Ok(schemas) => OpResult::Schemas {
                     db,
                     schemas,
@@ -6545,18 +6841,21 @@ async fn run_op(backend: &LocalBackend, op: Op, tx: &Tx) -> OpResult {
                 },
             }
         }
-        Op::ListTables(cfg, db, schema, gen) => match backend.list_tables(&cfg, &db, &schema).await {
+        Op::ListTables(cfg, db, schema, gen) => match backend.list_tables(&cfg, &db, &schema).await
+        {
             Ok(t) => OpResult::TablesFor { tables: t, gen },
             Err(e) => OpResult::Error(format!("list tables: {e}")),
         },
-        Op::Columns(cfg, db, schema, table) => match backend.get_columns(&cfg, &db, &schema, &table).await {
-            Ok(c) => OpResult::Columns {
-                table,
-                schema,
-                columns: c,
-            },
-            Err(e) => OpResult::Error(format!("columns: {e}")),
-        },
+        Op::Columns(cfg, db, schema, table) => {
+            match backend.get_columns(&cfg, &db, &schema, &table).await {
+                Ok(c) => OpResult::Columns {
+                    table,
+                    schema,
+                    columns: c,
+                },
+                Err(e) => OpResult::Error(format!("columns: {e}")),
+            }
+        }
         Op::Ddl(cfg, db, schema, table) => {
             // PostgreSQL renders `"schema"."table"`; when the schema layer did
             // not produce one (a failed `list_schemas`, an engine we do not
@@ -6565,7 +6864,8 @@ async fn run_op(backend: &LocalBackend, op: Op, tx: &Tx) -> OpResult {
             // *requested* schema is what the reply carries back, so the result
             // guard keeps working even when the fallback resolved a different
             // name.
-            let effective = if schema.trim().is_empty() && is_postgres_family(cfg.db_type.as_str()) {
+            let effective = if schema.trim().is_empty() && is_postgres_family(cfg.db_type.as_str())
+            {
                 resolve_ddl_schema(backend, &cfg, &db, &table).await
             } else {
                 schema.clone()
@@ -6717,7 +7017,7 @@ async fn run_op(backend: &LocalBackend, op: Op, tx: &Tx) -> OpResult {
                             let text = statements
                                 .get(idx)
                                 .cloned()
-                                .unwrap_or_else(|| format!("-- statement {}",  idx + 1));
+                                .unwrap_or_else(|| format!("-- statement {}", idx + 1));
                             total_ms = total_ms.saturating_add(r.result.execution_time_ms as u64);
                             outcomes.push(stmt_outcome(text, r));
                         }
@@ -6728,16 +7028,8 @@ async fn run_op(backend: &LocalBackend, op: Op, tx: &Tx) -> OpResult {
                     }
                     Err(e) => {
                         if record {
-                            record_history(
-                                backend,
-                                &cfg,
-                                &db,
-                                &sql,
-                                Some(e.clone()),
-                                0,
-                                origin,
-                            )
-                            .await;
+                            record_history(backend, &cfg, &db, &sql, Some(e.clone()), 0, origin)
+                                .await;
                         }
                         OpResult::Error(format!("script: {e}"))
                     }
@@ -6764,16 +7056,8 @@ async fn run_op(backend: &LocalBackend, op: Op, tx: &Tx) -> OpResult {
                     }
                     Err(e) => {
                         if record {
-                            record_history(
-                                backend,
-                                &cfg,
-                                &db,
-                                &sql,
-                                Some(e.clone()),
-                                0,
-                                origin,
-                            )
-                            .await;
+                            record_history(backend, &cfg, &db, &sql, Some(e.clone()), 0, origin)
+                                .await;
                         }
                         OpResult::Error(format!("query: {e}"))
                     }
@@ -6830,7 +7114,8 @@ async fn run_op(backend: &LocalBackend, op: Op, tx: &Tx) -> OpResult {
             reload_list,
         } => match backend.execute_redis_command(&cfg, db, &cmd, true).await {
             Ok(r) => {
-                let summary = serde_json::to_string(&r.value).unwrap_or_else(|_| format!("{:?}", r.value));
+                let summary =
+                    serde_json::to_string(&r.value).unwrap_or_else(|_| format!("{:?}", r.value));
                 OpResult::RedisWritten {
                     cmd,
                     summary: truncate_disp(&one_line(&summary), 160),
@@ -6869,7 +7154,7 @@ async fn run_op(backend: &LocalBackend, op: Op, tx: &Tx) -> OpResult {
                 first_error,
                 reload_list,
             }
-        },
+        }
         Op::RedisMore {
             cfg,
             db,
@@ -6953,7 +7238,11 @@ async fn run_op(backend: &LocalBackend, op: Op, tx: &Tx) -> OpResult {
                 Err(e) => OpResult::Error(format!("mongo docs: {e}")),
             }
         }
-        Op::MongoIndexes { cfg, db, collection } => {
+        Op::MongoIndexes {
+            cfg,
+            db,
+            collection,
+        } => {
             match dbx_core::mongo_ops::mongo_list_index_specs_core(
                 backend.state().as_ref(),
                 &cfg.id,
@@ -6964,7 +7253,11 @@ async fn run_op(backend: &LocalBackend, op: Op, tx: &Tx) -> OpResult {
             {
                 Ok(specs) => {
                     let qr = dbx_core::mongo_ops::mongo_indexes_query_result(specs, 500);
-                    let grid = Grid::from_query(qr.columns, &qr.rows, tf("{} 个索引", &[&(qr.rows.len())]));
+                    let grid = Grid::from_query(
+                        qr.columns,
+                        &qr.rows,
+                        tf("{} 个索引", &[&(qr.rows.len())]),
+                    );
                     OpResult::MongoIndexes {
                         collection,
                         grid: Box::new(grid),
@@ -7041,7 +7334,7 @@ async fn run_op(backend: &LocalBackend, op: Op, tx: &Tx) -> OpResult {
                 // Without it, dbx-core's allowlist blocks ordinary commands such as KEYS.
                 Ok(r) => OpResult::Redis(match serde_json::to_string_pretty(&r.value) {
                     Ok(s) => s,
-                    Err(_) => format!("{:?}",  r.value),
+                    Err(_) => format!("{:?}", r.value),
                 }),
                 Err(e) => OpResult::Error(if cfg.has_effective_ssh_tunnels() {
                     ssh_connect_error_message(&cfg, &e)
@@ -7055,7 +7348,11 @@ async fn run_op(backend: &LocalBackend, op: Op, tx: &Tx) -> OpResult {
                 Ok(r) => {
                     let mut rows = String::new();
                     for row in r.rows.iter().take(50) {
-                        let line: Vec<String> = row.iter().map(value_to_val).map(|v| v.text().to_string()).collect();
+                        let line: Vec<String> = row
+                            .iter()
+                            .map(value_to_val)
+                            .map(|v| v.text().to_string())
+                            .collect();
                         rows.push_str(&line.join("  "));
                         rows.push('\n');
                     }
@@ -7143,15 +7440,10 @@ async fn run_op(backend: &LocalBackend, op: Op, tx: &Tx) -> OpResult {
                 Err(e) => OpResult::Error(format!("history: {e}")),
             }
         }
-        Op::HistoryDelete { id } => {
-            match backend.state().storage.delete_history_entry(&id).await {
-                Ok(()) => OpResult::HistoryDeleted { id, error: None },
-                Err(e) => OpResult::HistoryDeleted {
-                    id,
-                    error: Some(e),
-                },
-            }
-        }
+        Op::HistoryDelete { id } => match backend.state().storage.delete_history_entry(&id).await {
+            Ok(()) => OpResult::HistoryDeleted { id, error: None },
+            Err(e) => OpResult::HistoryDeleted { id, error: Some(e) },
+        },
         Op::HistoryFavorite { cfg, sql, name } => {
             match backend.state().storage.load_saved_sql_library().await {
                 Ok(lib) => {
@@ -7159,7 +7451,8 @@ async fn run_op(backend: &LocalBackend, op: Op, tx: &Tx) -> OpResult {
                         .files
                         .iter()
                         .filter(|f| {
-                            f.sql == sql && (f.connection_id.is_empty() || f.connection_id == cfg.id)
+                            f.sql == sql
+                                && (f.connection_id.is_empty() || f.connection_id == cfg.id)
                         })
                         .map(|f| f.id.clone())
                         .collect();
@@ -7167,7 +7460,8 @@ async fn run_op(backend: &LocalBackend, op: Op, tx: &Tx) -> OpResult {
                         // Already a favourite: remove every matching copy.
                         let mut err = None;
                         for id in &existing {
-                            if let Err(e) = backend.state().storage.delete_saved_sql_file(id).await {
+                            if let Err(e) = backend.state().storage.delete_saved_sql_file(id).await
+                            {
                                 err = Some(e);
                             }
                         }
@@ -7232,7 +7526,7 @@ async fn run_op(backend: &LocalBackend, op: Op, tx: &Tx) -> OpResult {
                     .filter(|f| f.connection_id.is_empty() || f.connection_id == cfg.id)
                     .map(|f| {
                         let label = match folder_name(&f.folder_id) {
-                            Some(folder) if !folder.is_empty() => format!("{folder}/{}",  f.name),
+                            Some(folder) if !folder.is_empty() => format!("{folder}/{}", f.name),
                             _ => f.name.clone(),
                         };
                         (label, f.sql)
@@ -7271,7 +7565,10 @@ async fn run_op(backend: &LocalBackend, op: Op, tx: &Tx) -> OpResult {
             Err(e) => OpResult::Error(format!("databases: {e}")),
         },
         Op::AddConn(cfg) => match backend.add_connection_for_mcp(*cfg).await {
-            Ok(saved) => OpResult::Added(tf("已保存: {} ({})", &[&(saved.name), &(saved.db_type.as_str())])),
+            Ok(saved) => OpResult::Added(tf(
+                "已保存: {} ({})",
+                &[&(saved.name), &(saved.db_type.as_str())],
+            )),
             Err(e) => OpResult::Error(format!("save: {e}")),
         },
         Op::UpdateConn(cfg) => {
@@ -7280,9 +7577,10 @@ async fn run_op(backend: &LocalBackend, op: Op, tx: &Tx) -> OpResult {
             let id = cfg.id.clone();
             let _ = backend.remove_connection_for_mcp(&id).await;
             match backend.add_connection_for_mcp(*cfg).await {
-                Ok(saved) => {
-                    OpResult::Added(tf("已更新: {} ({})", &[&(saved.name), &(saved.db_type.as_str())]))
-                }
+                Ok(saved) => OpResult::Added(tf(
+                    "已更新: {} ({})",
+                    &[&(saved.name), &(saved.db_type.as_str())],
+                )),
                 Err(e) => OpResult::Error(format!("update: {e}")),
             }
         }
@@ -7295,7 +7593,11 @@ async fn run_op(backend: &LocalBackend, op: Op, tx: &Tx) -> OpResult {
             Ok(saved) => OpResult::ConnCopied(Box::new(saved)),
             Err(e) => OpResult::Error(format!("copy: {e}")),
         },
-        Op::ImportConns { items, skipped, needs_password } => {
+        Op::ImportConns {
+            items,
+            skipped,
+            needs_password,
+        } => {
             let mut saved: Vec<ConnectionConfig> = Vec::new();
             let mut failed: Vec<String> = Vec::new();
             for (replace_id, cfg) in items {
@@ -7309,36 +7611,69 @@ async fn run_op(backend: &LocalBackend, op: Op, tx: &Tx) -> OpResult {
                     Err(e) => failed.push(e.to_string()),
                 }
             }
-            OpResult::ConnsImported { saved, skipped, needs_password, failed }
+            OpResult::ConnsImported {
+                saved,
+                skipped,
+                needs_password,
+                failed,
+            }
         }
-        Op::ImportPlan { cfg, db, schema, table, path, gen } => {
+        Op::ImportPlan {
+            cfg,
+            db,
+            schema,
+            table,
+            path,
+            gen,
+        } => {
             let expanded = expand_home(&path.to_string_lossy());
             let bytes = match std::fs::read(&expanded) {
                 Ok(b) => b,
-                Err(e) => return OpResult::ImportFailed { gen, msg: tf("读取文件失败: {}", &[&(e)]) },
+                Err(e) => {
+                    return OpResult::ImportFailed {
+                        gen,
+                        msg: tf("读取文件失败: {}", &[&(e)]),
+                    }
+                }
             };
             let (text, encoding) = decode_csv_bytes(&bytes);
             let delimiter = detect_delimiter(&text);
             let mut rows = parse_csv(&text, delimiter);
             if rows.is_empty() {
-                return OpResult::ImportFailed { gen, msg: t("CSV 为空或无法解析").into() };
+                return OpResult::ImportFailed {
+                    gen,
+                    msg: t("CSV 为空或无法解析").into(),
+                };
             }
             let headers = rows.remove(0);
             if rows.is_empty() {
-                return OpResult::ImportFailed { gen, msg: t("CSV 没有数据行").into() };
+                return OpResult::ImportFailed {
+                    gen,
+                    msg: t("CSV 没有数据行").into(),
+                };
             }
             let table_columns = match backend.get_columns(&cfg, &db, &schema, &table).await {
                 Ok(c) => c,
-                Err(e) => return OpResult::ImportFailed { gen, msg: tf("读取表结构失败: {}", &[&(e)]) },
+                Err(e) => {
+                    return OpResult::ImportFailed {
+                        gen,
+                        msg: tf("读取表结构失败: {}", &[&(e)]),
+                    }
+                }
             };
-            let infer_rows: Vec<Vec<String>> = rows.iter().take(IMPORT_INFER_SAMPLE).cloned().collect();
-            let (columns, extra, missing) = align_import_columns(&headers, &infer_rows, &table_columns);
+            let infer_rows: Vec<Vec<String>> =
+                rows.iter().take(IMPORT_INFER_SAMPLE).cloned().collect();
+            let (columns, extra, missing) =
+                align_import_columns(&headers, &infer_rows, &table_columns);
             let error = if table_columns.is_empty() {
                 Some(t("目标表没有可对齐的列").to_string())
             } else if extra.is_empty() && columns.iter().all(|c| c.src.is_none()) {
                 Some(t("CSV 表头与表列不匹配（无任何列名对应）").to_string())
             } else if !extra.is_empty() {
-                Some(tf("CSV 有 {} 个多余列无法对齐（{}）", &[&extra.len(), &extra.join(", ")]))
+                Some(tf(
+                    "CSV 有 {} 个多余列无法对齐（{}）",
+                    &[&extra.len(), &extra.join(", ")],
+                ))
             } else {
                 None
             };
@@ -7381,7 +7716,10 @@ async fn run_op(backend: &LocalBackend, op: Op, tx: &Tx) -> OpResult {
             // filled) table — that is what an overwrite means.
             if mode == ImportMode::Overwrite {
                 let del = format!("DELETE FROM {};", table_ref(cfg.db_type, &schema, &table));
-                if let Err(e) = backend.execute_query(&cfg, &db, &del, Some(1), Some(60)).await {
+                if let Err(e) = backend
+                    .execute_query(&cfg, &db, &del, Some(1), Some(60))
+                    .await
+                {
                     return OpResult::ImportDone(Box::new(ImportReport {
                         table,
                         schema,
@@ -7414,7 +7752,10 @@ async fn run_op(backend: &LocalBackend, op: Op, tx: &Tx) -> OpResult {
                             use_transaction: Some(true),
                             ..Default::default()
                         };
-                        match backend.execute_batch(&cfg, &db, None, &script, options).await {
+                        match backend
+                            .execute_batch(&cfg, &db, None, &script, options)
+                            .await
+                        {
                             Ok(_) => inserted += chunk.len(),
                             Err(e) => {
                                 aborted = Some((import_row_of_error(base, &e, chunk.len()), e));
@@ -7431,7 +7772,10 @@ async fn run_op(backend: &LocalBackend, op: Op, tx: &Tx) -> OpResult {
                             continue_on_error: true,
                             ..Default::default()
                         };
-                        match backend.execute_batch(&cfg, &db, None, &script, options).await {
+                        match backend
+                            .execute_batch(&cfg, &db, None, &script, options)
+                            .await
+                        {
                             Ok(results) => {
                                 let mut bad = 0usize;
                                 for r in &results {
@@ -7497,15 +7841,7 @@ async fn run_op(backend: &LocalBackend, op: Op, tx: &Tx) -> OpResult {
                 let start = Instant::now();
                 let file = std::fs::File::create(&write_path)?;
                 let mut w = BufWriter::with_capacity(EXPORT_BUF_BYTES, file);
-                write_export(
-                    &mut w,
-                    cfg.as_ref(),
-                    &schema,
-                    &table,
-                    &types,
-                    &grid,
-                    format,
-                )?;
+                write_export(&mut w, cfg.as_ref(), &schema, &table, &types, &grid, format)?;
                 w.flush()?;
                 let bytes = w
                     .into_inner()
@@ -7562,16 +7898,16 @@ async fn run_op(backend: &LocalBackend, op: Op, tx: &Tx) -> OpResult {
             tgt_table,
             gen,
         } => {
-            let src = match fetch_diff_side(backend, &src_cfg, &src_db, &src_schema, &src_table).await
-            {
-                Ok(s) => s,
-                Err(e) => return OpResult::Error(format!("diff source: {e}")),
-            };
-            let tgt = match fetch_diff_side(backend, &tgt_cfg, &tgt_db, &tgt_schema, &tgt_table).await
-            {
-                Ok(s) => s,
-                Err(e) => return OpResult::Error(format!("diff target: {e}")),
-            };
+            let src =
+                match fetch_diff_side(backend, &src_cfg, &src_db, &src_schema, &src_table).await {
+                    Ok(s) => s,
+                    Err(e) => return OpResult::Error(format!("diff source: {e}")),
+                };
+            let tgt =
+                match fetch_diff_side(backend, &tgt_cfg, &tgt_db, &tgt_schema, &tgt_table).await {
+                    Ok(s) => s,
+                    Err(e) => return OpResult::Error(format!("diff target: {e}")),
+                };
             OpResult::DiffReady {
                 gen,
                 diff: Box::new(build_table_diff(src, tgt)),
@@ -7599,8 +7935,10 @@ async fn run_op(backend: &LocalBackend, op: Op, tx: &Tx) -> OpResult {
             // Deterministic, human-friendly order.
             src_names.sort_by_key(|a| a.to_ascii_lowercase());
             tgt_names.sort_by_key(|a| a.to_ascii_lowercase());
-            let src_set: HashSet<String> = src_names.iter().map(|n| n.to_ascii_lowercase()).collect();
-            let tgt_set: HashSet<String> = tgt_names.iter().map(|n| n.to_ascii_lowercase()).collect();
+            let src_set: HashSet<String> =
+                src_names.iter().map(|n| n.to_ascii_lowercase()).collect();
+            let tgt_set: HashSet<String> =
+                tgt_names.iter().map(|n| n.to_ascii_lowercase()).collect();
             let mut entries: Vec<DbDiffEntry> = Vec::new();
             for n in &src_names {
                 let mark = if tgt_set.contains(&n.to_ascii_lowercase()) {
@@ -7624,12 +7962,20 @@ async fn run_op(backend: &LocalBackend, op: Op, tx: &Tx) -> OpResult {
             let src_label = if src_schema.trim().is_empty() {
                 fix_double_encoding(&src_db)
             } else {
-                format!("{}.{}", fix_double_encoding(&src_db), fix_double_encoding(&src_schema))
+                format!(
+                    "{}.{}",
+                    fix_double_encoding(&src_db),
+                    fix_double_encoding(&src_schema)
+                )
             };
             let tgt_label = if tgt_schema.trim().is_empty() {
                 fix_double_encoding(&tgt_db)
             } else {
-                format!("{}.{}", fix_double_encoding(&tgt_db), fix_double_encoding(&tgt_schema))
+                format!(
+                    "{}.{}",
+                    fix_double_encoding(&tgt_db),
+                    fix_double_encoding(&tgt_schema)
+                )
             };
             OpResult::DbDiffReady {
                 gen,
@@ -7706,15 +8052,10 @@ async fn fetch_diff_side(
     table: &str,
 ) -> Result<DiffSide, String> {
     let columns = backend.get_columns(cfg, db, schema, table).await?;
-    let indexes = dbx_core::schema::list_indexes_core(
-        backend.state().as_ref(),
-        &cfg.id,
-        db,
-        schema,
-        table,
-    )
-    .await
-    .unwrap_or_default();
+    let indexes =
+        dbx_core::schema::list_indexes_core(backend.state().as_ref(), &cfg.id, db, schema, table)
+            .await
+            .unwrap_or_default();
     Ok(DiffSide {
         db: db.to_string(),
         schema: schema.to_string(),
@@ -7743,15 +8084,10 @@ async fn resolve_data_pk(
     table: &str,
     columns: &[ColumnInfo],
 ) -> Vec<String> {
-    let indexes = dbx_core::schema::list_indexes_core(
-        backend.state().as_ref(),
-        &cfg.id,
-        db,
-        schema,
-        table,
-    )
-    .await
-    .unwrap_or_default();
+    let indexes =
+        dbx_core::schema::list_indexes_core(backend.state().as_ref(), &cfg.id, db, schema, table)
+            .await
+            .unwrap_or_default();
     pk_from_metadata(columns, &indexes)
 }
 
@@ -7779,11 +8115,14 @@ async fn data_count(
         .execute_query(cfg, db, &sql, Some(1), Some(15))
         .await
         .ok()?;
-    r.rows.first().and_then(|row| row.first()).and_then(|v| match v {
-        serde_json::Value::Number(n) => n.as_u64(),
-        serde_json::Value::String(s) => s.parse().ok(),
-        _ => None,
-    })
+    r.rows
+        .first()
+        .and_then(|row| row.first())
+        .and_then(|v| match v {
+            serde_json::Value::Number(n) => n.as_u64(),
+            serde_json::Value::String(s) => s.parse().ok(),
+            _ => None,
+        })
 }
 
 /// A keyset key tuple holding a NULL cannot drive a `>` / `<` seek (`k > NULL`
@@ -7893,11 +8232,17 @@ async fn run_data_diff(
     cancel: &AtomicBool,
     tx: &Tx,
 ) -> OpResult {
-    let src_cols = match backend.get_columns(src_cfg, src_db, src_schema, src_table).await {
+    let src_cols = match backend
+        .get_columns(src_cfg, src_db, src_schema, src_table)
+        .await
+    {
         Ok(c) => c,
         Err(e) => return OpResult::Error(format!("data diff source columns: {e}")),
     };
-    let tgt_cols = match backend.get_columns(tgt_cfg, tgt_db, tgt_schema, tgt_table).await {
+    let tgt_cols = match backend
+        .get_columns(tgt_cfg, tgt_db, tgt_schema, tgt_table)
+        .await
+    {
         Ok(c) => c,
         Err(e) => return OpResult::Error(format!("data diff target columns: {e}")),
     };
@@ -8074,11 +8419,14 @@ async fn transfer_count(
         .execute_query(cfg, db, &sql, Some(1), Some(30))
         .await
         .ok()?;
-    r.rows.first().and_then(|row| row.first()).and_then(|v| match v {
-        serde_json::Value::Number(n) => n.as_u64(),
-        serde_json::Value::String(s) => s.parse().ok(),
-        _ => None,
-    })
+    r.rows
+        .first()
+        .and_then(|row| row.first())
+        .and_then(|v| match v {
+            serde_json::Value::Number(n) => n.as_u64(),
+            serde_json::Value::String(s) => s.parse().ok(),
+            _ => None,
+        })
 }
 
 /// Read one chunk of source rows for a transfer: keyset-paginated when the
@@ -8118,7 +8466,15 @@ async fn transfer_read_chunk(
             read_limit,
         )
     } else {
-        build_transfer_offset_select(cfg.db_type, schema, table, &cols, filter, read_limit, offset)
+        build_transfer_offset_select(
+            cfg.db_type,
+            schema,
+            table,
+            &cols,
+            filter,
+            read_limit,
+            offset,
+        )
     };
     let r = backend
         .execute_query(cfg, db, &sql, Some(read_limit), Some(60))
@@ -8161,7 +8517,10 @@ async fn transfer_exec_batch(
             ..Default::default()
         }
     };
-    match backend.execute_batch(cfg, db, None, script, options.clone()).await {
+    match backend
+        .execute_batch(cfg, db, None, script, options.clone())
+        .await
+    {
         Ok(v) => Ok(v),
         // One retry: a dropped connection or a transient deadlock should not
         // abort a long copy on its first hiccup.
@@ -8197,8 +8556,8 @@ async fn run_data_transfer(backend: &LocalBackend, job: TransferJob, tx: &Tx) ->
     let start = Instant::now();
     let src_label = data_table_label(&src_db, &src_schema, &src_table);
     let tgt_label = data_table_label(&tgt_db, &tgt_schema, &tgt_table);
-    let error_report = |aborted: (u64, String), created: bool, estimated: Option<u64>| {
-        OpResult::TransferDone {
+    let error_report =
+        |aborted: (u64, String), created: bool, estimated: Option<u64>| OpResult::TransferDone {
             gen,
             report: Box::new(TransferReport {
                 src_label: src_label.clone(),
@@ -8224,11 +8583,13 @@ async fn run_data_transfer(backend: &LocalBackend, job: TransferJob, tx: &Tx) ->
                 elapsed_ms: start.elapsed().as_millis(),
                 chunks_done: 0,
             }),
-        }
-    };
+        };
 
     // 1. Source shape.
-    let src_cols = match backend.get_columns(&src_cfg, &src_db, &src_schema, &src_table).await {
+    let src_cols = match backend
+        .get_columns(&src_cfg, &src_db, &src_schema, &src_table)
+        .await
+    {
         Ok(c) => c,
         Err(e) => return error_report((0, format!("读取源表结构失败: {e}")), false, None),
     };
@@ -8284,13 +8645,7 @@ async fn run_data_transfer(backend: &LocalBackend, job: TransferJob, tx: &Tx) ->
             match conflict {
                 TransferConflict::Stop => {
                     return error_report(
-                        (
-                            0,
-                            tf(
-                                "目标表已存在: {}（按 o 选择覆盖）",
-                                &[&tgt_label]
-                            ),
-                        ),
+                        (0, tf("目标表已存在: {}（按 o 选择覆盖）", &[&tgt_label])),
                         false,
                         estimated,
                     );
@@ -8304,7 +8659,11 @@ async fn run_data_transfer(backend: &LocalBackend, job: TransferJob, tx: &Tx) ->
                         .execute_query(&tgt_cfg, &tgt_db, &drop, Some(1), Some(60))
                         .await
                     {
-                        return error_report((0, format!("DROP TABLE 失败: {e}")), false, estimated);
+                        return error_report(
+                            (0, format!("DROP TABLE 失败: {e}")),
+                            false,
+                            estimated,
+                        );
                     }
                 }
             }
@@ -8380,7 +8739,9 @@ async fn run_data_transfer(backend: &LocalBackend, job: TransferJob, tx: &Tx) ->
             .await
         {
             Ok(c) => c,
-            Err(e) => return error_report((0, format!("读取目标表结构失败: {e}")), created, estimated),
+            Err(e) => {
+                return error_report((0, format!("读取目标表结构失败: {e}")), created, estimated)
+            }
         }
     };
     let align = match build_transfer_align(
@@ -8482,8 +8843,14 @@ async fn run_data_transfer(backend: &LocalBackend, job: TransferJob, tx: &Tx) ->
                 })
                 .collect::<Vec<_>>()
                 .join("\n");
-            match transfer_exec_batch(backend, &tgt_cfg, &tgt_db, &script, on_error == TransferOnError::Stop)
-                .await
+            match transfer_exec_batch(
+                backend,
+                &tgt_cfg,
+                &tgt_db,
+                &script,
+                on_error == TransferOnError::Stop,
+            )
+            .await
             {
                 Ok(results) => {
                     if on_error == TransferOnError::Stop {
@@ -8596,24 +8963,37 @@ async fn run_global_search(
         .collect();
     let total = tables.len();
     // Approximate counts, best effort: a failure just means "scan anyway".
-    let estimates: HashMap<String, u64> =
-        match backend
-            .execute_query(cfg, db, &build_search_estimates_sql(cfg.db_type, schema), None, Some(20))
-            .await
-        {
-            Ok(r) => parse_search_estimates(&r.rows),
-            Err(_) => HashMap::new(),
-        };
+    let estimates: HashMap<String, u64> = match backend
+        .execute_query(
+            cfg,
+            db,
+            &build_search_estimates_sql(cfg.db_type, schema),
+            None,
+            Some(20),
+        )
+        .await
+    {
+        Ok(r) => parse_search_estimates(&r.rows),
+        Err(_) => HashMap::new(),
+    };
     let needle_lower = needle.to_lowercase();
     let mut hits: Vec<SearchHit> = Vec::new();
     let mut skipped: Vec<(String, u64)> = Vec::new();
     let mut truncated = false;
     for (i, table) in tables.iter().enumerate() {
         if cancel.load(Ordering::Relaxed) {
-            let _ = tx.send(OpResult::SearchProgress { gen, done: i, total });
+            let _ = tx.send(OpResult::SearchProgress {
+                gen,
+                done: i,
+                total,
+            });
             return OpResult::SearchCancelled { gen };
         }
-        let _ = tx.send(OpResult::SearchProgress { gen, done: i, total });
+        let _ = tx.send(OpResult::SearchProgress {
+            gen,
+            done: i,
+            total,
+        });
         if let Some(est) = search_skip_reason(estimates.get(&table.name).copied(), max_rows) {
             skipped.push((table.name.clone(), est));
             continue;
@@ -8639,8 +9019,14 @@ async fn run_global_search(
             .iter()
             .map(|c| (c.name.clone(), c.data_type.clone()))
             .collect();
-        let sql =
-            build_search_scan_sql(cfg.db_type, schema, &table.name, &text_cols, needle, scan_limit);
+        let sql = build_search_scan_sql(
+            cfg.db_type,
+            schema,
+            &table.name,
+            &text_cols,
+            needle,
+            scan_limit,
+        );
         let Ok(r) = backend
             .execute_query(cfg, db, &sql, Some(scan_limit.max(1)), Some(60))
             .await
@@ -8674,9 +9060,7 @@ async fn run_global_search(
                     table: table.name.clone(),
                     column: cname.clone(),
                     matched: text.to_string(),
-                    filter: search_hit_filter(
-                        cfg.db_type, &col_names, &vals, &dtypes, &pk, cname,
-                    ),
+                    filter: search_hit_filter(cfg.db_type, &col_names, &vals, &dtypes, &pk, cname),
                 });
                 if hits.len() >= SEARCH_MAX_HITS {
                     truncated = true;
@@ -8685,7 +9069,11 @@ async fn run_global_search(
             }
         }
     }
-    let _ = tx.send(OpResult::SearchProgress { gen, done: total, total });
+    let _ = tx.send(OpResult::SearchProgress {
+        gen,
+        done: total,
+        total,
+    });
     OpResult::SearchDone {
         gen,
         hits,
@@ -8704,7 +9092,10 @@ fn spawn_op(backend: &Arc<LocalBackend>, tx: &Tx, op: Op) {
         // never answers must surface an error, not a spinner that never stops.
         let res = match tokio::time::timeout(limit, run_op(&backend, op, &tx)).await {
             Ok(r) => r,
-            Err(_) => OpResult::Error(tf("操作超时（{}s）· 服务器无响应或网络中断，请检查连接后用 d 重连", &[&(limit.as_secs())])),
+            Err(_) => OpResult::Error(tf(
+                "操作超时（{}s）· 服务器无响应或网络中断，请检查连接后用 d 重连",
+                &[&(limit.as_secs())],
+            )),
         };
         let _ = tx.send(res);
     });
@@ -8879,7 +9270,10 @@ fn color_sel_for(value: &str) -> usize {
     if v.is_empty() {
         return 0;
     }
-    if let Some(i) = CONN_COLOR_PRESETS.iter().position(|p| p.eq_ignore_ascii_case(v)) {
+    if let Some(i) = CONN_COLOR_PRESETS
+        .iter()
+        .position(|p| p.eq_ignore_ascii_case(v))
+    {
         return i + 1;
     }
     CONN_COLOR_CUSTOM
@@ -8912,7 +9306,10 @@ fn normalize_conn_color(raw: &str) -> Result<Option<String>, ()> {
     if parse_hex_color(v).is_none() {
         return Err(());
     }
-    Ok(Some(format!("#{}", v.trim_start_matches('#').to_ascii_lowercase())))
+    Ok(Some(format!(
+        "#{}",
+        v.trim_start_matches('#').to_ascii_lowercase()
+    )))
 }
 
 /// Order the connection picker `s` cycles through.
@@ -8944,7 +9341,12 @@ impl ConnSort {
 /// colour stay together, and uncoloured ones group by database family so the
 /// default badge colours still line up.
 fn conn_color_group(cfg: &ConnectionConfig) -> String {
-    match cfg.color.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
+    match cfg
+        .color
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+    {
         Some(hex) => format!("c:{}", hex.trim_start_matches('#').to_ascii_lowercase()),
         None => format!("t:{}", cfg.db_type.as_str().to_ascii_lowercase()),
     }
@@ -9103,7 +9505,11 @@ fn form_text_mut(f: &mut ConnForm, row: FormRow) -> Option<&mut String> {
         FormRow::SshKeyPath => Some(&mut f.ssh_key_path),
         FormRow::SshKeyPassphrase => Some(&mut f.ssh_key_passphrase),
         FormRow::SshAgentSock => Some(&mut f.ssh_agent_sock),
-        FormRow::Ssl | FormRow::ReadOnly | FormRow::SshEnabled | FormRow::SshAuth | FormRow::Save => None,
+        FormRow::Ssl
+        | FormRow::ReadOnly
+        | FormRow::SshEnabled
+        | FormRow::SshAuth
+        | FormRow::Save => None,
     }
 }
 
@@ -9141,7 +9547,11 @@ fn form_from_connection(cfg: &ConnectionConfig, name: String, edit_id: Option<St
     if let Some(ssh) = first_ssh_layer(cfg) {
         form.ssh_enabled = ssh.enabled;
         form.ssh_host = ssh.host.clone();
-        form.ssh_port = if ssh.port == 0 { "22".into() } else { ssh.port.to_string() };
+        form.ssh_port = if ssh.port == 0 {
+            "22".into()
+        } else {
+            ssh.port.to_string()
+        };
         form.ssh_user = ssh.user.clone();
         form.ssh_auth = SshAuth::from_layer(ssh);
         form.ssh_password = ssh.password.clone();
@@ -9453,7 +9863,10 @@ impl EditorViewport {
     /// past the end of a line lands on the nearest character (clicking the empty
     /// space below the text jumps to the end of the buffer).
     fn text_pos(&self, rel_x: u16, rel_y: u16) -> (u16, u16) {
-        (self.row.saturating_add(rel_y), self.col.saturating_add(rel_x))
+        (
+            self.row.saturating_add(rel_y),
+            self.col.saturating_add(rel_x),
+        )
     }
 }
 
@@ -9566,18 +9979,36 @@ enum NavEntry {
 enum SideRow {
     /// R48: a desktop sidebar group (`▾ name [n]`). `count` is the number of
     /// live connections inside it (nested groups included).
-    Group { id: String, name: String, depth: usize, count: usize, open: bool },
+    Group {
+        id: String,
+        name: String,
+        depth: usize,
+        count: usize,
+        open: bool,
+    },
     /// A connection root (every saved connection is a root).
     Conn { idx: usize, depth: usize },
     /// A non-current connection's database list is being fetched.
     ConnLoading { idx: usize, depth: usize },
     /// A non-current connection's database list could not be fetched.
-    ConnError { idx: usize, msg: String, depth: usize },
+    ConnError {
+        idx: usize,
+        msg: String,
+        depth: usize,
+    },
     /// A database under a connection. `idx` is the connection's index.
-    Db { idx: usize, db: String, depth: usize },
+    Db {
+        idx: usize,
+        db: String,
+        depth: usize,
+    },
     /// A table / collection under the current connection's current database.
     /// `table` indexes `App::tables`.
-    Table { idx: usize, table: usize, depth: usize },
+    Table {
+        idx: usize,
+        table: usize,
+        depth: usize,
+    },
 }
 
 // ── desktop sidebar groups (R48) ──
@@ -9673,12 +10104,12 @@ fn build_layout_group(
     if let Some(children) = entry.get("children").and_then(|v| v.as_array()) {
         for child in children {
             match child.get("type").and_then(|v| v.as_str()) {
-                Some("group") => {
-                    group.nodes.push(LayoutNode::Group(build_layout_group(child, names)?))
-                }
-                Some("connection") => group
+                Some("group") => group
                     .nodes
-                    .push(LayoutNode::Conn(child.get("id").and_then(|v| v.as_str())?.to_string())),
+                    .push(LayoutNode::Group(build_layout_group(child, names)?)),
+                Some("connection") => group.nodes.push(LayoutNode::Conn(
+                    child.get("id").and_then(|v| v.as_str())?.to_string(),
+                )),
                 _ => return None,
             }
         }
@@ -9689,7 +10120,6 @@ fn build_layout_group(
     }
     Some(group)
 }
-
 
 /// Per-connection state of the sidebar tree's lazy database fetch.
 #[derive(Clone, PartialEq, Debug)]
@@ -9716,7 +10146,9 @@ struct DbSizeInfo {
 /// numeric shape drivers report (`number` or a numeric `string`).
 fn json_u64(v: &serde_json::Value) -> Option<u64> {
     match v {
-        serde_json::Value::Number(n) => n.as_u64().or_else(|| n.as_f64().map(|f| f.max(0.0) as u64)),
+        serde_json::Value::Number(n) => {
+            n.as_u64().or_else(|| n.as_f64().map(|f| f.max(0.0) as u64))
+        }
         serde_json::Value::String(s) => s.trim().parse::<f64>().ok().map(|f| f.max(0.0) as u64),
         _ => None,
     }
@@ -9977,7 +10409,7 @@ struct App {
     grid_kind: GridKind,
     page_state: Option<PageState>,
     script: Option<ScriptView>,
-    sel: usize,       // cursor row inside the current page / result set
+    sel: usize,        // cursor row inside the current page / result set
     col_offset: usize, // leftmost column of the scrollable window
     col_cursor: usize, // focused column (cell cursor)
     /// R47b: while `Instant::now() < deadline` the horizontal scroll bar is
@@ -9985,7 +10417,7 @@ struct App {
     /// it; at rest the bar hides so the bottom border is not a permanent thick
     /// band. `None` means "never poked yet" (hidden).
     hbar_until: Option<Instant>,
-    vis_cols: usize,   // columns currently visible (set while rendering)
+    vis_cols: usize, // columns currently visible (set while rendering)
     /// Width cap actually used for the last render (compact mode aware).
     grid_max_cell: usize,
     freeze_first: bool, // pin the first data column (row-number gutter is always pinned)
@@ -10383,7 +10815,10 @@ impl App {
     fn set_placeholder(&mut self) {
         let t = match self.backend_kind {
             Backend::Redis => tf("redis 命令… (db={}) · Ctrl-L 切换", &[&(self.redis_db)]),
-            Backend::Mongo => tf("mongo shell… (db={}) · Ctrl-L 切换", &[&(self.current_db())]),
+            Backend::Mongo => tf(
+                "mongo shell… (db={}) · Ctrl-L 切换",
+                &[&(self.current_db())],
+            ),
             Backend::Sql => String::new(),
         };
         self.cmd_input.set_placeholder_text(t);
@@ -10874,7 +11309,8 @@ impl App {
             count_deadline: None,
             rects: Rects::default(),
         };
-        app.editor.set_placeholder_text(t("SQL … (Ctrl-J / F5 执行 · ↑ 历史)"));
+        app.editor
+            .set_placeholder_text(t("SQL … (Ctrl-J / F5 执行 · ↑ 历史)"));
         app.set_placeholder();
         app
     }
@@ -10919,7 +11355,9 @@ async fn run_app(mut terminal: ratatui::DefaultTerminal, backend: Arc<LocalBacke
     // a live on-screen readout.
     let mouse_debug = std::env::var_os("DBXT_MOUSE_DEBUG").is_some_and(|v| !v.is_empty());
     let trace_path = env_log_path("DBXT_EVENT_TRACE", "dbxt-events.log").or_else(|| {
-        mouse_debug.then(|| env_log_path("DBXT_MOUSE_DEBUG", "dbxt-mouse.log")).flatten()
+        mouse_debug
+            .then(|| env_log_path("DBXT_MOUSE_DEBUG", "dbxt-mouse.log"))
+            .flatten()
     });
 
     let config_path = config_path();
@@ -11072,7 +11510,9 @@ fn apply_op_result(app: &mut App, res: OpResult, tx: &Tx) {
                     input,
                 });
                 app.status = match kind {
-                    SshPromptKind::HostKeyVerify => t("SSH 主机密钥待确认（y 接受 / n 拒绝）").into(),
+                    SshPromptKind::HostKeyVerify => {
+                        t("SSH 主机密钥待确认（y 接受 / n 拒绝）").into()
+                    }
                     SshPromptKind::HostKeyChanged => t("SSH 主机密钥已变化，请确认").into(),
                     SshPromptKind::SecretInput => t("SSH 服务器要求额外验证").into(),
                     SshPromptKind::WorkerUploadConsent => t("SSH 请求确认").into(),
@@ -11127,7 +11567,11 @@ fn apply_op_result(app: &mut App, res: OpResult, tx: &Tx) {
             app.conn_live.remove(&id);
             app.conn_connecting.remove(&id);
             let n = app.connections.len();
-            let sel = app.conn_list.selected().unwrap_or(0).min(n.saturating_sub(1));
+            let sel = app
+                .conn_list
+                .selected()
+                .unwrap_or(0)
+                .min(n.saturating_sub(1));
             app.conn_list.select((n > 0).then_some(sel));
             app.status = format!("✓ {}", tf("已删除连接 {}", &[&name]));
         }
@@ -11292,7 +11736,8 @@ fn apply_op_result(app: &mut App, res: OpResult, tx: &Tx) {
             }
             match error {
                 Some(msg) => {
-                    app.db_size_state.insert(db.clone(), TreeDbState::Error(msg.clone()));
+                    app.db_size_state
+                        .insert(db.clone(), TreeDbState::Error(msg.clone()));
                     app.status = tf("✗ {} 尺寸查询失败: {}", &[&db, &msg]);
                 }
                 None => {
@@ -11311,7 +11756,11 @@ fn apply_op_result(app: &mut App, res: OpResult, tx: &Tx) {
                 }
             }
         }
-        OpResult::Schemas { db, schemas, warning } => {
+        OpResult::Schemas {
+            db,
+            schemas,
+            warning,
+        } => {
             // A reply for a database the user already left must not resurrect a
             // stale schema list.
             if db != app.current_db() {
@@ -11400,16 +11849,26 @@ fn apply_op_result(app: &mut App, res: OpResult, tx: &Tx) {
                 return;
             }
             let mut status = if app.table_filter.is_empty() {
-                tf("{} 个表/视图 · Enter 数据 · r 结构 · / 过滤 · Tab 编辑SQL", &[&(n)])
+                tf(
+                    "{} 个表/视图 · Enter 数据 · r 结构 · / 过滤 · Tab 编辑SQL",
+                    &[&(n)],
+                )
             } else {
-                tf("过滤「{}」· {}/{} 个表 · Esc 清除", &[&(app.table_filter), &(app.tables.len()), &(n)])
+                tf(
+                    "过滤「{}」· {}/{} 个表 · Esc 清除",
+                    &[&(app.table_filter), &(app.tables.len()), &(n)],
+                )
             };
             if let Some(nt) = notice.take() {
                 status = format!("{status} · ⚠ {nt}");
             }
             app.status = status;
         }
-        OpResult::Columns { table, schema, columns: cols } => {
+        OpResult::Columns {
+            table,
+            schema,
+            columns: cols,
+        } => {
             // Ignore a late result for a table the user has already navigated away from.
             if app.selected_table().map(|t| t.name.clone()).as_deref() != Some(table.as_str())
                 || app.schema != schema
@@ -11429,9 +11888,16 @@ fn apply_op_result(app: &mut App, res: OpResult, tx: &Tx) {
             app.col_cursor = 0;
             app.cell_popup = None;
             app.focus = Focus::Preview;
-            app.status = tf("{} 结构 · {} 字段 · t 切换 DDL · Esc 返回", &[&(fix_double_encoding(&table)), &(n)]);
+            app.status = tf(
+                "{} 结构 · {} 字段 · t 切换 DDL · Esc 返回",
+                &[&(fix_double_encoding(&table)), &(n)],
+            );
         }
-        OpResult::Ddl { table, schema, text } => {
+        OpResult::Ddl {
+            table,
+            schema,
+            text,
+        } => {
             if app.selected_table().map(|t| t.name.clone()).as_deref() == Some(table.as_str())
                 && app.schema == schema
             {
@@ -11519,7 +11985,17 @@ fn apply_op_result(app: &mut App, res: OpResult, tx: &Tx) {
             let ps = app.page_state.as_ref().unwrap();
             let total_txt = total_label(ps);
             let extra = page_state_extra(ps);
-            app.status = tf("{}.{} · 第 {} 页 · {} 行 · {}{}", &[&(fix_double_encoding(&app.current_db())), &(fix_double_encoding(&schema_label)), &(page + 1), &(rows), &(total_txt), &(extra)]);
+            app.status = tf(
+                "{}.{} · 第 {} 页 · {} 行 · {}{}",
+                &[
+                    &(fix_double_encoding(&app.current_db())),
+                    &(fix_double_encoding(&schema_label)),
+                    &(page + 1),
+                    &(rows),
+                    &(total_txt),
+                    &(extra),
+                ],
+            );
             // A deep OFFSET page (no primary key to seek by) is slow; say so
             // once instead of silently taking seconds.
             if app.pending_deep_hint {
@@ -11534,7 +12010,11 @@ fn apply_op_result(app: &mut App, res: OpResult, tx: &Tx) {
                 app.status = tf("{} · 已刷新（第 {} 页）", &[&(msg), &(page + 1)]);
             }
         }
-        OpResult::TableColumns { table, schema, columns } => {
+        OpResult::TableColumns {
+            table,
+            schema,
+            columns,
+        } => {
             // Only keep metadata that belongs to the table on screen (same
             // database *and* schema: `public.orders` ≠ `inv.orders`).
             let active = app
@@ -11583,7 +12063,7 @@ fn apply_op_result(app: &mut App, res: OpResult, tx: &Tx) {
             if app.pending_write && is_write {
                 app.pending_write = false;
                 let affected = r.affected_rows;
-                let note = format!("{}ms",  r.execution_time_ms);
+                let note = format!("{}ms", r.execution_time_ms);
                 if app.page_state.is_some() && app.grid_kind == GridKind::TableData {
                     let sel = app.sel;
                     let ps = app.page_state.clone().unwrap();
@@ -11607,7 +12087,7 @@ fn apply_op_result(app: &mut App, res: OpResult, tx: &Tx) {
                     &[&app.selected_name(), &(grid.rows.len()), &note],
                 )
             } else {
-                format!("{} · {} · {}",  app.selected_name(),  grid.rows.len(),  note)
+                format!("{} · {} · {}", app.selected_name(), grid.rows.len(), note)
             };
             // A large `LIMIT` (> 10000) is only a heads-up: the run is never
             // blocked, the yellow `⚠` prefix just makes a slow result expected.
@@ -11654,24 +12134,43 @@ fn apply_op_result(app: &mut App, res: OpResult, tx: &Tx) {
                 sel: 0,
                 drilled: None,
             };
-            push_result_tab(app, tf("脚本 {} 条", &[&(n)]), None, Some(script), GridKind::Query);
+            push_result_tab(
+                app,
+                tf("脚本 {} 条", &[&(n)]),
+                None,
+                Some(script),
+                GridKind::Query,
+            );
             app.ddl = None;
             app.struct_view = StructView::Fields;
             app.focus = Focus::Preview;
             if was_batch {
                 app.status = if errors == 0 {
-                    tf("✓ 批量提交成功 · {} 条语句 · 影响 {} 行", &[&(n), &(affected)])
+                    tf(
+                        "✓ 批量提交成功 · {} 条语句 · 影响 {} 行",
+                        &[&(n), &(affected)],
+                    )
                 } else {
-                    tf("✗ 批量提交失败 · {} 错误 · 影响 {} 行（事务可能已回滚）· Enter 看详情", &[&(errors), &(affected)])
+                    tf(
+                        "✗ 批量提交失败 · {} 错误 · 影响 {} 行（事务可能已回滚）· Enter 看详情",
+                        &[&(errors), &(affected)],
+                    )
                 };
             } else if direct {
                 app.status = tf(
                     "直跑历史 · {} 条语句 · 影响 {} 行 · {} 错误 · {}",
-                    &[&(n), &(affected), &(errors), &history_duration_label(total_ms)],
+                    &[
+                        &(n),
+                        &(affected),
+                        &(errors),
+                        &history_duration_label(total_ms),
+                    ],
                 );
             } else {
-                app.status =
-                    tf("脚本 · {} 条语句 · 影响 {} 行 · {} 错误 · Enter 看结果", &[&(n), &(affected), &(errors)]);
+                app.status = tf(
+                    "脚本 · {} 条语句 · 影响 {} 行 · {} 错误 · Enter 看结果",
+                    &[&(n), &(affected), &(errors)],
+                );
             }
         }
         OpResult::Redis(s) => {
@@ -11703,8 +12202,12 @@ fn apply_op_result(app: &mut App, res: OpResult, tx: &Tx) {
             // Drop selections whose key is no longer in the loaded window (a
             // rescan can remove keys); keep them across a load-more append.
             if !app.redis_selected.is_empty() {
-                let present: HashSet<String> =
-                    app.redis_scan.all.iter().map(|k| k.key_raw.clone()).collect();
+                let present: HashSet<String> = app
+                    .redis_scan
+                    .all
+                    .iter()
+                    .map(|k| k.key_raw.clone())
+                    .collect();
                 app.redis_selected.retain(|k| present.contains(k));
                 if app.redis_selected.is_empty() {
                     app.redis_anchor = None;
@@ -11723,10 +12226,17 @@ fn apply_op_result(app: &mut App, res: OpResult, tx: &Tx) {
             }
             let n = app.redis_scan.keys.len();
             let all = app.redis_scan.all.len();
-            let sel = app.redis_list.selected().unwrap_or(0).min(n.saturating_sub(1));
+            let sel = app
+                .redis_list
+                .selected()
+                .unwrap_or(0)
+                .min(n.saturating_sub(1));
             app.redis_list.select((n > 0).then_some(sel));
             app.status = if !app.redis_filter.is_empty() {
-                tf("过滤「{}」· {} 命中 / {} 个 key", &[&(app.redis_filter), &(n), &(all)])
+                tf(
+                    "过滤「{}」· {} 命中 / {} 个 key",
+                    &[&(app.redis_filter), &(n), &(all)],
+                )
             } else if app.redis_scan.exhausted {
                 tf("{} 个 key · 已全部加载", &[&(n)])
             } else {
@@ -11754,7 +12264,11 @@ fn apply_op_result(app: &mut App, res: OpResult, tx: &Tx) {
             let ttl = redis_ttl_label(view.ttl);
             app.status = tf(
                 "{} · {} · TTL {}",
-                &[&(fix_double_encoding(&view.key_display)), &(view.redis_type), &(ttl)],
+                &[
+                    &(fix_double_encoding(&view.key_display)),
+                    &(view.redis_type),
+                    &(ttl),
+                ],
             );
         }
         OpResult::RedisWritten {
@@ -11763,7 +12277,8 @@ fn apply_op_result(app: &mut App, res: OpResult, tx: &Tx) {
             reload_value,
             reload_list,
         } => {
-            app.cmd_output.push(format!("redis[{}]> {cmd}",  app.redis_db));
+            app.cmd_output
+                .push(format!("redis[{}]> {cmd}", app.redis_db));
             app.cmd_output.push(summary.clone());
             trim_output(&mut app.cmd_output);
             app.status = tf("✓ {}", &[&(truncate_disp(&one_line(&cmd), 60))]);
@@ -11802,7 +12317,10 @@ fn apply_op_result(app: &mut App, res: OpResult, tx: &Tx) {
             app.redis_anchor = None;
             app.redis_pending_batch = None;
             app.status = match first_error {
-                Some(e) => tf("⚠ 批量完成 {}/{}：{}", &[&executed, &total, &truncate_disp(&one_line(&e), 60)]),
+                Some(e) => tf(
+                    "⚠ 批量完成 {}/{}：{}",
+                    &[&executed, &total, &truncate_disp(&one_line(&e), 60)],
+                ),
                 None => tf("✓ 批量完成 {}/{} 条命令", &[&executed, &total]),
             };
             if reload_list {
@@ -11888,7 +12406,13 @@ fn apply_op_result(app: &mut App, res: OpResult, tx: &Tx) {
             app.focus = Focus::Preview;
             app.status = tf(
                 "{}.{} · 第 {} 页 · {} 个文档 · 共 {} · n/p 翻页 · f 过滤",
-                &[&(fix_double_encoding(&app.current_db())), &(fix_double_encoding(&collection)), &(page + 1), &(rows), &(total)],
+                &[
+                    &(fix_double_encoding(&app.current_db())),
+                    &(fix_double_encoding(&collection)),
+                    &(page + 1),
+                    &(rows),
+                    &(total),
+                ],
             );
         }
         OpResult::MongoIndexes { collection, grid } => {
@@ -11902,7 +12426,10 @@ fn apply_op_result(app: &mut App, res: OpResult, tx: &Tx) {
             app.col_offset = 0;
             app.col_cursor = 0;
             app.focus = Focus::Preview;
-            app.status = tf("{} 索引 · {} · Esc 返回", &[&(fix_double_encoding(&collection)), &(n)]);
+            app.status = tf(
+                "{} 索引 · {} · Esc 返回",
+                &[&(fix_double_encoding(&collection)), &(n)],
+            );
         }
         OpResult::MongoWritten { summary } => {
             app.status = format!("✓ {summary}");
@@ -11977,14 +12504,16 @@ fn apply_op_result(app: &mut App, res: OpResult, tx: &Tx) {
             let n = items.len();
             app.snippets = items;
             app.snippet_open = true;
-            app.snippet_list
-                .select(if n == 0 { None } else { Some(0) });
+            app.snippet_list.select(if n == 0 { None } else { Some(0) });
             // A just-saved confirmation must survive the refresh that follows it.
             if !app.status.starts_with('✓') {
                 app.status = if n == 0 {
                     t("没有保存的 SQL 片段（可在 DBX 桌面端保存后复用）").into()
                 } else {
-                    tf("{} 个 SQL 片段 · Enter 插入编辑器 · s 收藏当前 SQL · r 刷新 · Esc 关闭", &[&(n)])
+                    tf(
+                        "{} 个 SQL 片段 · Enter 插入编辑器 · s 收藏当前 SQL · r 刷新 · Esc 关闭",
+                        &[&(n)],
+                    )
                 };
             }
         }
@@ -12045,7 +12574,12 @@ fn apply_op_result(app: &mut App, res: OpResult, tx: &Tx) {
             }
             app.status = tf("✓ 已复制连接 {} · 树中新根 · l/→ 展开", &[&name]);
         }
-        OpResult::ConnsImported { saved, skipped, needs_password, failed } => {
+        OpResult::ConnsImported {
+            saved,
+            skipped,
+            needs_password,
+            failed,
+        } => {
             // Merge the saved configs in place (an overwrite keeps the same id,
             // so it replaces its old row) rather than re-listing, so the import
             // summary is not clobbered by the list status message.
@@ -12059,7 +12593,11 @@ fn apply_op_result(app: &mut App, res: OpResult, tx: &Tx) {
             sort_connection_list(&mut app.connections, app.conn_sort);
             app.picker_open = app.selected.is_none();
             let n = app.connections.len();
-            let sel = app.conn_list.selected().unwrap_or(0).min(n.saturating_sub(1));
+            let sel = app
+                .conn_list
+                .selected()
+                .unwrap_or(0)
+                .min(n.saturating_sub(1));
             app.conn_list.select((n > 0).then_some(sel));
             app.status = conn_import_status(added, skipped, needs_password, &failed);
         }
@@ -12156,7 +12694,13 @@ fn apply_op_result(app: &mut App, res: OpResult, tx: &Tx) {
             if ok && elapsed_ms >= 250 {
                 app.status = tf(
                     "✓ 已导出 {} · {} 行 · {} · {}ms → {}",
-                    &[&label, &rows, &human_size(bytes), &elapsed_ms, &(path.display())],
+                    &[
+                        &label,
+                        &rows,
+                        &human_size(bytes),
+                        &elapsed_ms,
+                        &(path.display()),
+                    ],
                 );
             }
         }
@@ -12285,10 +12829,7 @@ fn apply_op_result(app: &mut App, res: OpResult, tx: &Tx) {
             }
             app.data_diff = Some(Box::new(state));
             let tail = if truncated {
-                tf(
-                    " · ⚠ 已截断（仅前 {} 行）",
-                    &[&DATA_MAX_DIFF_ROWS],
-                )
+                tf(" · ⚠ 已截断（仅前 {} 行）", &[&DATA_MAX_DIFF_ROWS])
             } else {
                 String::new()
             };
@@ -12350,7 +12891,12 @@ fn apply_op_result(app: &mut App, res: OpResult, tx: &Tx) {
             app.status = if let Some((row, err)) = &aborted {
                 tf(
                     "✗ 搬运中止于源行 {}: {} · 已搬 {} 行{}",
-                    &[&row, &err, &moved, &(if created { " · 已建表" } else { "" })],
+                    &[
+                        &row,
+                        &err,
+                        &moved,
+                        &(if created { " · 已建表" } else { "" }),
+                    ],
                 )
             } else if cancelled {
                 tf(
@@ -12360,7 +12906,12 @@ fn apply_op_result(app: &mut App, res: OpResult, tx: &Tx) {
             } else {
                 tf(
                     "✓ 搬运完成 · 已搬 {} 行 · 跳过 {} 行 · 目标 {}{}",
-                    &[&moved, &skipped, &tgt, &(if created { " · 已建表" } else { "" })],
+                    &[
+                        &moved,
+                        &skipped,
+                        &tgt,
+                        &(if created { " · 已建表" } else { "" }),
+                    ],
                 )
             };
             app.transfer_report = Some(report);
@@ -12489,7 +13040,11 @@ fn count_cache_key(db: &str, schema: &str, table: &str, filter: &str) -> String 
 /// means "count at most this many rows and report a lower bound past it".
 /// `DBXT_COUNT_SAMPLE_LIMIT=0` (or `off`/`none`) disables the cap.
 fn count_sample_limit() -> Option<u64> {
-    match std::env::var("DBXT_COUNT_SAMPLE_LIMIT").ok().as_deref().map(str::trim) {
+    match std::env::var("DBXT_COUNT_SAMPLE_LIMIT")
+        .ok()
+        .as_deref()
+        .map(str::trim)
+    {
         Some("0") | Some("off") | Some("none") | Some("") => None,
         Some(v) => Some(v.parse().unwrap_or(COUNT_SAMPLE_LIMIT_DEFAULT)),
         None => Some(COUNT_SAMPLE_LIMIT_DEFAULT),
@@ -12644,7 +13199,10 @@ fn keyset_seek_for(
 fn page_state_extra(ps: &PageState) -> String {
     let mut s = String::new();
     if !ps.filter.trim().is_empty() {
-        s.push_str(&tf(" · 过滤: {}", &[&(truncate_disp(&one_line(&ps.filter), 48))]));
+        s.push_str(&tf(
+            " · 过滤: {}",
+            &[&(truncate_disp(&one_line(&ps.filter), 48))],
+        ));
     }
     if let Some(o) = ps.order_by.as_deref().filter(|o| !o.trim().is_empty()) {
         s.push_str(&tf(" · 排序: {}", &[&(truncate_disp(o, 32))]));
@@ -12653,10 +13211,17 @@ fn page_state_extra(ps: &PageState) -> String {
 }
 
 fn columns_grid(cols: &[ColumnInfo]) -> Grid {
-    let columns = [t("字段"), t("类型"), t("键"), t("可空"), t("默认值"), t("注释")]
-        .iter()
-        .map(|s| s.to_string())
-        .collect();
+    let columns = [
+        t("字段"),
+        t("类型"),
+        t("键"),
+        t("可空"),
+        t("默认值"),
+        t("注释"),
+    ]
+    .iter()
+    .map(|s| s.to_string())
+    .collect();
     let rows = cols
         .iter()
         .map(|c| {
@@ -12783,8 +13348,7 @@ fn quit_has_unsaved(app: &App) -> bool {
     let sql = sql.trim();
     let last = app.last_executed.as_deref().unwrap_or("").trim();
     let editor_dirty = !sql.is_empty() && sql != last;
-    let filter_dirty =
-        !app.table_filter.trim().is_empty() || !app.result_needle.trim().is_empty();
+    let filter_dirty = !app.table_filter.trim().is_empty() || !app.result_needle.trim().is_empty();
     editor_dirty || filter_dirty
 }
 
@@ -12807,8 +13371,8 @@ fn request_quit(app: &mut App) {
 fn key(app: &mut App, tx: &Tx, k: KeyEvent) {
     // The back/forward landing hint is transient: it survives until the next
     // key press (the history keys themselves refresh it).
-    let is_nav_key = k.modifiers.contains(KeyModifiers::ALT)
-        && matches!(k.code, KeyCode::Left | KeyCode::Right);
+    let is_nav_key =
+        k.modifiers.contains(KeyModifiers::ALT) && matches!(k.code, KeyCode::Left | KeyCode::Right);
     if !is_nav_key {
         app.nav_landing = None;
     }
@@ -12908,11 +13472,23 @@ fn confirm_key(app: &mut App, tx: &Tx, k: KeyEvent) {
                         // R47b: drain the pools (manual transactions roll back)
                         // and let the reply collapse the root to a grey dot.
                         app.status = tf("断开连接 {}…", &[&cc.name]);
-                        app.spawn(tx, Op::Disconnect { id: cc.id, name: cc.name });
+                        app.spawn(
+                            tx,
+                            Op::Disconnect {
+                                id: cc.id,
+                                name: cc.name,
+                            },
+                        );
                         return;
                     }
                     app.status = tf("删除连接 {}…", &[&cc.name]);
-                    app.spawn(tx, Op::DeleteConn { id: cc.id, name: cc.name });
+                    app.spawn(
+                        tx,
+                        Op::DeleteConn {
+                            id: cc.id,
+                            name: cc.name,
+                        },
+                    );
                     return;
                 }
                 if let Some(mc) = c.mongo {
@@ -13271,9 +13847,7 @@ fn browse_key(app: &mut App, tx: &Tx, k: KeyEvent) {
     }
 
     // Help works from anywhere except the text inputs (where `?` is a character).
-    if k.code == KeyCode::Char('?')
-        && !matches!(app.focus, Focus::Editor | Focus::CmdInput)
-    {
+    if k.code == KeyCode::Char('?') && !matches!(app.focus, Focus::Editor | Focus::CmdInput) {
         open_help(app);
         return;
     }
@@ -13662,7 +14236,11 @@ fn db_picker_key(app: &mut App, tx: &Tx, k: KeyEvent) {
         }
         KeyCode::Up | KeyCode::Char('k') => {
             if n > 0 {
-                let i = app.db_list.selected().map(|i| i.saturating_sub(1)).unwrap_or(0);
+                let i = app
+                    .db_list
+                    .selected()
+                    .map(|i| i.saturating_sub(1))
+                    .unwrap_or(0);
                 app.db_list.select(Some(i));
             }
         }
@@ -13924,7 +14502,10 @@ fn sidebar_key(app: &mut App, tx: &Tx, k: KeyEvent) {
             KeyCode::Char('s') => {
                 app.conn_sort = app.conn_sort.next();
                 app.sort_connections();
-                app.status = tf("排序：{} · s 切换（名称/类型/颜色）", &[&app.conn_sort.label()]);
+                app.status = tf(
+                    "排序：{} · s 切换（名称/类型/颜色）",
+                    &[&app.conn_sort.label()],
+                );
             }
             // R47b: disconnect the highlighted connection. The picker is the one
             // place every backend can reach the action (the Redis browser has no
@@ -14106,7 +14687,10 @@ fn sidebar_key(app: &mut App, tx: &Tx, k: KeyEvent) {
             KeyCode::Esc => {
                 if !app.redis_filter.is_empty() {
                     clear_redis_filter(app);
-                    app.status = tf("已清除 key 过滤 · {} 个 key", &[&(app.redis_scan.all.len())]);
+                    app.status = tf(
+                        "已清除 key 过滤 · {} 个 key",
+                        &[&(app.redis_scan.all.len())],
+                    );
                 } else if !app.redis_selected.is_empty() {
                     app.redis_selected.clear();
                     app.redis_anchor = None;
@@ -14304,8 +14888,10 @@ fn sidebar_key(app: &mut App, tx: &Tx, k: KeyEvent) {
                 app.status = t("还没有表可过滤").into();
             } else {
                 open_table_filter_with(app, Some(c));
-                app.status =
-                    tf("过滤「{}」· {} 个命中 · Enter 打开首位", &[&(app.table_filter), &(app.tables.len())]);
+                app.status = tf(
+                    "过滤「{}」· {} 个命中 · Enter 打开首位",
+                    &[&(app.table_filter), &(app.tables.len())],
+                );
             }
         }
         _ => {}
@@ -14355,13 +14941,21 @@ fn load_structure(app: &mut App, tx: &Tx) {
     let schema = app.schema.clone();
     app.spawn(
         tx,
-        Op::Columns(Box::new(cfg.clone()), db.clone(), schema.clone(), table.clone()),
+        Op::Columns(
+            Box::new(cfg.clone()),
+            db.clone(),
+            schema.clone(),
+            table.clone(),
+        ),
     );
     app.spawn(tx, Op::Ddl(Box::new(cfg), db, schema, table));
 }
 
 fn open_table_data(app: &mut App, tx: &Tx) {
-    let Some(table) = app.selected_table().map(|t| (t.name.clone(), t.table_type.clone())) else {
+    let Some(table) = app
+        .selected_table()
+        .map(|t| (t.name.clone(), t.table_type.clone()))
+    else {
         return;
     };
     let Some(cfg) = app.selected.clone() else {
@@ -14438,13 +15032,19 @@ fn open_table_data(app: &mut App, tx: &Tx) {
     app.status = if initial_filter.is_empty() {
         tf(
             "加载 {} 数据…",
-            &[&(qualified_display(&fix_double_encoding(&schema), &fix_double_encoding(&table.0)))],
+            &[&(qualified_display(
+                &fix_double_encoding(&schema),
+                &fix_double_encoding(&table.0),
+            ))],
         )
     } else {
         tf(
             "定位 {} · 过滤 {}",
             &[
-                &(qualified_display(&fix_double_encoding(&schema), &fix_double_encoding(&table.0))),
+                &(qualified_display(
+                    &fix_double_encoding(&schema),
+                    &fix_double_encoding(&table.0),
+                )),
                 &(truncate_disp(&one_line(&initial_filter), 48)),
             ],
         )
@@ -14455,18 +15055,19 @@ fn open_table_data(app: &mut App, tx: &Tx) {
     app.pending_open_page = true;
     app.spawn(
         tx,
-        Op::TableColumns(
-            Box::new(cfg),
-            app.current_db(),
-            schema,
-            table.0,
-        ),
+        Op::TableColumns(Box::new(cfg), app.current_db(), schema, table.0),
     );
 }
 
 impl App {
     /// Cached row count for a table view: `(value, is_lower_bound)`.
-    fn cached_count(&self, db: &str, schema: &str, table: &str, filter: &str) -> Option<(u64, bool)> {
+    fn cached_count(
+        &self,
+        db: &str,
+        schema: &str,
+        table: &str,
+        filter: &str,
+    ) -> Option<(u64, bool)> {
         self.count_cache
             .get(&count_cache_key(db, schema, table, filter))
             .copied()
@@ -14483,8 +15084,10 @@ impl App {
         value: u64,
         lower_bound: bool,
     ) {
-        self.count_cache
-            .insert(count_cache_key(db, schema, table, filter), (value, lower_bound));
+        self.count_cache.insert(
+            count_cache_key(db, schema, table, filter),
+            (value, lower_bound),
+        );
     }
 }
 
@@ -14513,9 +15116,11 @@ fn spawn_table_page(app: &mut App, tx: &Tx, page: usize) {
     }
     app.page_pending = true;
     app.loading = true;
-    app.status = tf("加载 {} 第 {} 页…", &[&(fix_double_encoding(&ps.table)), &(page + 1)]);
-    let known = app
-        .cached_count(&app.current_db(), &ps.schema, &ps.table, &ps.filter);
+    app.status = tf(
+        "加载 {} 第 {} 页…",
+        &[&(fix_double_encoding(&ps.table)), &(page + 1)],
+    );
+    let known = app.cached_count(&app.current_db(), &ps.schema, &ps.table, &ps.filter);
     app.page_gen += 1;
     let gen = app.page_gen;
     app.spawn(
@@ -14563,7 +15168,13 @@ fn goto_page(app: &mut App, tx: &Tx, page: usize, pending_sel: Option<usize>) ->
 
 /// Re-run the current table view from page 0 with a new filter / sort. The
 /// focus is intentionally left where it is (background refresh).
-fn reload_table_view(app: &mut App, tx: &Tx, filter: String, order_by: Option<String>, page: usize) {
+fn reload_table_view(
+    app: &mut App,
+    tx: &Tx,
+    filter: String,
+    order_by: Option<String>,
+    page: usize,
+) {
     let Some(ps) = app.page_state.clone() else {
         return;
     };
@@ -14952,8 +15563,15 @@ fn grid_max_cell(app: &App, ncols: usize, inner_w: usize, gutter: u16) -> usize 
 /// Human label for the compact mode, used in the status bar and messages.
 fn compact_label(app: &App) -> String {
     let on = compact_active(app.compact, app.layout_mode);
-    let auto = if app.compact.is_none() { t("自动") } else { t("手动") };
-    tf("紧凑列 {}{}", &[&(if on { t("开") } else { t("关") }), &(auto)])
+    let auto = if app.compact.is_none() {
+        t("自动")
+    } else {
+        t("手动")
+    };
+    tf(
+        "紧凑列 {}{}",
+        &[&(if on { t("开") } else { t("关") }), &(auto)],
+    )
 }
 
 /// Drop every column the user hid with Ctrl-Shift-H. At least one column always
@@ -15284,14 +15902,9 @@ fn switch_connection(app: &mut App, tx: &Tx, idx: usize) {
     }
     // Prefer this connection's own last position; fall back to carrying the
     // current connection's database / table names (same-named restore).
-    let restore = app
-        .conn_pointers
-        .get(&target.id)
-        .cloned()
-        .or(carry);
-    let notice = (!app.editor_sql().trim().is_empty()).then(|| {
-        t("编辑器仍有未提交内容（切连接不会清空，Ctrl-J 可执行）").to_string()
-    });
+    let restore = app.conn_pointers.get(&target.id).cloned().or(carry);
+    let notice = (!app.editor_sql().trim().is_empty())
+        .then(|| t("编辑器仍有未提交内容（切连接不会清空，Ctrl-J 可执行）").to_string());
     app.last_conn_id = prev_id;
     app.conn_list.select(Some(idx));
     activate_connection(app, tx, target, restore, notice);
@@ -15533,7 +16146,10 @@ fn ssh_connect_error_message(cfg: &ConnectionConfig, error: &str) -> String {
     };
     let hop = format!("{}@{}:{}", ssh.user, ssh.host, ssh.port);
     if classify_ssh_auth_error(error) {
-        return tf("SSH 认证失败（{}）：凭据被拒绝或不可用，请检查密码 / 密钥 / agent", &[&(hop)]);
+        return tf(
+            "SSH 认证失败（{}）：凭据被拒绝或不可用，请检查密码 / 密钥 / agent",
+            &[&(hop)],
+        );
     }
     // Checked before the host category: a closed far-side port surfaces to the
     // driver as a reset / EOF, which the host matcher would also catch.
@@ -15544,7 +16160,10 @@ fn ssh_connect_error_message(cfg: &ConnectionConfig, error: &str) -> String {
         );
     }
     if classify_ssh_host_error(error) {
-        return tf("SSH 主机不可达（{}）：无法建立连接，请检查地址 / 端口 / 网络", &[&(hop)]);
+        return tf(
+            "SSH 主机不可达（{}）：无法建立连接，请检查地址 / 端口 / 网络",
+            &[&(hop)],
+        );
     }
     tf("SSH 隧道连接失败（{}）：{}", &[&(hop), &(error)])
 }
@@ -15595,9 +16214,10 @@ fn ssh_notice_text(notice: &SshHostKeyNotice) -> String {
             "⚠ SSH 主机密钥已变化（{}:{}），可能被中间人攻击",
             &[&(notice.host), &(notice.port)],
         ),
-        SshHostKeyNoticeKind::Rejected => {
-            tf("SSH 主机密钥被拒绝（{}:{}）", &[&(notice.host), &(notice.port)])
-        }
+        SshHostKeyNoticeKind::Rejected => tf(
+            "SSH 主机密钥被拒绝（{}:{}）",
+            &[&(notice.host), &(notice.port)],
+        ),
         SshHostKeyNoticeKind::LearnFailed => tf(
             "SSH 主机密钥已接受但无法保存（{}:{}）：仅本次会话信任",
             &[&(notice.host), &(notice.port)],
@@ -15617,7 +16237,9 @@ fn ssh_prompt_key(app: &mut App, k: KeyEvent) {
                 Some(SshPromptAnswer::Accept { remember: true })
             }
             // Trust the key for this session only (do not write known_hosts).
-            KeyCode::Char('s') | KeyCode::Char('S') => Some(SshPromptAnswer::Accept { remember: false }),
+            KeyCode::Char('s') | KeyCode::Char('S') => {
+                Some(SshPromptAnswer::Accept { remember: false })
+            }
             KeyCode::Esc | KeyCode::Char('n') | KeyCode::Char('N') => Some(SshPromptAnswer::Reject),
             _ => None,
         },
@@ -15644,7 +16266,10 @@ fn ssh_prompt_key(app: &mut App, k: KeyEvent) {
                 None
             }
             KeyCode::Char(c) if !state.request.options.is_empty() => {
-                match c.to_digit(10).and_then(|n| n.checked_sub(1)).and_then(|i| state.request.options.get(i as usize))
+                match c
+                    .to_digit(10)
+                    .and_then(|n| n.checked_sub(1))
+                    .and_then(|i| state.request.options.get(i as usize))
                 {
                     Some(option) => Some(SshPromptAnswer::Secret(option.value.clone())),
                     None => {
@@ -15887,7 +16512,11 @@ fn open_redis_ttl_prompt(app: &mut App) {
     let Some(view) = app.redis_value.clone() else {
         return;
     };
-    let initial = if view.ttl >= 0 { view.ttl.to_string() } else { String::new() };
+    let initial = if view.ttl >= 0 {
+        view.ttl.to_string()
+    } else {
+        String::new()
+    };
     let mut ta = TextArea::from(vec![initial]);
     ta.set_placeholder_text(t("秒数（-1 = 持久化，0 = 立即删除）"));
     ta.move_cursor(CursorMove::End);
@@ -16347,7 +16976,10 @@ fn result_click(app: &mut App, x: u16, y: u16) {
     if n == 0 {
         return;
     }
-    let start = app.sel.saturating_sub(h / 2).min(n.saturating_sub(h.min(n)));
+    let start = app
+        .sel
+        .saturating_sub(h / 2)
+        .min(n.saturating_sub(h.min(n)));
     let idx = start + rel as usize;
     if idx >= n {
         return;
@@ -16608,7 +17240,10 @@ fn sidebar_click(app: &mut App, tx: &Tx, x: u16, y: u16) {
 /// True when the tree row draws a `▸` / `▾` expander that can be clicked
 /// (connections and databases have children; tables are leaves).
 fn side_row_has_tri(row: &SideRow) -> bool {
-    matches!(row, SideRow::Group { .. } | SideRow::Conn { .. } | SideRow::Db { .. })
+    matches!(
+        row,
+        SideRow::Group { .. } | SideRow::Conn { .. } | SideRow::Db { .. }
+    )
 }
 
 /// The two columns the expander occupies on a tree row, relative to the
@@ -16651,7 +17286,10 @@ fn sidebar_db_row(app: &App) -> bool {
 
 fn sidebar_db_label(app: &App) -> String {
     if app.backend_kind == Backend::Redis {
-        tf("redis db {} · {} keys · d 切换", &[&(app.redis_db), &(app.redis_scan.keys.len())])
+        tf(
+            "redis db {} · {} keys · d 切换",
+            &[&(app.redis_db), &(app.redis_scan.keys.len())],
+        )
     } else if !app.schemas.is_empty() {
         tf(
             "{} · schema {} · d 切换",
@@ -16784,11 +17422,7 @@ fn side_focus_nearest_root(app: &mut App, from_id: &str) {
         })
         .map(|(i, _)| i)
         .collect();
-    if let Some(target) = candidates
-        .iter()
-        .copied()
-        .min_by_key(|&i| i.abs_diff(cur))
-    {
+    if let Some(target) = candidates.iter().copied().min_by_key(|&i| i.abs_diff(cur)) {
         app.side_sel = target;
         side_mirror_table(app);
     }
@@ -17041,9 +17675,10 @@ fn rebuild_side_rows(app: &mut App) {
     let rows = compute_side_rows(app);
     let cur_table = app.table_list.selected();
     if cur_table != app.side_table_seen {
-        if let Some(pos) = rows.iter().position(
-            |r| matches!(r, SideRow::Table { table, .. } if Some(*table) == cur_table),
-        ) {
+        if let Some(pos) = rows
+            .iter()
+            .position(|r| matches!(r, SideRow::Table { table, .. } if Some(*table) == cur_table))
+        {
             app.side_sel = pos;
         }
         app.side_table_seen = cur_table;
@@ -17132,7 +17767,9 @@ fn side_expand(app: &mut App, tx: &Tx) {
             // any other database node selects it (switching connection when
             // needed).
             if side_is_active(app, idx) && db == app.current_db() {
-                let id = side_root_cfg(app, idx).map(|c| c.id.clone()).unwrap_or_default();
+                let id = side_root_cfg(app, idx)
+                    .map(|c| c.id.clone())
+                    .unwrap_or_default();
                 let key = db_node_key(&id, &db);
                 if app.tree_db_closed.remove(&key) {
                     rebuild_side_rows(app);
@@ -17163,7 +17800,9 @@ fn side_collapse(app: &mut App) {
             }
         }
         SideRow::Conn { idx, .. } => {
-            let id = side_root_cfg(app, idx).map(|c| c.id.clone()).unwrap_or_default();
+            let id = side_root_cfg(app, idx)
+                .map(|c| c.id.clone())
+                .unwrap_or_default();
             if side_conn_open(app, idx) {
                 if side_is_active(app, idx) {
                     app.tree_conn_closed.insert(id);
@@ -17175,7 +17814,9 @@ fn side_collapse(app: &mut App) {
         }
         SideRow::Db { idx, db, .. } => {
             if side_is_active(app, idx) && db == app.current_db() {
-                let id = side_root_cfg(app, idx).map(|c| c.id.clone()).unwrap_or_default();
+                let id = side_root_cfg(app, idx)
+                    .map(|c| c.id.clone())
+                    .unwrap_or_default();
                 let key = db_node_key(&id, &db);
                 if !app.tree_db_closed.contains(&key) {
                     app.tree_db_closed.insert(key);
@@ -17354,7 +17995,9 @@ fn side_activate(app: &mut App, tx: &Tx) {
             rebuild_side_rows(app);
         }
         SideRow::Conn { idx, .. } => {
-            let id = side_root_cfg(app, idx).map(|c| c.id.clone()).unwrap_or_default();
+            let id = side_root_cfg(app, idx)
+                .map(|c| c.id.clone())
+                .unwrap_or_default();
             if side_is_active(app, idx) {
                 if side_conn_open(app, idx) {
                     app.tree_conn_closed.insert(id);
@@ -17371,7 +18014,9 @@ fn side_activate(app: &mut App, tx: &Tx) {
         }
         SideRow::Db { idx, db, .. } => {
             if side_is_active(app, idx) {
-                let id = side_root_cfg(app, idx).map(|c| c.id.clone()).unwrap_or_default();
+                let id = side_root_cfg(app, idx)
+                    .map(|c| c.id.clone())
+                    .unwrap_or_default();
                 app.tree_db_closed.remove(&db_node_key(&id, &db));
                 if let Some(pos) = app.databases.iter().position(|d| d == &db) {
                     if app.db_index != pos {
@@ -17765,7 +18410,8 @@ fn editor_key(app: &mut App, tx: &Tx, k: KeyEvent) {
             }
         }
         (KeyModifiers::NONE, KeyCode::Down)
-            if app.history_idx.is_some() && app.editor.cursor().0 + 1 == app.editor.lines().len() =>
+            if app.history_idx.is_some()
+                && app.editor.cursor().0 + 1 == app.editor.lines().len() =>
         {
             if !app.history_next() {
                 app.editor.input(k);
@@ -17849,7 +18495,10 @@ fn redis_confirm_delete(app: &mut App) {
         app.status = t("先选中一个 key").into();
         return;
     };
-    let cmd = format!("DEL \"{}\"",  view.key_display.replace('\\', "\\\\").replace('"', "\\\""));
+    let cmd = format!(
+        "DEL \"{}\"",
+        view.key_display.replace('\\', "\\\\").replace('"', "\\\"")
+    );
     app.confirm = Some(Confirm {
         sql: cmd.clone(),
         reasons: vec![
@@ -17917,7 +18566,11 @@ fn redis_selection_targets(
 }
 
 fn redis_batch_targets(app: &App) -> Vec<(String, String)> {
-    redis_selection_targets(&app.redis_selected, &app.redis_scan.keys, app.redis_list.selected())
+    redis_selection_targets(
+        &app.redis_selected,
+        &app.redis_scan.keys,
+        app.redis_list.selected(),
+    )
 }
 
 /// True when the selection covers every loaded key (used to force the extra
@@ -18109,7 +18762,13 @@ fn redis_batch_delete(app: &mut App) {
     };
     let n = targets.len();
     let pattern = app.redis_scan.pattern.clone();
-    redis_open_batch_confirm(app, plan.commands, targets, plan.typed_confirm, plan.summary);
+    redis_open_batch_confirm(
+        app,
+        plan.commands,
+        targets,
+        plan.typed_confirm,
+        plan.summary,
+    );
     if let Some(c) = app.confirm.as_mut() {
         c.reasons = vec![
             tf("将批量删除 {} 个 key（模式 {}）", &[&n, &pattern]),
@@ -18290,7 +18949,12 @@ fn copy_mongo_doc_json(app: &mut App) {
     let json = serde_json::to_string_pretty(&doc).unwrap_or_else(|_| doc.to_string());
     let n = json.chars().count();
     match clipboard_copy(&json) {
-        Some(p) => app.status = tf("✓ 已复制文档 JSON（{} 字符）· 兜底 {}", &[&n, &(p.display())]),
+        Some(p) => {
+            app.status = tf(
+                "✓ 已复制文档 JSON（{} 字符）· 兜底 {}",
+                &[&n, &(p.display())],
+            )
+        }
         None => app.status = tf("✓ 已复制文档 JSON（{} 字符）", &[&n]),
     }
 }
@@ -18436,7 +19100,10 @@ fn mongo_dialog_submit(app: &mut App, d: MongoDocDialog) {
                 reasons: vec![
                     tf(
                         "将向 {}.{} 插入 1 个文档",
-                        &[&fix_double_encoding(&d.db), &fix_double_encoding(&d.collection)],
+                        &[
+                            &fix_double_encoding(&d.db),
+                            &fix_double_encoding(&d.collection),
+                        ],
                     ),
                     t("Enter 执行 · Esc 取消").into(),
                 ],
@@ -18522,7 +19189,11 @@ fn redis_prompt_key(app: &mut App, tx: &Tx, k: KeyEvent) {
     match p.kind {
         RedisPromptKind::Pattern => {
             let pat = input.trim();
-            app.redis_scan.pattern = if pat.is_empty() { "*".to_string() } else { pat.to_string() };
+            app.redis_scan.pattern = if pat.is_empty() {
+                "*".to_string()
+            } else {
+                pat.to_string()
+            };
             app.redis_value = None;
             app.clear_grid();
             app.redis_selected.clear();
@@ -18562,7 +19233,13 @@ fn redis_prompt_key(app: &mut App, tx: &Tx, k: KeyEvent) {
             };
             let n = p.batch.len();
             let pattern = app.redis_scan.pattern.clone();
-            redis_open_batch_confirm(app, plan.commands, p.batch.clone(), plan.typed_confirm, plan.summary);
+            redis_open_batch_confirm(
+                app,
+                plan.commands,
+                p.batch.clone(),
+                plan.typed_confirm,
+                plan.summary,
+            );
             if let Some(c) = app.confirm.as_mut() {
                 c.reasons = vec![
                     tf(
@@ -18575,12 +19252,8 @@ fn redis_prompt_key(app: &mut App, tx: &Tx, k: KeyEvent) {
             return;
         }
         RedisPromptKind::BatchRenamePrefix => {
-            let plan = match redis_plan_batch(
-                RedisBatchKind::RenamePrefix,
-                &p.batch,
-                false,
-                &input,
-            ) {
+            let plan = match redis_plan_batch(RedisBatchKind::RenamePrefix, &p.batch, false, &input)
+            {
                 Ok(plan) => plan,
                 Err(e) => {
                     app.status = format!("✗ {e}");
@@ -18598,7 +19271,13 @@ fn redis_prompt_key(app: &mut App, tx: &Tx, k: KeyEvent) {
             )
             .len();
             let pattern = app.redis_scan.pattern.clone();
-            redis_open_batch_confirm(app, plan.commands, p.batch.clone(), plan.typed_confirm, plan.summary);
+            redis_open_batch_confirm(
+                app,
+                plan.commands,
+                p.batch.clone(),
+                plan.typed_confirm,
+                plan.summary,
+            );
             if let Some(c) = app.confirm.as_mut() {
                 c.reasons = vec![
                     tf(
@@ -18619,7 +19298,9 @@ fn redis_prompt_key(app: &mut App, tx: &Tx, k: KeyEvent) {
     let (reload_value, reload_list) = match p.kind {
         // A renamed key has a new name, so just refresh the list.
         RedisPromptKind::Rename => (None, true),
-        RedisPromptKind::StringValue | RedisPromptKind::HashField => (Some(p.key_raw.clone()), false),
+        RedisPromptKind::StringValue | RedisPromptKind::HashField => {
+            (Some(p.key_raw.clone()), false)
+        }
         RedisPromptKind::Ttl => (Some(p.key_raw.clone()), true),
         RedisPromptKind::Pattern
         | RedisPromptKind::BatchTtl
@@ -18999,11 +19680,11 @@ fn preview_end(app: &mut App) {
 /// R22 export default), so a multi-statement run can be pasted into a ticket or
 /// a spreadsheet straight from the console.
 fn copy_stmt_result(app: &mut App) {
-    let (idx, grid) = match app.script.as_ref().and_then(|s| {
-        s.outcomes
-            .get(s.sel)
-            .map(|o| (s.sel, o.grid.clone()))
-    }) {
+    let (idx, grid) = match app
+        .script
+        .as_ref()
+        .and_then(|s| s.outcomes.get(s.sel).map(|o| (s.sel, o.grid.clone())))
+    {
         Some(v) => v,
         None => {
             app.status = t("没有可复制的结果").into();
@@ -19117,12 +19798,8 @@ fn help_key(app: &mut App, k: KeyEvent) {
             app.help_open = false;
             app.help_mini = false;
         }
-        KeyCode::Up | KeyCode::Char('k') => {
-            app.help_scroll = app.help_scroll.saturating_sub(1)
-        }
-        KeyCode::Down | KeyCode::Char('j') => {
-            app.help_scroll = app.help_scroll.saturating_add(1)
-        }
+        KeyCode::Up | KeyCode::Char('k') => app.help_scroll = app.help_scroll.saturating_sub(1),
+        KeyCode::Down | KeyCode::Char('j') => app.help_scroll = app.help_scroll.saturating_add(1),
         KeyCode::PageUp => app.help_scroll = app.help_scroll.saturating_sub(8),
         KeyCode::PageDown => app.help_scroll = app.help_scroll.saturating_add(8),
         _ => {}
@@ -19220,7 +19897,10 @@ fn result_filter_key(app: &mut App, k: KeyEvent) {
             app.status = if app.result_needle.trim().is_empty() {
                 t("结果搜索已清除").into()
             } else {
-                tf("搜索「{}」· {} 行命中 · n/N 跳转 · Esc 清除", &[&(app.result_needle), &(n)])
+                tf(
+                    "搜索「{}」· {} 行命中 · n/N 跳转 · Esc 清除",
+                    &[&(app.result_needle), &(n)],
+                )
             };
         }
         KeyCode::Esc => {
@@ -19264,7 +19944,10 @@ fn search_move(app: &mut App, dir: i32) {
     } else {
         app.sel = (app.sel + n - 1) % n;
     }
-    app.status = tf("搜索「{}」· 命中 {}/{}", &[&(app.result_needle), &(app.sel + 1), &(n)]);
+    app.status = tf(
+        "搜索「{}」· 命中 {}/{}",
+        &[&(app.result_needle), &(app.sel + 1), &(n)],
+    );
 }
 
 // ── grid value locate (`gv`) + column jump (`|`) ──
@@ -19456,7 +20139,12 @@ fn locate_move(app: &mut App, dir: i32) {
     let label = locate_col_label(app);
     app.status = tf(
         "定位 {}「{}」· 命中 {}/{}",
-        &[&(label), &(app.locate_needle), &(app.sel + 1), &(hits.len())],
+        &[
+            &(label),
+            &(app.locate_needle),
+            &(app.sel + 1),
+            &(hits.len()),
+        ],
     );
 }
 
@@ -19525,10 +20213,7 @@ fn col_jump_key(app: &mut App, k: KeyEvent) {
                     app.col_cursor = i;
                     app.poke_hbar();
                     app.sel = app.sel.min(grid.rows.len().saturating_sub(1));
-                    app.status = tf(
-                        "跳到第 {} 列 {}",
-                        &[&(i + 1), &(name)],
-                    );
+                    app.status = tf("跳到第 {} 列 {}", &[&(i + 1), &(name)]);
                 }
                 Err(msg) => app.status = msg,
             }
@@ -19555,9 +20240,15 @@ fn toggle_compact(app: &mut App) {
     app.compact = Some(!now);
     let on = compact_active(app.compact, app.layout_mode);
     app.status = if on {
-        tf("{} · 列宽≤{} 自适应，尽量一屏放下（Alt-C / w 关闭）", &[&(compact_label(app)), &(COMPACT_MAX_CELL)])
+        tf(
+            "{} · 列宽≤{} 自适应，尽量一屏放下（Alt-C / w 关闭）",
+            &[&(compact_label(app)), &(COMPACT_MAX_CELL)],
+        )
     } else {
-        tf("{} · 列宽按内容（Alt-C / w 开启）", &[&(compact_label(app))])
+        tf(
+            "{} · 列宽按内容（Alt-C / w 开启）",
+            &[&(compact_label(app))],
+        )
     };
     // Persist the choice: as the global default and, when a table is open, for
     // that exact `database.schema.table` so reopening it restores the mode.
@@ -19584,11 +20275,7 @@ fn open_col_picker(app: &mut App) {
 }
 
 fn col_picker_key(app: &mut App, k: KeyEvent) {
-    let n = app
-        .grid_full
-        .as_ref()
-        .map(|g| g.columns.len())
-        .unwrap_or(0);
+    let n = app.grid_full.as_ref().map(|g| g.columns.len()).unwrap_or(0);
     match k.code {
         KeyCode::Esc | KeyCode::Enter | KeyCode::Char('q') => {
             app.col_picker_open = false;
@@ -19657,11 +20344,7 @@ fn cols_popup_lines_for(app: &App) -> Vec<String> {
                 .columns
                 .iter()
                 .map(|c| {
-                    let mut s = format!(
-                        "{}  {}",
-                        fix_double_encoding(&c.name),
-                        c.data_type
-                    );
+                    let mut s = format!("{}  {}", fix_double_encoding(&c.name), c.data_type);
                     if c.is_primary_key {
                         s.push_str("  PK");
                     }
@@ -19813,7 +20496,11 @@ const NAV_DEPTH: usize = 50;
 /// no-op; anything else drops the forward branch and appends, moving the cursor
 /// to the new tail.
 fn record_nav(app: &mut App, entry: NavEntry) {
-    if app.nav_history.get(app.nav_pos).is_some_and(|e| *e == entry) {
+    if app
+        .nav_history
+        .get(app.nav_pos)
+        .is_some_and(|e| *e == entry)
+    {
         return;
     }
     app.nav_history.truncate(app.nav_pos + 1);
@@ -19874,16 +20561,7 @@ fn open_recent(app: &mut App, tx: &Tx, idx: usize) {
         return;
     };
     app.recent_open = false;
-    open_nav_entry(
-        app,
-        tx,
-        &NavEntry::Table {
-            db,
-            schema,
-            table,
-        },
-        "",
-    );
+    open_nav_entry(app, tx, &NavEntry::Table { db, schema, table }, "");
 }
 
 /// Jump to a history node, switching backend context first when needed.
@@ -19891,9 +20569,7 @@ fn open_recent(app: &mut App, tx: &Tx, idx: usize) {
 /// confirms its landing; the recent-table overlay passes empty.
 fn open_nav_entry(app: &mut App, tx: &Tx, entry: &NavEntry, arrow: &str) {
     match entry {
-        NavEntry::Table { db, schema, table } => {
-            open_nav_table(app, tx, db, schema, table, arrow)
-        }
+        NavEntry::Table { db, schema, table } => open_nav_table(app, tx, db, schema, table, arrow),
         NavEntry::RedisKey {
             db,
             key_raw,
@@ -19929,7 +20605,12 @@ fn open_nav_redis_key(
         set_nav_status(app, arrow, &qualified);
         return;
     }
-    if let Some(i) = app.redis_scan.keys.iter().position(|k| k.key_raw == key_raw) {
+    if let Some(i) = app
+        .redis_scan
+        .keys
+        .iter()
+        .position(|k| k.key_raw == key_raw)
+    {
         app.redis_list.select(Some(i));
         open_redis_value(app, tx);
         set_nav_status(app, arrow, &qualified);
@@ -19942,14 +20623,7 @@ fn open_nav_redis_key(
 }
 
 /// Open a `(database, schema, table)` triple from the round-trip stack.
-fn open_nav_table(
-    app: &mut App,
-    tx: &Tx,
-    db: &str,
-    schema: &str,
-    table: &str,
-    arrow: &str,
-) {
+fn open_nav_table(app: &mut App, tx: &Tx, db: &str, schema: &str, table: &str, arrow: &str) {
     if app.backend_kind == Backend::Redis {
         app.status = t("✗ 该记录属于表 / 集合").into();
         return;
@@ -20078,7 +20752,12 @@ fn history_time_label(executed_at: &str) -> String {
     // Require an all-ASCII prefix so the byte slices below can never split a
     // multi-byte character (real DBX timestamps are always RFC3339 ASCII).
     if b.len() >= 16 && b[..16].is_ascii() && b.get(10) == Some(&b'T') {
-        format!("{}-{} {}", &executed_at[5..7], &executed_at[8..10], &executed_at[11..16])
+        format!(
+            "{}-{} {}",
+            &executed_at[5..7],
+            &executed_at[8..10],
+            &executed_at[11..16]
+        )
     } else {
         truncate_disp(executed_at, 11)
     }
@@ -20194,7 +20873,10 @@ fn history_key(app: &mut App, tx: &Tx, k: KeyEvent) {
             let n = sql.chars().count();
             match clipboard_copy(&sql) {
                 Some(p) => {
-                    app.status = tf("✓ 已复制整条语句（{} 字符）· 兜底 {}", &[&n, &(p.display())])
+                    app.status = tf(
+                        "✓ 已复制整条语句（{} 字符）· 兜底 {}",
+                        &[&n, &(p.display())],
+                    )
                 }
                 None => app.status = tf("✓ 已复制整条语句（{} 字符）· OSC52 剪贴板", &[&n]),
             }
@@ -20262,7 +20944,10 @@ fn history_filter_key(app: &mut App, k: KeyEvent) {
     match k.code {
         KeyCode::Enter => {
             app.history_filter = None;
-            app.status = tf("历史过滤「{}」· 命中 {}", &[&(app.history_needle), &(app.history_view.len())]);
+            app.status = tf(
+                "历史过滤「{}」· 命中 {}",
+                &[&(app.history_needle), &(app.history_view.len())],
+            );
         }
         KeyCode::Esc => {
             app.history_filter = None;
@@ -20349,7 +21034,10 @@ fn open_global_search(app: &mut App) {
         let mut ta = TextArea::default();
         ta.set_placeholder_text(t("搜索词（所有表的文本列，大小写不敏感）"));
         app.search_input = Some(ta);
-        app.status = tf("全库搜索 {} · 输入搜索词 · Enter 开始 · Esc 取消", &[&(cfg.name)]);
+        app.status = tf(
+            "全库搜索 {} · 输入搜索词 · Enter 开始 · Esc 取消",
+            &[&(cfg.name)],
+        );
     } else {
         app.status = t("全库搜索仅支持 MySQL / PostgreSQL 连接").into();
     }
@@ -20630,14 +21318,15 @@ fn open_diff_picker(app: &mut App, mode: DiffPickMode, kind: DiffKind) {
 }
 
 fn diff_picker_key(app: &mut App, tx: &Tx, k: KeyEvent) {
-    let Some((mode, stage, kind)) = app
-        .diff_picker
-        .as_ref()
-        .map(|p| (p.mode, p.stage, p.kind))
+    let Some((mode, stage, kind)) = app.diff_picker.as_ref().map(|p| (p.mode, p.stage, p.kind))
     else {
         return;
     };
-    let n = app.diff_picker.as_ref().map(|p| p.entries.len()).unwrap_or(0);
+    let n = app
+        .diff_picker
+        .as_ref()
+        .map(|p| p.entries.len())
+        .unwrap_or(0);
     let comparing = app
         .diff_picker
         .as_ref()
@@ -20666,15 +21355,12 @@ fn diff_picker_key(app: &mut App, tx: &Tx, k: KeyEvent) {
             p.target_schema.clear();
             p.loading = false;
             p.gen = gen;
-            p.list.select(if p.entries.is_empty() { None } else { Some(0) });
+            p.list
+                .select(if p.entries.is_empty() { None } else { Some(0) });
         }
         app.status = match kind {
-            DiffKind::Schema => {
-                t("选择目标表（源 = 当前表；c 换连接做跨库/跨方言对比）").into()
-            }
-            DiffKind::Data => {
-                t("选择目标表做数据对比（按主键对齐；c 换连接；w 加 WHERE）").into()
-            }
+            DiffKind::Schema => t("选择目标表（源 = 当前表；c 换连接做跨库/跨方言对比）").into(),
+            DiffKind::Data => t("选择目标表做数据对比（按主键对齐；c 换连接；w 加 WHERE）").into(),
         };
     };
     match k.code {
@@ -20699,9 +21385,7 @@ fn diff_picker_key(app: &mut App, tx: &Tx, k: KeyEvent) {
         }
         // Toggle target kind: table (Alt-D) ↔ database (Shift+Alt-D). Structure only.
         KeyCode::Char('d') | KeyCode::Char('D')
-            if kind == DiffKind::Schema
-                && stage == DiffPickStage::Lists
-                && !comparing =>
+            if kind == DiffKind::Schema && stage == DiffPickStage::Lists && !comparing =>
         {
             let next = if mode == DiffPickMode::Table {
                 DiffPickMode::Database
@@ -20711,9 +21395,7 @@ fn diff_picker_key(app: &mut App, tx: &Tx, k: KeyEvent) {
             open_diff_picker(app, next, DiffKind::Schema);
         }
         // `m`: switch the picker between structure and data compare.
-        KeyCode::Char('m') | KeyCode::Char('M')
-            if stage == DiffPickStage::Lists && !comparing =>
-        {
+        KeyCode::Char('m') | KeyCode::Char('M') if stage == DiffPickStage::Lists && !comparing => {
             let next = match kind {
                 DiffKind::Schema => DiffKind::Data,
                 DiffKind::Data => DiffKind::Schema,
@@ -20722,17 +21404,13 @@ fn diff_picker_key(app: &mut App, tx: &Tx, k: KeyEvent) {
         }
         // `w`: type an optional WHERE applied to both sides of a data compare.
         KeyCode::Char('w') | KeyCode::Char('W')
-            if kind == DiffKind::Data
-                && stage == DiffPickStage::Lists
-                && !comparing =>
+            if kind == DiffKind::Data && stage == DiffPickStage::Lists && !comparing =>
         {
             open_data_where(app);
         }
         // `c`: pick another connection as the diff target (cross-dialect).
         KeyCode::Char('c')
-            if mode == DiffPickMode::Table
-                && stage == DiffPickStage::Lists
-                && !comparing =>
+            if mode == DiffPickMode::Table && stage == DiffPickStage::Lists && !comparing =>
         {
             let conns = diff_other_connections(app);
             if conns.is_empty() {
@@ -21025,7 +21703,11 @@ fn copy_diff_summary(app: &mut App) {
 }
 
 fn db_diff_key(app: &mut App, tx: &Tx, k: KeyEvent) {
-    let n = app.db_diff.as_ref().map(|s| s.diff.entries.len()).unwrap_or(0);
+    let n = app
+        .db_diff
+        .as_ref()
+        .map(|s| s.diff.entries.len())
+        .unwrap_or(0);
     let step = |app: &mut App, delta: i32| {
         if n == 0 {
             return;
@@ -21243,7 +21925,11 @@ fn transfer_conn_key(app: &mut App, k: KeyEvent) {
             let Some(idx) = app.transfer.as_ref().and_then(|w| w.conn_list.selected()) else {
                 return;
             };
-            let Some(cfg) = app.transfer.as_ref().and_then(|w| w.conns.get(idx).cloned()) else {
+            let Some(cfg) = app
+                .transfer
+                .as_ref()
+                .and_then(|w| w.conns.get(idx).cloned())
+            else {
                 return;
             };
             let src_schema = app
@@ -21555,7 +22241,10 @@ fn start_transfer(app: &mut App, tx: &Tx) {
     app.loading = true;
     app.status = tf(
         "开始搬运 {} → {} · Esc 中止（已提交批次保留）",
-        &[&fix_double_encoding(&src_label), &fix_double_encoding(&table)],
+        &[
+            &fix_double_encoding(&src_label),
+            &fix_double_encoding(&table),
+        ],
     );
     app.spawn(tx, Op::DataTransfer(Box::new(job)));
 }
@@ -21579,10 +22268,7 @@ fn transfer_report_key(app: &mut App, tx: &Tx, k: KeyEvent) {
                         &[&lines, &(p.display())],
                     )
                 }
-                None => {
-                    app.status =
-                        tf("✓ 已复制搬运摘要（{} 行）· OSC52 剪贴板", &[&lines])
-                }
+                None => app.status = tf("✓ 已复制搬运摘要（{} 行）· OSC52 剪贴板", &[&lines]),
             }
         }
         KeyCode::Char('b') => open_transfer_target(app, tx),
@@ -21745,7 +22431,17 @@ fn start_selected_data_diff(app: &mut App, tx: &Tx) {
         None => (src_cfg.clone(), db.clone(), schema.clone()),
     };
     start_data_diff(
-        app, tx, src_cfg, db, schema, src, tgt_cfg, tgt_db, tgt_schema, choice, where_input,
+        app,
+        tx,
+        src_cfg,
+        db,
+        schema,
+        src,
+        tgt_cfg,
+        tgt_db,
+        tgt_schema,
+        choice,
+        where_input,
     );
 }
 
@@ -21757,12 +22453,7 @@ fn data_tab_row(state: &DataDiffState, idx: usize) -> Option<&DataDiffRow> {
         DataTab::Diff => RowMark::Diff,
         DataTab::Summary | DataTab::Sync => return None,
     };
-    state
-        .result
-        .rows
-        .iter()
-        .filter(|r| r.mark == mark)
-        .nth(idx)
+    state.result.rows.iter().filter(|r| r.mark == mark).nth(idx)
 }
 
 /// Selectable row count in the active data tab (`Summary` / `Sync` are not
@@ -21989,7 +22680,10 @@ fn expand_tilde(raw: &str) -> PathBuf {
 fn read_sql_file(path: &std::path::Path) -> Result<String, String> {
     let bytes = std::fs::read(path).map_err(|e| e.to_string())?;
     let text = String::from_utf8_lossy(&bytes).into_owned();
-    Ok(text.strip_prefix('\u{feff}').map(str::to_string).unwrap_or(text))
+    Ok(text
+        .strip_prefix('\u{feff}')
+        .map(str::to_string)
+        .unwrap_or(text))
 }
 
 /// Count the executable statements in a script using the dialect-aware splitter
@@ -22118,10 +22812,7 @@ fn file_load_plan_key(app: &mut App, tx: &Tx, k: KeyEvent) {
             }
             let n = plan.statements;
             app.push_history(&plan.sql);
-            app.status = tf(
-                "执行 {} · {} 条语句…",
-                &[&(plan.path.display()), &n],
-            );
+            app.status = tf("执行 {} · {} 条语句…", &[&(plan.path.display()), &n]);
             execute_sql(app, tx, plan.sql, "script");
         }
         KeyCode::Esc => {
@@ -22263,7 +22954,10 @@ fn redis_filter_key(app: &mut App, tx: &Tx, k: KeyEvent) {
         || (k.modifiers.contains(KeyModifiers::ALT) && k.code == KeyCode::Backspace)
     {
         clear_redis_filter(app);
-        app.status = tf("已清除 key 过滤 · {} 个 key", &[&(app.redis_scan.all.len())]);
+        app.status = tf(
+            "已清除 key 过滤 · {} 个 key",
+            &[&(app.redis_scan.all.len())],
+        );
         return;
     }
     match k.code {
@@ -22284,13 +22978,19 @@ fn redis_filter_key(app: &mut App, tx: &Tx, k: KeyEvent) {
             app.status = if app.redis_filter.is_empty() {
                 tf("{} 个 key", &[&(total)])
             } else {
-                tf("过滤「{}」· 查看第 1 个命中 · Esc 清除", &[&(app.redis_filter)])
+                tf(
+                    "过滤「{}」· 查看第 1 个命中 · Esc 清除",
+                    &[&(app.redis_filter)],
+                )
             };
             open_redis_value(app, tx);
         }
         KeyCode::Esc => {
             clear_redis_filter(app);
-            app.status = tf("已清除 key 过滤 · {} 个 key", &[&(app.redis_scan.all.len())]);
+            app.status = tf(
+                "已清除 key 过滤 · {} 个 key",
+                &[&(app.redis_scan.all.len())],
+            );
         }
         _ => {
             if let Some(t) = app.redis_filter_prompt.as_mut() {
@@ -22302,7 +23002,10 @@ fn redis_filter_key(app: &mut App, tx: &Tx, k: KeyEvent) {
                 .map(|t| t.lines().join(" ").trim().to_string())
                 .unwrap_or_default();
             apply_redis_filter(app);
-            app.status = tf("过滤「{}」· {} 个命中", &[&(app.redis_filter), &(app.redis_scan.keys.len())]);
+            app.status = tf(
+                "过滤「{}」· {} 个命中",
+                &[&(app.redis_filter), &(app.redis_scan.keys.len())],
+            );
         }
     }
 }
@@ -22441,9 +23144,7 @@ fn highlight_match_spans(
 /// request for that table, so a leftover filter must not turn it into a bogus
 /// "table not found".
 fn focus_table_in_sidebar(app: &mut App, name: &str) -> Option<usize> {
-    if !app.tables.iter().any(|t| t.name == name)
-        && app.tables_all.iter().any(|t| t.name == name)
-    {
+    if !app.tables.iter().any(|t| t.name == name) && app.tables_all.iter().any(|t| t.name == name) {
         app.table_filter.clear();
         app.table_prompt = None;
         apply_table_filter(app);
@@ -22492,7 +23193,10 @@ fn table_filter_key(app: &mut App, tx: &Tx, k: KeyEvent) {
             app.status = if app.table_filter.is_empty() {
                 tf("{} 个表/视图", &[&(total)])
             } else {
-                tf("过滤「{}」· 打开第 1 个命中 · Esc 清除", &[&(app.table_filter)])
+                tf(
+                    "过滤「{}」· 打开第 1 个命中 · Esc 清除",
+                    &[&(app.table_filter)],
+                )
             };
             open_table_data(app, tx);
         }
@@ -22519,12 +23223,52 @@ fn table_filter_key(app: &mut App, tx: &Tx, k: KeyEvent) {
 /// Keywords offered alongside table / column names. Small on purpose: a TUI
 /// completion is a shortcut for long identifiers, not a SQL parser.
 const SQL_KEYWORDS: &[&str] = &[
-    "SELECT", "FROM", "WHERE", "GROUP BY", "ORDER BY", "HAVING", "LIMIT", "OFFSET",
-    "INSERT INTO", "UPDATE", "DELETE FROM", "SET", "VALUES", "JOIN", "LEFT JOIN",
-    "INNER JOIN", "ON", "AS", "AND", "OR", "NOT", "NULL", "IS NULL", "LIKE", "IN",
-    "BETWEEN", "DISTINCT", "COUNT", "SUM", "AVG", "MIN", "MAX", "CASE", "WHEN",
-    "THEN", "ELSE", "END", "ASC", "DESC", "CREATE TABLE", "ALTER TABLE", "DROP TABLE",
-    "UNION", "UNION ALL", "EXPLAIN", "WITH",
+    "SELECT",
+    "FROM",
+    "WHERE",
+    "GROUP BY",
+    "ORDER BY",
+    "HAVING",
+    "LIMIT",
+    "OFFSET",
+    "INSERT INTO",
+    "UPDATE",
+    "DELETE FROM",
+    "SET",
+    "VALUES",
+    "JOIN",
+    "LEFT JOIN",
+    "INNER JOIN",
+    "ON",
+    "AS",
+    "AND",
+    "OR",
+    "NOT",
+    "NULL",
+    "IS NULL",
+    "LIKE",
+    "IN",
+    "BETWEEN",
+    "DISTINCT",
+    "COUNT",
+    "SUM",
+    "AVG",
+    "MIN",
+    "MAX",
+    "CASE",
+    "WHEN",
+    "THEN",
+    "ELSE",
+    "END",
+    "ASC",
+    "DESC",
+    "CREATE TABLE",
+    "ALTER TABLE",
+    "DROP TABLE",
+    "UNION",
+    "UNION ALL",
+    "EXPLAIN",
+    "WITH",
 ];
 
 /// The identifier fragment ending at the cursor, and how many characters it is.
@@ -22743,7 +23487,11 @@ fn completion_candidates(app: &App, ctx: &CompCtx, partial: &str) -> Vec<Complet
     }
     // R48: a narrow phone terminal keeps the popup short (one column, 5 items)
     // so it never covers the SQL being typed; a normal terminal shows 8.
-    let cap = if app.term_w > 0 && app.term_w < 40 { 5 } else { 8 };
+    let cap = if app.term_w > 0 && app.term_w < 40 {
+        5
+    } else {
+        8
+    };
     out.truncate(cap);
     out
 }
@@ -22796,8 +23544,10 @@ fn accept_completion(app: &mut App) {
         // `delete_str` deletes *forward* from the cursor, so step back to the
         // start of the fragment first.
         let (row, col) = app.editor.cursor();
-        app.editor
-            .move_cursor(CursorMove::Jump(row as u16, col.saturating_sub(back) as u16));
+        app.editor.move_cursor(CursorMove::Jump(
+            row as u16,
+            col.saturating_sub(back) as u16,
+        ));
         app.editor.delete_str(back);
     }
     app.editor.insert_str(&item.text);
@@ -22847,9 +23597,20 @@ fn open_cell_popup(app: &mut App) {
     let Some(v) = row.get(app.col_cursor) else {
         return;
     };
-    let col = grid.columns.get(app.col_cursor).cloned().unwrap_or_default();
+    let col = grid
+        .columns
+        .get(app.col_cursor)
+        .cloned()
+        .unwrap_or_default();
     let (text, style) = value_display(v);
-    let title = tf("{} · 第 {} 行 · {} 字符", &[&(fix_double_encoding(&col)), &(cursor_abs_row(app)), &(text.chars().count())]);
+    let title = tf(
+        "{} · 第 {} 行 · {} 字符",
+        &[
+            &(fix_double_encoding(&col)),
+            &(cursor_abs_row(app)),
+            &(text.chars().count()),
+        ],
+    );
     app.popup_cache = None;
     app.cell_popup = Some(CellPopup {
         title,
@@ -22938,7 +23699,11 @@ fn row_pk_locator(app: &App, grid: &Grid, row: &[Val]) -> Option<String> {
     }
     let mut parts: Vec<String> = Vec::new();
     for name in &names {
-        if let Some(ci) = grid.columns.iter().position(|c| c.eq_ignore_ascii_case(name)) {
+        if let Some(ci) = grid
+            .columns
+            .iter()
+            .position(|c| c.eq_ignore_ascii_case(name))
+        {
             let shown = row
                 .get(ci)
                 .map(|v| value_display(v).0)
@@ -23136,7 +23901,7 @@ fn row_popup_key(app: &mut App, k: KeyEvent) {
 /// Escape a value as a standard SQL string literal (quote doubled, backslash
 /// escaped). Fine for MySQL's default mode and standard SQL alike.
 fn sql_literal(s: &str) -> String {
-    format!("'{}'",  s.replace('\\', "\\\\").replace('\'', "''"))
+    format!("'{}'", s.replace('\\', "\\\\").replace('\'', "''"))
 }
 
 fn is_numeric_type(t: &str) -> bool {
@@ -23144,7 +23909,8 @@ fn is_numeric_type(t: &str) -> bool {
     let base = lower.split(['(', ' ']).next().unwrap_or("");
     matches!(
         base,
-        "int" | "integer"
+        "int"
+            | "integer"
             | "bigint"
             | "smallint"
             | "tinyint"
@@ -23221,7 +23987,12 @@ fn is_binary_type(t: &str) -> bool {
 /// The bare base of a declared type: `numeric(12,2)` → `numeric`,
 /// `timestamp with time zone` → `timestamp`, `text[]` → `text[]`.
 fn base_type(t: &str) -> String {
-    t.trim().to_ascii_lowercase().split(['(', ' ']).next().unwrap_or("").to_string()
+    t.trim()
+        .to_ascii_lowercase()
+        .split(['(', ' '])
+        .next()
+        .unwrap_or("")
+        .to_string()
 }
 
 /// Date/time families whose NOT NULL placeholder should be `CURRENT_TIMESTAMP`
@@ -23256,7 +24027,11 @@ fn is_server_generated_column(c: &ColumnInfo) -> bool {
 /// (PostgreSQL rejects `''` for boolean / timestamp / numeric columns, which is
 /// exactly what the old numeric-else-empty rule produced).
 fn insert_placeholder(c: &ColumnInfo) -> String {
-    if c.column_default.as_deref().map(|d| !d.trim().is_empty()).unwrap_or(false) {
+    if c.column_default
+        .as_deref()
+        .map(|d| !d.trim().is_empty())
+        .unwrap_or(false)
+    {
         return "DEFAULT".to_string();
     }
     if c.is_nullable {
@@ -23399,7 +24174,11 @@ fn array_element_literal(v: &serde_json::Value) -> String {
 fn array_literal(s: &str, data_type: &str) -> Option<String> {
     let items: Vec<serde_json::Value> = serde_json::from_str(s).ok()?;
     let ty = data_type.trim();
-    let cast = if ty.ends_with("[]") { format!("::{ty}") } else { String::new() };
+    let cast = if ty.ends_with("[]") {
+        format!("::{ty}")
+    } else {
+        String::new()
+    };
     if items.is_empty() {
         return Some(format!("'{{}}'{cast}"));
     }
@@ -23518,7 +24297,10 @@ fn read_ident(s: &str) -> Option<String> {
                 (rest[1..1 + i].to_string(), i + 2)
             }
             b if is_ident_byte(b) => {
-                let end = rest.bytes().position(|b| !is_ident_byte(b)).unwrap_or(rest.len());
+                let end = rest
+                    .bytes()
+                    .position(|b| !is_ident_byte(b))
+                    .unwrap_or(rest.len());
                 (rest[..end].to_string(), end)
             }
             _ => break,
@@ -23694,7 +24476,10 @@ fn copy_row_sql(app: &mut App) {
     let n = sql.chars().count();
     match clipboard_copy(&sql) {
         Some(p) => {
-            app.status = tf("✓ 已复制 INSERT（{} 字符）· OSC52 剪贴板 · 兜底 {}", &[&(n), &(p.display())])
+            app.status = tf(
+                "✓ 已复制 INSERT（{} 字符）· OSC52 剪贴板 · 兜底 {}",
+                &[&(n), &(p.display())],
+            )
         }
         None => app.status = tf("✓ 已复制 INSERT（{} 字符）· OSC52 剪贴板", &[&(n)]),
     }
@@ -23738,7 +24523,7 @@ fn edit_prefill(v: &Val) -> String {
             if new_value_literal(s, None) == sql_literal(s) {
                 s.clone()
             } else {
-                format!("'{}'",  s.replace('\'', "''"))
+                format!("'{}'", s.replace('\'', "''"))
             }
         }
     }
@@ -23825,8 +24610,8 @@ fn row_where_clause(
             continue;
         };
         conds.push(format!(
-            "{} = {}", 
-            q(k), 
+            "{} = {}",
+            q(k),
             val_literal(v, column_type(app, schema, table, k).as_deref())
         ));
     }
@@ -23946,7 +24731,10 @@ fn edit_cell(app: &mut App) {
         insert_sql: String::new(),
         insert_preview: Vec::new(),
     });
-    app.status = tf("编辑 {} → Enter 确认执行 · Esc 取消 · Ctrl-V 转编辑器 · Ctrl-T 加入批量", &[&(col)]);
+    app.status = tf(
+        "编辑 {} → Enter 确认执行 · Esc 取消 · Ctrl-V 转编辑器 · Ctrl-T 加入批量",
+        &[&(col)],
+    );
 }
 
 /// `i` — open the diff layer with an `INSERT` template built from the table's
@@ -23984,7 +24772,11 @@ fn quick_insert(app: &mut App) {
         return;
     }
     let q = |name: &str| quote_table_identifier(Some(cfg.db_type), name);
-    let col_list = cols.iter().map(|c| q(&c.name)).collect::<Vec<_>>().join(", ");
+    let col_list = cols
+        .iter()
+        .map(|c| q(&c.name))
+        .collect::<Vec<_>>()
+        .join(", ");
     let mut preview: Vec<(String, String)> = Vec::new();
     let mut vals: Vec<String> = Vec::new();
     for c in &cols {
@@ -23993,9 +24785,9 @@ fn quick_insert(app: &mut App) {
         preview.push((fix_double_encoding(&c.name), v));
     }
     let sql = format!(
-        "INSERT INTO {} ({})\nVALUES ({});", 
-        table_ref(cfg.db_type, &ps.schema, &ps.table), 
-        col_list, 
+        "INSERT INTO {} ({})\nVALUES ({});",
+        table_ref(cfg.db_type, &ps.schema, &ps.table),
+        col_list,
         vals.join(", ")
     );
     app.edit_dialog = Some(EditDialog {
@@ -24014,7 +24806,10 @@ fn quick_insert(app: &mut App) {
         insert_sql: sql,
         insert_preview: preview,
     });
-    app.status = tf("插入 {} → Enter 确认执行 · Esc 取消 · Ctrl-V 转编辑器 · Ctrl-T 加入批量", &[&(ps.table)]);
+    app.status = tf(
+        "插入 {} → Enter 确认执行 · Esc 取消 · Ctrl-V 转编辑器 · Ctrl-T 加入批量",
+        &[&(ps.table)],
+    );
 }
 
 /// Keys for the diff-style edit confirmation layer. UPDATE has a live text
@@ -24026,8 +24821,10 @@ fn edit_dialog_key(app: &mut App, tx: &Tx, k: KeyEvent) {
     let ctrl = k.modifiers.contains(KeyModifiers::CONTROL);
     let plain = k.modifiers.is_empty();
     let insert = d.kind == EditKind::Insert;
-    let to_editor = ctrl && k.code == KeyCode::Char('v') || (insert && plain && k.code == KeyCode::Char('v'));
-    let to_batch = ctrl && k.code == KeyCode::Char('t') || (insert && plain && k.code == KeyCode::Char('b'));
+    let to_editor =
+        ctrl && k.code == KeyCode::Char('v') || (insert && plain && k.code == KeyCode::Char('v'));
+    let to_batch =
+        ctrl && k.code == KeyCode::Char('t') || (insert && plain && k.code == KeyCode::Char('b'));
     if k.code == KeyCode::Esc {
         app.status = t("已取消编辑").into();
     } else if k.code == KeyCode::Enter {
@@ -24040,7 +24837,10 @@ fn edit_dialog_key(app: &mut App, tx: &Tx, k: KeyEvent) {
     } else if to_batch {
         let sql = d.sql();
         app.batch.push(sql);
-        app.status = tf("已加入批量队列（{} 条）· Ctrl-S 打包提交 · Ctrl-X 清空", &[&(app.batch.len())]);
+        app.status = tf(
+            "已加入批量队列（{} 条）· Ctrl-S 打包提交 · Ctrl-X 清空",
+            &[&(app.batch.len())],
+        );
     } else {
         if d.kind == EditKind::Update {
             d.new_input.input(k);
@@ -24099,7 +24899,10 @@ fn commit_batch(app: &mut App) {
     app.confirm = Some(Confirm {
         sql: script,
         reasons: vec![
-            tf("批量事务：{} 条修改将在同一个 BEGIN … COMMIT 中执行", &[&(n)]),
+            tf(
+                "批量事务：{} 条修改将在同一个 BEGIN … COMMIT 中执行",
+                &[&(n)],
+            ),
             t("任一语句失败则整体回滚；Enter 后立即执行").into(),
         ],
         refresh: true,
@@ -24110,7 +24913,6 @@ fn commit_batch(app: &mut App) {
     });
     app.status = tf("批量提交确认（{} 条）· Enter 执行 · Esc 取消", &[&(n)]);
 }
-
 
 // ── filter / sort ──
 
@@ -24127,7 +24929,7 @@ fn open_filter_prompt(app: &mut App) {
     let initial = if ps.filter.trim().is_empty() {
         match (active_grid(app), app.selected.as_ref()) {
             (Some(grid), Some(cfg)) => match grid.columns.get(app.col_cursor) {
-                Some(col) => format!("{} = ",  quote_table_identifier(Some(cfg.db_type), col)),
+                Some(col) => format!("{} = ", quote_table_identifier(Some(cfg.db_type), col)),
                 None => String::new(),
             },
             _ => String::new(),
@@ -24207,7 +25009,7 @@ fn build_order_by(cfg: &ConnectionConfig, keys: &[(String, bool)]) -> Option<Str
     let q = |n: &str| quote_table_identifier(Some(cfg.db_type), n);
     Some(
         keys.iter()
-            .map(|(c, d)| format!("{} {}",  q(c),  if *d { "DESC" } else { "ASC" }))
+            .map(|(c, d)| format!("{} {}", q(c), if *d { "DESC" } else { "ASC" }))
             .collect::<Vec<_>>()
             .join(", "),
     )
@@ -24257,7 +25059,18 @@ fn sort_column(app: &mut App, tx: &Tx, append: bool) {
     app.config.entry(&db, &ps.schema, &ps.table).order_by = next.clone();
     app.persist();
     reload_table_view(app, tx, ps.filter.clone(), next, 0);
-    app.status = tf("按 {} {}{}", &[&(col), &(dir), &(if append { t("（附加排序键）") } else { "" })]);
+    app.status = tf(
+        "按 {} {}{}",
+        &[
+            &(col),
+            &(dir),
+            &(if append {
+                t("（附加排序键）")
+            } else {
+                ""
+            }),
+        ],
+    );
 }
 
 fn drill_script(app: &mut App, idx: usize) {
@@ -24406,7 +25219,10 @@ fn load_more_rows(app: &mut App, tx: &Tx) {
         return;
     };
     if cap >= QUERY_MAX_ROWS_CAP {
-        app.status = tf("已达上限 {} 行，请用 WHERE / LIMIT 缩小查询", &[&(QUERY_MAX_ROWS_CAP)]);
+        app.status = tf(
+            "已达上限 {} 行，请用 WHERE / LIMIT 缩小查询",
+            &[&(QUERY_MAX_ROWS_CAP)],
+        );
         return;
     }
     let Some(cfg) = app.selected.clone() else {
@@ -24438,11 +25254,8 @@ fn run_cmd_line(app: &mut App, tx: &Tx) {
             app.redis_value = None;
             app.clear_grid();
             app.cmd_output
-                .push(format!("redis[{}]> {cmd}",  app.redis_db));
-            app.spawn(
-                tx,
-                Op::Redis(Box::new(cfg), app.redis_db, cmd),
-            );
+                .push(format!("redis[{}]> {cmd}", app.redis_db));
+            app.spawn(tx, Op::Redis(Box::new(cfg), app.redis_db, cmd));
         }
         Backend::Mongo => {
             // Show the console output rather than a stale document grid.
@@ -24466,11 +25279,8 @@ fn run_cmd_line(app: &mut App, tx: &Tx) {
                 return;
             }
             app.cmd_output
-                .push(format!("mongo({})> {cmd}",  app.current_db()));
-            app.spawn(
-                tx,
-                Op::Mongo(Box::new(cfg), app.current_db(), cmd),
-            );
+                .push(format!("mongo({})> {cmd}", app.current_db()));
+            app.spawn(tx, Op::Mongo(Box::new(cfg), app.current_db(), cmd));
         }
         Backend::Sql => run_sql(app, tx, RunScope::All),
     }
@@ -24596,7 +25406,13 @@ fn build_ssh_layer(f: &ConnForm) -> Result<Option<SshTunnelConfig>, String> {
             if f.ssh_password.is_empty() {
                 return Err(t("SSH 密码为空（或改用密钥 / agent）").into());
             }
-            (f.ssh_password.clone(), String::new(), String::new(), false, String::new())
+            (
+                f.ssh_password.clone(),
+                String::new(),
+                String::new(),
+                false,
+                String::new(),
+            )
         }
         SshAuth::Key => {
             if f.ssh_key_path.trim().is_empty() {
@@ -24649,7 +25465,10 @@ fn save_form(app: &mut App, tx: &Tx) {
         return;
     }
     let Ok(db_type) = parse_database_type(&f.db_type) else {
-        app.form.err = tf("未知类型: {} (mysql / postgres / redis / mongodb …)", &[&(f.db_type)]);
+        app.form.err = tf(
+            "未知类型: {} (mysql / postgres / redis / mongodb …)",
+            &[&(f.db_type)],
+        );
         return;
     };
     let port = f
@@ -24841,7 +25660,7 @@ fn explain_sql_for(db_type: &str, sql: &str) -> Option<String> {
 /// RFC 4180 CSV field: quote when the value contains a comma, quote, CR or LF.
 fn csv_field(s: &str) -> String {
     if s.contains([',', '"', '\n', '\r']) {
-        format!("\"{}\"",  s.replace('"', "\"\""))
+        format!("\"{}\"", s.replace('"', "\"\""))
     } else {
         s.to_string()
     }
@@ -24961,7 +25780,10 @@ fn decode_csv_bytes(bytes: &[u8]) -> (String, String) {
     if !had_errors {
         return (cow.into_owned(), "GB18030/GBK".to_string());
     }
-    (String::from_utf8_lossy(bytes).into_owned(), "UTF-8 (lossy)".to_string())
+    (
+        String::from_utf8_lossy(bytes).into_owned(),
+        "UTF-8 (lossy)".to_string(),
+    )
 }
 
 /// `YYYY-MM-DD` with a plausible month/day (a cheap sanity check, not a
@@ -25296,7 +26118,8 @@ fn grid_to_json_array(grid: &Grid) -> String {
         .iter()
         .map(|row| serde_json::Value::Object(grid_row_object(grid, row)))
         .collect();
-    serde_json::to_string_pretty(&serde_json::Value::Array(arr)).unwrap_or_else(|_| "[]".to_string())
+    serde_json::to_string_pretty(&serde_json::Value::Array(arr))
+        .unwrap_or_else(|_| "[]".to_string())
 }
 
 /// NDJSON: one compact JSON object per line.
@@ -25429,7 +26252,11 @@ fn batch_insert_sql(
                     .enumerate()
                     .map(|(ci, _)| {
                         let v = row.get(ci).cloned().unwrap_or(Val::Null);
-                        insert_literal(&v, types.get(ci).and_then(|t| t.as_deref()), Some(cfg.db_type.as_str()))
+                        insert_literal(
+                            &v,
+                            types.get(ci).and_then(|t| t.as_deref()),
+                            Some(cfg.db_type.as_str()),
+                        )
                     })
                     .collect::<Vec<_>>()
                     .join(", ");
@@ -25821,15 +26648,9 @@ fn pan_columns(app: &mut App, delta: i32) -> bool {
 /// Shift+wheel (and some swallow Shift+wheel for their own horizontal scroll), so
 /// the app cannot rely on SHIFT alone. ALT and CONTROL are reported far more
 /// reliably, and `Ctrl-G` pan mode works regardless of what the terminal sends.
-fn wheel_wants_pan(
-    focus: Focus,
-    mods: KeyModifiers,
-    pan_mode: bool,
-    has_h_scroll: bool,
-) -> bool {
-    let modifier_pan = mods.intersects(
-        KeyModifiers::SHIFT | KeyModifiers::ALT | KeyModifiers::CONTROL,
-    );
+fn wheel_wants_pan(focus: Focus, mods: KeyModifiers, pan_mode: bool, has_h_scroll: bool) -> bool {
+    let modifier_pan =
+        mods.intersects(KeyModifiers::SHIFT | KeyModifiers::ALT | KeyModifiers::CONTROL);
     focus == Focus::Preview && (pan_mode || modifier_pan) && has_h_scroll
 }
 
@@ -25880,8 +26701,8 @@ fn mouse_wire_hint(m: &MouseEvent) -> String {
     // Legacy X10 encoding: three bytes after `ESC [ M`, each offset by 32.
     if x <= 223 && y <= 223 && cb + 32 <= 255 {
         out.push_str(&format!(
-            " | X10 \\x1b[M {}+32 {}+32 {}+32", 
-            cb,  m.column,  m.row
+            " | X10 \\x1b[M {}+32 {}+32 {}+32",
+            cb, m.column, m.row
         ));
     }
     out
@@ -25892,14 +26713,14 @@ fn describe_mouse(m: &MouseEvent) -> String {
     let mods = if m.modifiers.is_empty() {
         String::new()
     } else {
-        format!(" mods={:?}",  m.modifiers)
+        format!(" mods={:?}", m.modifiers)
     };
     format!(
-        "{:?} @({},{}){} · {}", 
-        m.kind, 
-        m.column, 
-        m.row, 
-        mods, 
+        "{:?} @({},{}){} · {}",
+        m.kind,
+        m.column,
+        m.row,
+        mods,
         mouse_wire_hint(m)
     )
 }
@@ -25907,7 +26728,7 @@ fn describe_mouse(m: &MouseEvent) -> String {
 /// Human-readable description of the mouse/resize events we trace.
 fn describe_event(ev: &Event) -> Option<String> {
     match ev {
-        Event::Mouse(m) => Some(format!("Mouse {}",  describe_mouse(m))),
+        Event::Mouse(m) => Some(format!("Mouse {}", describe_mouse(m))),
         Event::Resize(w, h) => Some(format!("Resize {w}x{h}")),
         _ => None,
     }
@@ -25921,9 +26742,12 @@ fn describe_event_short(ev: &Event) -> Option<String> {
             let mods = if m.modifiers.is_empty() {
                 String::new()
             } else {
-                format!(" mods={:?}",  m.modifiers)
+                format!(" mods={:?}", m.modifiers)
             };
-            Some(format!("Mouse {:?} @({},{}){}",  m.kind,  m.column,  m.row,  mods))
+            Some(format!(
+                "Mouse {:?} @({},{}){}",
+                m.kind, m.column, m.row, mods
+            ))
         }
         Event::Resize(w, h) => Some(format!("Resize {w}x{h}")),
         _ => None,
@@ -25951,7 +26775,11 @@ fn trace_event(app: &mut App, ev: &Event) {
 
 /// Short tab label for a query: its first non-empty line.
 fn query_tab_title(sql: &str) -> String {
-    let first = sql.lines().find(|l| !l.trim().is_empty()).unwrap_or("").trim();
+    let first = sql
+        .lines()
+        .find(|l| !l.trim().is_empty())
+        .unwrap_or("")
+        .trim();
     truncate_disp(first, 40)
 }
 
@@ -26027,9 +26855,7 @@ impl App {
     /// hot-path cost the render loop used to pay on every frame.
     fn column_widths(&mut self, grid: &Grid, max_cell: usize) -> Vec<usize> {
         if let Some((epoch, cell, widths)) = &self.width_cache {
-            if *epoch == self.grid_epoch
-                && *cell == max_cell
-                && widths.len() == grid.columns.len()
+            if *epoch == self.grid_epoch && *cell == max_cell && widths.len() == grid.columns.len()
             {
                 return widths.clone();
             }
@@ -26083,9 +26909,7 @@ impl App {
             return;
         };
         let db = self.current_db();
-        self.config
-            .entry(&db, &ps.schema, &ps.table)
-            .hidden = self.col_hidden.clone();
+        self.config.entry(&db, &ps.schema, &ps.table).hidden = self.col_hidden.clone();
         self.persist();
     }
 
@@ -26123,7 +26947,13 @@ impl App {
             self.locate_prompt = None;
         }
         self.rebuild_view();
-        self.sel = tab.sel.min(self.grid.as_ref().map(|g| g.rows.len()).unwrap_or(0).saturating_sub(1));
+        self.sel = tab.sel.min(
+            self.grid
+                .as_ref()
+                .map(|g| g.rows.len())
+                .unwrap_or(0)
+                .saturating_sub(1),
+        );
         self.col_offset = tab.col_offset;
         self.col_cursor = tab.col_cursor;
         self.page_state = None;
@@ -26143,9 +26973,13 @@ fn push_result_tab(
     app.save_result_tab();
     app.result_tabs.push(ResultTab {
         title,
-        grid: grid
-            .as_ref()
-            .map(|g| if kind == GridKind::Columns { g.clone() } else { filter_grid(g, &app.col_hidden) }),
+        grid: grid.as_ref().map(|g| {
+            if kind == GridKind::Columns {
+                g.clone()
+            } else {
+                filter_grid(g, &app.col_hidden)
+            }
+        }),
         grid_full: grid.clone(),
         script: script.clone(),
         kind,
@@ -26189,9 +27023,13 @@ fn replace_result_tab(
     let idx = app.result_tab.min(app.result_tabs.len() - 1);
     app.result_tabs[idx] = ResultTab {
         title,
-        grid: grid
-            .as_ref()
-            .map(|g| if kind == GridKind::Columns { g.clone() } else { filter_grid(g, &app.col_hidden) }),
+        grid: grid.as_ref().map(|g| {
+            if kind == GridKind::Columns {
+                g.clone()
+            } else {
+                filter_grid(g, &app.col_hidden)
+            }
+        }),
         grid_full: grid.clone(),
         script: script.clone(),
         kind,
@@ -26225,7 +27063,10 @@ fn switch_result_tab(app: &mut App, delta: i32) {
     let n = app.result_tabs.len() as i32;
     app.result_tab = (app.result_tab as i32 + delta).rem_euclid(n) as usize;
     app.restore_result_tab();
-    app.status = tf("结果 {}/{}", &[&(app.result_tab + 1), &(app.result_tabs.len())]);
+    app.status = tf(
+        "结果 {}/{}",
+        &[&(app.result_tab + 1), &(app.result_tabs.len())],
+    );
 }
 
 /// `Alt-F` in the results pane (R48): pin / unpin the current grid. A pinned
@@ -26265,7 +27106,7 @@ fn explain_current(app: &mut App, tx: &Tx) {
     match explain_sql_for(cfg.db_type.as_str(), &sql) {
         Some(explain) => {
             app.loading = true;
-            app.status = format!("{} EXPLAIN…",  cfg.db_type.as_str());
+            app.status = format!("{} EXPLAIN…", cfg.db_type.as_str());
             let db = app.current_db();
             app.spawn(
                 tx,
@@ -26273,7 +27114,10 @@ fn explain_current(app: &mut App, tx: &Tx) {
             );
         }
         None => {
-            app.status = tf("{} 不支持单语句 EXPLAIN（请手动执行）", &[&(cfg.db_type.as_str())]);
+            app.status = tf(
+                "{} 不支持单语句 EXPLAIN（请手动执行）",
+                &[&(cfg.db_type.as_str())],
+            );
         }
     }
 }
@@ -26344,7 +27188,8 @@ fn choose_export_format(app: &mut App, format: ExportFormat) {
         match export_insert_table(app) {
             Some(t) => Some(t),
             None => {
-                app.status = t("无法确定表名，INSERT 导出不可用（先浏览表或含 FROM 的查询）").into();
+                app.status =
+                    t("无法确定表名，INSERT 导出不可用（先浏览表或含 FROM 的查询）").into();
                 app.export_open = false;
                 return;
             }
@@ -26396,9 +27241,7 @@ fn export_path_key(app: &mut App, tx: &Tx, k: KeyEvent) {
                     &[&label, &n, &(p.display())],
                 )
             }
-            None => {
-                app.status = tf("✓ 已导出 {} 到剪贴板（{} 字符）", &[&label, &n])
-            }
+            None => app.status = tf("✓ 已导出 {} 到剪贴板（{} 字符）", &[&label, &n]),
         }
         return;
     }
@@ -26593,10 +27436,7 @@ fn start_import(app: &mut App, tx: &Tx, plan: &ImportPlan) {
 
 /// Completion overlay keys.
 fn import_report_key(app: &mut App, k: KeyEvent) {
-    if matches!(
-        k.code,
-        KeyCode::Esc | KeyCode::Enter | KeyCode::Char('q')
-    ) {
+    if matches!(k.code, KeyCode::Esc | KeyCode::Enter | KeyCode::Char('q')) {
         app.import_report = None;
     }
 }
@@ -26824,10 +27664,13 @@ fn map_driver_alias(key: &str) -> Option<&'static str> {
     Some(match key {
         "mysql" | "mariadb" | "mysql5" | "mysql8" | "mysqlconnector" => "mysql",
         "postgresql" | "pgsql" | "pg" | "postgresql9" | "postgresql10" | "postgresql11"
-        | "postgresql12" | "postgresql13" | "postgresql14" | "postgresql15" | "postgresql16" => "postgres",
+        | "postgresql12" | "postgresql13" | "postgresql14" | "postgresql15" | "postgresql16" => {
+            "postgres"
+        }
         "sqlite3" => "sqlite",
-        "mssql" | "jtds" | "sqlserver2005" | "sqlserver2008" | "sqlserver2012" | "sqlserver2014"
-        | "sqlserver2016" | "sqlserver2017" | "sqlserver2019" | "sqlserver2022" | "microsoftsqlserver" => "sqlserver",
+        "mssql" | "jtds" | "sqlserver2005" | "sqlserver2008" | "sqlserver2012"
+        | "sqlserver2014" | "sqlserver2016" | "sqlserver2017" | "sqlserver2019"
+        | "sqlserver2022" | "microsoftsqlserver" => "sqlserver",
         "oracleoci" | "oraclethin" => "oracle",
         "presto" | "prestodb" | "prestosql" => "prestosql",
         "hive2" | "hivejdbc" | "hiveserver2" => "hive",
@@ -26853,7 +27696,10 @@ fn ssh_export_value(ssh: &SshTunnelConfig, include_passwords: bool) -> serde_jso
         m.insert("use_agent".into(), serde_json::json!(true));
     }
     if !ssh.ssh_agent_sock_path.is_empty() {
-        m.insert("agent_sock".into(), serde_json::json!(ssh.ssh_agent_sock_path));
+        m.insert(
+            "agent_sock".into(),
+            serde_json::json!(ssh.ssh_agent_sock_path),
+        );
     }
     if !ssh.key_path.is_empty() {
         m.insert("key_path".into(), serde_json::json!(ssh.key_path));
@@ -26863,7 +27709,10 @@ fn ssh_export_value(ssh: &SshTunnelConfig, include_passwords: bool) -> serde_jso
             m.insert("password".into(), serde_json::json!(ssh.password));
         }
         if !ssh.key_passphrase.is_empty() {
-            m.insert("key_passphrase".into(), serde_json::json!(ssh.key_passphrase));
+            m.insert(
+                "key_passphrase".into(),
+                serde_json::json!(ssh.key_passphrase),
+            );
         }
     }
     serde_json::Value::Object(m)
@@ -26938,7 +27787,9 @@ fn parse_ssh_value(m: &serde_json::Map<String, serde_json::Value>) -> ImportSsh 
 fn parse_dbxt_bundle(arr: &[serde_json::Value]) -> Result<Vec<ImportConn>, String> {
     let mut out = Vec::new();
     for item in arr {
-        let Some(obj) = item.as_object() else { continue };
+        let Some(obj) = item.as_object() else {
+            continue;
+        };
         let mut c = ImportConn::default();
         c.name = cfg_str(obj, &["name"]).unwrap_or_default();
         c.driver = cfg_str(obj, &["db_type", "dbType", "type"]).unwrap_or_default();
@@ -26963,7 +27814,10 @@ fn parse_dbxt_bundle(arr: &[serde_json::Value]) -> Result<Vec<ImportConn>, Strin
 }
 
 fn parse_dbeaver_ssh(m: &serde_json::Map<String, serde_json::Value>) -> ImportSsh {
-    let key_path = cfg_str(m, &["private-key-path", "privateKeyPath", "key-path", "keyPath"]);
+    let key_path = cfg_str(
+        m,
+        &["private-key-path", "privateKeyPath", "key-path", "keyPath"],
+    );
     let auth = cfg_str(m, &["auth-type", "authType"])
         .unwrap_or_default()
         .to_ascii_lowercase();
@@ -26993,7 +27847,9 @@ fn parse_dbeaver_json(v: &serde_json::Value) -> Result<Vec<ImportConn>, String> 
         .ok_or_else(|| t("不是 DBeaver data-sources.json（缺少 connections 对象）").to_string())?;
     let mut out = Vec::new();
     for (id, item) in map {
-        let Some(obj) = item.as_object() else { continue };
+        let Some(obj) = item.as_object() else {
+            continue;
+        };
         let cfg = obj.get("configuration").and_then(|c| c.as_object());
         let mut c = ImportConn::default();
         c.name = cfg_str(obj, &["name"]).unwrap_or_else(|| id.clone());
@@ -27002,7 +27858,8 @@ fn parse_dbeaver_json(v: &serde_json::Value) -> Result<Vec<ImportConn>, String> 
             .unwrap_or_default();
         c.db_type = map_driver_to_db_type(&c.driver).map(str::to_string);
         if let Some(cfg) = cfg {
-            c.host = cfg_str(cfg, &["host", "serverName", "hostName", "server"]).unwrap_or_default();
+            c.host =
+                cfg_str(cfg, &["host", "serverName", "hostName", "server"]).unwrap_or_default();
             c.port = cfg.get("port").and_then(value_to_port);
             c.user = cfg_str(cfg, &["user", "username"]).unwrap_or_default();
             c.database = cfg_str(cfg, &["database", "databaseName", "db"]);
@@ -27012,7 +27869,12 @@ fn parse_dbeaver_json(v: &serde_json::Value) -> Result<Vec<ImportConn>, String> 
                 }
             }
             let ssl_mode = cfg_str(cfg, &["sslMode", "ssl_mode"])
-                .map(|s| matches!(s.to_ascii_lowercase().as_str(), "require" | "required" | "verify-ca" | "verify-full"))
+                .map(|s| {
+                    matches!(
+                        s.to_ascii_lowercase().as_str(),
+                        "require" | "required" | "verify-ca" | "verify-full"
+                    )
+                })
                 .unwrap_or(false);
             c.ssl = value_truthy(cfg.get("ssl")) || ssl_mode;
         }
@@ -27053,7 +27915,10 @@ fn parse_navicat_xml(text: &str) -> Vec<ImportConn> {
         let start = pos + rel;
         let after = lower.as_bytes().get(start + needle.len()).copied();
         // Skip `<connections>` (the root element).
-        if !matches!(after, Some(b'>') | Some(b'/') | Some(b' ') | Some(b'\t') | Some(b'\n') | Some(b'\r')) {
+        if !matches!(
+            after,
+            Some(b'>') | Some(b'/') | Some(b' ') | Some(b'\t') | Some(b'\n') | Some(b'\r')
+        ) {
             pos = start + needle.len();
             continue;
         }
@@ -27078,8 +27943,16 @@ fn parse_navicat_xml(text: &str) -> Vec<ImportConn> {
 
 fn parse_navicat_conn(block: &str) -> ImportConn {
     let mut c = ImportConn::default();
-    c.name = xml_field(block, &["name", "connectionname", "connection_name", "connname"]).unwrap_or_default();
-    c.driver = xml_field(block, &["conntype", "conn_type", "type", "servertype", "dbtype"]).unwrap_or_default();
+    c.name = xml_field(
+        block,
+        &["name", "connectionname", "connection_name", "connname"],
+    )
+    .unwrap_or_default();
+    c.driver = xml_field(
+        block,
+        &["conntype", "conn_type", "type", "servertype", "dbtype"],
+    )
+    .unwrap_or_default();
     c.db_type = map_driver_to_db_type(&c.driver).map(str::to_string);
     c.host = xml_field(block, &["host", "hostname", "server", "address"]).unwrap_or_default();
     c.port = xml_field(block, &["port"]).and_then(|p| p.trim().parse::<u16>().ok());
@@ -27088,7 +27961,10 @@ fn parse_navicat_conn(block: &str) -> ImportConn {
     c.ssl = xml_field(block, &["usessl", "ssl", "sslmode", "sslenabled"])
         .map(|v| {
             let v = v.trim().to_ascii_lowercase();
-            matches!(v.as_str(), "true" | "1" | "yes" | "on" | "require" | "required") || v.contains("verify")
+            matches!(
+                v.as_str(),
+                "true" | "1" | "yes" | "on" | "require" | "required"
+            ) || v.contains("verify")
         })
         .unwrap_or(false);
     c.color = xml_field(block, &["color"]);
@@ -27106,9 +27982,22 @@ fn parse_navicat_conn(block: &str) -> ImportConn {
             .and_then(|p| p.trim().parse::<u16>().ok())
             .unwrap_or(22);
         ssh.user = xml_field(block, &["ssh_user", "ssh_username", "sshuser"]).unwrap_or_default();
-        ssh.key_path = xml_field(block, &["ssh_keypath", "ssh_key_path", "ssh_privatekeypath", "sshprivatekeypath"]);
+        ssh.key_path = xml_field(
+            block,
+            &[
+                "ssh_keypath",
+                "ssh_key_path",
+                "ssh_privatekeypath",
+                "sshprivatekeypath",
+            ],
+        );
         ssh.use_agent = xml_field(block, &["ssh_useagent", "sshagent", "ssh_use_agent"])
-            .map(|v| matches!(v.trim().to_ascii_lowercase().as_str(), "true" | "1" | "yes" | "on"))
+            .map(|v| {
+                matches!(
+                    v.trim().to_ascii_lowercase().as_str(),
+                    "true" | "1" | "yes" | "on"
+                )
+            })
             .unwrap_or(false);
         ssh.auth_method = if ssh.key_path.is_some() {
             "key".into()
@@ -27144,7 +28033,10 @@ fn xml_element(block: &str, name: &str) -> Option<String> {
     while let Some(rel) = lower[from..].find(&needle) {
         let start = from + rel;
         let after = lower.as_bytes().get(start + needle.len()).copied();
-        if !matches!(after, Some(b'>') | Some(b'/') | Some(b' ') | Some(b'\t') | Some(b'\n') | Some(b'\r')) {
+        if !matches!(
+            after,
+            Some(b'>') | Some(b'/') | Some(b' ') | Some(b'\t') | Some(b'\n') | Some(b'\r')
+        ) {
             from = start + needle.len();
             continue;
         }
@@ -27166,8 +28058,15 @@ fn xml_attr(block: &str, name: &str) -> Option<String> {
     let mut from = 0usize;
     while let Some(rel) = lower[from..].find(&needle) {
         let start = from + rel;
-        let prev = if start == 0 { None } else { bytes.get(start - 1).copied() };
-        if !matches!(prev, None | Some(b' ') | Some(b'\t') | Some(b'\n') | Some(b'\r') | Some(b'>')) {
+        let prev = if start == 0 {
+            None
+        } else {
+            bytes.get(start - 1).copied()
+        };
+        if !matches!(
+            prev,
+            None | Some(b' ') | Some(b'\t') | Some(b'\n') | Some(b'\r') | Some(b'>')
+        ) {
             from = start + needle.len();
             continue;
         }
@@ -27270,7 +28169,11 @@ fn build_conn_import_plan(
 }
 
 fn unique_import_name(base: &str, used: &[String]) -> String {
-    let base = if base.trim().is_empty() { "imported" } else { base.trim() };
+    let base = if base.trim().is_empty() {
+        "imported"
+    } else {
+        base.trim()
+    };
     let mut candidate = format!("{base}{CONN_IMPORT_SUFFIX}");
     let mut n = 2usize;
     while used.iter().any(|u| u == &candidate) {
@@ -27301,7 +28204,11 @@ fn import_ssh_to_layer(conn_name: &str, s: &ImportSsh) -> SshTunnelConfig {
     }
 }
 
-fn import_conn_to_config(c: &ImportConn, name: String, id: String) -> Result<ConnectionConfig, String> {
+fn import_conn_to_config(
+    c: &ImportConn,
+    name: String,
+    id: String,
+) -> Result<ConnectionConfig, String> {
     let raw = c
         .db_type
         .clone()
@@ -27370,7 +28277,9 @@ fn resolve_import_targets(rows: &[ConnImportRow], existing: &[ConnectionConfig])
         if row.conn.needs_password {
             needs_password += 1;
         }
-        let id = replace_id.clone().unwrap_or_else(|| Uuid::new_v4().to_string());
+        let id = replace_id
+            .clone()
+            .unwrap_or_else(|| Uuid::new_v4().to_string());
         match import_conn_to_config(&row.conn, name.clone(), id) {
             Ok(cfg) => {
                 used.push(name);
@@ -27379,10 +28288,20 @@ fn resolve_import_targets(rows: &[ConnImportRow], existing: &[ConnectionConfig])
             Err(e) => errors.push(e),
         }
     }
-    ImportTargets { items, skipped, needs_password, errors }
+    ImportTargets {
+        items,
+        skipped,
+        needs_password,
+        errors,
+    }
 }
 
-fn conn_import_status(added: usize, skipped: usize, needs_password: usize, failed: &[String]) -> String {
+fn conn_import_status(
+    added: usize,
+    skipped: usize,
+    needs_password: usize,
+    failed: &[String],
+) -> String {
     if !failed.is_empty() {
         return format!("✗ {}", tf("导入失败: {}", &[&failed.join("; ")]));
     }
@@ -27420,7 +28339,9 @@ fn open_conn_export(app: &mut App) {
 /// `Alt-I`: open the connection-file path prompt.
 fn open_conn_import(app: &mut App) {
     let mut ta = TextArea::default();
-    ta.set_placeholder_text(t("连接文件路径（dbxt / DBeaver data-sources.json / Navicat .ncx，支持 ~）"));
+    ta.set_placeholder_text(t(
+        "连接文件路径（dbxt / DBeaver data-sources.json / Navicat .ncx，支持 ~）",
+    ));
     app.conn_import_path = Some(ta);
     app.status = t("导入连接 · 输入文件路径 · Enter 预览 · Esc 取消").into();
 }
@@ -27452,7 +28373,10 @@ fn export_conns_file(app: &mut App, path_input: &str, include_passwords: bool) {
     match std::fs::write(&path, json.as_bytes()) {
         Ok(()) => {
             app.status = if include_passwords {
-                tf("✓ 已导出 {} 条连接（含明文密码）→ {}", &[&n, &(path.display())])
+                tf(
+                    "✓ 已导出 {} 条连接（含明文密码）→ {}",
+                    &[&n, &(path.display())],
+                )
             } else {
                 tf("✓ 已导出 {} 条连接 → {}", &[&n, &(path.display())])
             };
@@ -27665,7 +28589,10 @@ fn conn_import_plan_key(app: &mut App, tx: &Tx, k: KeyEvent) {
                     let next = row.policy.next();
                     if next == DupPolicy::Overwrite {
                         plan.confirm = Some(ConnOverwriteScope::Row(plan.cursor));
-                        app.status = tf("⚠ 覆盖同名连接 {} · Enter 确认 / Esc 取消", &[&row.conn.name]);
+                        app.status = tf(
+                            "⚠ 覆盖同名连接 {} · Enter 确认 / Esc 取消",
+                            &[&row.conn.name],
+                        );
                     } else if let Some(target) = plan.rows.get_mut(plan.cursor) {
                         target.policy = next;
                         app.status = tf("{} · {}", &[&row.conn.name, &next.label()]);
@@ -27708,7 +28635,14 @@ fn run_conn_import(app: &mut App, tx: &Tx, plan: &ConnImportPlan) {
     app.conn_import_plan = None;
     app.loading = true;
     app.status = tf("导入 {} 条连接…", &[&count]);
-    app.spawn(tx, Op::ImportConns { items, skipped, needs_password });
+    app.spawn(
+        tx,
+        Op::ImportConns {
+            items,
+            skipped,
+            needs_password,
+        },
+    );
 }
 
 /// `Ctrl-O`: open the saved-SQL snippet overlay for the current connection.
@@ -27759,7 +28693,9 @@ fn snippet_key(app: &mut App, tx: &Tx, k: KeyEvent) {
                 app.snippet_list.select(Some(i));
             }
         }
-        KeyCode::Char('r') if k.modifiers.is_empty() => open_snippets_impl(app, tx, app.snippet_insert),
+        KeyCode::Char('r') if k.modifiers.is_empty() => {
+            open_snippets_impl(app, tx, app.snippet_insert)
+        }
         // `s`: save the editor's SQL as a new DBX favourite.
         KeyCode::Char('s') if k.modifiers.is_empty() => open_snippet_name(app),
         KeyCode::Enter => {
@@ -27825,10 +28761,7 @@ fn snippet_name_key(app: &mut App, tx: &Tx, k: KeyEvent) {
             };
             let sql = app.editor_sql();
             app.status = tf("保存片段 {} …", &[&(name)]);
-            app.spawn(
-                tx,
-                Op::SaveSnippet(Box::new(cfg), name, sql),
-            );
+            app.spawn(tx, Op::SaveSnippet(Box::new(cfg), name, sql));
         }
         KeyCode::Esc => {
             app.snippet_name = None;
@@ -28131,7 +29064,10 @@ fn render_mouse_debug(f: &mut Frame, area: Rect, app: &App) {
         width: w,
         height: h,
     };
-    let title = tf(" 鼠标事件 DBXT_MOUSE_DEBUG · 横滑={} ", &[&format!("{:?}", app.drag_pan)]);
+    let title = tf(
+        " 鼠标事件 DBXT_MOUSE_DEBUG · 横滑={} ",
+        &[&format!("{:?}", app.drag_pan)],
+    );
     f.render_widget(Clear, rect);
     f.render_widget(
         Paragraph::new(lines).block(
@@ -28178,25 +29114,29 @@ fn render_header(f: &mut Frame, area: Rect, app: &App) {
     let conn = app
         .selected
         .as_ref()
-        .map(|c| format!("{} ({})",  c.name,  c.db_type.as_str()))
+        .map(|c| format!("{} ({})", c.name, c.db_type.as_str()))
         .unwrap_or_else(|| t("未连接").into());
     // The current connection carries its own colour in the title bar, matching
     // the sidebar / picker (the name stays fully readable either way).
     let conn_style = app
         .selected
         .as_ref()
-        .map(|c| Style::default().fg(connection_color(c)).add_modifier(Modifier::BOLD))
+        .map(|c| {
+            Style::default()
+                .fg(connection_color(c))
+                .add_modifier(Modifier::BOLD)
+        })
         .unwrap_or_else(|| Style::default().add_modifier(Modifier::BOLD));
     let db = if app.selected.is_some() {
         if app.backend_kind == Backend::Redis {
-            format!(" · db:{}",  app.redis_db)
+            format!(" · db:{}", app.redis_db)
         } else if !app.current_db().is_empty() {
             let schema = if app.schema.is_empty() {
                 String::new()
             } else {
-                format!(".{}",  fix_double_encoding(&app.schema))
+                format!(".{}", fix_double_encoding(&app.schema))
             };
-            format!(" · db:{}{schema}",  fix_double_encoding(&app.current_db()))
+            format!(" · db:{}{schema}", fix_double_encoding(&app.current_db()))
         } else {
             String::new()
         }
@@ -28216,9 +29156,9 @@ fn render_header(f: &mut Frame, area: Rect, app: &App) {
             .map(|t| t.elapsed().as_secs())
             .unwrap_or(0);
         if secs >= 3 {
-            format!(" {} {}s",  spinner_frame(app.spinner),  secs)
+            format!(" {} {}s", spinner_frame(app.spinner), secs)
         } else {
-            format!(" {}",  spinner_frame(app.spinner))
+            format!(" {}", spinner_frame(app.spinner))
         }
     } else {
         String::new()
@@ -28327,7 +29267,10 @@ fn context_info(app: &App) -> String {
     });
     // Result tabs (queries only).
     if app.result_tabs.len() > 1 && app.grid_kind != GridKind::TableData {
-        parts.push(tf("结果 {}/{}", &[&(app.result_tab + 1), &(app.result_tabs.len())]));
+        parts.push(tf(
+            "结果 {}/{}",
+            &[&(app.result_tab + 1), &(app.result_tabs.len())],
+        ));
     }
     // Live event readout while `DBXT_EVENT_TRACE` is set, so a user can report
     // exactly which events their terminal sends for a swipe. Pushed last so the
@@ -28401,7 +29344,10 @@ fn render_status(f: &mut Frame, area: Rect, app: &App) {
         .as_ref()
         .map(|(n, _)| disp_width(&format!("● {n} ")) as u16)
         .unwrap_or(0);
-    let msg = fit_status(&app.status, chunks[0].width.saturating_sub(prefix_w) as usize);
+    let msg = fit_status(
+        &app.status,
+        chunks[0].width.saturating_sub(prefix_w) as usize,
+    );
     let mut left: Vec<Span> = Vec::new();
     if let Some((name, color)) = badge {
         left.push(Span::styled(
@@ -28575,7 +29521,11 @@ fn footer_ctx_inner(app: &App, include_help: bool) -> FooterCtx {
         FooterView::TransferPrompt
     } else if app.transfer.as_ref().is_some_and(|w| w.submitted) {
         FooterView::TransferRunning
-    } else if app.transfer.as_ref().is_some_and(|w| w.step == TransferStep::Confirm) {
+    } else if app
+        .transfer
+        .as_ref()
+        .is_some_and(|w| w.step == TransferStep::Confirm)
+    {
         FooterView::TransferConfirm
     } else if app.transfer.is_some() {
         FooterView::TransferWizard
@@ -28597,7 +29547,10 @@ fn footer_ctx_inner(app: &App, include_help: bool) -> FooterCtx {
         FooterView::NewConn
     } else if app.picker_open && app.selected.is_none() {
         FooterView::ConnPicker
-    } else if app.backend_kind == Backend::Redis && app.selected.is_some() && app.focus == Focus::Sidebar {
+    } else if app.backend_kind == Backend::Redis
+        && app.selected.is_some()
+        && app.focus == Focus::Sidebar
+    {
         FooterView::RedisKeys
     } else if app.backend_kind == Backend::Redis && app.grid_kind == GridKind::RedisValue {
         FooterView::RedisValue
@@ -28622,10 +29575,7 @@ fn footer_ctx_inner(app: &App, include_help: bool) -> FooterCtx {
 fn footer_hints_ctx(ctx: FooterCtx) -> Vec<Hint> {
     let mut v: Vec<Hint> = match ctx.view {
         FooterView::Help => vec![("↑↓", t("滚动")), ("Esc", t("关闭"))],
-        FooterView::HelpMini => vec![
-            ("Enter/?", t("全部键位")),
-            ("Esc", t("关闭")),
-        ],
+        FooterView::HelpMini => vec![("Enter/?", t("全部键位")), ("Esc", t("关闭"))],
         // R20–R22 overlays: import / export / Redis input dialogs. Without
         // these arms the footer fell through to the page's group while an
         // overlay owned the keyboard.
@@ -28672,10 +29622,7 @@ fn footer_hints_ctx(ctx: FooterCtx) -> Vec<Hint> {
         FooterView::TablePrompt | FooterView::ResultFilter => {
             vec![("Enter", t("保留")), ("Esc", t("清除"))]
         }
-        FooterView::LocatePrompt => vec![
-            ("Enter", t("跳到命中")),
-            ("Esc", t("清除")),
-        ],
+        FooterView::LocatePrompt => vec![("Enter", t("跳到命中")), ("Esc", t("清除"))],
         FooterView::ColJump => vec![("Enter", t("跳列")), ("Esc", t("取消"))],
         FooterView::HistoryFilter => vec![("Enter", t("保留")), ("Esc", t("清除"))],
         FooterView::History => vec![
@@ -28723,10 +29670,7 @@ fn footer_hints_ctx(ctx: FooterCtx) -> Vec<Hint> {
             ("↑↓", t("滚动")),
             ("Esc", t("关闭")),
         ],
-        FooterView::DataWhere => vec![
-            ("Enter", t("开始对比")),
-            ("Esc", t("取消")),
-        ],
+        FooterView::DataWhere => vec![("Enter", t("开始对比")), ("Esc", t("取消"))],
         FooterView::TransferWizard => vec![
             ("↑↓", t("选择")),
             ("Enter", t("下一步/切换")),
@@ -28734,10 +29678,7 @@ fn footer_hints_ctx(ctx: FooterCtx) -> Vec<Hint> {
             ("w/l", t("WHERE/LIMIT")),
             ("Esc", t("取消")),
         ],
-        FooterView::TransferConfirm => vec![
-            ("Enter", t("确认覆盖")),
-            ("Esc", t("返回")),
-        ],
+        FooterView::TransferConfirm => vec![("Enter", t("确认覆盖")), ("Esc", t("返回"))],
         FooterView::TransferRunning => vec![("Esc", t("中止搬运"))],
         FooterView::TransferPrompt => vec![("Enter", t("确定")), ("Esc", t("取消"))],
         FooterView::TransferReport => vec![
@@ -28745,11 +29686,7 @@ fn footer_hints_ctx(ctx: FooterCtx) -> Vec<Hint> {
             ("b", t("浏览目标表")),
             ("Esc", t("关闭")),
         ],
-        FooterView::Recent => vec![
-            ("↑↓", t("选择")),
-            ("Enter", t("直达")),
-            ("Esc", t("关闭")),
-        ],
+        FooterView::Recent => vec![("↑↓", t("选择")), ("Enter", t("直达")), ("Esc", t("关闭"))],
         FooterView::ColPicker => vec![
             ("Space", t("勾选")),
             ("a", t("全选")),
@@ -28791,10 +29728,7 @@ fn footer_hints_ctx(ctx: FooterCtx) -> Vec<Hint> {
             ("Ctrl-V", t("转编辑器")),
             ("Ctrl-T", t("加入批量")),
         ],
-        FooterView::MongoDoc => vec![
-            ("Ctrl-S", t("校验并保存")),
-            ("Esc", t("取消")),
-        ],
+        FooterView::MongoDoc => vec![("Ctrl-S", t("校验并保存")), ("Esc", t("取消"))],
         FooterView::DbPicker => vec![
             ("↑↓", t("选择")),
             ("Enter", t("切换")),
@@ -29054,11 +29988,7 @@ fn render_browse(f: &mut Frame, area: Rect, app: &mut App) {
     // Stacked layout when the terminal is narrow or the sidebar is collapsed:
     // the sidebar becomes a one-line strip above the editor / results column.
     if mode == LayoutMode::Narrow || sidebar_collapsed {
-        let sidebar_h = if sidebar_collapsed {
-            1
-        } else {
-            7
-        };
+        let sidebar_h = if sidebar_collapsed { 1 } else { 7 };
         let v = Layout::vertical([Constraint::Length(sidebar_h), Constraint::Min(4)]).split(area);
         app.rects.sidebar = v[0];
         if sidebar_collapsed {
@@ -29068,11 +29998,7 @@ fn render_browse(f: &mut Frame, area: Rect, app: &mut App) {
         }
         render_main_area(f, v[1], app, editor_collapsed, results_collapsed, has_cmd);
     } else {
-        let sidebar_w = sidebar_width(
-            app.term_w,
-            mode,
-            sidebar_tree_longest_name(app),
-        );
+        let sidebar_w = sidebar_width(app.term_w, mode, sidebar_tree_longest_name(app));
         let hz =
             Layout::horizontal([Constraint::Length(sidebar_w), Constraint::Min(20)]).split(area);
         app.rects.sidebar = hz[0];
@@ -29145,8 +30071,8 @@ fn render_main_area(
 
     if has_cmd {
         let title = match app.backend_kind {
-            Backend::Redis => format!(" redis[{}] ",  app.redis_db),
-            Backend::Mongo => format!(" mongo({}) ",  app.current_db()),
+            Backend::Redis => format!(" redis[{}] ", app.redis_db),
+            Backend::Mongo => format!(" mongo({}) ", app.current_db()),
             Backend::Sql => " cmd ".into(),
         };
         let cfocused = app.focus == Focus::CmdInput;
@@ -29174,24 +30100,30 @@ fn render_sidebar_strip(f: &mut Frame, area: Rect, app: &mut App) {
     let mut text = String::new();
     if let Some(c) = &app.selected {
         if app.backend_kind == Backend::Redis {
-            text.push_str(&tf("▸ {} · {} keys", &[&(truncate_disp(&c.name, 16)), &(app.redis_scan.keys.len())]));
-            text.push_str(&format!(" · db{}",  app.redis_db));
+            text.push_str(&tf(
+                "▸ {} · {} keys",
+                &[&(truncate_disp(&c.name, 16)), &(app.redis_scan.keys.len())],
+            ));
+            text.push_str(&format!(" · db{}", app.redis_db));
             if let Some(v) = &app.redis_value {
-                text.push_str(&format!(" · {}",  fix_double_encoding(&v.key_display)));
+                text.push_str(&format!(" · {}", fix_double_encoding(&v.key_display)));
             }
         } else {
-            text.push_str(&tf("▸ {} · {} 表", &[&(truncate_disp(&c.name, 16)), &(app.tables.len())]));
+            text.push_str(&tf(
+                "▸ {} · {} 表",
+                &[&(truncate_disp(&c.name, 16)), &(app.tables.len())],
+            ));
             let db = app.current_db();
             if !db.is_empty() {
                 let schema = if app.schema.is_empty() {
                     String::new()
                 } else {
-                    format!(".{}",  fix_double_encoding(&app.schema))
+                    format!(".{}", fix_double_encoding(&app.schema))
                 };
-                text.push_str(&format!(" · {db}{schema}",  db = fix_double_encoding(&db)));
+                text.push_str(&format!(" · {db}{schema}", db = fix_double_encoding(&db)));
             }
             if let Some(t) = app.selected_table() {
-                text.push_str(&format!(" · {}",  fix_double_encoding(&t.name)));
+                text.push_str(&format!(" · {}", fix_double_encoding(&t.name)));
             }
         }
     } else {
@@ -29261,11 +30193,18 @@ fn render_results_pane(f: &mut Frame, area: Rect, app: &mut App) {
     if let Some(s) = app.script.clone() {
         if let Some(i) = s.drilled {
             let o = &s.outcomes[i];
-            let title = tf(" {}语句 {} 结果 · {} · Esc 返回脚本 ", &[&(search_marker(app)), &(i + 1), &(if o.grid.note.is_empty() {
-                    "".to_string()
-                } else {
-                    o.grid.note.clone()
-                })]);
+            let title = tf(
+                " {}语句 {} 结果 · {} · Esc 返回脚本 ",
+                &[
+                    &(search_marker(app)),
+                    &(i + 1),
+                    &(if o.grid.note.is_empty() {
+                        "".to_string()
+                    } else {
+                        o.grid.note.clone()
+                    }),
+                ],
+            );
             if let Some(grid) = active_grid(app) {
                 render_grid(f, area, app, &grid, GridKind::Query, &title, false);
             }
@@ -29289,7 +30228,9 @@ fn render_results_pane(f: &mut Frame, area: Rect, app: &mut App) {
     let area = if app.backend_kind == Backend::Sql {
         match app.pinned_result.clone() {
             Some(pin) if area.height >= 8 && area.width >= 12 => {
-                let ph = (area.height / 3).clamp(4, 7).min(area.height.saturating_sub(4));
+                let ph = (area.height / 3)
+                    .clamp(4, 7)
+                    .min(area.height.saturating_sub(4));
                 let top = Rect { height: ph, ..area };
                 let bottom = Rect {
                     y: area.y + ph,
@@ -29368,7 +30309,10 @@ fn search_marker(app: &App) -> String {
     if app.result_needle.trim().is_empty() {
         String::new()
     } else {
-        tf("🔍「{}」{} 命中 · ", &[&(app.result_needle), &(result_row_count(app))])
+        tf(
+            "🔍「{}」{} 命中 · ",
+            &[&(app.result_needle), &(result_row_count(app))],
+        )
     }
 }
 
@@ -29388,7 +30332,15 @@ fn narrow_table_title(app: &App, ps: &PageState) -> String {
     } else {
         format!(" {marks}")
     };
-    tf(" {}.{}{} · p{} ", &[&fix_double_encoding(&app.current_db()), &table, &marks, &(ps.page + 1)])
+    tf(
+        " {}.{}{} · p{} ",
+        &[
+            &fix_double_encoding(&app.current_db()),
+            &table,
+            &marks,
+            &(ps.page + 1),
+        ],
+    )
 }
 
 fn grid_title(app: &App) -> String {
@@ -29408,36 +30360,91 @@ fn grid_title(app: &App) -> String {
             let rows = app.grid.as_ref().map(|g| g.rows.len()).unwrap_or(0);
             let offset = ps.page * ps.page_size;
             let total = total_label(ps);
-            let more = if ps.has_next { t(" · n 下一页") } else { "" };
+            let more = if ps.has_next {
+                t(" · n 下一页")
+            } else {
+                ""
+            };
             let table_label = fix_double_encoding(&qualified_display(&ps.schema, &ps.table));
-            tf(" {}{}.{} · 第 {} 页 · {}–{} / {} · {}{}{} ", &[&(search_marker(app)), &(fix_double_encoding(&app.current_db())), &(table_label), &(ps.page + 1), &(if rows == 0 { 0 } else { offset + 1 }), &(offset + rows), &(total), &(app.grid.as_ref().map(|g| g.note.clone()).unwrap_or_default()), &(more), &(page_state_extra(ps))])
+            tf(
+                " {}{}.{} · 第 {} 页 · {}–{} / {} · {}{}{} ",
+                &[
+                    &(search_marker(app)),
+                    &(fix_double_encoding(&app.current_db())),
+                    &(table_label),
+                    &(ps.page + 1),
+                    &(if rows == 0 { 0 } else { offset + 1 }),
+                    &(offset + rows),
+                    &(total),
+                    &(app
+                        .grid
+                        .as_ref()
+                        .map(|g| g.note.clone())
+                        .unwrap_or_default()),
+                    &(more),
+                    &(page_state_extra(ps)),
+                ],
+            )
         }
         GridKind::Columns => {
             let table = app
                 .selected_table()
                 .map(|t| fix_double_encoding(&qualified_display(&app.schema, &t.name)))
                 .unwrap_or_default();
-            tf(" 表结构 · {} · {} · t 查看 DDL ", &[&(table), &(app.grid.as_ref().map(|g| g.note.clone()).unwrap_or_default())])
+            tf(
+                " 表结构 · {} · {} · t 查看 DDL ",
+                &[
+                    &(table),
+                    &(app
+                        .grid
+                        .as_ref()
+                        .map(|g| g.note.clone())
+                        .unwrap_or_default()),
+                ],
+            )
         }
         GridKind::Query => {
-            let note = app.grid.as_ref().map(|g| g.note.clone()).unwrap_or_default();
+            let note = app
+                .grid
+                .as_ref()
+                .map(|g| g.note.clone())
+                .unwrap_or_default();
             if app.result_tabs.len() > 1 {
                 let title = app
                     .result_tabs
                     .get(app.result_tab)
                     .map(|t| t.title.clone())
                     .unwrap_or_default();
-                tf(" {}结果 {}/{} · {} · {} · [ ] 切换 ", &[&(search_marker(app)), &(app.result_tab + 1), &(app.result_tabs.len()), &(note), &(truncate_disp(&title, 20))])
+                tf(
+                    " {}结果 {}/{} · {} · {} · [ ] 切换 ",
+                    &[
+                        &(search_marker(app)),
+                        &(app.result_tab + 1),
+                        &(app.result_tabs.len()),
+                        &(note),
+                        &(truncate_disp(&title, 20)),
+                    ],
+                )
             } else {
                 tf(" {}结果 · {} ", &[&(search_marker(app)), &(note)])
             }
         }
         GridKind::RedisValue => {
-            let note = app.grid.as_ref().map(|g| g.note.clone()).unwrap_or_default();
+            let note = app
+                .grid
+                .as_ref()
+                .map(|g| g.note.clone())
+                .unwrap_or_default();
             match &app.redis_value {
                 Some(v) => tf(
                     " {}Redis · {} · {} · TTL {} · {} · e 编辑 x TTL m 重命名 Del 删除 ",
-                    &[&(search_marker(app)), &(fix_double_encoding(&v.key_display)), &(v.redis_type), &(redis_ttl_label(v.ttl)), &(note)],
+                    &[
+                        &(search_marker(app)),
+                        &(fix_double_encoding(&v.key_display)),
+                        &(v.redis_type),
+                        &(redis_ttl_label(v.ttl)),
+                        &(note),
+                    ],
                 ),
                 None => tf(" {}Redis value · {} ", &[&(search_marker(app)), &(note)]),
             }
@@ -29451,8 +30458,15 @@ fn grid_title(app: &App) -> String {
             }
             let rows = app.grid.as_ref().map(|g| g.rows.len()).unwrap_or(0);
             let offset = ps.page * ps.page_size;
-            let total = ps.total.map(|t| tf("共 {} 个", &[&(t)])).unwrap_or_else(|| t("总数未知").into());
-            let more = if ps.has_next { t(" · n 下一页") } else { "" };
+            let total = ps
+                .total
+                .map(|t| tf("共 {} 个", &[&(t)]))
+                .unwrap_or_else(|| t("总数未知").into());
+            let more = if ps.has_next {
+                t(" · n 下一页")
+            } else {
+                ""
+            };
             let filt = if ps.filter.trim().is_empty() {
                 String::new()
             } else {
@@ -29460,7 +30474,22 @@ fn grid_title(app: &App) -> String {
             };
             tf(
                 " {}{}.{} · 第 {} 页 · {}–{} / {} · {}{}{} ",
-                &[&(search_marker(app)), &(fix_double_encoding(&app.current_db())), &(fix_double_encoding(&qualified_display(&ps.schema, &ps.table))), &(ps.page + 1), &(if rows == 0 { 0 } else { offset + 1 }), &(offset + rows), &(total), &(app.grid.as_ref().map(|g| g.note.clone()).unwrap_or_default()), &(more), &(filt)],
+                &[
+                    &(search_marker(app)),
+                    &(fix_double_encoding(&app.current_db())),
+                    &(fix_double_encoding(&qualified_display(&ps.schema, &ps.table))),
+                    &(ps.page + 1),
+                    &(if rows == 0 { 0 } else { offset + 1 }),
+                    &(offset + rows),
+                    &(total),
+                    &(app
+                        .grid
+                        .as_ref()
+                        .map(|g| g.note.clone())
+                        .unwrap_or_default()),
+                    &(more),
+                    &(filt),
+                ],
             )
         }
     }
@@ -29529,7 +30558,8 @@ fn render_grid(
     } else {
         natural_widths(grid, max_cell)
     };
-    let frozen = effective_frozen_widths(app.freeze_first, ncols, &widths, gutter as usize, inner_w);
+    let frozen =
+        effective_frozen_widths(app.freeze_first, ncols, &widths, gutter as usize, inner_w);
     let left_w: usize = gutter as usize
         + if frozen > 0 {
             frozen + widths[..frozen].iter().sum::<usize>()
@@ -29539,13 +30569,8 @@ fn render_grid(
     const GAP: usize = 1;
     let avail = inner_w.saturating_sub(left_w + GAP).max(MIN_CELL_WIDTH);
     app.grid_avail = avail;
-    let (off, visible) = window_for_cursor_widths(
-        &widths,
-        app.col_cursor,
-        app.col_offset,
-        avail,
-        frozen,
-    );
+    let (off, visible) =
+        window_for_cursor_widths(&widths, app.col_cursor, app.col_offset, avail, frozen);
     app.col_offset = off;
     app.vis_cols = visible;
     app.grid_gutter = gutter;
@@ -29695,7 +30720,10 @@ fn render_grid(
             1 => "1|".to_string(),
             f => format!("1-{f}|"),
         };
-        let label = tf("列 {}{}-{}/{}", &[&(pin), &(off + 1), &(off + visible), &(ncols)]);
+        let label = tf(
+            "列 {}{}-{}/{}",
+            &[&(pin), &(off + 1), &(off + visible), &(ncols)],
+        );
         // One cell at each end is a tap target for panning a whole window — the
         // touch-friendly control for phones whose terminal sends no h-wheel.
         let track = inner_w - 2;
@@ -29708,10 +30736,7 @@ fn render_grid(
         let (ts, tl) = scrollbar_geom(scrollable_total, win_start, visible, bar_len);
         let tl = tl.max(1).min(bar_len);
         let mut spans: Vec<Span> = Vec::new();
-        spans.push(Span::styled(
-            "◀",
-            Style::default().fg(Color::LightGreen),
-        ));
+        spans.push(Span::styled("◀", Style::default().fg(Color::LightGreen)));
         // R47b: a dashed mid-line track plus a heavy mid-line thumb. Both sit on
         // the same thin line, so the bar reads as one hairline with a bright
         // segment instead of the old `▁`/`▄` band that stood half a cell tall.
@@ -29739,10 +30764,7 @@ fn render_grid(
             }
             spans.push(Span::styled(label, Style::default().fg(Color::Gray)));
         }
-        spans.push(Span::styled(
-            "▶",
-            Style::default().fg(Color::LightGreen),
-        ));
+        spans.push(Span::styled("▶", Style::default().fg(Color::LightGreen)));
         let bar_area = Rect {
             x: inner.x,
             y: area.y + area.height - 1,
@@ -29823,10 +30845,7 @@ fn vbar_lines(total: usize, start: usize, win: usize, height: usize) -> Vec<Line
         .map(|i| {
             if i >= ts && i < ts + tl {
                 // Half-width block: a thin vertical thumb on the right border.
-                Line::from(Span::styled(
-                    "▐",
-                    Style::default().fg(Color::LightGreen),
-                ))
+                Line::from(Span::styled("▐", Style::default().fg(Color::LightGreen)))
             } else {
                 Line::from(Span::styled("│", Style::default().fg(Color::DarkGray)))
             }
@@ -29897,9 +30916,11 @@ fn render_columns_grid(
         .enumerate()
         .map(|(i, row)| {
             let mut cells = vec![gutter_cell(i, i == app.sel)];
-            cells.extend(row.iter().enumerate().map(|(ci, v)| {
-                cell_widget_hl(v, 40, i == app.sel && ci == cc, None)
-            }));
+            cells.extend(
+                row.iter()
+                    .enumerate()
+                    .map(|(ci, v)| cell_widget_hl(v, 40, i == app.sel && ci == cc, None)),
+            );
             let mut r = Row::new(cells);
             if i == app.sel {
                 r = r.style(highlight_style());
@@ -29915,10 +30936,7 @@ fn render_columns_grid(
 }
 
 fn gutter_header_cell() -> Cell<'static> {
-    Cell::from(Span::styled(
-        "#",
-        Style::default().fg(Color::DarkGray),
-    ))
+    Cell::from(Span::styled("#", Style::default().fg(Color::DarkGray)))
 }
 
 fn gutter_cell(i: usize, selected: bool) -> Cell<'static> {
@@ -29930,7 +30948,7 @@ fn gutter_cell(i: usize, selected: bool) -> Cell<'static> {
     } else {
         Style::default().fg(Color::DarkGray)
     };
-    Cell::from(Span::styled(format!("{}",  i + 1), style))
+    Cell::from(Span::styled(format!("{}", i + 1), style))
 }
 
 fn col_header_cell(
@@ -29953,7 +30971,7 @@ fn col_header_cell(
     }
     let sw = disp_width(&suffix);
     let text = if w > sw {
-        format!("{}{}",  truncate_disp(name, w - sw),  suffix)
+        format!("{}{}", truncate_disp(name, w - sw), suffix)
     } else {
         truncate_disp(suffix.trim_start(), w)
     };
@@ -30071,7 +31089,10 @@ fn render_script_list(f: &mut Frame, area: Rect, app: &mut App, script: &ScriptV
     let focused = app.focus == Focus::Preview;
     let errors = script.outcomes.iter().filter(|o| o.error.is_some()).count();
     let affected: u64 = script.outcomes.iter().map(|o| o.affected).sum();
-    let title = tf(" 脚本 · {} 条语句 · 影响 {} 行 · {} 错误 · Enter 查看结果 ", &[&(script.outcomes.len()), &(affected), &(errors)]);
+    let title = tf(
+        " 脚本 · {} 条语句 · 影响 {} 行 · {} 错误 · Enter 查看结果 ",
+        &[&(script.outcomes.len()), &(affected), &(errors)],
+    );
     let widths = [
         Constraint::Length(4),
         Constraint::Min(20),
@@ -30084,7 +31105,7 @@ fn render_script_list(f: &mut Frame, area: Rect, app: &mut App, script: &ScriptV
         .enumerate()
         .map(|(i, o)| {
             let status = match &o.error {
-                Some(e) => format!("✗ {}",  truncate_disp(&one_line(e), 16)),
+                Some(e) => format!("✗ {}", truncate_disp(&one_line(e), 16)),
                 None if !o.grid.columns.is_empty() => tf("{} 行", &[&(o.grid.rows.len())]),
                 None => tf("影响 {} 行", &[&(o.affected)]),
             };
@@ -30095,13 +31116,13 @@ fn render_script_list(f: &mut Frame, area: Rect, app: &mut App, script: &ScriptV
             };
             let mut r = Row::new(vec![
                 Cell::from(Span::styled(
-                    format!("{}",  i + 1),
+                    format!("{}", i + 1),
                     Style::default().fg(Color::DarkGray),
                 )),
                 Cell::from(Span::raw(truncate_disp(&one_line(&o.sql), 80))),
                 Cell::from(Span::styled(status, style)),
                 Cell::from(Span::styled(
-                    format!("{}ms",  o.ms),
+                    format!("{}ms", o.ms),
                     Style::default().fg(Color::DarkGray),
                 )),
             ]);
@@ -30157,11 +31178,7 @@ fn render_script_stream(f: &mut Frame, area: Rect, app: &mut App, script: &Scrip
     // Three lines per statement: separator, statement, result.
     let mut lines: Vec<Line> = Vec::with_capacity(script.outcomes.len() * 3);
     for (i, o) in script.outcomes.iter().enumerate() {
-        let head = format!(
-            "── #{} · {} ",
-            i + 1,
-            format_elapsed_ms(o.ms)
-        );
+        let head = format!("── #{} · {} ", i + 1, format_elapsed_ms(o.ms));
         let pad = inner_w.saturating_sub(disp_width(&head));
         let sep_style = Style::default().fg(Color::DarkGray);
         lines.push(Line::from(Span::styled(
@@ -30185,7 +31202,10 @@ fn render_script_stream(f: &mut Frame, area: Rect, app: &mut App, script: &Scrip
         )));
         let (status, status_style) = match &o.error {
             Some(e) => (
-                format!("  ✗ {}", truncate_disp(&one_line(e), inner_w.saturating_sub(4))),
+                format!(
+                    "  ✗ {}",
+                    truncate_disp(&one_line(e), inner_w.saturating_sub(4))
+                ),
                 Style::default().fg(Color::Red),
             ),
             None if !o.grid.columns.is_empty() => (
@@ -30240,20 +31260,28 @@ fn render_ddl(f: &mut Frame, area: Rect, app: &mut App, ddl: &str) {
             } else {
                 Style::default()
             };
-            Line::from(vec![Span::raw(" ".repeat(indent)), Span::styled(trimmed.to_string(), style)])
+            Line::from(vec![
+                Span::raw(" ".repeat(indent)),
+                Span::styled(trimmed.to_string(), style),
+            ])
         })
         .collect();
-    let title = tf(" 表结构 (DDL) · {} · {}/{} 行 · t 返回字段 ", &[&(fix_double_encoding(&table)), &((app.ddl_scroll as usize + inner_h).min(total)), &(total)]);
+    let title = tf(
+        " 表结构 (DDL) · {} · {}/{} 行 · t 返回字段 ",
+        &[
+            &(fix_double_encoding(&table)),
+            &((app.ddl_scroll as usize + inner_h).min(total)),
+            &(total),
+        ],
+    );
     f.render_widget(
-        Paragraph::new(body)
-            .scroll((app.ddl_scroll, 0))
-            .block(
-                Block::default()
-                    .borders(Borders::ALL)
-                    .title(title)
-                    .border_set(border::ROUNDED)
-                    .border_style(border_style(focused)),
-            ),
+        Paragraph::new(body).scroll((app.ddl_scroll, 0)).block(
+            Block::default()
+                .borders(Borders::ALL)
+                .title(title)
+                .border_set(border::ROUNDED)
+                .border_style(border_style(focused)),
+        ),
         area,
     );
 }
@@ -30342,17 +31370,11 @@ fn render_sidebar(f: &mut Frame, area: Rect, app: &mut App) {
         let status = conn_status_for(app, &c.id);
         let dot_style = match status {
             ConnStatus::Active => Style::default().fg(conn_color),
-            ConnStatus::Connecting => Style::default()
-                .fg(conn_color)
-                .add_modifier(Modifier::BOLD),
-            ConnStatus::Idle => Style::default()
-                .fg(conn_color)
-                .add_modifier(Modifier::DIM),
+            ConnStatus::Connecting => Style::default().fg(conn_color).add_modifier(Modifier::BOLD),
+            ConnStatus::Idle => Style::default().fg(conn_color).add_modifier(Modifier::DIM),
         };
         let name_style = match status {
-            ConnStatus::Active => Style::default()
-                .fg(conn_color)
-                .add_modifier(Modifier::BOLD),
+            ConnStatus::Active => Style::default().fg(conn_color).add_modifier(Modifier::BOLD),
             ConnStatus::Connecting => Style::default().fg(conn_color),
             ConnStatus::Idle => Style::default()
                 .fg(Color::DarkGray)
@@ -30396,7 +31418,12 @@ fn render_sidebar(f: &mut Frame, area: Rect, app: &mut App) {
         } else {
             (
                 "▸ ",
-                format!("/{} · {}/{}",  app.table_filter,  app.tables.len(),  app.tables_all.len()),
+                format!(
+                    "/{} · {}/{}",
+                    app.table_filter,
+                    app.tables.len(),
+                    app.tables_all.len()
+                ),
                 Style::default().fg(Color::Yellow),
             )
         };
@@ -30423,9 +31450,12 @@ fn render_sidebar(f: &mut Frame, area: Rect, app: &mut App) {
     }
 
     let title = if app.table_filter.is_empty() {
-        format!(" {} ({}) ",  c.name,  app.tables_all.len())
+        format!(" {} ({}) ", c.name, app.tables_all.len())
     } else {
-        tf(" {} 表 {}/{} ", &[&(c.name), &(app.tables.len()), &(app.tables_all.len())])
+        tf(
+            " {} 表 {}/{} ",
+            &[&(c.name), &(app.tables.len()), &(app.tables_all.len())],
+        )
     };
     f.render_widget(
         Paragraph::new(lines).block(
@@ -30461,12 +31491,21 @@ fn side_row_line(
     let inner = (area_w as usize).saturating_sub(2 + indent.len()).max(4);
     let mut spans: Vec<Span> = vec![Span::styled(indent, mk(Style::default()))];
     match row {
-        SideRow::Group { id, name, depth: _, count, open } => {
+        SideRow::Group {
+            id,
+            name,
+            depth: _,
+            count,
+            open,
+        } => {
             spans.push(Span::styled(
                 if *open { "▾ " } else { "▸ " }.to_string(),
                 mk(Style::default().fg(Color::DarkGray)),
             ));
-            spans.push(Span::styled("📁 ".to_string(), mk(Style::default().fg(Color::Yellow))));
+            spans.push(Span::styled(
+                "📁 ".to_string(),
+                mk(Style::default().fg(Color::Yellow)),
+            ));
             let badge = format!(" [{count}]");
             let name_w = inner.saturating_sub(disp_width(&badge));
             spans.push(Span::styled(
@@ -30501,22 +31540,21 @@ fn side_row_line(
             // disconnected root reads as muted without losing its colour.
             let dot_style = match status {
                 ConnStatus::Active => Style::default().fg(color),
-                ConnStatus::Connecting => Style::default()
-                    .fg(color)
-                    .add_modifier(Modifier::BOLD),
+                ConnStatus::Connecting => Style::default().fg(color).add_modifier(Modifier::BOLD),
                 ConnStatus::Idle => Style::default().fg(color).add_modifier(Modifier::DIM),
             };
             spans.push(Span::styled(format!("{} ", status.shape()), mk(dot_style)));
             if ro {
-                spans.push(Span::styled("🔒 ".to_string(), mk(Style::default().fg(color))));
+                spans.push(Span::styled(
+                    "🔒 ".to_string(),
+                    mk(Style::default().fg(color)),
+                ));
             }
             let name_w = inner.saturating_sub(if ro { 2 } else { 0 });
             // A disconnected root's name is muted grey so it cannot be mistaken
             // for a live connection at a glance.
             let name_style = match status {
-                ConnStatus::Active => Style::default()
-                    .fg(color)
-                    .add_modifier(Modifier::BOLD),
+                ConnStatus::Active => Style::default().fg(color).add_modifier(Modifier::BOLD),
                 ConnStatus::Connecting => Style::default().fg(color),
                 ConnStatus::Idle => Style::default()
                     .fg(Color::DarkGray)
@@ -30532,7 +31570,7 @@ fn side_row_line(
         }
         SideRow::ConnError { msg, .. } => {
             spans.push(Span::styled(
-                format!("✗ {}",  truncate_disp(msg, inner)),
+                format!("✗ {}", truncate_disp(msg, inner)),
                 mk(Style::default().fg(Color::Red)),
             ));
         }
@@ -30543,8 +31581,14 @@ fn side_row_line(
                 && side_root_cfg(app, *idx)
                     .is_some_and(|c| !app.tree_db_closed.contains(&db_node_key(&c.id, db)));
             let tri = if is_cur_db && open { "▾ " } else { "▸ " };
-            spans.push(Span::styled(tri.to_string(), mk(Style::default().fg(Color::DarkGray))));
-            spans.push(Span::styled("▤ ".to_string(), mk(Style::default().fg(Color::Cyan))));
+            spans.push(Span::styled(
+                tri.to_string(),
+                mk(Style::default().fg(Color::DarkGray)),
+            ));
+            spans.push(Span::styled(
+                "▤ ".to_string(),
+                mk(Style::default().fg(Color::Cyan)),
+            ));
             let disp = fix_double_encoding(db);
             // R47b: a database under a disconnected connection is a cached,
             // muted row — still visible so the tree keeps its shape, but dimmed
@@ -30585,7 +31629,10 @@ fn side_row_line(
             let hit = style.add_modifier(Modifier::UNDERLINED);
             spans.extend(highlight_match_spans(&disp, needle, style, hit));
             if view {
-                spans.push(Span::styled("~".to_string(), mk(Style::default().fg(Color::Blue))));
+                spans.push(Span::styled(
+                    "~".to_string(),
+                    mk(Style::default().fg(Color::Blue)),
+                ));
             }
         }
     }
@@ -30672,7 +31719,11 @@ fn render_redis_sidebar(f: &mut Frame, area: Rect, app: &App, lines: &mut Vec<Li
     } else {
         (
             "▸ ",
-            format!("/{} · {} keys",  app.redis_scan.pattern,  app.redis_scan.keys.len()),
+            format!(
+                "/{} · {} keys",
+                app.redis_scan.pattern,
+                app.redis_scan.keys.len()
+            ),
             Style::default().fg(Color::Yellow),
         )
     };
@@ -30698,9 +31749,7 @@ fn render_redis_sidebar(f: &mut Frame, area: Rect, app: &App, lines: &mut Vec<Li
 
     // Header rows: connection + db row + pattern row (+ filter row).
     let extra = if app.redis_filter.is_empty() { 0 } else { 1 };
-    let cap = (area.height as usize)
-        .saturating_sub(5 + extra)
-        .max(1);
+    let cap = (area.height as usize).saturating_sub(5 + extra).max(1);
     let n = app.redis_scan.keys.len();
     let sel = app.redis_list.selected();
     let start = sel
@@ -30725,7 +31774,9 @@ fn render_redis_sidebar(f: &mut Frame, area: Rect, app: &App, lines: &mut Vec<Li
         let marker = if sel == Some(i) { "▸" } else { " " };
         let check = if picked { "[x]" } else { "[ ]" };
         let check_style = if picked {
-            Style::default().fg(Color::Green).add_modifier(Modifier::BOLD)
+            Style::default()
+                .fg(Color::Green)
+                .add_modifier(Modifier::BOLD)
         } else {
             Style::default().fg(Color::DarkGray)
         };
@@ -30733,7 +31784,9 @@ fn render_redis_sidebar(f: &mut Frame, area: Rect, app: &App, lines: &mut Vec<Li
         let name_w = w.saturating_sub(prefix_w).max(4);
         let name = truncate_disp(&fix_double_encoding(&key.key_display), name_w);
         let row_style = if sel == Some(i) {
-            Style::default().fg(Color::Green).add_modifier(Modifier::BOLD)
+            Style::default()
+                .fg(Color::Green)
+                .add_modifier(Modifier::BOLD)
         } else {
             Style::default()
         };
@@ -30773,11 +31826,18 @@ fn render_redis_sidebar(f: &mut Frame, area: Rect, app: &App, lines: &mut Vec<Li
         )));
     }
 
-    let conn = app.selected.as_ref().map(|c| c.name.clone()).unwrap_or_default();
+    let conn = app
+        .selected
+        .as_ref()
+        .map(|c| c.name.clone())
+        .unwrap_or_default();
     let title = if app.redis_selected.is_empty() {
-        format!(" {} · {} keys ",  conn,  n)
+        format!(" {} · {} keys ", conn, n)
     } else {
-        tf(" {} · {} keys · 已选 {} ", &[&(conn), &(n), &(app.redis_selected.len())])
+        tf(
+            " {} · {} keys · 已选 {} ",
+            &[&(conn), &(n), &(app.redis_selected.len())],
+        )
     };
     f.render_widget(
         Paragraph::new(lines.clone()).block(
@@ -30879,7 +31939,11 @@ fn render_form(f: &mut Frame, area: Rect, app: &mut App) {
     let end = (scroll + visible).min(rows.len());
     for (i, (row, label)) in rows.iter().enumerate().take(end).skip(scroll) {
         let (row, label) = (*row, *label);
-        let label = if narrow { form_label_short(label) } else { label };
+        let label = if narrow {
+            form_label_short(label)
+        } else {
+            label
+        };
         let is_active = i == active;
         let mut value = form_row_value(&form, row);
         if form.editing && is_active {
@@ -30887,7 +31951,9 @@ fn render_form(f: &mut Frame, area: Rect, app: &mut App) {
         }
         let marker = if is_active { "▸ " } else { "  " };
         let style = if is_active {
-            Style::default().fg(Color::Green).add_modifier(Modifier::BOLD)
+            Style::default()
+                .fg(Color::Green)
+                .add_modifier(Modifier::BOLD)
         } else {
             Style::default()
         };
@@ -30899,8 +31965,8 @@ fn render_form(f: &mut Frame, area: Rect, app: &mut App) {
             // Read-only colour preview swatch: the connection colour when set,
             // else the database-family default the sidebar will use.
             if row == FormRow::Color {
-                let swatch = parse_hex_color(&form.color)
-                    .unwrap_or_else(|| db_type_color(&form.db_type));
+                let swatch =
+                    parse_hex_color(&form.color).unwrap_or_else(|| db_type_color(&form.db_type));
                 spans.push(Span::styled("  ███", Style::default().fg(swatch)));
             }
             spans
@@ -30994,7 +32060,8 @@ fn overlay_hint_title(width: u16, prefix: &str, hints: &[Hint], suffix: &str) ->
     out
 }
 
-fn centered_overlay(area: Rect, w: u16, h: u16) -> Rect {    let w = w.min(area.width);
+fn centered_overlay(area: Rect, w: u16, h: u16) -> Rect {
+    let w = w.min(area.width);
     let h = h.min(area.height);
     let x = area.x + area.width.saturating_sub(w) / 2;
     let y = area.y + area.height.saturating_sub(h) / 2;
@@ -31054,7 +32121,7 @@ fn render_conn_picker(f: &mut Frame, area: Rect, app: &mut App) {
             let color = connection_color(c);
             ListItem::new(Line::from(vec![
                 Span::styled(
-                    format!("{:11}",  truncate_disp(c.db_type.as_str(), 11)),
+                    format!("{:11}", truncate_disp(c.db_type.as_str(), 11)),
                     Style::default().fg(color),
                 ),
                 Span::raw(" "),
@@ -31202,7 +32269,7 @@ fn render_snippets(f: &mut Frame, area: Rect, app: &mut App) {
                 .trim();
             ListItem::new(Line::from(vec![
                 Span::styled(
-                    format!("{:20}",  truncate_disp(name, 20)),
+                    format!("{:20}", truncate_disp(name, 20)),
                     Style::default()
                         .fg(Color::Cyan)
                         .add_modifier(Modifier::BOLD),
@@ -31220,7 +32287,10 @@ fn render_snippets(f: &mut Frame, area: Rect, app: &mut App) {
             Block::default()
                 .borders(Borders::ALL)
                 .title(fit_title(
-                    &tf(" SQL 片段 · {} 个 · Enter 插入 · r 刷新 · Esc 关 ", &[&(app.snippets.len())]),
+                    &tf(
+                        " SQL 片段 · {} 个 · Enter 插入 · r 刷新 · Esc 关 ",
+                        &[&(app.snippets.len())],
+                    ),
                     t(" SQL 片段 · Enter 插入 · Esc "),
                     box_area.width,
                 ))
@@ -31338,10 +32408,7 @@ fn render_col_picker(f: &mut Frame, area: Rect, app: &mut App) {
                     ),
                     style,
                 ),
-                Span::styled(
-                    format!("  {}",  i + 1),
-                    Style::default().fg(Color::DarkGray),
-                ),
+                Span::styled(format!("  {}", i + 1), Style::default().fg(Color::DarkGray)),
             ]))
         })
         .collect();
@@ -31355,7 +32422,10 @@ fn render_col_picker(f: &mut Frame, area: Rect, app: &mut App) {
             Block::default()
                 .borders(Borders::ALL)
                 .title(fit_title(
-                    &tf(" 列显示 {}/{} · 空格勾选 · a 全选 · x 仅首列 · Esc 关 ", &[&(visible), &(grid.columns.len())]),
+                    &tf(
+                        " 列显示 {}/{} · 空格勾选 · a 全选 · x 仅首列 · Esc 关 ",
+                        &[&(visible), &(grid.columns.len())],
+                    ),
                     t(" 列显示 · 空格/a/x · Esc "),
                     box_area.width,
                 ))
@@ -31402,7 +32472,7 @@ fn render_recent_tables(f: &mut Frame, area: Rect, app: &mut App) {
                     Style::default().add_modifier(Modifier::BOLD),
                 ),
                 Span::styled(
-                    format!("  {}",  fix_double_encoding(db)),
+                    format!("  {}", fix_double_encoding(db)),
                     Style::default().fg(Color::Cyan),
                 ),
             ]))
@@ -31461,12 +32531,8 @@ fn history_list_item(app: &App, ri: usize, list_w: usize) -> ListItem<'static> {
     } else {
         String::new()
     };
-    let reserved = disp_width(&time)
-        + 4
-        + disp_width(&src)
-        + 2
-        + disp_width(&duration)
-        + disp_width(&origin);
+    let reserved =
+        disp_width(&time) + 4 + disp_width(&src) + 2 + disp_width(&duration) + disp_width(&origin);
     let summary = truncate_disp(
         &history_summary(&r.sql),
         list_w.saturating_sub(reserved).max(8),
@@ -31479,7 +32545,10 @@ fn history_list_item(app: &App, ri: usize, list_w: usize) -> ListItem<'static> {
     let mut spans = vec![
         Span::styled(time, Style::default().fg(Color::DarkGray)),
         Span::raw(" "),
-        Span::styled(if fav { "★" } else { " " }, Style::default().fg(Color::Yellow)),
+        Span::styled(
+            if fav { "★" } else { " " },
+            Style::default().fg(Color::Yellow),
+        ),
         Span::raw(" "),
         Span::styled(summary, sum_style),
     ];
@@ -31496,7 +32565,10 @@ fn history_list_item(app: &App, ri: usize, list_w: usize) -> ListItem<'static> {
         ));
     }
     if !src.is_empty() {
-        spans.push(Span::styled(format!("  {src}"), Style::default().fg(Color::Cyan)));
+        spans.push(Span::styled(
+            format!("  {src}"),
+            Style::default().fg(Color::Cyan),
+        ));
     }
     ListItem::new(Line::from(spans))
 }
@@ -31703,12 +32775,7 @@ fn render_history_confirm(f: &mut Frame, area: Rect, hc: &HistoryConfirm) -> (Re
 /// The `/` table-name filter prompt, drawn as a one-line box at the bottom.
 /// Highlight every case-insensitive occurrence of `needle` inside `text`. Used
 /// by the global-search list so a hit is visible at a glance.
-fn search_highlight(
-    text: &str,
-    needle: &str,
-    base: Style,
-    hit: Style,
-) -> Vec<Span<'static>> {
+fn search_highlight(text: &str, needle: &str, base: Style, hit: Style) -> Vec<Span<'static>> {
     let nchars = needle.chars().count();
     if nchars == 0 {
         return vec![Span::styled(text.to_string(), base)];
@@ -31798,7 +32865,10 @@ fn render_search_panel(f: &mut Frame, area: Rect, app: &mut App) {
             t("（没有命中）").to_string()
         };
         f.render_widget(
-            Paragraph::new(Line::from(Span::styled(msg, Style::default().fg(Color::DarkGray)))),
+            Paragraph::new(Line::from(Span::styled(
+                msg,
+                Style::default().fg(Color::DarkGray),
+            ))),
             inner,
         );
         return;
@@ -31815,7 +32885,10 @@ fn render_search_panel(f: &mut Frame, area: Rect, app: &mut App) {
                 hit.column
             );
             let loc = truncate_disp(&loc, (list_w / 3).clamp(8, 40));
-            let matched = truncate_disp(&one_line(&hit.matched), list_w.saturating_sub(loc.chars().count() + 3).max(8));
+            let matched = truncate_disp(
+                &one_line(&hit.matched),
+                list_w.saturating_sub(loc.chars().count() + 3).max(8),
+            );
             let mut spans = vec![
                 Span::styled(
                     loc,
@@ -31863,7 +32936,10 @@ fn render_search_input(f: &mut Frame, area: Rect, app: &mut App) {
     let block = Block::default()
         .borders(Borders::ALL)
         .title(fit_title(
-            &tf(" 全库搜索 · {} · Enter 开始 · Esc 取消 ", &[&(app.selected_name())]),
+            &tf(
+                " 全库搜索 · {} · Enter 开始 · Esc 取消 ",
+                &[&(app.selected_name())],
+            ),
             t(" 全库搜索 · Enter 开始 "),
             box_area.width,
         ))
@@ -31958,10 +33034,7 @@ fn diff_index_line(row: &IndexDiffRow, width: usize) -> Line<'static> {
 
 /// The `Alt-D` target picker overlay.
 fn render_diff_picker(f: &mut Frame, area: Rect, app: &mut App) {
-    let Some((mode, stage, kind)) = app
-        .diff_picker
-        .as_ref()
-        .map(|p| (p.mode, p.stage, p.kind))
+    let Some((mode, stage, kind)) = app.diff_picker.as_ref().map(|p| (p.mode, p.stage, p.kind))
     else {
         return;
     };
@@ -31969,9 +33042,7 @@ fn render_diff_picker(f: &mut Frame, area: Rect, app: &mut App) {
         return;
     }
     let src = match diff_source(app) {
-        Some((_, schema, table)) => {
-            fix_double_encoding(&qualified_display(&schema, &table))
-        }
+        Some((_, schema, table)) => fix_double_encoding(&qualified_display(&schema, &table)),
         None => fix_double_encoding(&app.current_db()),
     };
     // Database mode compares whole databases, so its title names the source
@@ -32072,7 +33143,11 @@ fn render_diff_picker(f: &mut Frame, area: Rect, app: &mut App) {
     };
     // A long diff title (source table + target + every key hint) clips on a
     // narrow terminal; fall back to the essentials (R39 titles-never-truncated).
-    let title = fit_title(&title, t(" 结构/数据对比 · Enter 对比 · Esc "), box_area.width);
+    let title = fit_title(
+        &title,
+        t(" 结构/数据对比 · Enter 对比 · Esc "),
+        box_area.width,
+    );
     let block = Block::default()
         .borders(Borders::ALL)
         .border_set(border::ROUNDED)
@@ -32090,7 +33165,10 @@ fn render_diff_picker(f: &mut Frame, area: Rect, app: &mut App) {
             t("（没有可选项）").to_string()
         };
         f.render_widget(
-            Paragraph::new(Line::from(Span::styled(msg, Style::default().fg(Color::DarkGray)))),
+            Paragraph::new(Line::from(Span::styled(
+                msg,
+                Style::default().fg(Color::DarkGray),
+            ))),
             inner,
         );
         return;
@@ -32234,10 +33312,7 @@ fn render_diff_panel(f: &mut Frame, area: Rect, app: &mut App) {
                     Line::from(Span::styled(l.to_string(), Style::default().fg(color)))
                 })
                 .collect();
-            f.render_widget(
-                Paragraph::new(lines).scroll((state.scroll, 0)),
-                body,
-            );
+            f.render_widget(Paragraph::new(lines).scroll((state.scroll, 0)), body);
         }
     }
 }
@@ -32291,7 +33366,10 @@ fn render_db_diff(f: &mut Frame, area: Rect, app: &mut App) {
                     Style::default().fg(color).add_modifier(Modifier::BOLD),
                 ),
                 Span::styled(
-                    truncate_disp(&fix_double_encoding(&e.table), width.saturating_sub(3).max(4)),
+                    truncate_disp(
+                        &fix_double_encoding(&e.table),
+                        width.saturating_sub(3).max(4),
+                    ),
                     Style::default().fg(if e.mark == DbTableMark::Both {
                         Color::White
                     } else {
@@ -32362,7 +33440,10 @@ fn data_diff_row_line(row: &DataDiffRow, width: usize) -> Line<'static> {
                 .fg(Color::Yellow)
                 .add_modifier(Modifier::BOLD),
         ),
-        Span::styled(truncate_disp(&rest, avail), Style::default().fg(Color::Gray)),
+        Span::styled(
+            truncate_disp(&rest, avail),
+            Style::default().fg(Color::Gray),
+        ),
     ])
 }
 
@@ -32476,7 +33557,11 @@ fn render_data_diff(f: &mut Frame, area: Rect, app: &mut App) {
                     Style::default().fg(Color::DarkGray),
                 )),
                 Line::from(Span::raw(format!("{}: {}", t("主键"), pk))),
-                Line::from(Span::raw(format!("{}: {}", t("对比列"), truncate_disp(&cols, width.saturating_sub(8))))),
+                Line::from(Span::raw(format!(
+                    "{}: {}",
+                    t("对比列"),
+                    truncate_disp(&cols, width.saturating_sub(8))
+                ))),
             ];
             if cmp.equal() {
                 lines.push(Line::from(Span::styled(
@@ -32495,8 +33580,7 @@ fn render_data_diff(f: &mut Frame, area: Rect, app: &mut App) {
             let legend = if narrow {
                 t("< 仅源  > 仅目标  ≠ 差异").to_string()
             } else {
-                t("< 仅源有   > 仅目标有   ≠ 两边都有但内容不同（Enter 展开列级对照）")
-                    .to_string()
+                t("< 仅源有   > 仅目标有   ≠ 两边都有但内容不同（Enter 展开列级对照）").to_string()
             };
             let legend_area = Rect {
                 x: body.x,
@@ -32627,11 +33711,7 @@ fn render_data_where(f: &mut Frame, area: Rect, app: &mut App) {
 
 /// The `Alt-T` transfer wizard overlay (three steps + the red overwrite layer).
 fn render_transfer_wizard(f: &mut Frame, area: Rect, app: &mut App) {
-    if app
-        .transfer
-        .as_ref()
-        .is_some_and(|w| w.submitted)
-    {
+    if app.transfer.as_ref().is_some_and(|w| w.submitted) {
         render_transfer_running(f, area, app);
         return;
     }
@@ -32743,10 +33823,7 @@ fn render_transfer_wizard(f: &mut Frame, area: Rect, app: &mut App) {
                 Style::default().fg(Color::DarkGray),
             )));
             if let Some(e) = err {
-                text_lines.push(Line::from(Span::styled(
-                    e,
-                    Style::default().fg(Color::Red),
-                )));
+                text_lines.push(Line::from(Span::styled(e, Style::default().fg(Color::Red))));
             }
             let list_h = text_lines.len() as u16;
             let para = Paragraph::new(text_lines);
@@ -32932,7 +34009,9 @@ fn render_transfer_running(f: &mut Frame, area: Rect, app: &mut App) {
     let inner = block.inner(box_area);
     f.render_widget(block, box_area);
     let (rows, chunks, elapsed, total) = app.transfer_progress.unwrap_or((0, 0, 0, None));
-    let rate = (rows as u128 * 1000).checked_div(elapsed).unwrap_or(rows as u128) as u64;
+    let rate = (rows as u128 * 1000)
+        .checked_div(elapsed)
+        .unwrap_or(rows as u128) as u64;
     let mut lines = vec![
         Line::from(Span::styled(
             tf("{} → {}", &[&src, &fix_double_encoding(&table)]),
@@ -33156,7 +34235,10 @@ fn render_file_load_prompt(f: &mut Frame, area: Rect, app: &mut App) {
     let block = Block::default()
         .borders(Borders::ALL)
         .title(fit_title(
-            &tf(" 加载 SQL 文件 · {} · Enter 预览 · Esc 取消 ", &[&(app.selected_name())]),
+            &tf(
+                " 加载 SQL 文件 · {} · Enter 预览 · Esc 取消 ",
+                &[&(app.selected_name())],
+            ),
             t(" 加载 SQL 文件 · Enter 预览 "),
             box_area.width,
         ))
@@ -33371,7 +34453,7 @@ fn render_completion(f: &mut Frame, app: &App) {
             // accepted fragment is still the name the server actually knows.
             let shown = fix_double_encoding(&item.text);
             Line::from(vec![
-                Span::styled(format!("{:<room$}",  truncate_disp(&shown, room)), style),
+                Span::styled(format!("{:<room$}", truncate_disp(&shown, room)), style),
                 Span::styled(format!("[{tag}]"), style.fg(Color::DarkGray)),
             ])
         })
@@ -33464,7 +34546,14 @@ fn render_text_popup(
     f.render_widget(Clear, box_area);
     let max_scroll = total.saturating_sub(inner_h).min(u16::MAX as usize) as u16;
     let scroll = scroll.min(max_scroll);
-    let title = tf(" {} · {}/{} · Esc 关闭 ", &[&(title), &((scroll as usize + inner_h).min(total)), &(total)]);
+    let title = tf(
+        " {} · {}/{} · Esc 关闭 ",
+        &[
+            &(title),
+            &((scroll as usize + inner_h).min(total)),
+            &(total),
+        ],
+    );
     f.render_widget(
         Paragraph::new(body.clone()).scroll((scroll, 0)).block(
             Block::default()
@@ -33655,9 +34744,15 @@ fn render_error_popup(f: &mut Frame, area: Rect, app: &mut App) {
     };
     app.rects.error_max_scroll = 0;
     f.render_widget(Clear, box_area);
-    let first = truncate_disp(popup.lines.first().map(String::as_str).unwrap_or(""), inner_w);
+    let first = truncate_disp(
+        popup.lines.first().map(String::as_str).unwrap_or(""),
+        inner_w,
+    );
     let hint = if total > 1 {
-        tf("✗ {} · 共 {} 行 · Enter 看全量 · Esc 关 ", &[&first, &total])
+        tf(
+            "✗ {} · 共 {} 行 · Enter 看全量 · Esc 关 ",
+            &[&first, &total],
+        )
     } else {
         tf("✗ {} · Enter 看全量 · Esc 关 ", &[&first])
     };
@@ -33704,10 +34799,7 @@ fn render_edit_dialog(f: &mut Frame, area: Rect, app: &mut App) {
                         .add_modifier(Modifier::BOLD),
                 ),
                 Span::styled(
-                    format!(
-                        "  {}", 
-                        d.data_type.clone().unwrap_or_else(|| "?".into())
-                    ),
+                    format!("  {}", d.data_type.clone().unwrap_or_else(|| "?".into())),
                     Style::default().fg(Color::DarkGray),
                 ),
             ]));
@@ -33767,7 +34859,13 @@ fn render_edit_dialog(f: &mut Frame, area: Rect, app: &mut App) {
             let block = Block::default()
                 .borders(Borders::ALL)
                 .title(Span::styled(
-                    tf(" ✎ 编辑 {}.{} ", &[&(fix_double_encoding(&d.db)), &(fix_double_encoding(&qualified_display(&d.schema, &d.table)))]),
+                    tf(
+                        " ✎ 编辑 {}.{} ",
+                        &[
+                            &(fix_double_encoding(&d.db)),
+                            &(fix_double_encoding(&qualified_display(&d.schema, &d.table))),
+                        ],
+                    ),
                     Style::default()
                         .fg(Color::Yellow)
                         .add_modifier(Modifier::BOLD),
@@ -33778,11 +34876,7 @@ fn render_edit_dialog(f: &mut Frame, area: Rect, app: &mut App) {
             f.render_widget(block, box_area);
             // Keep room for the value input + hint even on a short terminal.
             let max_header = inner.height.saturating_sub(3 + 1) as usize;
-            let shown: Vec<Line> = header_lines
-                .iter()
-                .take(max_header)
-                .cloned()
-                .collect();
+            let shown: Vec<Line> = header_lines.iter().take(max_header).cloned().collect();
             let shown_h = shown.len() as u16;
             let hdr_area = Rect {
                 x: inner.x,
@@ -33831,7 +34925,13 @@ fn render_edit_dialog(f: &mut Frame, area: Rect, app: &mut App) {
         EditKind::Insert => {
             let mut lines: Vec<Line> = Vec::new();
             lines.push(Line::from(Span::styled(
-                tf("新增一行到 {}.{}", &[&(fix_double_encoding(&d.db)), &(fix_double_encoding(&qualified_display(&d.schema, &d.table)))]),
+                tf(
+                    "新增一行到 {}.{}",
+                    &[
+                        &(fix_double_encoding(&d.db)),
+                        &(fix_double_encoding(&qualified_display(&d.schema, &d.table))),
+                    ],
+                ),
                 Style::default().fg(Color::Cyan),
             )));
             for (col, val) in d.insert_preview.iter().take(10) {
@@ -33859,7 +34959,10 @@ fn render_edit_dialog(f: &mut Frame, area: Rect, app: &mut App) {
                 Style::default().fg(Color::DarkGray),
             )));
             for l in wrap_sql_lines(&d.sql(), inner_w.saturating_sub(2)) {
-                lines.push(Line::from(Span::styled(l, Style::default().fg(Color::White))));
+                lines.push(Line::from(Span::styled(
+                    l,
+                    Style::default().fg(Color::White),
+                )));
             }
             lines.push(Line::from(Span::styled(
                 t("Enter 执行 · Esc 取消 · Ctrl-V 转编辑器 · Ctrl-T 加入批量"),
@@ -33871,7 +34974,13 @@ fn render_edit_dialog(f: &mut Frame, area: Rect, app: &mut App) {
             let block = Block::default()
                 .borders(Borders::ALL)
                 .title(Span::styled(
-                    tf(" ➕ 插入 {}.{} ", &[&(fix_double_encoding(&d.db)), &(fix_double_encoding(&qualified_display(&d.schema, &d.table)))]),
+                    tf(
+                        " ➕ 插入 {}.{} ",
+                        &[
+                            &(fix_double_encoding(&d.db)),
+                            &(fix_double_encoding(&qualified_display(&d.schema, &d.table))),
+                        ],
+                    ),
                     Style::default()
                         .fg(Color::Green)
                         .add_modifier(Modifier::BOLD),
@@ -33896,7 +35005,11 @@ fn render_redis_prompt(f: &mut Frame, area: Rect, app: &mut App) {
     let block = Block::default()
         .borders(Borders::ALL)
         .title(Span::styled(
-            format!(" {} · {} ", truncate_disp(&title, 40), t("Enter 确认 · Esc 取消")),
+            format!(
+                " {} · {} ",
+                truncate_disp(&title, 40),
+                t("Enter 确认 · Esc 取消")
+            ),
             Style::default().fg(Color::Yellow),
         ))
         .border_set(border::ROUNDED)
@@ -33955,11 +35068,17 @@ fn render_mongo_dialog(f: &mut Frame, area: Rect, app: &mut App) {
     let title = match d.mode {
         MongoDocMode::Edit => tf(
             " ✎ 编辑文档 {}.{} ",
-            &[&fix_double_encoding(&d.db), &fix_double_encoding(&d.collection)],
+            &[
+                &fix_double_encoding(&d.db),
+                &fix_double_encoding(&d.collection),
+            ],
         ),
         MongoDocMode::Insert => tf(
             " ➕ 插入文档 {}.{} ",
-            &[&fix_double_encoding(&d.db), &fix_double_encoding(&d.collection)],
+            &[
+                &fix_double_encoding(&d.db),
+                &fix_double_encoding(&d.collection),
+            ],
         ),
     };
     let block = Block::default()
@@ -34084,80 +35203,188 @@ fn render_filter_prompt(f: &mut Frame, area: Rect, app: &mut App) {
 /// mirrors.
 const HELP_ROWS: &[(&str, &str)] = &[
     ("— 全局 —", ""),
-    ("q / Ctrl-C", "退出（编辑器有未执行语句时两段确认：再按一次退出，Esc 留下）"),
+    (
+        "q / Ctrl-C",
+        "退出（编辑器有未执行语句时两段确认：再按一次退出，Esc 留下）",
+    ),
     ("Ctrl-L", "切换命令模式 SQL → Redis → MongoDB"),
     ("F5 / Ctrl-J", "执行 SQL（有选区只跑选区，否则整段）"),
-    ("Alt-Enter", "只执行光标处语句（有选区则执行选区；分号分隔，字面量/注释里的分号不算）"),
+    (
+        "Alt-Enter",
+        "只执行光标处语句（有选区则执行选区；分号分隔，字面量/注释里的分号不算）",
+    ),
     ("Tab / Shift-Tab", "循环切换区域（侧栏 → 编辑器 → 结果）"),
-    ("Alt-1..9", "直切第 N 个连接（侧栏连接顺序；智能恢复上次库/表）"),
+    (
+        "Alt-1..9",
+        "直切第 N 个连接（侧栏连接顺序；智能恢复上次库/表）",
+    ),
     ("Alt-Tab / Alt-`", "当前连接与上一个连接对切"),
-    ("Alt-Shift-1/2/3", "直接聚焦 侧栏 / 编辑器 / 结果（终端可能报成 Alt-! @ #）"),
+    (
+        "Alt-Shift-1/2/3",
+        "直接聚焦 侧栏 / 编辑器 / 结果（终端可能报成 Alt-! @ #）",
+    ),
     ("Ctrl-A", "自动折叠 开 / 关（开=非焦点栏收起）"),
     ("Ctrl-W", "收起 / 展开当前焦点区域"),
     ("Ctrl-G", "横滚模式（触屏兜底：滚轮/上下滑 = 横滚列）"),
     ("Alt-C / w", "紧凑列宽：窄屏自动共享列宽，宽表尽量一屏放下"),
-    ("Alt-V / c", "列显隐：空格勾选显示的列（按 库.表 记住，跨会话）"),
+    (
+        "Alt-V / c",
+        "列显隐：空格勾选显示的列（按 库.表 记住，跨会话）",
+    ),
     ("Alt-R / t", "最近浏览的 5 张表，Enter 直达（侧栏 t）"),
-    ("Alt-← →", "最近表 / 集合 / Redis key 后退 / 前进（浏览器语义，最多 50 个，跨库可用）"),
-    ("Alt-O", "脚本输出：语句分隔线 + 每条耗时前缀（默认关；Alt-T 已被数据搬运占用）"),
+    (
+        "Alt-← →",
+        "最近表 / 集合 / Redis key 后退 / 前进（浏览器语义，最多 50 个，跨库可用）",
+    ),
+    (
+        "Alt-O",
+        "脚本输出：语句分隔线 + 每条耗时前缀（默认关；Alt-T 已被数据搬运占用）",
+    ),
     ("Shift+← →", "列窗口横滚一列（任意区域，按住连滚）"),
     ("Ctrl-O", "SQL 片段收藏（DBX saved_sql_files）"),
     ("Ctrl-P", "EXPLAIN 当前 SQL（SQL 后端）"),
     ("?", "本帮助"),
-    ("DBXT_MOUSE_DEBUG=1", "启动时显示鼠标事件浮层（滑动无效时排查终端编码）"),
+    (
+        "DBXT_MOUSE_DEBUG=1",
+        "启动时显示鼠标事件浮层（滑动无效时排查终端编码）",
+    ),
     ("— 显示约定 —", ""),
-    ("NULL", "真正的 SQL NULL：灰色斜体（终端不支持斜体时仅灰色）"),
+    (
+        "NULL",
+        "真正的 SQL NULL：灰色斜体（终端不支持斜体时仅灰色）",
+    ),
     ("''", "空字符串：灰色，带引号的空串，不会与 NULL 混淆"),
     ("DBXT_NO_ITALIC=1", "强制 NULL 仅用灰色，不依赖终端斜体"),
     ("— 连接选择 —", ""),
-    ("Alt-1..9", "直切第 N 个连接（按当前排序；同库表存在则直达，否则落首屏）"),
+    (
+        "Alt-1..9",
+        "直切第 N 个连接（按当前排序；同库表存在则直达，否则落首屏）",
+    ),
     ("Alt-Tab / Alt-`", "与上一个连接对切（双缓冲，来回横跳）"),
     ("↑ ↓ / Enter", "选择 / 连接"),
     ("c", "新建连接"),
     ("e", "编辑选中连接（含 SSH 隧道，预填表单）"),
     ("p", "复制连接（预填表单）"),
     ("s", "循环排序：名称 / 类型 / 颜色（同色连接排在一起）"),
-    ("x / Del", "删除选中连接（红色确认；只删配置，不删数据库数据）"),
-    ("d", "断开选中连接（关闭连接池，未提交手动事务回滚；配置保留，可重连）"),
+    (
+        "x / Del",
+        "删除选中连接（红色确认；只删配置，不删数据库数据）",
+    ),
+    (
+        "d",
+        "断开选中连接（关闭连接池，未提交手动事务回滚；配置保留，可重连）",
+    ),
     ("q", "折叠 / 展开连接列表"),
     ("— 连接表单 —", ""),
     ("↑ ↓ / Tab", "切换字段（开启 ssh_tunnel 后自动展开 SSH 段）"),
     ("Enter", "编辑字段 / 切换开关 / 保存连接"),
     ("Space", "切换 ssh_tunnel / ssl / read_only / 登录方式"),
-    ("color", "Space 循环预设颜色（无色→10 色→自定义），Enter 输入 #RRGGBB；色块为只读预览"),
-    ("ssh_tunnel", "开启 SSH 跳板隧道（ssh_host / ssh_port / ssh_user / 登录方式）"),
-    ("read_only", "只读连接：拒绝 INSERT/UPDATE/DELETE/DDL（SELECT/SHOW/EXPLAIN 照常；树中显 🔒）"),
-    ("登录方式", "password / key（密钥路径 + 口令）/ agent（SSH_AUTH_SOCK）"),
-    ("远端目标", "隧道转发目标 = 连接的 host:port（改 host / port 即改目标）"),
-    ("~/.ssh/config", "ssh_host 可填别名；ProxyJump 自动展开为多跳"),
-    ("SSH 主机密钥", "首次连接弹出指纹确认（y 接受并记住 / s 仅本次 / n 拒绝）"),
+    (
+        "color",
+        "Space 循环预设颜色（无色→10 色→自定义），Enter 输入 #RRGGBB；色块为只读预览",
+    ),
+    (
+        "ssh_tunnel",
+        "开启 SSH 跳板隧道（ssh_host / ssh_port / ssh_user / 登录方式）",
+    ),
+    (
+        "read_only",
+        "只读连接：拒绝 INSERT/UPDATE/DELETE/DDL（SELECT/SHOW/EXPLAIN 照常；树中显 🔒）",
+    ),
+    (
+        "登录方式",
+        "password / key（密钥路径 + 口令）/ agent（SSH_AUTH_SOCK）",
+    ),
+    (
+        "远端目标",
+        "隧道转发目标 = 连接的 host:port（改 host / port 即改目标）",
+    ),
+    (
+        "~/.ssh/config",
+        "ssh_host 可填别名；ProxyJump 自动展开为多跳",
+    ),
+    (
+        "SSH 主机密钥",
+        "首次连接弹出指纹确认（y 接受并记住 / s 仅本次 / n 拒绝）",
+    ),
     ("— 连接导入 / 导出（Alt-E / Alt-I）—", ""),
-    ("Alt-E", "导出全部连接为 JSON 包（默认 ~/dbxt-connections.json）"),
-    ("Enter / y / p", "Enter 写文件 · y 复制 JSON 到剪贴板 · p 切换含密码导出（红色确认）"),
-    ("Alt-I / i", "导入连接：自动识别 dbxt JSON / DBeaver data-sources.json / Navicat .ncx"),
-    ("预览 s/r/b", "同名策略：s 跳过 · r 覆盖（红色确认，按 name 匹配） · b 都存（名加 -imported）"),
-    ("预览 Space / d", "Space 勾选/取消该条 · d 逐条循环 跳过/覆盖/都存 · Enter 导入"),
-    ("密码", "导出默认不含密码（p 显式开启）；DBeaver / Navicat 密码加密，不解析，导入后标「需补密码」"),
+    (
+        "Alt-E",
+        "导出全部连接为 JSON 包（默认 ~/dbxt-connections.json）",
+    ),
+    (
+        "Enter / y / p",
+        "Enter 写文件 · y 复制 JSON 到剪贴板 · p 切换含密码导出（红色确认）",
+    ),
+    (
+        "Alt-I / i",
+        "导入连接：自动识别 dbxt JSON / DBeaver data-sources.json / Navicat .ncx",
+    ),
+    (
+        "预览 s/r/b",
+        "同名策略：s 跳过 · r 覆盖（红色确认，按 name 匹配） · b 都存（名加 -imported）",
+    ),
+    (
+        "预览 Space / d",
+        "Space 勾选/取消该条 · d 逐条循环 跳过/覆盖/都存 · Enter 导入",
+    ),
+    (
+        "密码",
+        "导出默认不含密码（p 显式开启）；DBeaver / Navicat 密码加密，不解析，导入后标「需补密码」",
+    ),
     ("— 侧栏（连接树）—", ""),
-    ("↑ ↓ / j k", "在 连接 → 库 → 表 树上移动（可计数：3 j 下移 3 项）"),
-    ("h l / ← →", "折叠 / 展开当前节点（连接节点列出库，库节点列出表）"),
+    (
+        "↑ ↓ / j k",
+        "在 连接 → 库 → 表 树上移动（可计数：3 j 下移 3 项）",
+    ),
+    (
+        "h l / ← →",
+        "折叠 / 展开当前节点（连接节点列出库，库节点列出表）",
+    ),
     ("Enter", "打开：连接=切换并展开 · 库=切到该库 · 表=浏览数据"),
     ("1-9", "直跳第 N 个连接 / 表（树光标跟随）"),
-    ("3 j / 3 k", "计数前缀：下 / 上移动 3 项（侧栏 / 结果 / 历史通用）"),
-    ("a-z / /", "过滤：命中表名 / 库名，父节点保留（Enter 打开首个命中，Esc 清除）"),
+    (
+        "3 j / 3 k",
+        "计数前缀：下 / 上移动 3 项（侧栏 / 结果 / 历史通用）",
+    ),
+    (
+        "a-z / /",
+        "过滤：命中表名 / 库名，父节点保留（Enter 打开首个命中，Esc 清除）",
+    ),
     ("Ctrl-U / Alt-⌫", "清除表过滤（过滤提示框内）"),
     ("s", "表排序：名称 / 类型（TABLE / VIEW）"),
-    ("s（库行）", "惰性查询该库聚合大小 + 各表行数估计（information_schema，不扫表；会话缓存）"),
-    ("Y", "复制连接（新名字 xxx-copy，含密码 / SSH 隧道，树中新根）"),
-    ("状态点（连接根）", "● 活跃（可查）/ ○ 已断开 / ◐ 连接中；沿用连接色，形状区分（色盲友好）"),
-    ("x（连接根）", "断开连接：关闭连接池（未提交手动事务回滚）；树保留灰根，展开可重连"),
+    (
+        "s（库行）",
+        "惰性查询该库聚合大小 + 各表行数估计（information_schema，不扫表；会话缓存）",
+    ),
+    (
+        "Y",
+        "复制连接（新名字 xxx-copy，含密码 / SSH 隧道，树中新根）",
+    ),
+    (
+        "状态点（连接根）",
+        "● 活跃（可查）/ ○ 已断开 / ◐ 连接中；沿用连接色，形状区分（色盲友好）",
+    ),
+    (
+        "x（连接根）",
+        "断开连接：关闭连接池（未提交手动事务回滚）；树保留灰根，展开可重连",
+    ),
     ("尺寸列", "库大小 / 表行数估计右对齐；终端 <56 列自动隐藏"),
-    ("分组节点", "DBX 桌面的连接分组（▾ 组名 [n]）；h l / ← → 折叠展开，会话内记忆；无分组则平铺"),
-    ("Alt+a-z · ; ,", "首字母跳：跳到以该字母开头的下一张表；; , 前后循环（与过滤互斥）"),
+    (
+        "分组节点",
+        "DBX 桌面的连接分组（▾ 组名 [n]）；h l / ← → 折叠展开，会话内记忆；无分组则平铺",
+    ),
+    (
+        "Alt+a-z · ; ,",
+        "首字母跳：跳到以该字母开头的下一张表；; , 前后循环（与过滤互斥）",
+    ),
     ("t", "最近表浮层（Enter 直达）"),
     ("r", "表结构（字段 + DDL）"),
     ("I", "导入 CSV 到当前表（预览 + 追加/覆盖确认）"),
-    ("d", "数据库 / 模式列表（PG 等支持 schema 的连接；浮层内 r 刷新）"),
+    (
+        "d",
+        "数据库 / 模式列表（PG 等支持 schema 的连接；浮层内 r 刷新）",
+    ),
     ("[ ]", "切换数据库（快捷）"),
     ("o", "返回连接选择"),
     ("c", "新建连接"),
@@ -34167,11 +35394,20 @@ const HELP_ROWS: &[(&str, &str)] = &[
     ("PgUp / PgDn", "整屏滚动，跨页衔接"),
     ("n / p", "下一页 / 上一页（可计数：5 n = 翻 5 页）"),
     ("Ctrl-F / Ctrl-B", "下一页 / 上一页"),
-    ("大表翻页", "有主键时按主键续读（keyset），翻页耗时与页深无关"),
+    (
+        "大表翻页",
+        "有主键时按主键续读（keyset），翻页耗时与页深无关",
+    ),
     ("行数上限", "50 万行以上的表显示 >50万，不再每页 COUNT"),
     ("← → / h l", "单元格光标（列窗口跟随）"),
-    ("Home / End · g g / G", "首行 / 末行（脚本语句列表同样适用）"),
-    ("y（脚本列表）", "复制当前语句结果为 CSV（与 Ctrl-Y 导出的首选格式一致）"),
+    (
+        "Home / End · g g / G",
+        "首行 / 末行（脚本语句列表同样适用）",
+    ),
+    (
+        "y（脚本列表）",
+        "复制当前语句结果为 CSV（与 Ctrl-Y 导出的首选格式一致）",
+    ),
     ("Ctrl-E", "聚焦 SQL 编辑器"),
     (
         "Shift/Alt/Ctrl+滚轮 · 横滑",
@@ -34179,17 +35415,38 @@ const HELP_ROWS: &[(&str, &str)] = &[
     ),
     ("Shift+← →", "横滚列一列（任意区域，按住连滚）"),
     ("Ctrl-G", "横滚模式：纵向滚轮/上下滑改为横滚列"),
-    ("◀ ▶（底部）", "点击向左/右翻一屏列（触屏可用；滚动条横滚后短暂显示，静止自动隐藏）"),
-    ("底部进度条", "当前列窗口位置 · 横滚后 2.5s 内显示 · 点击可跳转"),
+    (
+        "◀ ▶（底部）",
+        "点击向左/右翻一屏列（触屏可用；滚动条横滚后短暂显示，静止自动隐藏）",
+    ),
+    (
+        "底部进度条",
+        "当前列窗口位置 · 横滚后 2.5s 内显示 · 点击可跳转",
+    ),
     ("[ ]", "切换本次会话的结果标签"),
-    ("Ctrl-Y", "导出当前结果（CSV / JSON / NDJSON / Markdown / INSERT）"),
+    (
+        "Ctrl-Y",
+        "导出当前结果（CSV / JSON / NDJSON / Markdown / INSERT）",
+    ),
     ("y", "复制当前行为 INSERT 语句（OSC52 + 文件兜底）"),
-    ("/", "搜索结果行（隐藏不匹配行，输入即筛，Enter 保留，Esc 清除）"),
-    ("g v", "定位值：在排序列 / 主键列内搜值并跳转，不隐藏行（n/N 循环命中）"),
+    (
+        "/",
+        "搜索结果行（隐藏不匹配行，输入即筛，Enter 保留，Esc 清除）",
+    ),
+    (
+        "g v",
+        "定位值：在排序列 / 主键列内搜值并跳转，不隐藏行（n/N 循环命中）",
+    ),
     ("|", "跳列：输入列号或列名前缀直达该列（宽表横滚）"),
-    ("n / Shift-N", "搜索结果或定位命中时：下 / 上一个命中（否则 n 翻页）"),
+    (
+        "n / Shift-N",
+        "搜索结果或定位命中时：下 / 上一个命中（否则 n 翻页）",
+    ),
     ("Ctrl-N", "结果被截断时加载更多行"),
-    ("Enter", "整行详情（纵向，含隐藏列；看某一行从这里进；结果区双击行同效）"),
+    (
+        "Enter",
+        "整行详情（纵向，含隐藏列；看某一行从这里进；结果区双击行同效）",
+    ),
     ("v", "完整单元格（任意模式，不进整行弹层）"),
     ("o", "整行详情（与 Enter 等价）"),
     ("e", "编辑单元格 → diff 确认后执行"),
@@ -34200,18 +35457,33 @@ const HELP_ROWS: &[(&str, &str)] = &[
     ("s", "按当前列升 / 降序"),
     ("Ctrl-K", "附加排序键（多列排序）"),
     ("z", "钉住 / 取消首列"),
-    ("w / Alt-C", "紧凑列宽 开 / 关（窄屏默认自动开，按 库.表 记住）"),
-    ("c / Alt-V", "列显隐浮层（空格勾选 / a 全选 / x 仅首列，按 库.表 记住）"),
+    (
+        "w / Alt-C",
+        "紧凑列宽 开 / 关（窄屏默认自动开，按 库.表 记住）",
+    ),
+    (
+        "c / Alt-V",
+        "列显隐浮层（空格勾选 / a 全选 / x 仅首列，按 库.表 记住）",
+    ),
     ("Alt-R", "最近表直达浮层"),
     ("t", "字段 ↔ DDL（表结构）"),
     ("g d / g t", "跳表结构视图 / 回表数据"),
-    ("g c", "列结构弹层：列名 / 类型 / 可空 / 注释（缓存元数据，不额外查库）"),
-    ("Alt-F", "钉住 / 解除当前结果区（钉住后切换表/库仍显示，上下对照）"),
+    (
+        "g c",
+        "列结构弹层：列名 / 类型 / 可空 / 注释（缓存元数据，不额外查库）",
+    ),
+    (
+        "Alt-F",
+        "钉住 / 解除当前结果区（钉住后切换表/库仍显示，上下对照）",
+    ),
     ("g v", "定位值（排序列 / 主键列，不隐藏行）"),
     ("Esc", "收起结果 / 关闭浮层"),
     ("— 行详情浮层（Enter / o）—", ""),
     ("↑ ↓ / j k · 5j", "移动选中列（计数前缀：5j 跳 5 列）"),
-    ("Enter / v", "下钻完整单元格（Esc 返回行弹层，再 Esc 回表格）"),
+    (
+        "Enter / v",
+        "下钻完整单元格（Esc 返回行弹层，再 Esc 回表格）",
+    ),
     ("y", "复制选中列值（状态栏带列名）"),
     ("/", "按列名过滤（宽表 40+ 列找列）"),
     ("标题", "主键定位：第 12 行 · id=4821"),
@@ -34220,41 +35492,74 @@ const HELP_ROWS: &[(&str, &str)] = &[
     ("Esc", "取消编辑"),
     ("Ctrl-V", "将生成的 SQL 转入编辑器微调"),
     ("Ctrl-T", "加入批量队列（Ctrl-S 打包事务提交）"),
-    ("插入层 v / b", "转编辑器 / 加入批量（等价 Ctrl-V / Ctrl-T）"),
+    (
+        "插入层 v / b",
+        "转编辑器 / 加入批量（等价 Ctrl-V / Ctrl-T）",
+    ),
     ("Ctrl-S / Ctrl-X", "提交 / 清空批量队列"),
     ("— 编辑器 / 命令 —", ""),
-    ("Alt-H", "查询历史面板（最近 300 条：时间 / 摘要 / 来源连接）"),
-    ("Alt-F", "格式化当前 SQL（关键字大写 / 子句换行）；再按压缩为单行"),
+    (
+        "Alt-H",
+        "查询历史面板（最近 300 条：时间 / 摘要 / 来源连接）",
+    ),
+    (
+        "Alt-F",
+        "格式化当前 SQL（关键字大写 / 子句换行）；再按压缩为单行",
+    ),
     ("Ctrl-U", "撤销上一次 Alt-F 格式化"),
-    ("Alt-/", "SQL 前缀补全（表名 T / 列名 C / 关键字 K，Tab 上屏）"),
+    (
+        "Alt-/",
+        "SQL 前缀补全（表名 T / 列名 C / 关键字 K，Tab 上屏）",
+    ),
     ("Alt-P", "片段收藏：选中即插到光标处（一步）"),
     ("%", "跳到配对括号（光标在 ()[]{} 上或旁；否则照常输入 %）"),
     ("Ctrl-A / Ctrl-E", "行首 / 行尾（Home / End 同）"),
     ("Ctrl-K / Ctrl-⇧K", "删至行尾（kill line）"),
     ("Ctrl-W", "删前一个词"),
     ("— 全库搜索（Alt-G）—", ""),
-    ("Alt-G", "全库搜索：扫描当前连接所有表的文本列（每表 LIMIT，大表跳过）"),
+    (
+        "Alt-G",
+        "全库搜索：扫描当前连接所有表的文本列（每表 LIMIT，大表跳过）",
+    ),
     ("↑ ↓ / Enter", "选择命中 / 跳到该表并定位到命中行"),
     ("y / r", "复制命中值 / 以同一关键词重搜"),
     ("Esc", "关闭；扫描中按一下中止（保留已扫描结果）"),
-    ("Alt-L", "加载并执行 .sql 文件（预览语句数/大小/目标库，危险语句先确认）"),
+    (
+        "Alt-L",
+        "加载并执行 .sql 文件（预览语句数/大小/目标库，危险语句先确认）",
+    ),
     ("— 结构对比（Alt-D）—", ""),
-    ("Alt-D", "结构对比：源 = 当前表，选择目标表（对比列 / 主键 / 索引 / 字符集）"),
-    ("c（对比浮层内）", "选择其他连接作为目标（跨库 / 跨方言对比）"),
-    ("Shift+Alt-D", "库对库对比：两库的表清单（仅源 / 仅目标 / 共有）"),
+    (
+        "Alt-D",
+        "结构对比：源 = 当前表，选择目标表（对比列 / 主键 / 索引 / 字符集）",
+    ),
+    (
+        "c（对比浮层内）",
+        "选择其他连接作为目标（跨库 / 跨方言对比）",
+    ),
+    (
+        "Shift+Alt-D",
+        "库对库对比：两库的表清单（仅源 / 仅目标 / 共有）",
+    ),
     ("d（对比浮层内）", "切换 表 / 库 两种对比模式"),
     ("Tab", "切换 列 / 索引 / ALTER 三个视图"),
     ("y", "复制差异摘要（纯文本，可贴进工单）"),
     ("g", "生成 ALTER 同步语句（方向：源 → 目标，只生成不执行）"),
     ("Enter", "对比：库清单里两库都有的表进入单表对比"),
     ("— 数据对比（Alt-K）—", ""),
-    ("Alt-K", "数据对比：按主键对齐两张表的数据（源 = 当前表；选择目标，可跨连接）"),
+    (
+        "Alt-K",
+        "数据对比：按主键对齐两张表的数据（源 = 当前表；选择目标，可跨连接）",
+    ),
     ("m（对比浮层内）", "切换 结构对比 / 数据对比"),
     ("w（数据对比内）", "输入 WHERE 过滤（两边同时生效，可留空）"),
     ("Tab", "切换 汇总 / 仅源 / 仅目标 / 差异 四个视图"),
     ("Enter", "展开差异行的列级对照（两侧值对照）"),
     ("y", "复制差异摘要（纯文本）"),
-    ("g", "生成同步 INSERT/UPDATE/DELETE（方向：源 → 目标，只生成不执行）"),
+    (
+        "g",
+        "生成同步 INSERT/UPDATE/DELETE（方向：源 → 目标，只生成不执行）",
+    ),
     ("Esc", "关闭；对比进行中按一下中止（保留已比结果）"),
     ("— 数据搬运（Alt-T）—", ""),
     (
@@ -34262,32 +35567,71 @@ const HELP_ROWS: &[(&str, &str)] = &[
         "跨库搬数据：源 = 当前表，目标可同连接或跨连接/跨方言（MySQL↔PG 双向）",
     ),
     ("① 选目标连接", "Enter 下一步；默认当前连接（同方言）"),
-    ("② 目标库/表", "Tab 切换 库/Schema/表名；改名 = 表复制；默认同名"),
-    ("③ 模式", "建表+搬数据（默认）/ 仅建表 / 插入已有表（append）"),
-    ("表已存在（o）", "报错停下（默认）或 覆盖 = 先 DROP（红色确认层）"),
-    ("选项", "w WHERE 子集 · l LIMIT 上限 · i 带索引 · a 自增值 · s 停止/跳过"),
-    ("搬运引擎", "源 keyset 分块（1000 行）→ 目标事务批量 INSERT（500/批）"),
-    ("进度 / 中止", "状态栏显示 行数/块数/速率；Esc 中止（已提交批次保留）"),
-    ("大表防护", "源预估 ≥100 万行需再按 Enter 确认；单批失败重试 1 次"),
-    ("完成汇总", "g 复制摘要 · b 浏览目标表（同连接/库时）· Esc 关闭"),
-    ("补全上下文", "表名. 后只补该表列名；FROM/JOIN 后只补表名；WHERE/ON 后只补列名"),
+    (
+        "② 目标库/表",
+        "Tab 切换 库/Schema/表名；改名 = 表复制；默认同名",
+    ),
+    (
+        "③ 模式",
+        "建表+搬数据（默认）/ 仅建表 / 插入已有表（append）",
+    ),
+    (
+        "表已存在（o）",
+        "报错停下（默认）或 覆盖 = 先 DROP（红色确认层）",
+    ),
+    (
+        "选项",
+        "w WHERE 子集 · l LIMIT 上限 · i 带索引 · a 自增值 · s 停止/跳过",
+    ),
+    (
+        "搬运引擎",
+        "源 keyset 分块（1000 行）→ 目标事务批量 INSERT（500/批）",
+    ),
+    (
+        "进度 / 中止",
+        "状态栏显示 行数/块数/速率；Esc 中止（已提交批次保留）",
+    ),
+    (
+        "大表防护",
+        "源预估 ≥100 万行需再按 Enter 确认；单批失败重试 1 次",
+    ),
+    (
+        "完成汇总",
+        "g 复制摘要 · b 浏览目标表（同连接/库时）· Esc 关闭",
+    ),
+    (
+        "补全上下文",
+        "表名. 后只补该表列名；FROM/JOIN 后只补表名；WHERE/ON 后只补列名",
+    ),
     ("↑ ↓", "历史（首行 / 末行）"),
     ("Esc", "回到侧栏"),
     ("[ ]", "Redis 逻辑库"),
     ("use <db>", "MongoDB 切库"),
     ("— Redis key 浏览器 —", ""),
     ("↑ ↓ / Enter", "选择 key / 查看 value"),
-    ("a-z / f", "按已加载 key 子串过滤（一步直达，命中高亮；Enter 查看首位，Esc 清除）"),
-    ("Alt+a-z · ; ,", "首字母跳：跳到以该字母开头的下一个 key；; , 前后循环"),
+    (
+        "a-z / f",
+        "按已加载 key 子串过滤（一步直达，命中高亮；Enter 查看首位，Esc 清除）",
+    ),
+    (
+        "Alt+a-z · ; ,",
+        "首字母跳：跳到以该字母开头的下一个 key；; , 前后循环",
+    ),
     ("1-9", "直跳第 N 个已加载 key"),
     ("Space / Shift+↑↓", "勾选 key / 范围选（a 全选已加载）"),
     ("/", "编辑 SCAN MATCH 模式（服务端，留空 = 全部）"),
     ("n / End", "加载下一 SCAN 页"),
     ("r", "以当前模式重扫"),
     ("[ ]", "切换逻辑 db"),
-    ("Del / x / m", "批量删除 / 设 TTL / 前缀重命名选中 key（均确认）"),
+    (
+        "Del / x / m",
+        "批量删除 / 设 TTL / 前缀重命名选中 key（均确认）",
+    ),
     ("y", "复制选中的 key 名（每行一个）"),
-    ("value: e x m Del", "编辑 string·hash 字段 / TTL / 重命名 / 删除 key（均确认）"),
+    (
+        "value: e x m Del",
+        "编辑 string·hash 字段 / TTL / 重命名 / 删除 key（均确认）",
+    ),
     ("value: y / Esc", "复制值（string）/ 返回 key 列表"),
     ("value: n", "大集合继续加载 200 项"),
     ("窄屏徽章", "类型与 TTL 融合为单行 `S·12s`，key 名不换行"),
@@ -34295,16 +35639,25 @@ const HELP_ROWS: &[(&str, &str)] = &[
     ("Enter", "浏览 collection 文档（JSON 网格）"),
     ("n / p", "文档翻页"),
     ("f", "JSON 过滤（如 {\"age\": {\"$gt\": 30}}，留空清除）"),
-    ("e / i / Del", "编辑 / 插入 / 删除文档（均确认，_id 不可改）"),
+    (
+        "e / i / Del",
+        "编辑 / 插入 / 删除文档（均确认，_id 不可改）",
+    ),
     ("y / Esc", "复制当前文档 JSON / 返回集合列表"),
-    ("a-z / Alt+a-z / 1-9", "集合列表：子串过滤 / 首字母跳 / 直跳（同表列表）"),
+    (
+        "a-z / Alt+a-z / 1-9",
+        "集合列表：子串过滤 / 首字母跳 / 直跳（同表列表）",
+    ),
     ("r", "查看 collection 索引"),
     ("— 危险操作 / 删除确认 —", ""),
     ("Enter / y", "执行（SQL 全文可见）"),
     ("Esc / n", "取消"),
     ("— SQL 片段（Ctrl-O）—", ""),
     ("↑ ↓ / Enter", "选择 / 插入到编辑器"),
-    ("s", "把编辑器里的 SQL 收藏为片段（写入 DBX saved_sql_files）"),
+    (
+        "s",
+        "把编辑器里的 SQL 收藏为片段（写入 DBX saved_sql_files）",
+    ),
     ("r / Esc", "刷新 / 关闭"),
     ("— 查询历史（Alt-H）—", ""),
     ("↑ ↓ / PgUp PgDn", "移动光标（列表即过滤视图）"),
@@ -34315,14 +35668,35 @@ const HELP_ROWS: &[(&str, &str)] = &[
     ("Del", "删除单条历史（红色确认，不影响数据库数据）"),
     ("/", "按语句内容过滤（大小写不敏感子串）"),
     ("— 鼠标 / 触屏 —", ""),
-    ("点击（结果区）", "选中该行；同一位置 400ms 内再点一次 = 双击，打开整行详情（等价 Enter）"),
-    ("双击（行弹层）", "下钻该值到完整单元格弹层（等价 Enter）；单击 = 光标移到该值"),
-    ("点击（▶ / ▼ 图标）", "折叠 / 展开该连接或库（不必先选中该行）；行其余部分仍是两击选中 + 激活"),
-    ("点击（确认弹层按钮）", "点 [ 执行 ] / [ 取消 ] = Enter / Esc 两条分支"),
-    ("点击（错误弹层）", "紧凑态点开全量；长错误逐页下翻，翻到底再点关闭"),
+    (
+        "点击（结果区）",
+        "选中该行；同一位置 400ms 内再点一次 = 双击，打开整行详情（等价 Enter）",
+    ),
+    (
+        "双击（行弹层）",
+        "下钻该值到完整单元格弹层（等价 Enter）；单击 = 光标移到该值",
+    ),
+    (
+        "点击（▶ / ▼ 图标）",
+        "折叠 / 展开该连接或库（不必先选中该行）；行其余部分仍是两击选中 + 激活",
+    ),
+    (
+        "点击（确认弹层按钮）",
+        "点 [ 执行 ] / [ 取消 ] = Enter / Esc 两条分支",
+    ),
+    (
+        "点击（错误弹层）",
+        "紧凑态点开全量；长错误逐页下翻，翻到底再点关闭",
+    ),
     ("点击（单元格弹层）", "关闭，回到下面的行弹层"),
-    ("点击（编辑器）", "聚焦并把光标放到点击处（含横滚偏移；点在文本下方 = 跳文末）"),
-    ("滚轮 / 横滑", "纵向滚行；Shift/Alt/Ctrl+滚轮 或左右滑动 = 横滚列"),
+    (
+        "点击（编辑器）",
+        "聚焦并把光标放到点击处（含横滚偏移；点在文本下方 = 跳文末）",
+    ),
+    (
+        "滚轮 / 横滑",
+        "纵向滚行；Shift/Alt/Ctrl+滚轮 或左右滑动 = 横滚列",
+    ),
 ];
 
 /// Width of the `?` help overlay. The cheat-sheet has grown a lot (R15–R33),
@@ -34389,9 +35763,15 @@ fn render_help(f: &mut Frame, area: Rect, app: &mut App) {
     let title = if box_area.width < 56 {
         // Narrow: the footer already carries the scroll/close hints, so the
         // title only names the sheet and its position.
-        tf(" 快捷键 · {}/{} ", &[&((scroll as usize + inner_h).min(total)), &(total)])
+        tf(
+            " 快捷键 · {}/{} ",
+            &[&((scroll as usize + inner_h).min(total)), &(total)],
+        )
     } else {
-        tf(" 快捷键 · {}/{} · ↑↓ 滚动 · Esc 关闭 ", &[&((scroll as usize + inner_h).min(total)), &(total)])
+        tf(
+            " 快捷键 · {}/{} · ↑↓ 滚动 · Esc 关闭 ",
+            &[&((scroll as usize + inner_h).min(total)), &(total)],
+        )
     };
     f.render_widget(
         Paragraph::new(lines).scroll((scroll, 0)).block(
@@ -34443,7 +35823,10 @@ fn render_help_mini(f: &mut Frame, area: Rect, app: &mut App) {
     let title = if box_area.width < 60 {
         tf(" 快捷键 · {} 项 ", &[&(hints.len())])
     } else {
-        tf(" 快捷键 · 当前上下文 · {} 项 · ? 全部 · Esc 关闭 ", &[&(hints.len())])
+        tf(
+            " 快捷键 · 当前上下文 · {} 项 · ? 全部 · Esc 关闭 ",
+            &[&(hints.len())],
+        )
     };
     f.render_widget(
         Paragraph::new(lines).block(
@@ -34532,9 +35915,7 @@ fn render_conn_confirm(f: &mut Frame, area: Rect, cc: &ConnConfirm) -> (Rect, Re
             vec![
                 Line::from(Span::styled(
                     tf("断开连接 {} ({})？", &[&cc.name, &cc.db_type]),
-                    Style::default()
-                        .fg(Color::Red)
-                        .add_modifier(Modifier::BOLD),
+                    Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
                 )),
                 Line::from(""),
                 Line::from(Span::styled(
@@ -34555,9 +35936,7 @@ fn render_conn_confirm(f: &mut Frame, area: Rect, cc: &ConnConfirm) -> (Rect, Re
             vec![
                 Line::from(Span::styled(
                     tf("将删除连接 {} ({})", &[&cc.name, &cc.db_type]),
-                    Style::default()
-                        .fg(Color::Red)
-                        .add_modifier(Modifier::BOLD),
+                    Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
                 )),
                 Line::from(""),
                 Line::from(Span::styled(
@@ -34570,7 +35949,9 @@ fn render_conn_confirm(f: &mut Frame, area: Rect, cc: &ConnConfirm) -> (Rect, Re
         )
     };
     let mut lines = body;
-    let h = (lines.len() as u16 + 1 + 2).min(area.height).max(3.min(area.height));
+    let h = (lines.len() as u16 + 1 + 2)
+        .min(area.height)
+        .max(3.min(area.height));
     let box_area = centered_overlay(area, w, h);
     let inner = Rect {
         x: box_area.x + 1,
@@ -34624,9 +36005,7 @@ fn render_confirm(f: &mut Frame, area: Rect, confirm: &Confirm) -> (Rect, Rect) 
     for r in &confirm.reasons {
         lines.push(Line::from(Span::styled(
             format!("⚠ {r}"),
-            Style::default()
-                .fg(Color::Red)
-                .add_modifier(Modifier::BOLD),
+            Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
         )));
     }
     for p in &impact {
@@ -34636,8 +36015,8 @@ fn render_confirm(f: &mut Frame, area: Rect, confirm: &Confirm) -> (Rect, Rect) 
         )));
     }
     lines.push(Line::from(""));
-    let sql_room = (box_area.height as usize)
-        .saturating_sub(confirm.reasons.len() + impact.len() + 5);
+    let sql_room =
+        (box_area.height as usize).saturating_sub(confirm.reasons.len() + impact.len() + 5);
     let truncated = sql_lines.len() > sql_room;
     let shown_sql = if truncated {
         sql_room.saturating_sub(1)
@@ -34752,9 +36131,7 @@ fn render_ssh_prompt(f: &mut Frame, area: Rect, app: &mut App) {
             )));
         }
         SshPromptKind::WorkerUploadConsent => {
-            lines.push(Line::from(
-                req.prompt.clone().unwrap_or_default(),
-            ));
+            lines.push(Line::from(req.prompt.clone().unwrap_or_default()));
             lines.push(Line::from(Span::styled(
                 t("Enter/y 允许 · Esc/n 取消"),
                 Style::default().fg(Color::Yellow),
@@ -34801,7 +36178,10 @@ fn render_ssh_prompt(f: &mut Frame, area: Rect, app: &mut App) {
     f.render_widget(Clear, box_area);
     let block = Block::default()
         .borders(Borders::ALL)
-        .title(Span::styled(title, Style::default().fg(color).add_modifier(Modifier::BOLD)))
+        .title(Span::styled(
+            title,
+            Style::default().fg(color).add_modifier(Modifier::BOLD),
+        ))
         .border_set(border::THICK)
         .border_style(Style::default().fg(color));
     f.render_widget(Paragraph::new(lines).block(block), box_area);
@@ -34835,14 +36215,11 @@ fn render_import_prompt(f: &mut Frame, area: Rect, app: &mut App) {
         width: inner.width,
         height: hint_h,
     };
-    let error = app
-        .import_prompt
-        .as_ref()
-        .and_then(|p| p.error.clone());
+    let error = app.import_prompt.as_ref().and_then(|p| p.error.clone());
     let target = app
         .import_prompt
         .as_ref()
-        .map(|p| format!("{}.{}",  p.db,  qualified_display(&p.schema, &p.table)))
+        .map(|p| format!("{}.{}", p.db, qualified_display(&p.schema, &p.table)))
         .unwrap_or_default();
     if let Some(p) = app.import_prompt.as_mut() {
         p.input.set_block(Block::default());
@@ -34871,7 +36248,9 @@ fn render_import_prompt(f: &mut Frame, area: Rect, app: &mut App) {
 fn import_plan_lines(plan: &ImportPlan) -> Vec<PopupLine> {
     let plain = Style::default().fg(Color::White);
     let dim = Style::default().fg(Color::DarkGray);
-    let head = Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD);
+    let head = Style::default()
+        .fg(Color::Cyan)
+        .add_modifier(Modifier::BOLD);
     let warn = Style::default().fg(Color::Yellow);
     let bad = Style::default().fg(Color::Red).add_modifier(Modifier::BOLD);
     let mut lines: Vec<PopupLine> = Vec::new();
@@ -34892,7 +36271,11 @@ fn import_plan_lines(plan: &ImportPlan) -> Vec<PopupLine> {
     lines.push(PopupLine {
         text: tf(
             "编码 {} · 分隔符 {} · 数据行 {}",
-            &[&plan.encoding, &delim_label(plan.delimiter), &plan.rows.len()],
+            &[
+                &plan.encoding,
+                &delim_label(plan.delimiter),
+                &plan.rows.len(),
+            ],
         ),
         style: plain,
     });
@@ -35058,7 +36441,9 @@ fn render_import_report(f: &mut Frame, area: Rect, app: &mut App) {
     };
     let plain = Style::default().fg(Color::White);
     let dim = Style::default().fg(Color::DarkGray);
-    let head = Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD);
+    let head = Style::default()
+        .fg(Color::Cyan)
+        .add_modifier(Modifier::BOLD);
     let warn = Style::default().fg(Color::Yellow);
     let bad = Style::default().fg(Color::Red).add_modifier(Modifier::BOLD);
     let mut lines: Vec<PopupLine> = Vec::new();
@@ -35068,10 +36453,7 @@ fn render_import_report(f: &mut Frame, area: Rect, app: &mut App) {
         t("追加")
     };
     lines.push(PopupLine {
-        text: tf(
-            "目标表: {}",
-            &[&qualified_display(&rep.schema, &rep.table)],
-        ),
+        text: tf("目标表: {}", &[&qualified_display(&rep.schema, &rep.table)]),
         style: head,
     });
     lines.push(PopupLine {
@@ -35081,7 +36463,12 @@ fn render_import_report(f: &mut Frame, area: Rect, app: &mut App) {
     lines.push(PopupLine {
         text: tf(
             "总行数 {} · 成功 {} · 跳过 {} · 耗时 {}ms",
-            &[&rep.total, &rep.inserted, &rep.skipped.len(), &rep.elapsed_ms],
+            &[
+                &rep.total,
+                &rep.inserted,
+                &rep.skipped.len(),
+                &rep.elapsed_ms,
+            ],
         ),
         style: if rep.ok() { plain } else { warn },
     });
@@ -35300,7 +36687,11 @@ fn render_conn_export(f: &mut Frame, area: Rect, app: &mut App) {
     let h = 11.min(area.height).max(4);
     let box_area = centered_overlay(area, w, h);
     f.render_widget(Clear, box_area);
-    let border = if ex.confirm_pw { Color::Red } else { Color::Cyan };
+    let border = if ex.confirm_pw {
+        Color::Red
+    } else {
+        Color::Cyan
+    };
     let title = if ex.confirm_pw {
         t(" ⚠ 含密码导出确认 · Enter 确认 · Esc 取消 ")
     } else {
@@ -35468,13 +36859,22 @@ fn render_conn_import_plan(f: &mut Frame, area: Rect, app: &mut App) {
         return;
     }
     let w = overlay_width(area.width, 96, 40);
-    let body_h = (rows_n as u16 + 5).min(area.height.saturating_sub(2)).max(3);
+    let body_h = (rows_n as u16 + 5)
+        .min(area.height.saturating_sub(2))
+        .max(3);
     let box_area = centered_overlay(area, w, body_h);
     f.render_widget(Clear, box_area);
-    let border = if confirm.is_some() { Color::Red } else { Color::Cyan };
+    let border = if confirm.is_some() {
+        Color::Red
+    } else {
+        Color::Cyan
+    };
     let block = Block::default()
         .borders(Borders::ALL)
-        .title(tf(" 导入连接 · {} · {} · {} 条 ", &[&source, &origin, &rows_n]))
+        .title(tf(
+            " 导入连接 · {} · {} · {} 条 ",
+            &[&source, &origin, &rows_n],
+        ))
         .border_set(border::ROUNDED)
         .border_style(Style::default().fg(border));
     let inner = block.inner(box_area);
@@ -35558,13 +36958,7 @@ fn render_conn_import_plan(f: &mut Frame, area: Rect, app: &mut App) {
         let skipped: Vec<String> = app
             .conn_import_plan
             .as_ref()
-            .map(|p| {
-                p.skipped
-                    .iter()
-                    .take(6)
-                    .cloned()
-                    .collect::<Vec<_>>()
-            })
+            .map(|p| p.skipped.iter().take(6).cloned().collect::<Vec<_>>())
             .unwrap_or_default();
         let mut joined = skipped.join(", ");
         if skipped_n > 6 {
@@ -35616,8 +37010,7 @@ mod tests {
         use std::sync::OnceLock;
         static B: OnceLock<Arc<LocalBackend>> = OnceLock::new();
         B.get_or_init(|| {
-            let dir =
-                std::env::temp_dir().join(format!("dbxt-render-test-{}", std::process::id()));
+            let dir = std::env::temp_dir().join(format!("dbxt-render-test-{}", std::process::id()));
             let _ = std::fs::create_dir_all(&dir);
             // Build on a dedicated thread: some tests call `test_app()` from
             // inside their own `run_rt` runtime, and a nested `block_on` would
@@ -35628,7 +37021,8 @@ mod tests {
                     .enable_all()
                     .build()
                     .expect("tokio runtime");
-                rt.block_on(LocalBackend::open(&path)).expect("open test backend")
+                rt.block_on(LocalBackend::open(&path))
+                    .expect("open test backend")
             })
             .join()
             .expect("test backend thread");
@@ -35945,14 +37339,34 @@ mod tests {
         app.backend_kind = Backend::Sql;
         app.focus = Focus::Preview;
         app.script = Some(sample_script(5));
-        key(&mut app, &tx, KeyEvent::new(KeyCode::Char('G'), KeyModifiers::NONE));
+        key(
+            &mut app,
+            &tx,
+            KeyEvent::new(KeyCode::Char('G'), KeyModifiers::NONE),
+        );
         assert_eq!(app.script.as_ref().unwrap().sel, 4);
-        key(&mut app, &tx, KeyEvent::new(KeyCode::Char('g'), KeyModifiers::NONE));
-        key(&mut app, &tx, KeyEvent::new(KeyCode::Char('g'), KeyModifiers::NONE));
+        key(
+            &mut app,
+            &tx,
+            KeyEvent::new(KeyCode::Char('g'), KeyModifiers::NONE),
+        );
+        key(
+            &mut app,
+            &tx,
+            KeyEvent::new(KeyCode::Char('g'), KeyModifiers::NONE),
+        );
         assert_eq!(app.script.as_ref().unwrap().sel, 0, "gg goes to the top");
-        key(&mut app, &tx, KeyEvent::new(KeyCode::End, KeyModifiers::NONE));
+        key(
+            &mut app,
+            &tx,
+            KeyEvent::new(KeyCode::End, KeyModifiers::NONE),
+        );
         assert_eq!(app.script.as_ref().unwrap().sel, 4);
-        key(&mut app, &tx, KeyEvent::new(KeyCode::Home, KeyModifiers::NONE));
+        key(
+            &mut app,
+            &tx,
+            KeyEvent::new(KeyCode::Home, KeyModifiers::NONE),
+        );
         assert_eq!(app.script.as_ref().unwrap().sel, 0);
     }
 
@@ -36007,7 +37421,10 @@ mod tests {
         open_cell_popup(&mut app);
         assert!(app.popup_cache.is_none(), "cache is cleared on open");
         draw(&mut app, 42, 22);
-        let cache = app.popup_cache.as_ref().expect("cache filled on first draw");
+        let cache = app
+            .popup_cache
+            .as_ref()
+            .expect("cache filled on first draw");
         let width = cache.width;
         let ptr = cache.lines.as_ptr();
         // Same width: the wrap is reused (same allocation), even when scrolled.
@@ -36039,7 +37456,11 @@ mod tests {
             app.layout_mode = mode;
             app.sel = 0;
             app.col_cursor = 0;
-            key(&mut app, &tx, KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+            key(
+                &mut app,
+                &tx,
+                KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+            );
             assert!(
                 app.row_popup.is_some(),
                 "{mode:?}: Enter should open the row"
@@ -36049,7 +37470,11 @@ mod tests {
                 "{mode:?}: Enter should not open the cell"
             );
             // Esc closes the row, then `v` opens the cell directly.
-            key(&mut app, &tx, KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+            key(
+                &mut app,
+                &tx,
+                KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE),
+            );
             assert!(app.row_popup.is_none());
             key(
                 &mut app,
@@ -36074,7 +37499,11 @@ mod tests {
         app.sel = 0;
         open_row_popup(&mut app);
         assert_eq!(row_popup_visible(app.row_popup.as_ref().unwrap()).len(), 8);
-        key(&mut app, &tx, KeyEvent::new(KeyCode::Char('/'), KeyModifiers::NONE));
+        key(
+            &mut app,
+            &tx,
+            KeyEvent::new(KeyCode::Char('/'), KeyModifiers::NONE),
+        );
         assert!(app.row_popup.as_ref().unwrap().filtering);
         key(
             &mut app,
@@ -36085,11 +37514,19 @@ mod tests {
         assert_eq!(popup.filter, "5", "digits are filter text while typing");
         assert_eq!(row_popup_visible(popup).len(), 1);
         // Enter keeps the filter and leaves the input mode.
-        key(&mut app, &tx, KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        key(
+            &mut app,
+            &tx,
+            KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+        );
         assert!(!app.row_popup.as_ref().unwrap().filtering);
         assert_eq!(row_popup_visible(app.row_popup.as_ref().unwrap()).len(), 1);
         // Esc now closes the popup (the filter is no longer being typed).
-        key(&mut app, &tx, KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+        key(
+            &mut app,
+            &tx,
+            KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE),
+        );
         assert!(app.row_popup.is_none());
     }
 
@@ -36144,7 +37581,11 @@ mod tests {
         app.focus = Focus::Preview;
         app.sel = 0;
         app.col_cursor = 0;
-        key(&mut app, &tx, KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        key(
+            &mut app,
+            &tx,
+            KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+        );
         assert!(app.row_popup.is_some());
         // Move to the second column and drill in.
         key(
@@ -36152,15 +37593,27 @@ mod tests {
             &tx,
             KeyEvent::new(KeyCode::Char('j'), KeyModifiers::NONE),
         );
-        key(&mut app, &tx, KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        key(
+            &mut app,
+            &tx,
+            KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+        );
         assert!(app.cell_popup.is_some());
         assert!(app.row_popup.is_some(), "row stays under the drilled cell");
         assert_eq!(app.row_popup.as_ref().unwrap().cursor, 1);
         // Esc unwinds to the row, then closes it.
-        key(&mut app, &tx, KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+        key(
+            &mut app,
+            &tx,
+            KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE),
+        );
         assert!(app.cell_popup.is_none());
         assert!(app.row_popup.is_some());
-        key(&mut app, &tx, KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+        key(
+            &mut app,
+            &tx,
+            KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE),
+        );
         assert!(app.row_popup.is_none());
     }
 
@@ -36176,12 +37629,20 @@ mod tests {
         open_row_popup(&mut app);
         for c in ["5", "j"] {
             let ch = c.chars().next().unwrap();
-            key(&mut app, &tx, KeyEvent::new(KeyCode::Char(ch), KeyModifiers::NONE));
+            key(
+                &mut app,
+                &tx,
+                KeyEvent::new(KeyCode::Char(ch), KeyModifiers::NONE),
+            );
         }
         assert_eq!(app.row_popup.as_ref().unwrap().cursor, 5);
         for c in ["2", "k"] {
             let ch = c.chars().next().unwrap();
-            key(&mut app, &tx, KeyEvent::new(KeyCode::Char(ch), KeyModifiers::NONE));
+            key(
+                &mut app,
+                &tx,
+                KeyEvent::new(KeyCode::Char(ch), KeyModifiers::NONE),
+            );
         }
         assert_eq!(app.row_popup.as_ref().unwrap().cursor, 3);
     }
@@ -36254,7 +37715,10 @@ mod tests {
                 "locate-prompt",
                 Box::new(|a| a.locate_prompt = Some(TextArea::default())),
             ),
-            ("col-jump", Box::new(|a| a.col_jump = Some(TextArea::default()))),
+            (
+                "col-jump",
+                Box::new(|a| a.col_jump = Some(TextArea::default())),
+            ),
             ("export-picker", Box::new(|a| a.export_open = true)),
             (
                 "export-path",
@@ -36510,10 +37974,22 @@ mod tests {
                 }),
             ),
             ("snippets", Box::new(|a| a.snippet_open = true)),
-            ("snippet-name", Box::new(|a| a.snippet_name = Some(TextArea::default()))),
-            ("table-prompt", Box::new(|a| a.table_prompt = Some(TextArea::default()))),
-            ("result-filter", Box::new(|a| a.result_filter = Some(TextArea::default()))),
-            ("filter-prompt", Box::new(|a| a.filter_prompt = Some(TextArea::default()))),
+            (
+                "snippet-name",
+                Box::new(|a| a.snippet_name = Some(TextArea::default())),
+            ),
+            (
+                "table-prompt",
+                Box::new(|a| a.table_prompt = Some(TextArea::default())),
+            ),
+            (
+                "result-filter",
+                Box::new(|a| a.result_filter = Some(TextArea::default())),
+            ),
+            (
+                "filter-prompt",
+                Box::new(|a| a.filter_prompt = Some(TextArea::default())),
+            ),
             (
                 "ssh-hostkey",
                 Box::new(|a| {
@@ -36816,7 +38292,12 @@ mod tests {
             note: String::new(),
         };
         for format in EXPORT_FORMATS {
-            let out = render_export_content(&app, &grid, *format, Some(&("".to_string(), "t".to_string())));
+            let out = render_export_content(
+                &app,
+                &grid,
+                *format,
+                Some(&("".to_string(), "t".to_string())),
+            );
             assert!(!out.is_empty(), "{format:?} produced nothing");
         }
         // The blob column is copied as `X'…'`, never as a quoted string.
@@ -36828,15 +38309,30 @@ mod tests {
         );
         assert!(insert.contains("X'0001726177'"), "{insert}");
         // The 1 MB text cell survives verbatim in CSV and Markdown.
-        let csv = render_export_content(&app, &grid, ExportFormat::Csv, Some(&("".to_string(), "t".to_string())));
+        let csv = render_export_content(
+            &app,
+            &grid,
+            ExportFormat::Csv,
+            Some(&("".to_string(), "t".to_string())),
+        );
         assert!(csv.contains(&huge));
-        let md = render_export_content(&app, &grid, ExportFormat::Markdown, Some(&("".to_string(), "t".to_string())));
+        let md = render_export_content(
+            &app,
+            &grid,
+            ExportFormat::Markdown,
+            Some(&("".to_string(), "t".to_string())),
+        );
         assert!(md.contains(&huge));
     }
 
     /// Build an `App` whose table metadata matches `(schema, table)` so the
     /// INSERT generators resolve column types exactly as they would in the TUI.
-    fn export_meta_app(cfg: ConnectionConfig, schema: &str, table: &str, cols: &[(&str, &str)]) -> App {
+    fn export_meta_app(
+        cfg: ConnectionConfig,
+        schema: &str,
+        table: &str,
+        cols: &[(&str, &str)],
+    ) -> App {
         let mut app = test_app();
         app.selected = Some(cfg);
         app.table_meta = Some(TableMeta {
@@ -36888,12 +38384,7 @@ mod tests {
             ("blob", "longblob"),
             ("tags", "text[]"),
         ];
-        let app = export_meta_app(
-            test_conn("mysql"),
-            "shop",
-            "orders",
-            &cols,
-        );
+        let app = export_meta_app(test_conn("mysql"), "shop", "orders", &cols);
         let grid = Grid {
             columns: cols.iter().map(|(n, _)| (*n).to_string()).collect(),
             rows: vec![
@@ -36934,12 +38425,7 @@ mod tests {
 
         // The PostgreSQL dialect exercises `"schema"."table"` quoting, bytea
         // and array literals through the same comparison.
-        let pg = export_meta_app(
-            test_conn("postgres"),
-            "public",
-            "items",
-            &cols,
-        );
+        let pg = export_meta_app(test_conn("postgres"), "public", "items", &cols);
         assert_stream_matches(&pg, &grid, "public", "items");
     }
 
@@ -36968,16 +38454,15 @@ mod tests {
         };
         assert_stream_matches(&app, &no_cols, "shop", "t");
 
-        for rows in [EXPORT_INSERT_BATCH - 1, EXPORT_INSERT_BATCH, EXPORT_INSERT_BATCH + 1] {
+        for rows in [
+            EXPORT_INSERT_BATCH - 1,
+            EXPORT_INSERT_BATCH,
+            EXPORT_INSERT_BATCH + 1,
+        ] {
             let grid = Grid {
                 columns: vec!["id".into(), "name".into()],
                 rows: (0..rows)
-                    .map(|i| {
-                        vec![
-                            Val::Text(i.to_string()),
-                            Val::Text(format!("n{i}")),
-                        ]
-                    })
+                    .map(|i| vec![Val::Text(i.to_string()), Val::Text(format!("n{i}"))])
                     .collect(),
                 note: String::new(),
             };
@@ -37056,7 +38541,8 @@ mod tests {
     fn import_done_invalidates_the_count_cache() {
         let (tx, _rx) = tokio::sync::mpsc::unbounded_channel::<OpResult>();
         let mut app = test_app();
-        app.count_cache.insert("d\u{1}\u{1}t\u{1}".into(), (5, false));
+        app.count_cache
+            .insert("d\u{1}\u{1}t\u{1}".into(), (5, false));
         app.import_progress = Some((1, 1));
         let rep = ImportReport {
             table: "t".into(),
@@ -37069,7 +38555,10 @@ mod tests {
             elapsed_ms: 1,
         };
         apply_op_result(&mut app, OpResult::ImportDone(Box::new(rep)), &tx);
-        assert!(app.count_cache.is_empty(), "stale COUNT(*) survived an import");
+        assert!(
+            app.count_cache.is_empty(),
+            "stale COUNT(*) survived an import"
+        );
         assert!(app.import_progress.is_none());
         assert!(app.import_report.is_some());
     }
@@ -37089,7 +38578,8 @@ mod tests {
             Box::new(rep)
         };
         let mut app = test_app();
-        app.count_cache.insert("d\u{1}\u{1}t\u{1}".into(), (5, false));
+        app.count_cache
+            .insert("d\u{1}\u{1}t\u{1}".into(), (5, false));
         apply_op_result(
             &mut app,
             OpResult::TransferDone {
@@ -37104,7 +38594,8 @@ mod tests {
         );
 
         // An append that moved nothing changed no rows, so the cache stays.
-        app.count_cache.insert("d\u{1}\u{1}t\u{1}".into(), (5, false));
+        app.count_cache
+            .insert("d\u{1}\u{1}t\u{1}".into(), (5, false));
         apply_op_result(
             &mut app,
             OpResult::TransferDone {
@@ -37228,7 +38719,10 @@ mod tests {
     #[test]
     fn danger_detection_sees_cte_delete() {
         assert!(detect_danger("WITH x AS (SELECT id FROM t) DELETE FROM t").is_some());
-        assert!(detect_danger("WITH x AS (SELECT id FROM t) DELETE FROM t WHERE id IN (SELECT id FROM x)").is_none());
+        assert!(detect_danger(
+            "WITH x AS (SELECT id FROM t) DELETE FROM t WHERE id IN (SELECT id FROM x)"
+        )
+        .is_none());
     }
 
     #[test]
@@ -37354,9 +38848,15 @@ mod tests {
         assert_eq!(large_limit_hint("SELECT * FROM t LIMIT 20000"), Some(20000));
         assert_eq!(large_limit_hint("SELECT * FROM t LIMIT 500"), None);
         // Not a read statement, so no heads-up.
-        assert_eq!(large_limit_hint("UPDATE t SET a = 1 WHERE id = 1 LIMIT 20000"), None);
+        assert_eq!(
+            large_limit_hint("UPDATE t SET a = 1 WHERE id = 1 LIMIT 20000"),
+            None
+        );
         // MySQL `LIMIT offset, count` counts the second number.
-        assert_eq!(large_limit_hint("SELECT * FROM t LIMIT 10, 20000"), Some(20000));
+        assert_eq!(
+            large_limit_hint("SELECT * FROM t LIMIT 10, 20000"),
+            Some(20000)
+        );
         assert_eq!(large_limit_hint("SELECT * FROM t"), None);
     }
 
@@ -37367,17 +38867,33 @@ mod tests {
         app.selected = Some(test_conn("mysql"));
         app.set_editor_text("SELECT 1;");
         // The first q only arms the quit.
-        key(&mut app, &tx, KeyEvent::new(KeyCode::Char('q'), KeyModifiers::NONE));
+        key(
+            &mut app,
+            &tx,
+            KeyEvent::new(KeyCode::Char('q'), KeyModifiers::NONE),
+        );
         assert!(app.quit_armed);
         assert!(!app.quit);
         // Esc leaves without quitting and disarms.
-        key(&mut app, &tx, KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+        key(
+            &mut app,
+            &tx,
+            KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE),
+        );
         assert!(!app.quit_armed);
         assert!(!app.quit);
         // Two presses quit.
-        key(&mut app, &tx, KeyEvent::new(KeyCode::Char('q'), KeyModifiers::NONE));
+        key(
+            &mut app,
+            &tx,
+            KeyEvent::new(KeyCode::Char('q'), KeyModifiers::NONE),
+        );
         assert!(app.quit_armed);
-        key(&mut app, &tx, KeyEvent::new(KeyCode::Char('q'), KeyModifiers::NONE));
+        key(
+            &mut app,
+            &tx,
+            KeyEvent::new(KeyCode::Char('q'), KeyModifiers::NONE),
+        );
         assert!(app.quit);
     }
 
@@ -37388,7 +38904,11 @@ mod tests {
         app.selected = Some(test_conn("mysql"));
         app.set_editor_text("SELECT 1;");
         app.last_executed = Some("SELECT 1;".into());
-        key(&mut app, &tx, KeyEvent::new(KeyCode::Char('q'), KeyModifiers::NONE));
+        key(
+            &mut app,
+            &tx,
+            KeyEvent::new(KeyCode::Char('q'), KeyModifiers::NONE),
+        );
         assert!(app.quit, "a clean editor quits on the first q");
         // Ctrl-C shares the same guard: an unrun statement arms instead of quitting.
         let mut app = test_app();
@@ -37489,28 +39009,53 @@ mod tests {
         let mut g = PanGesture::default();
         // the press itself is still handled as a potential tap
         assert_eq!(
-            g.feed(MouseEventKind::Down(MouseButton::Left), 10, 5, DragPan::Button),
+            g.feed(
+                MouseEventKind::Down(MouseButton::Left),
+                10,
+                5,
+                DragPan::Button
+            ),
             None
         );
         assert!(!g.is_swipe());
         // one column of travel: not enough for a step, and not yet a swipe
         assert_eq!(
-            g.feed(MouseEventKind::Drag(MouseButton::Left), 11, 5, DragPan::Button),
+            g.feed(
+                MouseEventKind::Drag(MouseButton::Left),
+                11,
+                5,
+                DragPan::Button
+            ),
             Some(0)
         );
         assert!(!g.is_swipe());
         assert_eq!(
-            g.feed(MouseEventKind::Drag(MouseButton::Left), 13, 5, DragPan::Button),
+            g.feed(
+                MouseEventKind::Drag(MouseButton::Left),
+                13,
+                5,
+                DragPan::Button
+            ),
             Some(1)
         );
         assert!(g.is_swipe(), "2 columns of travel is a swipe, not a tap");
         assert_eq!(
-            g.feed(MouseEventKind::Drag(MouseButton::Left), 15, 5, DragPan::Button),
+            g.feed(
+                MouseEventKind::Drag(MouseButton::Left),
+                15,
+                5,
+                DragPan::Button
+            ),
             Some(1)
         );
         // releasing swallows nothing else and re-arms the tap logic
         assert_eq!(
-            g.feed(MouseEventKind::Up(MouseButton::Left), 15, 5, DragPan::Button),
+            g.feed(
+                MouseEventKind::Up(MouseButton::Left),
+                15,
+                5,
+                DragPan::Button
+            ),
             None
         );
         assert!(!g.is_swipe());
@@ -37519,9 +39064,19 @@ mod tests {
     #[test]
     fn a_drag_leftward_pans_the_other_way() {
         let mut g = PanGesture::default();
-        g.feed(MouseEventKind::Down(MouseButton::Left), 20, 5, DragPan::Button);
+        g.feed(
+            MouseEventKind::Down(MouseButton::Left),
+            20,
+            5,
+            DragPan::Button,
+        );
         assert_eq!(
-            g.feed(MouseEventKind::Drag(MouseButton::Left), 16, 5, DragPan::Button),
+            g.feed(
+                MouseEventKind::Drag(MouseButton::Left),
+                16,
+                5,
+                DragPan::Button
+            ),
             Some(-2)
         );
     }
@@ -37529,12 +39084,25 @@ mod tests {
     #[test]
     fn vertical_travel_is_neither_a_pan_nor_a_tap() {
         let mut g = PanGesture::default();
-        g.feed(MouseEventKind::Down(MouseButton::Left), 10, 5, DragPan::Button);
+        g.feed(
+            MouseEventKind::Down(MouseButton::Left),
+            10,
+            5,
+            DragPan::Button,
+        );
         assert_eq!(
-            g.feed(MouseEventKind::Drag(MouseButton::Left), 10, 9, DragPan::Button),
+            g.feed(
+                MouseEventKind::Drag(MouseButton::Left),
+                10,
+                9,
+                DragPan::Button
+            ),
             Some(0)
         );
-        assert!(g.is_swipe(), "a vertical drag must not fire the deferred tap");
+        assert!(
+            g.is_swipe(),
+            "a vertical drag must not fire the deferred tap"
+        );
     }
 
     #[test]
@@ -37551,8 +39119,16 @@ mod tests {
         assert_eq!(h.feed(MouseEventKind::Moved, 12, 5, DragPan::Any), Some(1));
         // but a held left button also qualifies in the default mode
         let mut i = PanGesture::default();
-        i.feed(MouseEventKind::Down(MouseButton::Left), 10, 5, DragPan::Button);
-        assert_eq!(i.feed(MouseEventKind::Moved, 12, 5, DragPan::Button), Some(1));
+        i.feed(
+            MouseEventKind::Down(MouseButton::Left),
+            10,
+            5,
+            DragPan::Button,
+        );
+        assert_eq!(
+            i.feed(MouseEventKind::Moved, 12, 5, DragPan::Button),
+            Some(1)
+        );
     }
 
     #[test]
@@ -37562,22 +39138,34 @@ mod tests {
             g.feed(MouseEventKind::Drag(MouseButton::Left), 10, 5, DragPan::Off),
             None
         );
-        assert_eq!(
-            g.feed(MouseEventKind::Moved, 14, 5, DragPan::Off),
-            None
-        );
+        assert_eq!(g.feed(MouseEventKind::Moved, 14, 5, DragPan::Off), None);
         // a right-button drag (text selection on a desktop) is not a swipe
         let mut h = PanGesture::default();
         assert_eq!(
-            h.feed(MouseEventKind::Down(MouseButton::Right), 10, 5, DragPan::Button),
+            h.feed(
+                MouseEventKind::Down(MouseButton::Right),
+                10,
+                5,
+                DragPan::Button
+            ),
             None
         );
         assert_eq!(
-            h.feed(MouseEventKind::Drag(MouseButton::Right), 14, 5, DragPan::Button),
+            h.feed(
+                MouseEventKind::Drag(MouseButton::Right),
+                14,
+                5,
+                DragPan::Button
+            ),
             None
         );
         assert_eq!(
-            h.feed(MouseEventKind::Drag(MouseButton::Left), 18, 5, DragPan::Button),
+            h.feed(
+                MouseEventKind::Drag(MouseButton::Left),
+                18,
+                5,
+                DragPan::Button
+            ),
             None
         );
     }
@@ -37589,12 +39177,22 @@ mod tests {
         // swallowed (it cannot be turned into travel yet) ...
         let mut g = PanGesture::default();
         assert_eq!(
-            g.feed(MouseEventKind::Drag(MouseButton::Left), 10, 5, DragPan::Button),
+            g.feed(
+                MouseEventKind::Drag(MouseButton::Left),
+                10,
+                5,
+                DragPan::Button
+            ),
             None
         );
         // ... and every later drag pans from it.
         assert_eq!(
-            g.feed(MouseEventKind::Drag(MouseButton::Left), 14, 5, DragPan::Button),
+            g.feed(
+                MouseEventKind::Drag(MouseButton::Left),
+                14,
+                5,
+                DragPan::Button
+            ),
             Some(2)
         );
     }
@@ -37603,7 +39201,12 @@ mod tests {
     fn taps_are_deferred_only_once_a_release_was_seen() {
         let mut g = PanGesture::default();
         assert!(!g.can_defer_tap(), "press-to-click until an Up is proven");
-        g.feed(MouseEventKind::Up(MouseButton::Left), 10, 5, DragPan::Button);
+        g.feed(
+            MouseEventKind::Up(MouseButton::Left),
+            10,
+            5,
+            DragPan::Button,
+        );
         assert!(g.can_defer_tap());
     }
 
@@ -37700,7 +39303,10 @@ mod tests {
 
     #[test]
     fn tree_expander_columns_follow_the_depth() {
-        assert_eq!(side_tri_cols(&SideRow::Conn { idx: 0, depth: 0 }), Some(0..2));
+        assert_eq!(
+            side_tri_cols(&SideRow::Conn { idx: 0, depth: 0 }),
+            Some(0..2)
+        );
         assert_eq!(
             side_tri_cols(&SideRow::Db {
                 idx: 0,
@@ -37718,7 +39324,10 @@ mod tests {
             }),
             None
         );
-        assert!(!side_row_has_tri(&SideRow::ConnLoading { idx: 0, depth: 1 }));
+        assert!(!side_row_has_tri(&SideRow::ConnLoading {
+            idx: 0,
+            depth: 1
+        }));
     }
 
     /// A drawn query grid, with `rects` populated, ready for a mouse event.
@@ -37749,7 +39358,10 @@ mod tests {
         assert!(app.row_popup.is_none(), "a single click only selects");
         press(&mut app, &tx, MouseEventKind::Down(MouseButton::Left), x, y);
         press(&mut app, &tx, MouseEventKind::Up(MouseButton::Left), x, y);
-        assert!(app.row_popup.is_some(), "a double click opens the row detail");
+        assert!(
+            app.row_popup.is_some(),
+            "a double click opens the row detail"
+        );
         assert_eq!(app.row_popup.as_ref().unwrap().lines.len(), 8);
     }
 
@@ -37779,8 +39391,20 @@ mod tests {
         press(&mut app, &tx, MouseEventKind::Up(MouseButton::Left), x, y);
         // Second press, then a horizontal drag far enough to be a swipe.
         press(&mut app, &tx, MouseEventKind::Down(MouseButton::Left), x, y);
-        press(&mut app, &tx, MouseEventKind::Drag(MouseButton::Left), x + 6, y);
-        press(&mut app, &tx, MouseEventKind::Up(MouseButton::Left), x + 6, y);
+        press(
+            &mut app,
+            &tx,
+            MouseEventKind::Drag(MouseButton::Left),
+            x + 6,
+            y,
+        );
+        press(
+            &mut app,
+            &tx,
+            MouseEventKind::Up(MouseButton::Left),
+            x + 6,
+            y,
+        );
         assert!(app.row_popup.is_none());
     }
 
@@ -37824,11 +39448,20 @@ mod tests {
         assert_eq!(app.row_popup.as_ref().unwrap().cursor, 2);
         assert!(app.cell_popup.is_none(), "one click only moves the cursor");
         press(&mut app, &tx, MouseEventKind::Down(MouseButton::Left), x, y);
-        assert!(app.cell_popup.is_some(), "a double click drills into the cell");
+        assert!(
+            app.cell_popup.is_some(),
+            "a double click drills into the cell"
+        );
         // A press on the cell popup closes it (like Enter) and reveals the row.
         draw(&mut app, 100, 30);
         let cb = app.rects.cell_popup;
-        press(&mut app, &tx, MouseEventKind::Down(MouseButton::Left), cb.x + 1, cb.y + 1);
+        press(
+            &mut app,
+            &tx,
+            MouseEventKind::Down(MouseButton::Left),
+            cb.x + 1,
+            cb.y + 1,
+        );
         assert!(app.cell_popup.is_none());
         assert!(app.row_popup.is_some());
     }
@@ -37851,8 +39484,17 @@ mod tests {
         draw(&mut app, 100, 30);
         let cancel = app.rects.confirm_cancel;
         assert!(cancel.width > 0, "the buttons were laid out");
-        press(&mut app, &tx, MouseEventKind::Down(MouseButton::Left), cancel.x + 1, cancel.y);
-        assert!(app.confirm.is_none(), "the cancel button takes the Esc branch");
+        press(
+            &mut app,
+            &tx,
+            MouseEventKind::Down(MouseButton::Left),
+            cancel.x + 1,
+            cancel.y,
+        );
+        assert!(
+            app.confirm.is_none(),
+            "the cancel button takes the Esc branch"
+        );
         assert!(app.history.is_empty());
         // Now the execute button: it takes the Enter branch (the statement is
         // pushed to history before it runs).
@@ -37868,7 +39510,13 @@ mod tests {
         draw(&mut app, 100, 30);
         let ok = app.rects.confirm_ok;
         assert!(ok.width > 0);
-        press(&mut app, &tx, MouseEventKind::Down(MouseButton::Left), ok.x + 1, ok.y);
+        press(
+            &mut app,
+            &tx,
+            MouseEventKind::Down(MouseButton::Left),
+            ok.x + 1,
+            ok.y,
+        );
         assert!(app.confirm.is_none());
         assert_eq!(app.history.len(), 1, "the Enter branch ran");
         // A press on the layer's body (neither button) is ignored.
@@ -37883,8 +39531,17 @@ mod tests {
         });
         draw(&mut app, 100, 30);
         let ok = app.rects.confirm_ok;
-        press(&mut app, &tx, MouseEventKind::Down(MouseButton::Left), ok.x, ok.y + 3);
-        assert!(app.confirm.is_some(), "a stray tap does not dismiss the layer");
+        press(
+            &mut app,
+            &tx,
+            MouseEventKind::Down(MouseButton::Left),
+            ok.x,
+            ok.y + 3,
+        );
+        assert!(
+            app.confirm.is_some(),
+            "a stray tap does not dismiss the layer"
+        );
     }
 
     /// The error box: a click widens a compact box (Enter), pages a long one, and
@@ -37897,24 +39554,57 @@ mod tests {
         open_error_popup(&mut app, "boom: relation does not exist");
         draw(&mut app, 100, 30);
         let ebox = app.rects.error_box;
-        press(&mut app, &tx, MouseEventKind::Down(MouseButton::Left), ebox.x + 2, ebox.y + 1);
-        assert!(app.error_popup.as_ref().unwrap().expanded, "a click widens it");
+        press(
+            &mut app,
+            &tx,
+            MouseEventKind::Down(MouseButton::Left),
+            ebox.x + 2,
+            ebox.y + 1,
+        );
+        assert!(
+            app.error_popup.as_ref().unwrap().expanded,
+            "a click widens it"
+        );
         draw(&mut app, 100, 30);
         assert_eq!(app.rects.error_max_scroll, 0, "the text fits");
         let ebox = app.rects.error_box;
-        press(&mut app, &tx, MouseEventKind::Down(MouseButton::Left), ebox.x + 2, ebox.y + 1);
+        press(
+            &mut app,
+            &tx,
+            MouseEventKind::Down(MouseButton::Left),
+            ebox.x + 2,
+            ebox.y + 1,
+        );
         assert!(app.error_popup.is_none(), "a click at the end closes it");
         // A long error pages instead of closing.
-        let long = (0..60).map(|i| format!("line {i}")).collect::<Vec<_>>().join("\n");
+        let long = (0..60)
+            .map(|i| format!("line {i}"))
+            .collect::<Vec<_>>()
+            .join("\n");
         open_error_popup(&mut app, &long);
         draw(&mut app, 100, 30);
         let ebox = app.rects.error_box;
-        press(&mut app, &tx, MouseEventKind::Down(MouseButton::Left), ebox.x + 2, ebox.y + 1);
+        press(
+            &mut app,
+            &tx,
+            MouseEventKind::Down(MouseButton::Left),
+            ebox.x + 2,
+            ebox.y + 1,
+        );
         draw(&mut app, 100, 30);
         assert!(app.rects.error_max_scroll > 0);
         let ebox = app.rects.error_box;
-        press(&mut app, &tx, MouseEventKind::Down(MouseButton::Left), ebox.x + 2, ebox.y + 1);
-        assert!(app.error_popup.is_some(), "a long error pages, it does not close");
+        press(
+            &mut app,
+            &tx,
+            MouseEventKind::Down(MouseButton::Left),
+            ebox.x + 2,
+            ebox.y + 1,
+        );
+        assert!(
+            app.error_popup.is_some(),
+            "a long error pages, it does not close"
+        );
         assert!(app.error_popup.as_ref().unwrap().scroll > 0);
     }
 
@@ -37966,7 +39656,13 @@ mod tests {
             width: ed.width - 2,
             height: ed.height - 2,
         };
-        press(&mut app, &tx, MouseEventKind::Down(MouseButton::Left), inner.x + 1, inner.y + 1);
+        press(
+            &mut app,
+            &tx,
+            MouseEventKind::Down(MouseButton::Left),
+            inner.x + 1,
+            inner.y + 1,
+        );
         assert!(app.focus == Focus::Editor);
         assert_eq!(app.editor.cursor(), (1, 1), "the caret followed the click");
         // A click past the last line jumps to the end of the text.
@@ -37996,7 +39692,9 @@ mod tests {
         let (tx, _rx) = tokio::sync::mpsc::unbounded_channel::<OpResult>();
         let mut app = test_app();
         app.picker_open = false;
-        let long: String = (0..120).map(|i| char::from(b'a' + (i % 26) as u8)).collect();
+        let long: String = (0..120)
+            .map(|i| char::from(b'a' + (i % 26) as u8))
+            .collect();
         app.set_editor_text(&long);
         draw(&mut app, 100, 30);
         assert!(app.editor_vp.col > 0, "the editor scrolled horizontally");
@@ -38052,7 +39750,8 @@ mod tests {
         for _ in 0..8 {
             let target = (off + 1).min(grid.columns.len() - 1);
             let vis = visible_cols(&grid, target, avail, max_cell).max(1);
-            let (next_off, next_cursor) = pan_window(grid.columns.len(), frozen, off, cursor, vis, 1);
+            let (next_off, next_cursor) =
+                pan_window(grid.columns.len(), frozen, off, cursor, vis, 1);
             off = next_off;
             cursor = next_cursor;
             let vis = visible_cols(&grid, off, avail, max_cell).max(1);
@@ -38079,7 +39778,10 @@ mod tests {
         let drag = mouse(MouseEventKind::Drag(MouseButton::Left), 0, 0);
         assert!(mouse_wire_hint(&drag).contains("<32;1;1M"));
         let up = mouse(MouseEventKind::Up(MouseButton::Left), 2, 3);
-        assert!(mouse_wire_hint(&up).contains("<3;3;4m"), "SGR release uses a lowercase m");
+        assert!(
+            mouse_wire_hint(&up).contains("<3;3;4m"),
+            "SGR release uses a lowercase m"
+        );
         assert!(describe_mouse(&drag).contains("Drag(Left)"));
     }
 
@@ -38134,7 +39836,9 @@ mod tests {
             .collect();
         let table = Table::new(
             rendered,
-            (0..ncols).map(|_| Constraint::Length(8)).collect::<Vec<_>>(),
+            (0..ncols)
+                .map(|_| Constraint::Length(8))
+                .collect::<Vec<_>>(),
         )
         .column_spacing(1);
         term.draw(|f| f.render_widget(table, f.area())).unwrap();
@@ -38179,7 +39883,10 @@ mod tests {
                 let empty_cell = buf.cell((9u16, y)).unwrap();
                 assert_eq!(text_at(9, y, 2), "''", "{w}x{h} r{r}");
                 assert_eq!(empty_cell.fg, Color::DarkGray, "{w}x{h} r{r}");
-                assert!(!empty_cell.modifier.contains(Modifier::ITALIC), "{w}x{h} r{r}");
+                assert!(
+                    !empty_cell.modifier.contains(Modifier::ITALIC),
+                    "{w}x{h} r{r}"
+                );
 
                 // The mixed column: the literal "NULL" is plain, the real
                 // NULL is grey (and italic when supported).
@@ -38188,7 +39895,11 @@ mod tests {
                     Val::Null => "NULL".to_string(),
                 };
                 let mixed = buf.cell((18u16, y)).unwrap();
-                assert_eq!(text_at(18, y, expected.len() as u16), expected, "{w}x{h} r{r}");
+                assert_eq!(
+                    text_at(18, y, expected.len() as u16),
+                    expected,
+                    "{w}x{h} r{r}"
+                );
                 if row[2] == Val::Null {
                     assert_eq!(mixed.fg, Color::DarkGray, "{w}x{h} r{r}");
                     assert_eq!(
@@ -38316,13 +40027,13 @@ mod tests {
         // numeric column + numeric value → unquoted
         assert_eq!(val_literal(&Val::Text("42".into()), Some("int")), "42");
         // same value in a text column → quoted
-        assert_eq!(val_literal(&Val::Text("42".into()), Some("varchar(10)")), "'42'");
+        assert_eq!(
+            val_literal(&Val::Text("42".into()), Some("varchar(10)")),
+            "'42'"
+        );
         // a non-numeric value in a numeric column must still be quoted
         assert_eq!(val_literal(&Val::Text("n/a".into()), Some("int")), "'n/a'");
-        assert_eq!(
-            val_literal(&Val::Text("true".into()), Some("bool")),
-            "TRUE"
-        );
+        assert_eq!(val_literal(&Val::Text("true".into()), Some("bool")), "TRUE");
     }
 
     #[test]
@@ -38397,7 +40108,8 @@ mod tests {
         );
         // String keys are quoted and escaped.
         assert_eq!(
-            table_data_keyset_predicate(Some(DatabaseType::Mysql), &pk, &[s("O'Brien")], ">").unwrap(),
+            table_data_keyset_predicate(Some(DatabaseType::Mysql), &pk, &[s("O'Brien")], ">")
+                .unwrap(),
             "`id` > 'O''Brien'"
         );
         // Composite keys use a row-value comparison.
@@ -38419,7 +40131,9 @@ mod tests {
             "`id` > TRUE"
         );
         // An incomplete tuple or a NULL key aborts the seek.
-        assert!(table_data_keyset_predicate(Some(DatabaseType::Mysql), &cpk, &[n(1)], ">").is_none());
+        assert!(
+            table_data_keyset_predicate(Some(DatabaseType::Mysql), &cpk, &[n(1)], ">").is_none()
+        );
         assert!(table_data_keyset_predicate(
             Some(DatabaseType::Mysql),
             &pk,
@@ -38438,36 +40152,68 @@ mod tests {
         let before = PageSeek::Before(vec![serde_json::json!(51)]);
 
         // First page under a keyset plan: primary-key order, no OFFSET at all.
-        let (sql, rev) = build_table_page_query(&cfg, None, "orders", None, 0, 50, "", None, &pk, true, &PageSeek::Offset);
+        let (sql, rev) = build_table_page_query(
+            &cfg,
+            None,
+            "orders",
+            None,
+            0,
+            50,
+            "",
+            None,
+            &pk,
+            true,
+            &PageSeek::Offset,
+        );
         assert!(!rev);
         assert!(sql.contains("ORDER BY `id` ASC"), "{sql}");
         assert!(sql.contains("LIMIT 51"), "{sql}");
         assert!(!sql.contains("OFFSET"), "{sql}");
 
         // Next page: seek past the last key, still no OFFSET.
-        let (sql, rev) = build_table_page_query(&cfg, None, "orders", None, 1, 50, "", None, &pk, true, &after);
+        let (sql, rev) = build_table_page_query(
+            &cfg, None, "orders", None, 1, 50, "", None, &pk, true, &after,
+        );
         assert!(!rev);
         assert!(sql.contains("`id` > 50"), "{sql}");
         assert!(!sql.contains("OFFSET"), "{sql}");
 
         // Previous page: seek before the first key, order and rows reversed.
-        let (sql, rev) = build_table_page_query(&cfg, None, "orders", None, 0, 50, "", None, &pk, true, &before);
+        let (sql, rev) = build_table_page_query(
+            &cfg, None, "orders", None, 0, 50, "", None, &pk, true, &before,
+        );
         assert!(rev);
         assert!(sql.contains("`id` < 51"), "{sql}");
         assert!(sql.contains("ORDER BY `id` DESC"), "{sql}");
 
         // A descending view flips the comparison.
-        let (sql, rev) = build_table_page_query(&cfg, None, "orders", None, 1, 50, "", None, &pk, false, &after);
+        let (sql, rev) = build_table_page_query(
+            &cfg, None, "orders", None, 1, 50, "", None, &pk, false, &after,
+        );
         assert!(!rev);
         assert!(sql.contains("`id` < 50"), "{sql}");
         assert!(sql.contains("ORDER BY `id` DESC"), "{sql}");
 
         // A user filter is ANDed with the seek predicate.
-        let (sql, _) = build_table_page_query(&cfg, None, "orders", None, 1, 50, "grp = 1", None, &pk, true, &after);
+        let (sql, _) = build_table_page_query(
+            &cfg, None, "orders", None, 1, 50, "grp = 1", None, &pk, true, &after,
+        );
         assert!(sql.contains("(grp = 1) AND (`id` > 50)"), "{sql}");
 
         // Without a keyset plan a custom sort keeps the classic OFFSET page.
-        let (sql, rev) = build_table_page_query(&cfg, None, "orders", None, 3, 50, "", Some("`name` ASC"), &[], true, &PageSeek::Offset);
+        let (sql, rev) = build_table_page_query(
+            &cfg,
+            None,
+            "orders",
+            None,
+            3,
+            50,
+            "",
+            Some("`name` ASC"),
+            &[],
+            true,
+            &PageSeek::Offset,
+        );
         assert!(!rev);
         assert!(sql.contains("ORDER BY `name` ASC"), "{sql}");
         assert!(sql.contains("OFFSET 150"), "{sql}");
@@ -38491,7 +40237,10 @@ mod tests {
             Some((vec!["id".to_string()], false))
         );
         // A custom sort falls back to OFFSET.
-        assert_eq!(keyset_plan(Some(&single), &orders_page(Some("`name` ASC"))), None);
+        assert_eq!(
+            keyset_plan(Some(&single), &orders_page(Some("`name` ASC"))),
+            None
+        );
 
         // Composite key: column order must match and the direction must agree.
         let composite = orders_meta(&[("a", "int"), ("b", "int")], &[]);
@@ -38508,9 +40257,18 @@ mod tests {
             Some((vec!["a".to_string(), "b".to_string()], false))
         );
         // Mixed directions, swapped order, or a partial key cannot seek.
-        assert_eq!(keyset_plan(Some(&composite), &orders_page(Some("`a` ASC, `b` DESC"))), None);
-        assert_eq!(keyset_plan(Some(&composite), &orders_page(Some("`b` ASC, `a` ASC"))), None);
-        assert_eq!(keyset_plan(Some(&composite), &orders_page(Some("`a` ASC"))), None);
+        assert_eq!(
+            keyset_plan(Some(&composite), &orders_page(Some("`a` ASC, `b` DESC"))),
+            None
+        );
+        assert_eq!(
+            keyset_plan(Some(&composite), &orders_page(Some("`b` ASC, `a` ASC"))),
+            None
+        );
+        assert_eq!(
+            keyset_plan(Some(&composite), &orders_page(Some("`a` ASC"))),
+            None
+        );
 
         // No primary key, a binary key, or metadata for another table → OFFSET.
         let keyless = orders_meta(&[], &[("x", "int")]);
@@ -38541,11 +40299,20 @@ mod tests {
             PageSeek::Before(vec![serde_json::json!(10)])
         );
         // A jump that is not exactly one page keeps OFFSET.
-        assert_eq!(keyset_seek_for(Some(&plan), Some(&cur), 0, 5), PageSeek::Offset);
-        assert_eq!(keyset_seek_for(Some(&plan), Some(&cur), 5, 0), PageSeek::Offset);
+        assert_eq!(
+            keyset_seek_for(Some(&plan), Some(&cur), 0, 5),
+            PageSeek::Offset
+        );
+        assert_eq!(
+            keyset_seek_for(Some(&plan), Some(&cur), 5, 0),
+            PageSeek::Offset
+        );
         // A direction or key mismatch keeps OFFSET.
         let desc = (vec!["id".to_string()], false);
-        assert_eq!(keyset_seek_for(Some(&desc), Some(&cur), 0, 1), PageSeek::Offset);
+        assert_eq!(
+            keyset_seek_for(Some(&desc), Some(&cur), 0, 1),
+            PageSeek::Offset
+        );
         assert_eq!(keyset_seek_for(None, Some(&cur), 0, 1), PageSeek::Offset);
         assert_eq!(keyset_seek_for(Some(&plan), None, 0, 1), PageSeek::Offset);
     }
@@ -38631,7 +40398,11 @@ mod tests {
         ps.total_lower_bound = true;
         assert!(total_label(&ps).contains(">500000"), "{}", total_label(&ps));
         ps.total_lower_bound = false;
-        assert!(total_label(&ps).contains("共 500000 行"), "{}", total_label(&ps));
+        assert!(
+            total_label(&ps).contains("共 500000 行"),
+            "{}",
+            total_label(&ps)
+        );
         ps.total = None;
         assert_eq!(total_label(&ps), "总数未知");
     }
@@ -38729,7 +40500,10 @@ mod tests {
             keys,
             vec![("id".to_string(), true), ("name".to_string(), false)]
         );
-        assert_eq!(parse_order_by(Some("\"a b\" DESC")), vec![("a b".into(), true)]);
+        assert_eq!(
+            parse_order_by(Some("\"a b\" DESC")),
+            vec![("a b".into(), true)]
+        );
         assert!(parse_order_by(None).is_empty());
     }
 
@@ -38780,12 +40554,18 @@ mod tests {
         assert_eq!(round(Val::Text(String::new()), Some("varchar(10)")), "''");
         // A literal "NULL" is quoted so an unchanged submit cannot turn it into NULL.
         assert_eq!(edit_prefill(&Val::Text("NULL".into())), "'NULL'");
-        assert_eq!(round(Val::Text("NULL".into()), Some("varchar(10)")), "'NULL'");
+        assert_eq!(
+            round(Val::Text("NULL".into()), Some("varchar(10)")),
+            "'NULL'"
+        );
         // Ordinary values open verbatim.
         assert_eq!(edit_prefill(&Val::Text("42".into())), "42");
         assert_eq!(round(Val::Text("42".into()), Some("int")), "42");
         assert_eq!(round(Val::Text("42".into()), Some("varchar(10)")), "'42'");
-        assert_eq!(round(Val::Text("O'Brien".into()), Some("text")), "'O''Brien'");
+        assert_eq!(
+            round(Val::Text("O'Brien".into()), Some("text")),
+            "'O''Brien'"
+        );
     }
 
     #[test]
@@ -38801,8 +40581,18 @@ mod tests {
         assert!(!resolve_collapse(true, Focus::Editor, PANE_EDITOR, None));
         assert!(!resolve_collapse(true, Focus::Sidebar, PANE_RESULTS, None));
         // A manual per-pane override always wins, even against the master switch.
-        assert!(resolve_collapse(false, Focus::Sidebar, PANE_SIDEBAR, Some(true)));
-        assert!(!resolve_collapse(true, Focus::Preview, PANE_SIDEBAR, Some(false)));
+        assert!(resolve_collapse(
+            false,
+            Focus::Sidebar,
+            PANE_SIDEBAR,
+            Some(true)
+        ));
+        assert!(!resolve_collapse(
+            true,
+            Focus::Preview,
+            PANE_SIDEBAR,
+            Some(false)
+        ));
     }
 
     #[test]
@@ -38817,7 +40607,9 @@ mod tests {
 
     #[test]
     fn format_sql_splits_clauses_and_uppercases_keywords() {
-        let out = format_sql("select id, name from users where age > 30 and city = 'NY' order by name limit 10");
+        let out = format_sql(
+            "select id, name from users where age > 30 and city = 'NY' order by name limit 10",
+        );
         assert_eq!(
             out,
             "SELECT id, name\nFROM users\nWHERE age > 30\n  AND city = 'NY'\nORDER BY name\nLIMIT 10"
@@ -38833,13 +40625,18 @@ mod tests {
     #[test]
     fn format_sql_protects_literals_and_quoted_identifiers() {
         // A `FROM` / keyword inside a literal or quoted identifier is untouched.
-        let out = format_sql("select 'from where select' as `from`, \"where\" from t where x = 'a''b'");
+        let out =
+            format_sql("select 'from where select' as `from`, \"where\" from t where x = 'a''b'");
         assert!(out.contains("'from where select'"), "{out}");
         assert!(out.contains("`from`"), "{out}");
         assert!(out.contains("\"where\""), "{out}");
         assert!(out.contains("'a''b'"), "{out}");
         // The literal must not have introduced a clause break.
-        assert_eq!(out.lines().filter(|l| l.contains("FROM")).count(), 1, "{out}");
+        assert_eq!(
+            out.lines().filter(|l| l.contains("FROM")).count(),
+            1,
+            "{out}"
+        );
     }
 
     #[test]
@@ -38878,7 +40675,10 @@ mod tests {
             "SELECT CAST(x AS int)\nFROM t"
         );
         // …while a plain function name keeps the user's case.
-        assert_eq!(format_sql("select count(*) from t"), "SELECT count(*)\nFROM t");
+        assert_eq!(
+            format_sql("select count(*) from t"),
+            "SELECT count(*)\nFROM t"
+        );
     }
 
     #[test]
@@ -38941,18 +40741,34 @@ mod tests {
         app.set_editor_text("SELECT f(a, (b)) FROM t");
         // On the inner `(` at col 12 -> the inner `)` at col 14.
         app.editor.move_cursor(CursorMove::Jump(0, 12));
-        key(&mut app, &tx, KeyEvent::new(KeyCode::Char('%'), KeyModifiers::NONE));
+        key(
+            &mut app,
+            &tx,
+            KeyEvent::new(KeyCode::Char('%'), KeyModifiers::NONE),
+        );
         assert_eq!(app.editor.cursor(), (0, 14));
         // On the closing bracket it jumps back (round trip).
-        key(&mut app, &tx, KeyEvent::new(KeyCode::Char('%'), KeyModifiers::NONE));
+        key(
+            &mut app,
+            &tx,
+            KeyEvent::new(KeyCode::Char('%'), KeyModifiers::NONE),
+        );
         assert_eq!(app.editor.cursor(), (0, 12));
         // Just after a bracket (`b` at 13) it still jumps from the bracket.
         app.editor.move_cursor(CursorMove::Jump(0, 13));
-        key(&mut app, &tx, KeyEvent::new(KeyCode::Char('%'), KeyModifiers::NONE));
+        key(
+            &mut app,
+            &tx,
+            KeyEvent::new(KeyCode::Char('%'), KeyModifiers::NONE),
+        );
         assert_eq!(app.editor.cursor(), (0, 14));
         // Away from any bracket `%` is a normal character (LIKE patterns / modulo).
         app.editor.move_cursor(CursorMove::Jump(0, 17));
-        key(&mut app, &tx, KeyEvent::new(KeyCode::Char('%'), KeyModifiers::NONE));
+        key(
+            &mut app,
+            &tx,
+            KeyEvent::new(KeyCode::Char('%'), KeyModifiers::NONE),
+        );
         assert!(app.editor_sql().contains('%'), "{} ", app.editor_sql());
     }
 
@@ -39040,7 +40856,11 @@ mod tests {
         let mut app = test_app();
         app.focus = Focus::Editor;
         app.set_editor_text("abc");
-        key(&mut app, &tx, KeyEvent::new(KeyCode::Left, KeyModifiers::SHIFT));
+        key(
+            &mut app,
+            &tx,
+            KeyEvent::new(KeyCode::Left, KeyModifiers::SHIFT),
+        );
         assert!(
             app.editor.selection_range().is_some(),
             "Shift+← starts a selection in the editor"
@@ -39143,22 +40963,42 @@ mod tests {
         let (tx, _rx) = tokio::sync::mpsc::unbounded_channel::<OpResult>();
         let mut app = test_app();
         app.focus = Focus::Sidebar;
-        key(&mut app, &tx, KeyEvent::new(KeyCode::Left, KeyModifiers::ALT));
+        key(
+            &mut app,
+            &tx,
+            KeyEvent::new(KeyCode::Left, KeyModifiers::ALT),
+        );
         assert!(app.status.contains("还没有浏览过表"), "{}", app.status);
-        key(&mut app, &tx, KeyEvent::new(KeyCode::Right, KeyModifiers::ALT));
+        key(
+            &mut app,
+            &tx,
+            KeyEvent::new(KeyCode::Right, KeyModifiers::ALT),
+        );
         assert!(app.status.contains("还没有浏览过表"), "{}", app.status);
         // In the editor the arrow is left alone (it does not navigate).
         app.focus = Focus::Editor;
         app.status.clear();
-        key(&mut app, &tx, KeyEvent::new(KeyCode::Left, KeyModifiers::ALT));
-        assert!(app.status.is_empty(), "editor Alt-← stayed local: {}", app.status);
+        key(
+            &mut app,
+            &tx,
+            KeyEvent::new(KeyCode::Left, KeyModifiers::ALT),
+        );
+        assert!(
+            app.status.is_empty(),
+            "editor Alt-← stayed local: {}",
+            app.status
+        );
         // The landing hint is both the status and the context-block entry, and
         // any other key clears the latter.
         set_nav_status(&mut app, "←", "public.orders");
         assert_eq!(app.status, "← public.orders");
         assert_eq!(app.nav_landing.as_deref(), Some("← public.orders"));
         assert!(context_info(&app).starts_with("← public.orders"));
-        key(&mut app, &tx, KeyEvent::new(KeyCode::Char('x'), KeyModifiers::NONE));
+        key(
+            &mut app,
+            &tx,
+            KeyEvent::new(KeyCode::Char('x'), KeyModifiers::NONE),
+        );
         assert!(app.nav_landing.is_none());
     }
 
@@ -39179,7 +41019,10 @@ mod tests {
     fn truncate_table_name_marks_the_cut() {
         assert_eq!(truncate_table_name("orders", 10), "orders");
         assert_eq!(truncate_table_name("public.accounts", 10), "public.ac~");
-        assert_eq!(truncate_table_name("public.accounts", 15), "public.accounts");
+        assert_eq!(
+            truncate_table_name("public.accounts", 15),
+            "public.accounts"
+        );
         assert_eq!(truncate_table_name("x", 0), "");
     }
 
@@ -39204,7 +41047,10 @@ mod tests {
             joined.contains("a_very_long_table~"),
             "cut name is marked with ~: {joined}"
         );
-        assert!(joined.contains("short"), "short name is untouched: {joined}");
+        assert!(
+            joined.contains("short"),
+            "short name is untouched: {joined}"
+        );
     }
 
     /// A narrow grid that clips columns shows the focused column's name early in
@@ -39282,8 +41128,22 @@ mod tests {
         let rows = compute_side_rows(&app);
         assert_eq!(rows[0], SideRow::Conn { idx: 0, depth: 0 });
         assert!(matches!(&rows[1], SideRow::Db { idx: 0, db, .. } if db == "shop"));
-        assert!(matches!(&rows[2], SideRow::Table { table: 0, depth: 2, .. }));
-        assert!(matches!(&rows[3], SideRow::Table { table: 1, depth: 2, .. }));
+        assert!(matches!(
+            &rows[2],
+            SideRow::Table {
+                table: 0,
+                depth: 2,
+                ..
+            }
+        ));
+        assert!(matches!(
+            &rows[3],
+            SideRow::Table {
+                table: 1,
+                depth: 2,
+                ..
+            }
+        ));
         assert!(matches!(&rows[4], SideRow::Db { idx: 0, db, .. } if db == "logs"));
         // The second connection is a collapsed root.
         assert_eq!(rows[5], SideRow::Conn { idx: 1, depth: 0 });
@@ -39293,7 +41153,11 @@ mod tests {
     // ── R48: DBX Desktop sidebar groups ──
 
     fn group(id: &str, name: &str, nodes: Vec<LayoutNode>) -> LayoutGroup {
-        LayoutGroup { id: id.into(), name: name.into(), nodes }
+        LayoutGroup {
+            id: id.into(),
+            name: name.into(),
+            nodes,
+        }
     }
 
     /// R48: the desktop `sidebar_layout` JSON parses nested groups, the legacy
@@ -39348,11 +41212,15 @@ mod tests {
             r#"{"groups":[{"id":"g1","name":"x"}],"order":[{"type":"group","id":"g1","children":[{"type":"bogus"}]}]}"#,
         ];
         for raw in bad {
-            let v: serde_json::Value =
-                serde_json::from_str(raw).unwrap_or(serde_json::Value::Null);
-            assert!(parse_sidebar_layout(&v).groups.is_empty(), "should degrade: {raw}");
+            let v: serde_json::Value = serde_json::from_str(raw).unwrap_or(serde_json::Value::Null);
+            assert!(
+                parse_sidebar_layout(&v).groups.is_empty(),
+                "should degrade: {raw}"
+            );
         }
-        assert!(parse_sidebar_layout(&serde_json::Value::Null).groups.is_empty());
+        assert!(parse_sidebar_layout(&serde_json::Value::Null)
+            .groups
+            .is_empty());
     }
 
     /// R48: desktop groups render as `▾ 组名 [n]` nodes with their members
@@ -39387,7 +41255,14 @@ mod tests {
         assert!(matches!(&rows[3], SideRow::Conn { idx: 0, depth: 2 }));
         // The active connection's subtree is indented below its group.
         assert!(matches!(&rows[4], SideRow::Db { idx: 0, db, depth: 3 } if db == "shop"));
-        assert!(matches!(&rows[5], SideRow::Table { table: 0, depth: 4, .. }));
+        assert!(matches!(
+            &rows[5],
+            SideRow::Table {
+                table: 0,
+                depth: 4,
+                ..
+            }
+        ));
     }
 
     /// R48: a group with no live member (or none matching the filter) draws
@@ -39402,20 +41277,45 @@ mod tests {
         // No filter: the group and its (collapsed) connection are both visible,
         // and the ungrouped active connection stays flat after them.
         let rows = compute_side_rows(&app);
-        assert_eq!(rows.iter().filter(|r| matches!(r, SideRow::Group { .. })).count(), 1);
-        assert!(rows.iter().any(|r| matches!(r, SideRow::Conn { idx: 1, .. })));
-        assert!(rows.iter().any(|r| matches!(r, SideRow::Conn { idx: 0, .. })));
+        assert_eq!(
+            rows.iter()
+                .filter(|r| matches!(r, SideRow::Group { .. }))
+                .count(),
+            1
+        );
+        assert!(rows
+            .iter()
+            .any(|r| matches!(r, SideRow::Conn { idx: 1, .. })));
+        assert!(rows
+            .iter()
+            .any(|r| matches!(r, SideRow::Conn { idx: 0, .. })));
         // A filter the grouped connection does not match hides the whole group.
         app.table_filter = "zzz".into();
         let rows = compute_side_rows(&app);
-        assert_eq!(rows.iter().filter(|r| matches!(r, SideRow::Group { .. })).count(), 0);
-        assert!(!rows.iter().any(|r| matches!(r, SideRow::Conn { idx: 1, .. })));
-        assert!(rows.iter().any(|r| matches!(r, SideRow::Conn { idx: 0, .. })));
+        assert_eq!(
+            rows.iter()
+                .filter(|r| matches!(r, SideRow::Group { .. }))
+                .count(),
+            0
+        );
+        assert!(!rows
+            .iter()
+            .any(|r| matches!(r, SideRow::Conn { idx: 1, .. })));
+        assert!(rows
+            .iter()
+            .any(|r| matches!(r, SideRow::Conn { idx: 0, .. })));
         // A member hit keeps the group (and only that member) visible.
         app.table_filter = "postgres".into();
         let rows = compute_side_rows(&app);
-        assert_eq!(rows.iter().filter(|r| matches!(r, SideRow::Group { .. })).count(), 1);
-        assert!(rows.iter().any(|r| matches!(r, SideRow::Conn { idx: 1, .. })));
+        assert_eq!(
+            rows.iter()
+                .filter(|r| matches!(r, SideRow::Group { .. }))
+                .count(),
+            1
+        );
+        assert!(rows
+            .iter()
+            .any(|r| matches!(r, SideRow::Conn { idx: 1, .. })));
     }
 
     /// R48: `h` folds a group and the fold is remembered for the session; `l`
@@ -39438,12 +41338,17 @@ mod tests {
         side_collapse(&mut app);
         assert!(app.group_closed.contains("g1"));
         assert!(
-            !app.side_rows.iter().any(|r| matches!(r, SideRow::Conn { idx: 0, .. })),
+            !app.side_rows
+                .iter()
+                .any(|r| matches!(r, SideRow::Conn { idx: 0, .. })),
             "a folded group hides its connections"
         );
         side_expand(&mut app, &tx);
         assert!(!app.group_closed.contains("g1"));
-        assert!(app.side_rows.iter().any(|r| matches!(r, SideRow::Conn { idx: 0, .. })));
+        assert!(app
+            .side_rows
+            .iter()
+            .any(|r| matches!(r, SideRow::Conn { idx: 0, .. })));
     }
 
     // ── R48: pinned result pane ──
@@ -39463,15 +41368,29 @@ mod tests {
         app.focus = Focus::Preview;
         // Alt-F in the results pane pins; it is free there (the editor keeps
         // Alt-F for SQL formatting).
-        preview_key(&mut app, &tx, KeyEvent::new(KeyCode::Char('f'), KeyModifiers::ALT));
+        preview_key(
+            &mut app,
+            &tx,
+            KeyEvent::new(KeyCode::Char('f'), KeyModifiers::ALT),
+        );
         assert!(app.pinned_result.is_some(), "Alt-F should pin the grid");
         // Switching table clears the live grid, but the pinned snapshot stays.
         app.clear_grid();
-        assert!(app.pinned_result.is_some(), "a table switch must not drop the pin");
+        assert!(
+            app.pinned_result.is_some(),
+            "a table switch must not drop the pin"
+        );
         let rows = draw(&mut app, 42, 22);
-        assert!(rows.iter().any(|r| r.contains("📌")), "pin marker missing: {rows:?}");
+        assert!(
+            rows.iter().any(|r| r.contains("📌")),
+            "pin marker missing: {rows:?}"
+        );
         // A second Alt-F releases it.
-        preview_key(&mut app, &tx, KeyEvent::new(KeyCode::Char('f'), KeyModifiers::ALT));
+        preview_key(
+            &mut app,
+            &tx,
+            KeyEvent::new(KeyCode::Char('f'), KeyModifiers::ALT),
+        );
         assert!(app.pinned_result.is_none());
     }
 
@@ -39504,9 +41423,17 @@ mod tests {
             columns: vec![pk_col("id", "bigint")],
         });
         app.focus = Focus::Preview;
-        key(&mut app, &tx, KeyEvent::new(KeyCode::Char('g'), KeyModifiers::NONE));
+        key(
+            &mut app,
+            &tx,
+            KeyEvent::new(KeyCode::Char('g'), KeyModifiers::NONE),
+        );
         assert!(app.pending_g, "g should arm the chord");
-        key(&mut app, &tx, KeyEvent::new(KeyCode::Char('c'), KeyModifiers::NONE));
+        key(
+            &mut app,
+            &tx,
+            KeyEvent::new(KeyCode::Char('c'), KeyModifiers::NONE),
+        );
         assert!(app.cols_popup_open, "g c should open the column popup");
         assert!(!app.col_picker_open, "g c must not open column visibility");
     }
@@ -39530,7 +41457,10 @@ mod tests {
         assert!(app.cols_popup_open);
         let rows = draw(&mut app, 42, 22);
         let joined = rows.join("\n");
-        assert!(joined.contains("id") && joined.contains("bigint"), "{joined}");
+        assert!(
+            joined.contains("id") && joined.contains("bigint"),
+            "{joined}"
+        );
         assert!(joined.contains("PK"), "primary-key mark missing: {joined}");
         // A query result has no `table_meta`: the grid columns stand in.
         app.cols_popup_open = false;
@@ -39557,7 +41487,10 @@ mod tests {
         let mut app = tree_app();
         rebuild_side_rows(&mut app);
         // The cursor follows the externally selected table.
-        assert!(matches!(app.side_rows[app.side_sel], SideRow::Table { table: 0, .. }));
+        assert!(matches!(
+            app.side_rows[app.side_sel],
+            SideRow::Table { table: 0, .. }
+        ));
         side_step(&mut app, 1, true);
         assert_eq!(app.table_list.selected(), Some(1));
         side_step(&mut app, 1, false);
@@ -39567,13 +41500,18 @@ mod tests {
         assert!(matches!(app.side_rows[app.side_sel], SideRow::Db { .. }));
         side_collapse(&mut app);
         assert!(
-            app.side_rows.iter().all(|r| !matches!(r, SideRow::Table { .. })),
+            app.side_rows
+                .iter()
+                .all(|r| !matches!(r, SideRow::Table { .. })),
             "collapsed database hides its tables"
         );
         assert!(matches!(app.side_rows[app.side_sel], SideRow::Db { .. }));
         // `l` re-expands the database; the collapse is remembered per (conn, db).
         side_expand(&mut app, &tx);
-        assert!(app.side_rows.iter().any(|r| matches!(r, SideRow::Table { .. })));
+        assert!(app
+            .side_rows
+            .iter()
+            .any(|r| matches!(r, SideRow::Table { .. })));
     }
 
     /// R43: the `/` filter keeps a node when it or a descendant matches, so the
@@ -39651,7 +41589,9 @@ mod tests {
         app.table_filter = "ord".into();
         apply_table_filter(&mut app);
         let rows = compute_side_rows(&app);
-        assert!(!rows.iter().any(|r| matches!(r, SideRow::ConnLoading { .. })));
+        assert!(!rows
+            .iter()
+            .any(|r| matches!(r, SideRow::ConnLoading { .. })));
         assert!(rows
             .iter()
             .any(|r| matches!(r, SideRow::Db { db, .. } if db == "shop")));
@@ -39727,7 +41667,11 @@ mod tests {
             assert!(cc.disconnect, "it is a disconnect, not a delete");
             assert_eq!(cc.id, c1.id);
             // Enter accepts and spawns the disconnect op.
-            key(&mut app, &tx, KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+            key(
+                &mut app,
+                &tx,
+                KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+            );
             assert!(app.confirm.is_none(), "the layer closed");
             assert!(app.status.contains("断开连接"), "{}", app.status);
         });
@@ -39761,9 +41705,15 @@ mod tests {
             );
             assert!(!conn_is_live(&app, &c1), "the pool is gone");
             assert!(app.tree_conn_closed.contains(&c1), "the root collapsed");
-            assert!(app.databases.is_empty(), "the dead pool's browse state is gone");
+            assert!(
+                app.databases.is_empty(),
+                "the dead pool's browse state is gone"
+            );
             // The cursor landed on the sibling root, not the dead one.
-            assert!(matches!(app.side_rows[app.side_sel], SideRow::Conn { idx: 1, .. }));
+            assert!(matches!(
+                app.side_rows[app.side_sel],
+                SideRow::Conn { idx: 1, .. }
+            ));
             // Re-expanding the dead root reconnects (marks it connecting).
             let idx = app
                 .side_rows
@@ -39832,7 +41782,10 @@ mod tests {
                 .unwrap();
             app.side_sel = idx;
             side_expand(&mut app, &tx);
-            assert!(app.conn_connecting.contains(&c2), "a reconnect is in flight");
+            assert!(
+                app.conn_connecting.contains(&c2),
+                "a reconnect is in flight"
+            );
             assert!(matches!(
                 app.tree_db_state.get(&c2),
                 Some(TreeDbState::Loading)
@@ -39882,7 +41835,10 @@ mod tests {
                 },
                 &tx,
             );
-            assert!(!app.conn_connecting.contains(&c2), "the pending mark cleared");
+            assert!(
+                !app.conn_connecting.contains(&c2),
+                "the pending mark cleared"
+            );
             assert!(!conn_is_live(&app, &c2), "a failed open is not live");
             assert!(matches!(
                 app.tree_db_state.get(&c2),
@@ -39899,7 +41855,10 @@ mod tests {
         let now = Instant::now();
         assert!(!hbar_should_show(None, now), "never poked means hidden");
         assert!(hbar_should_show(Some(now + Duration::from_millis(1)), now));
-        assert!(!hbar_should_show(Some(now), now), "the deadline is exclusive");
+        assert!(
+            !hbar_should_show(Some(now), now),
+            "the deadline is exclusive"
+        );
         assert!(!hbar_should_show(Some(now - Duration::from_millis(1)), now));
         // `poke_hbar` sets a future deadline.
         let mut app = test_app();
@@ -40091,7 +42050,10 @@ mod tests {
             &tx,
             KeyEvent::new(KeyCode::Char('p'), KeyModifiers::NONE),
         );
-        assert!(app.confirm.is_some(), "a DELETE still needs the red confirm");
+        assert!(
+            app.confirm.is_some(),
+            "a DELETE still needs the red confirm"
+        );
         assert_eq!(app.pending_run_origin, "direct");
         assert!(!app.history_open);
     }
@@ -40106,13 +42068,21 @@ mod tests {
         ];
         app.history_favorites.insert("SELECT 3".into());
         recompute_history_view(&mut app);
-        assert_eq!(app.history_view, vec![2, 0, 1], "favorite first, then time order");
+        assert_eq!(
+            app.history_view,
+            vec![2, 0, 1],
+            "favorite first, then time order"
+        );
         assert_eq!(history_fav_count(&app), 1);
         // Toggling SELECT 1 into favorites moves it under the favorites header,
         // and the cursor follows it.
         app.history_favorites.insert("SELECT 1".into());
         recompute_history_view_keep(&mut app, "SELECT 1");
-        assert_eq!(app.history_view, vec![0, 2, 1], "favorites stay in time order");
+        assert_eq!(
+            app.history_view,
+            vec![0, 2, 1],
+            "favorites stay in time order"
+        );
         assert_eq!(history_fav_count(&app), 2);
         assert_eq!(app.history_list.selected(), Some(0));
         // Un-favoriting drops it back to the chronological section.
@@ -40127,7 +42097,10 @@ mod tests {
         assert_eq!(human_bytes(0), "0 B");
         assert_eq!(human_bytes(512), "512 B");
         assert_eq!(human_bytes(1024), "1.0 KB");
-        assert_eq!(human_bytes(2 * 1024 * 1024 * 1024 + 100 * 1024 * 1024), "2.1 GB");
+        assert_eq!(
+            human_bytes(2 * 1024 * 1024 * 1024 + 100 * 1024 * 1024),
+            "2.1 GB"
+        );
         assert_eq!(human_count(12), "12");
         assert_eq!(human_count(1200), "1.2k");
         assert_eq!(human_count(3_400_000), "3.4M");
@@ -40218,7 +42191,11 @@ mod tests {
             depth: 2,
         };
         app.term_w = 42;
-        assert_eq!(side_row_size(&app, &db_row), None, "hidden below 56 columns");
+        assert_eq!(
+            side_row_size(&app, &db_row),
+            None,
+            "hidden below 56 columns"
+        );
         assert_eq!(side_row_size(&app, &table_row), None);
         app.term_w = 80;
         assert_eq!(side_row_size(&app, &db_row), Some("2.1 GB".into()));
@@ -40441,7 +42418,10 @@ mod tests {
         assert!(keys.contains(&"— 连接选择 —"));
         assert!(HELP_ROWS.iter().any(|(_, d)| *d == "回到侧栏"));
         // CSV import has a documented sidebar binding.
-        assert!(keys.contains(&"I"), "help is missing the CSV import binding");
+        assert!(
+            keys.contains(&"I"),
+            "help is missing the CSV import binding"
+        );
     }
 
     #[test]
@@ -40547,7 +42527,10 @@ mod tests {
 
     #[test]
     fn parse_csv_handles_quotes_commas_and_newlines() {
-        let rows = parse_csv("a,b\n\"x,1\",\"he said \"\"hi\"\"\"\n\"multi\nline\",2\n", ',');
+        let rows = parse_csv(
+            "a,b\n\"x,1\",\"he said \"\"hi\"\"\"\n\"multi\nline\",2\n",
+            ',',
+        );
         assert_eq!(rows.len(), 3);
         assert_eq!(rows[0], vec!["a", "b"]);
         assert_eq!(rows[1], vec!["x,1", "he said \"hi\""]);
@@ -40626,7 +42609,10 @@ mod tests {
         assert_eq!(import_literal("3.5", ColType::Float, "double"), "3.5");
         assert_eq!(import_literal("true", ColType::Bool, "tinyint"), "TRUE");
         assert_eq!(import_literal("FALSE", ColType::Bool, "tinyint"), "FALSE");
-        assert_eq!(import_literal("O'Brien", ColType::Text, "text"), "'O''Brien'");
+        assert_eq!(
+            import_literal("O'Brien", ColType::Text, "text"),
+            "'O''Brien'"
+        );
         // A numeric target keeps a number bare even when inference said text.
         assert_eq!(import_literal("42", ColType::Text, "int"), "42");
         assert_eq!(
@@ -40674,7 +42660,10 @@ mod tests {
 
     #[test]
     fn import_error_row_reads_the_statement_index() {
-        assert_eq!(import_row_of_error(1000, "Statement 3 failed: Duplicate entry", 500), 1003);
+        assert_eq!(
+            import_row_of_error(1000, "Statement 3 failed: Duplicate entry", 500),
+            1003
+        );
         // Unparseable / out-of-range errors fall back to the chunk start.
         assert_eq!(import_row_of_error(1000, "boom", 500), 1001);
         assert_eq!(import_row_of_error(1000, "Statement 999 failed", 500), 1001);
@@ -40796,7 +42785,10 @@ mod tests {
         cfg.color = Some("#123456".into());
         let custom = form_from_connection(&cfg, cfg.name.clone(), None);
         assert_eq!(custom.color_sel, CONN_COLOR_CUSTOM);
-        assert_eq!(normalize_conn_color(&custom.color).unwrap().as_deref(), Some("#123456"));
+        assert_eq!(
+            normalize_conn_color(&custom.color).unwrap().as_deref(),
+            Some("#123456")
+        );
     }
 
     fn conn_for_sort(id: &str, name: &str, db_type: &str, color: Option<&str>) -> ConnectionConfig {
@@ -40815,9 +42807,7 @@ mod tests {
             conn_for_sort("c", "beta", "mysql", None),
             conn_for_sort("d", "prod-red-2", "postgres", Some("#e06c75")),
         ];
-        let names = |l: &[ConnectionConfig]| {
-            l.iter().map(|c| c.name.clone()).collect::<Vec<_>>()
-        };
+        let names = |l: &[ConnectionConfig]| l.iter().map(|c| c.name.clone()).collect::<Vec<_>>();
         sort_connection_list(&mut list, ConnSort::Name);
         assert_eq!(names(&list), ["alpha", "beta", "prod-red", "prod-red-2"]);
         sort_connection_list(&mut list, ConnSort::Type);
@@ -40985,12 +42975,20 @@ mod tests {
         // Primary key: Alt-/ opens, then Tab accepts the first candidate.
         let mut app = open(KeyModifiers::ALT, KeyCode::Char('/'));
         assert!(app.completion.is_some(), "Alt-/ should open completion");
-        editor_key(&mut app, &tx, KeyEvent::new(KeyCode::Tab, KeyModifiers::empty()));
+        editor_key(
+            &mut app,
+            &tx,
+            KeyEvent::new(KeyCode::Tab, KeyModifiers::empty()),
+        );
         assert!(app.completion.is_none(), "Tab should accept the completion");
         assert_eq!(app.editor.lines(), ["select * from users"]);
         // Compatibility aliases still open the popup.
-        assert!(open(KeyModifiers::CONTROL, KeyCode::Char(' ')).completion.is_some());
-        assert!(open(KeyModifiers::empty(), KeyCode::Null).completion.is_some());
+        assert!(open(KeyModifiers::CONTROL, KeyCode::Char(' '))
+            .completion
+            .is_some());
+        assert!(open(KeyModifiers::empty(), KeyCode::Null)
+            .completion
+            .is_some());
     }
 
     // ── R13: copy row as INSERT ──
@@ -41014,7 +43012,11 @@ mod tests {
         );
         // A binary column becomes a portable hex literal.
         assert_eq!(
-            insert_literal(&Val::Text("\u{0}\u{1}A".into()), Some("varbinary(8)"), Some("mysql")),
+            insert_literal(
+                &Val::Text("\u{0}\u{1}A".into()),
+                Some("varbinary(8)"),
+                Some("mysql")
+            ),
             "X'000141'"
         );
         // PostgreSQL bytea needs its own form — `X'…'` is a bit string there.
@@ -41029,7 +43031,11 @@ mod tests {
         // The kernel renders bytea/blob cells as `0x<hex>`; re-hexing that text
         // used to write the ASCII of `0x…` instead of the original bytes.
         assert_eq!(
-            insert_literal(&Val::Text("0xdeadbeef".into()), Some("bytea"), Some("postgres")),
+            insert_literal(
+                &Val::Text("0xdeadbeef".into()),
+                Some("bytea"),
+                Some("postgres")
+            ),
             "'\\xdeadbeef'::bytea"
         );
         assert_eq!(
@@ -41037,7 +43043,11 @@ mod tests {
             "X'DEADBEEF'"
         );
         assert_eq!(
-            insert_literal(&Val::Text("\\x0a1b".into()), Some("bytea"), Some("postgres")),
+            insert_literal(
+                &Val::Text("\\x0a1b".into()),
+                Some("bytea"),
+                Some("postgres")
+            ),
             "'\\x0a1b'::bytea"
         );
         // A non-hex `0x…`-looking string still falls back to raw-byte hex.
@@ -41056,11 +43066,19 @@ mod tests {
         // PostgreSQL arrays arrive as JSON; an INSERT needs `ARRAY[…]`, not the
         // JSON text (which the server rejects as a malformed array literal).
         assert_eq!(
-            insert_literal(&Val::Text("[\"admin\",\"beta\"]".into()), Some("text[]"), Some("postgres")),
+            insert_literal(
+                &Val::Text("[\"admin\",\"beta\"]".into()),
+                Some("text[]"),
+                Some("postgres")
+            ),
             "ARRAY['admin', 'beta']::text[]"
         );
         assert_eq!(
-            insert_literal(&Val::Text("[1,2,3]".into()), Some("integer[]"), Some("postgres")),
+            insert_literal(
+                &Val::Text("[1,2,3]".into()),
+                Some("integer[]"),
+                Some("postgres")
+            ),
             "ARRAY[1, 2, 3]::integer[]"
         );
         assert_eq!(
@@ -41069,7 +43087,11 @@ mod tests {
         );
         // An element containing a quote or comma is quoted safely.
         assert_eq!(
-            insert_literal(&Val::Text("[\"a,b\",\"O'Brien\"]".into()), Some("text[]"), Some("postgres")),
+            insert_literal(
+                &Val::Text("[\"a,b\",\"O'Brien\"]".into()),
+                Some("text[]"),
+                Some("postgres")
+            ),
             "ARRAY['a,b', 'O''Brien']::text[]"
         );
         // A non-array column is untouched.
@@ -41087,7 +43109,11 @@ mod tests {
     fn data_literal_handles_arrays_and_binary_like_the_insert_path() {
         let pg = parse_database_type("postgres").unwrap();
         assert_eq!(
-            data_val_literal(&Val::Text("[\"admin\",\"beta\"]".into()), Some("text[]"), pg),
+            data_val_literal(
+                &Val::Text("[\"admin\",\"beta\"]".into()),
+                Some("text[]"),
+                pg
+            ),
             "ARRAY['admin', 'beta']::text[]"
         );
         assert_eq!(
@@ -41191,7 +43217,10 @@ mod tests {
             "text[]",
             "jsonb",
         ] {
-            assert!(!is_text_search_column(ty), "{ty} must not be scanned as text");
+            assert!(
+                !is_text_search_column(ty),
+                "{ty} must not be scanned as text"
+            );
         }
     }
 
@@ -41236,7 +43265,10 @@ mod tests {
         let pg = parse_database_type("postgres").unwrap();
         let my = parse_database_type("mysql").unwrap();
         let sql = build_search_estimates_sql(pg, "inv");
-        assert!(sql.contains("pg_class") && sql.contains("reltuples"), "{sql}");
+        assert!(
+            sql.contains("pg_class") && sql.contains("reltuples"),
+            "{sql}"
+        );
         assert!(sql.contains("'inv'"), "{sql}");
         let sql = build_search_estimates_sql(my, "");
         assert!(sql.contains("information_schema.tables"), "{sql}");
@@ -41321,7 +43353,11 @@ mod tests {
         open_global_search(&mut app);
         assert!(app.search_input.is_some(), "the term prompt should open");
         // Esc closes the prompt without starting a scan.
-        key(&mut app, &tx, KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+        key(
+            &mut app,
+            &tx,
+            KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE),
+        );
         assert!(app.search_input.is_none());
         assert!(!app.search_open);
 
@@ -41338,12 +43374,20 @@ mod tests {
         app.search_running = true;
         app.search_query = "ali".into();
         let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
-        search_key(&mut app, &tx, KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+        search_key(
+            &mut app,
+            &tx,
+            KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE),
+        );
         assert!(app.search_cancel.load(Ordering::Relaxed));
         assert!(app.search_open, "the overlay stays until the scan stops");
         // Once stopped, Esc closes it.
         app.search_running = false;
-        search_key(&mut app, &tx, KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+        search_key(
+            &mut app,
+            &tx,
+            KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE),
+        );
         assert!(!app.search_open);
     }
 
@@ -41386,7 +43430,13 @@ mod tests {
         assert!(read_sql_file(&path).is_err());
     }
 
-    fn column(name: &str, ty: &str, nullable: bool, default: Option<&str>, extra: Option<&str>) -> ColumnInfo {
+    fn column(
+        name: &str,
+        ty: &str,
+        nullable: bool,
+        default: Option<&str>,
+        extra: Option<&str>,
+    ) -> ColumnInfo {
         ColumnInfo {
             name: name.into(),
             data_type: ty.into(),
@@ -41400,8 +43450,20 @@ mod tests {
     #[test]
     fn insert_template_skips_server_generated_columns() {
         // MySQL auto-increment, PostgreSQL serial, identity and generated.
-        assert!(is_server_generated_column(&column("id", "int", false, None, Some("auto_increment"))));
-        assert!(is_server_generated_column(&column("id", "bigint", false, None, Some("bigserial"))));
+        assert!(is_server_generated_column(&column(
+            "id",
+            "int",
+            false,
+            None,
+            Some("auto_increment")
+        )));
+        assert!(is_server_generated_column(&column(
+            "id",
+            "bigint",
+            false,
+            None,
+            Some("bigserial")
+        )));
         assert!(is_server_generated_column(&column(
             "id",
             "bigint",
@@ -41425,30 +43487,68 @@ mod tests {
             None
         )));
         // Ordinary columns are not skipped.
-        assert!(!is_server_generated_column(&column("email", "text", false, None, None)));
-        assert!(!is_server_generated_column(&column("balance", "numeric(12,2)", false, Some("0.00"), None)));
+        assert!(!is_server_generated_column(&column(
+            "email", "text", false, None, None
+        )));
+        assert!(!is_server_generated_column(&column(
+            "balance",
+            "numeric(12,2)",
+            false,
+            Some("0.00"),
+            None
+        )));
     }
 
     #[test]
     fn insert_placeholder_is_valid_for_the_column_type() {
         // PostgreSQL NOT NULL columns: the old rule emitted `''`, which the
         // server rejects for boolean / timestamp / numeric.
-        assert_eq!(insert_placeholder(&column("active", "boolean", false, None, None)), "FALSE");
         assert_eq!(
-            insert_placeholder(&column("created_at", "timestamp with time zone", false, None, None)),
+            insert_placeholder(&column("active", "boolean", false, None, None)),
+            "FALSE"
+        );
+        assert_eq!(
+            insert_placeholder(&column(
+                "created_at",
+                "timestamp with time zone",
+                false,
+                None,
+                None
+            )),
             "CURRENT_TIMESTAMP"
         );
-        assert_eq!(insert_placeholder(&column("qty", "integer", false, None, None)), "0");
-        assert_eq!(insert_placeholder(&column("meta", "jsonb", false, None, None)), "'{}'");
-        assert_eq!(insert_placeholder(&column("tags", "text[]", false, None, None)), "'{}'");
-        assert_eq!(insert_placeholder(&column("email", "text", false, None, None)), "''");
+        assert_eq!(
+            insert_placeholder(&column("qty", "integer", false, None, None)),
+            "0"
+        );
+        assert_eq!(
+            insert_placeholder(&column("meta", "jsonb", false, None, None)),
+            "'{}'"
+        );
+        assert_eq!(
+            insert_placeholder(&column("tags", "text[]", false, None, None)),
+            "'{}'"
+        );
+        assert_eq!(
+            insert_placeholder(&column("email", "text", false, None, None)),
+            "''"
+        );
         // A declared default is delegated to the server.
         assert_eq!(
-            insert_placeholder(&column("balance", "numeric(12,2)", false, Some("0.00"), None)),
+            insert_placeholder(&column(
+                "balance",
+                "numeric(12,2)",
+                false,
+                Some("0.00"),
+                None
+            )),
             "DEFAULT"
         );
         // Nullable columns stay NULL.
-        assert_eq!(insert_placeholder(&column("note", "text", true, None, None)), "NULL");
+        assert_eq!(
+            insert_placeholder(&column("note", "text", true, None, None)),
+            "NULL"
+        );
         // An enum NOT NULL picks its first label.
         let mut mood = column("feeling", "mood", false, None, None);
         mood.enum_values = Some(vec!["happy".into(), "sad".into()]);
@@ -41457,15 +43557,15 @@ mod tests {
 
     #[test]
     fn table_name_is_guessed_from_common_statements() {
-        assert_eq!(guess_table_from_sql("select * from users"), Some("users".into()));
+        assert_eq!(
+            guess_table_from_sql("select * from users"),
+            Some("users".into())
+        );
         assert_eq!(
             guess_table_from_sql("SELECT a FROM `shop`.`orders` WHERE x=1"),
             Some("orders".into())
         );
-        assert_eq!(
-            guess_table_from_sql("select * from (select 1)"),
-            None
-        );
+        assert_eq!(guess_table_from_sql("select * from (select 1)"), None);
         assert_eq!(
             guess_table_from_sql("update public.t set a=1"),
             Some("t".into())
@@ -41609,7 +43709,10 @@ mod tests {
         c.save(&path);
         let cleared = TuiConfig::load(&path);
         assert!(cleared.table("db", "", "a").is_none());
-        assert!(cleared.table("db", "", "b").is_some(), "unrelated entry survives");
+        assert!(
+            cleared.table("db", "", "b").is_some(),
+            "unrelated entry survives"
+        );
         let _ = std::fs::remove_file(&path);
     }
 
@@ -41617,12 +43720,20 @@ mod tests {
 
     #[test]
     fn schema_picker_engine_is_opt_in() {
-        assert!(schema_picker_engine(parse_database_type("postgres").unwrap()));
-        assert!(schema_picker_engine(parse_database_type("sqlserver").unwrap()));
+        assert!(schema_picker_engine(
+            parse_database_type("postgres").unwrap()
+        ));
+        assert!(schema_picker_engine(
+            parse_database_type("sqlserver").unwrap()
+        ));
         assert!(schema_picker_engine(parse_database_type("oracle").unwrap()));
         // Embedded / single-namespace engines keep the flat list.
-        assert!(!schema_picker_engine(parse_database_type("sqlite").unwrap()));
-        assert!(!schema_picker_engine(parse_database_type("duckdb").unwrap()));
+        assert!(!schema_picker_engine(
+            parse_database_type("sqlite").unwrap()
+        ));
+        assert!(!schema_picker_engine(
+            parse_database_type("duckdb").unwrap()
+        ));
         assert!(!schema_picker_engine(parse_database_type("mysql").unwrap()));
     }
 
@@ -42106,7 +44217,11 @@ mod tests {
             let rows = draw(&mut app, 42, 22);
             // The TestBackend pads each wide CJK glyph with a space cell, so
             // strip whitespace before matching a multi-character title.
-            let text: String = rows.join("\n").chars().filter(|c| !c.is_whitespace()).collect();
+            let text: String = rows
+                .join("\n")
+                .chars()
+                .filter(|c| !c.is_whitespace())
+                .collect();
             assert!(
                 text.contains(fragment),
                 "{name}: short title {fragment:?} missing at 42×22\n{text}"
@@ -42201,8 +44316,16 @@ mod tests {
             .hidden
             .contains("secret"));
         // The public entry kept no hidden set, and vice versa.
-        assert!(back.table("shop", "public", "orders").unwrap().hidden.is_empty());
-        assert!(back.table("shop", "inv", "orders").unwrap().order_by.is_none());
+        assert!(back
+            .table("shop", "public", "orders")
+            .unwrap()
+            .hidden
+            .is_empty());
+        assert!(back
+            .table("shop", "inv", "orders")
+            .unwrap()
+            .order_by
+            .is_none());
         let _ = std::fs::remove_file(&path);
     }
 
@@ -42215,14 +44338,23 @@ mod tests {
             ta.move_cursor(CursorMove::End);
             ta
         };
-        assert_eq!(completion_context(&end("select * from us")).0, CompCtx::TableList);
+        assert_eq!(
+            completion_context(&end("select * from us")).0,
+            CompCtx::TableList
+        );
         assert_eq!(completion_context(&end("select * from us")).1, "us");
         assert_eq!(
             completion_context(&end("select * from t left join ")).0,
             CompCtx::TableList
         );
-        assert_eq!(completion_context(&end("select * from t where ")).0, CompCtx::Column);
-        assert_eq!(completion_context(&end("select * from t on ")).0, CompCtx::Column);
+        assert_eq!(
+            completion_context(&end("select * from t where ")).0,
+            CompCtx::Column
+        );
+        assert_eq!(
+            completion_context(&end("select * from t on ")).0,
+            CompCtx::Column
+        );
         assert_eq!(completion_context(&end("select * ")).0, CompCtx::Any);
         let (ctx, partial) = completion_context(&end("select * from users.na"));
         assert_eq!(ctx, CompCtx::Qualified("users".into()));
@@ -42271,9 +44403,15 @@ mod tests {
             .map(|i| table_info(&format!("t{i:02}"), "TABLE"))
             .collect();
         app.term_w = 36;
-        assert_eq!(completion_candidates(&app, &CompCtx::TableList, "").len(), 5);
+        assert_eq!(
+            completion_candidates(&app, &CompCtx::TableList, "").len(),
+            5
+        );
         app.term_w = 120;
-        assert_eq!(completion_candidates(&app, &CompCtx::TableList, "").len(), 8);
+        assert_eq!(
+            completion_candidates(&app, &CompCtx::TableList, "").len(),
+            8
+        );
     }
 
     // ── R15: wheel modifier encodings, footer layout, bilingual UI ──
@@ -42298,7 +44436,12 @@ mod tests {
             assert!(!wheel_wants_pan(Focus::Preview, mods, false, false));
         }
         // Ctrl-G pan mode pans with an unmodified wheel; other panes never pan.
-        assert!(wheel_wants_pan(Focus::Preview, KeyModifiers::NONE, true, true));
+        assert!(wheel_wants_pan(
+            Focus::Preview,
+            KeyModifiers::NONE,
+            true,
+            true
+        ));
         assert!(!wheel_wants_pan(
             Focus::Editor,
             KeyModifiers::CONTROL,
@@ -42333,7 +44476,10 @@ mod tests {
         };
         for code in [64u8, 65, 68, 69, 72, 73, 80, 81] {
             let hint = mouse_wire_hint(&mk(code));
-            assert!(hint.contains(&format!("<{code};1;1M")), "code {code}: {hint}");
+            assert!(
+                hint.contains(&format!("<{code};1;1M")),
+                "code {code}: {hint}"
+            );
         }
     }
 
@@ -42384,13 +44530,11 @@ mod tests {
 
         // Short hints so each tier's width is reached: a narrow footer shows at
         // most 4 hints, a mid one at most 6, a wide one all of them.
-        let hints: Vec<Hint> = [
-            "a", "b", "c", "d", "e", "f", "g", "h", "i", "j", "k", "l",
-        ]
-        .into_iter()
-        .map(|key| (key, "d"))
-        .chain(std::iter::once(("?", "help")))
-        .collect();
+        let hints: Vec<Hint> = ["a", "b", "c", "d", "e", "f", "g", "h", "i", "j", "k", "l"]
+            .into_iter()
+            .map(|key| (key, "d"))
+            .chain(std::iter::once(("?", "help")))
+            .collect();
         let (mini, more) = footer_select(&hints, 42);
         assert!(mini.len() <= 4, "mini chose {} hints", mini.len());
         assert!(more);
@@ -42420,7 +44564,10 @@ mod tests {
         let q = || KeyEvent::new(KeyCode::Char('?'), KeyModifiers::NONE);
 
         key(&mut app, &tx, q());
-        assert!(app.help_mini && !app.help_open, "first ? opens the mini sheet");
+        assert!(
+            app.help_mini && !app.help_open,
+            "first ? opens the mini sheet"
+        );
         assert_eq!(footer_ctx(&app).view, FooterView::HelpMini);
         // The mini rows come from the current context, capped at ten and never
         // including the pinned `?` hint itself.
@@ -42441,7 +44588,11 @@ mod tests {
         // Esc on the mini layer closes it without ever showing the full list.
         key(&mut app, &tx, q());
         assert!(app.help_mini);
-        key(&mut app, &tx, KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+        key(
+            &mut app,
+            &tx,
+            KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE),
+        );
         assert!(!app.help_mini && !app.help_open);
     }
 
@@ -42462,7 +44613,8 @@ mod tests {
     }
 
     #[test]
-    fn count_prefix_parses_and_jumps() {        assert_eq!(parse_count(""), None);
+    fn count_prefix_parses_and_jumps() {
+        assert_eq!(parse_count(""), None);
         assert_eq!(parse_count("0"), None);
         assert_eq!(parse_count("5"), Some(5));
         assert_eq!(parse_count("12"), Some(12));
@@ -42500,9 +44652,16 @@ mod tests {
 
         key(&mut app, &tx, digit('3'));
         assert_eq!(app.count_buf, "3");
-        key(&mut app, &tx, KeyEvent::new(KeyCode::Char('j'), KeyModifiers::NONE));
+        key(
+            &mut app,
+            &tx,
+            KeyEvent::new(KeyCode::Char('j'), KeyModifiers::NONE),
+        );
         assert_eq!(app.table_list.selected(), Some(3));
-        assert!(app.count_buf.is_empty(), "the count is consumed by the motion");
+        assert!(
+            app.count_buf.is_empty(),
+            "the count is consumed by the motion"
+        );
 
         // A bare digit flushes as a jump to the Nth item.
         key(&mut app, &tx, digit('6'));
@@ -42511,7 +44670,11 @@ mod tests {
 
         // Esc cancels a pending count without moving.
         key(&mut app, &tx, digit('9'));
-        key(&mut app, &tx, KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+        key(
+            &mut app,
+            &tx,
+            KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE),
+        );
         assert!(app.count_buf.is_empty());
         assert_eq!(app.table_list.selected(), Some(5));
 
@@ -42543,16 +44706,32 @@ mod tests {
         app.grid_kind = GridKind::TableData;
         app.set_grid(sample_grid());
 
-        key(&mut app, &tx, KeyEvent::new(KeyCode::Char('g'), KeyModifiers::NONE));
+        key(
+            &mut app,
+            &tx,
+            KeyEvent::new(KeyCode::Char('g'), KeyModifiers::NONE),
+        );
         assert!(app.pending_g);
-        key(&mut app, &tx, KeyEvent::new(KeyCode::Char('d'), KeyModifiers::NONE));
+        key(
+            &mut app,
+            &tx,
+            KeyEvent::new(KeyCode::Char('d'), KeyModifiers::NONE),
+        );
         assert!(!app.pending_g);
         assert!(app.status.contains("结构"), "status: {}", app.status);
 
         // `gv` opens the value-locate prompt. It must survive the browse-level
         // g-chord interceptor, which forwards only the known second keys.
-        key(&mut app, &tx, KeyEvent::new(KeyCode::Char('g'), KeyModifiers::NONE));
-        key(&mut app, &tx, KeyEvent::new(KeyCode::Char('v'), KeyModifiers::NONE));
+        key(
+            &mut app,
+            &tx,
+            KeyEvent::new(KeyCode::Char('g'), KeyModifiers::NONE),
+        );
+        key(
+            &mut app,
+            &tx,
+            KeyEvent::new(KeyCode::Char('v'), KeyModifiers::NONE),
+        );
         assert!(app.locate_prompt.is_some(), "gv opens the locate prompt");
         assert!(!app.pending_g);
         // Close it without an Esc (Esc from the results pane also refocuses the
@@ -42560,17 +44739,37 @@ mod tests {
         app.locate_prompt = None;
         app.locate_needle.clear();
 
-        key(&mut app, &tx, KeyEvent::new(KeyCode::Char('g'), KeyModifiers::NONE));
-        key(&mut app, &tx, KeyEvent::new(KeyCode::Char('t'), KeyModifiers::NONE));
+        key(
+            &mut app,
+            &tx,
+            KeyEvent::new(KeyCode::Char('g'), KeyModifiers::NONE),
+        );
+        key(
+            &mut app,
+            &tx,
+            KeyEvent::new(KeyCode::Char('t'), KeyModifiers::NONE),
+        );
         assert!(app.page_state.is_some(), "gt loads the table data page");
 
         // A pending `g` must not survive an unrelated key: `?` opens help and
         // clears the chord instead of being swallowed.
-        key(&mut app, &tx, KeyEvent::new(KeyCode::Char('g'), KeyModifiers::NONE));
+        key(
+            &mut app,
+            &tx,
+            KeyEvent::new(KeyCode::Char('g'), KeyModifiers::NONE),
+        );
         assert!(app.pending_g);
-        key(&mut app, &tx, KeyEvent::new(KeyCode::Char('?'), KeyModifiers::NONE));
+        key(
+            &mut app,
+            &tx,
+            KeyEvent::new(KeyCode::Char('?'), KeyModifiers::NONE),
+        );
         assert!(app.help_mini && !app.pending_g, "? wins over a stale g");
-        key(&mut app, &tx, KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+        key(
+            &mut app,
+            &tx,
+            KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE),
+        );
     }
 
     /// A narrow results pane keeps only the table name, page number and the
@@ -43042,7 +45241,11 @@ mod tests {
         );
         // Escaped braces survive template substitution.
         assert_eq!(
-            tf_lang("mongo parse: {} (例: db.col.find({{}}))", &[&"boom"], Lang::En),
+            tf_lang(
+                "mongo parse: {} (例: db.col.find({{}}))",
+                &[&"boom"],
+                Lang::En
+            ),
             "mongo parse: boom (e.g. db.col.find({}))"
         );
     }
@@ -43116,7 +45319,10 @@ mod tests {
             let prev_ok = i == 0 || !(chars[i - 1].is_ascii_alphanumeric() || chars[i - 1] == '_');
             let after = if chars[i] == 't' && chars.get(i + 1) == Some(&'(') {
                 Some(i + 2)
-            } else if chars[i] == 't' && chars.get(i + 1) == Some(&'f') && chars.get(i + 2) == Some(&'(') {
+            } else if chars[i] == 't'
+                && chars.get(i + 1) == Some(&'f')
+                && chars.get(i + 2) == Some(&'(')
+            {
                 Some(i + 3)
             } else {
                 None
@@ -43240,7 +45446,11 @@ mod tests {
         assert!(help.contains("https://github.com/vst93/dbxt"));
         assert!(help.ends_with('\n'));
         // Exactly the two long options the parser actually accepts.
-        assert_eq!(help.matches("--").count(), 2, "unexpected --help drift: {help:?}");
+        assert_eq!(
+            help.matches("--").count(),
+            2,
+            "unexpected --help drift: {help:?}"
+        );
     }
 
     #[test]
@@ -43459,7 +45669,12 @@ mod tests {
 
     #[test]
     fn redis_multi_select_toggles_and_ranges() {
-        let keys = vec![rk("a", "app:1"), rk("b", "app:2"), rk("c", "app:3"), rk("d", "app:4")];
+        let keys = vec![
+            rk("a", "app:1"),
+            rk("b", "app:2"),
+            rk("c", "app:3"),
+            rk("d", "app:4"),
+        ];
         let mut sel: HashSet<String> = HashSet::new();
         let mut anchor: Option<usize> = None;
         redis_selection_toggle(&mut sel, &mut anchor, &keys, 0);
@@ -43519,7 +45734,11 @@ mod tests {
 
     #[test]
     fn redis_prefix_rename_plan_filters_and_rewrites() {
-        let displays = vec!["app:1".to_string(), "other:2".to_string(), "app:3".to_string()];
+        let displays = vec![
+            "app:1".to_string(),
+            "other:2".to_string(),
+            "app:3".to_string(),
+        ];
         assert_eq!(
             redis_prefix_rename_plan(&displays, "app:", "new:"),
             vec![
@@ -43532,7 +45751,10 @@ mod tests {
         // An empty old prefix prepends to every key.
         assert_eq!(redis_prefix_rename_plan(&displays, "", "x").len(), 3);
         let cmds = redis_batch_rename_commands(&displays, "app:", "new:");
-        assert_eq!(cmds, vec!["RENAME \"app:1\" \"new:1\"", "RENAME \"app:3\" \"new:3\""]);
+        assert_eq!(
+            cmds,
+            vec!["RENAME \"app:1\" \"new:1\"", "RENAME \"app:3\" \"new:3\""]
+        );
     }
 
     #[test]
@@ -43570,7 +45792,9 @@ mod tests {
         );
         // Invalid arguments surface an error instead of a broken command.
         assert!(redis_plan_batch(RedisBatchKind::Ttl, &targets, false, "abc").is_err());
-        assert!(redis_plan_batch(RedisBatchKind::RenamePrefix, &targets, false, "no-equals").is_err());
+        assert!(
+            redis_plan_batch(RedisBatchKind::RenamePrefix, &targets, false, "no-equals").is_err()
+        );
     }
 
     // ── R21: MongoDB document CRUD ──
@@ -43587,7 +45811,10 @@ mod tests {
             mongo_id_arg(&serde_json::json!("507f1f77bcf86cd799439011")),
             "__dbx_mongo_string_id__\"507f1f77bcf86cd799439011\""
         );
-        assert_eq!(mongo_id_arg(&serde_json::json!("customer-42")), "customer-42");
+        assert_eq!(
+            mongo_id_arg(&serde_json::json!("customer-42")),
+            "customer-42"
+        );
         assert_eq!(mongo_id_arg(&serde_json::json!(42)), "42");
         assert_eq!(
             mongo_id_arg(&serde_json::json!({"$numberLong": "2048938405781032962"})),
@@ -43602,11 +45829,19 @@ mod tests {
         let old = serde_json::json!({"_id": {"$oid": "x"}, "name": "Ada", "age": 30, "gone": true});
         let new = serde_json::json!({"_id": {"$oid": "x"}, "name": "Grace", "age": 30, "added": 1});
         let diff = mongo_doc_diff(&old, &new, 10);
-        assert!(diff.iter().any(|l| l.contains("name") && l.contains("Ada") && l.contains("Grace")));
+        assert!(diff
+            .iter()
+            .any(|l| l.contains("name") && l.contains("Ada") && l.contains("Grace")));
         assert!(diff.iter().any(|l| l.starts_with("+ added")));
         assert!(diff.iter().any(|l| l.starts_with("- gone")));
-        assert!(!diff.iter().any(|l| l.contains("age")), "unchanged fields are omitted");
-        assert!(!diff.iter().any(|l| l.contains("_id")), "_id is never part of the diff");
+        assert!(
+            !diff.iter().any(|l| l.contains("age")),
+            "unchanged fields are omitted"
+        );
+        assert!(
+            !diff.iter().any(|l| l.contains("_id")),
+            "_id is never part of the diff"
+        );
         assert!(mongo_doc_diff(&old, &old, 10).is_empty());
     }
 
@@ -43660,7 +45895,10 @@ mod tests {
         assert_eq!(layer.auth_method, "key");
         assert_eq!(layer.key_path, "~/.ssh/id_ed25519");
         assert_eq!(layer.key_passphrase, "pp");
-        assert!(layer.password.is_empty(), "key auth must not carry a password");
+        assert!(
+            layer.password.is_empty(),
+            "key auth must not carry a password"
+        );
         assert!(!layer.use_ssh_agent);
 
         f.ssh_auth = SshAuth::Agent;
@@ -43682,7 +45920,10 @@ mod tests {
         f.ssh_host = "jump".into();
         assert!(build_ssh_layer(&f).is_err(), "user is required");
         f.ssh_user = "ops".into();
-        assert!(build_ssh_layer(&f).is_err(), "password auth needs a password");
+        assert!(
+            build_ssh_layer(&f).is_err(),
+            "password auth needs a password"
+        );
         f.ssh_password = "pw".into();
         assert!(build_ssh_layer(&f).unwrap().is_some());
         // Port defaults to 22 when blank; a disabled tunnel yields no layer.
@@ -43850,7 +46091,10 @@ mod tests {
             responder: Some(tx),
             input: String::new(),
         });
-        ssh_prompt_key(&mut app, KeyEvent::new(KeyCode::Char('y'), KeyModifiers::NONE));
+        ssh_prompt_key(
+            &mut app,
+            KeyEvent::new(KeyCode::Char('y'), KeyModifiers::NONE),
+        );
         assert!(app.ssh_prompt.is_none());
         assert!(matches!(
             rx.try_recv(),
@@ -43877,7 +46121,10 @@ mod tests {
             input: String::new(),
         });
         for c in "123456".chars() {
-            ssh_prompt_key(&mut app, KeyEvent::new(KeyCode::Char(c), KeyModifiers::NONE));
+            ssh_prompt_key(
+                &mut app,
+                KeyEvent::new(KeyCode::Char(c), KeyModifiers::NONE),
+            );
         }
         ssh_prompt_key(&mut app, KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
         assert!(matches!(rx.try_recv(), Ok(SshPromptAnswer::Secret(s)) if s == "123456"));
@@ -43897,7 +46144,11 @@ mod tests {
         let (otx, _orx) = tokio::sync::mpsc::unbounded_channel::<OpResult>();
         // `q` would normally toggle the connection list; while the prompt is up
         // it must be ignored (the prompt only answers y/s/n/Esc).
-        key(&mut app, &otx, KeyEvent::new(KeyCode::Char('q'), KeyModifiers::NONE));
+        key(
+            &mut app,
+            &otx,
+            KeyEvent::new(KeyCode::Char('q'), KeyModifiers::NONE),
+        );
         assert!(app.ssh_prompt.is_some());
     }
 
@@ -43911,19 +46162,22 @@ mod tests {
     #[tokio::test(flavor = "multi_thread")]
     async fn ssh_tunnel_end_to_end_through_local_jump_host() {
         if std::env::var("DBXT_SSH_TEST").ok().as_deref() != Some("1") {
-            eprintln!("skipping ssh_tunnel_end_to_end: set DBXT_SSH_TEST=1 (needs a local sshd + MySQL)");
+            eprintln!(
+                "skipping ssh_tunnel_end_to_end: set DBXT_SSH_TEST=1 (needs a local sshd + MySQL)"
+            );
             return;
         }
         let ssh_user = std::env::var("DBXT_SSH_TEST_USER").unwrap_or_else(|_| "dbxtjump".into());
         let ssh_password =
             std::env::var("DBXT_SSH_TEST_PASSWORD").unwrap_or_else(|_| "dbxt-jump-Pw1".into());
-        let ssh_key =
-            std::env::var("DBXT_SSH_TEST_KEY").unwrap_or_else(|_| "/tmp/dbxt-ssh-test/id_ed25519".into());
+        let ssh_key = std::env::var("DBXT_SSH_TEST_KEY")
+            .unwrap_or_else(|_| "/tmp/dbxt-ssh-test/id_ed25519".into());
         let mysql_port: u16 = std::env::var("DBXT_SSH_TEST_MYSQL_PORT")
             .ok()
             .and_then(|p| p.parse().ok())
             .unwrap_or(13306);
-        let mysql_user = std::env::var("DBXT_SSH_TEST_MYSQL_USER").unwrap_or_else(|_| "root".into());
+        let mysql_user =
+            std::env::var("DBXT_SSH_TEST_MYSQL_USER").unwrap_or_else(|_| "root".into());
         let mysql_password =
             std::env::var("DBXT_SSH_TEST_MYSQL_PASSWORD").unwrap_or_else(|_| "dbxt-test".into());
 
@@ -43968,8 +46222,16 @@ mod tests {
                 host: "127.0.0.1".into(),
                 port: 22,
                 user: ssh_user.clone(),
-                password: if auth == SshAuth::Password { ssh_password.clone() } else { String::new() },
-                key_path: if auth == SshAuth::Key { ssh_key.clone() } else { String::new() },
+                password: if auth == SshAuth::Password {
+                    ssh_password.clone()
+                } else {
+                    String::new()
+                },
+                key_path: if auth == SshAuth::Key {
+                    ssh_key.clone()
+                } else {
+                    String::new()
+                },
                 key_passphrase: String::new(),
                 connect_timeout_secs: 5,
                 expose_lan: false,
@@ -43983,7 +46245,12 @@ mod tests {
             // config, so persist it first (as the TUI's save flow does).
             backend.add_connection_for_mcp(cfg.clone()).await.unwrap();
             let dbs = backend.list_databases(&cfg).await;
-            assert!(dbs.is_ok(), "{} auth failed through the tunnel: {:?}", auth.as_str(), dbs);
+            assert!(
+                dbs.is_ok(),
+                "{} auth failed through the tunnel: {:?}",
+                auth.as_str(),
+                dbs
+            );
             let dbs = dbs.unwrap();
             assert!(
                 dbs.iter().any(|d| d == "shop"),
@@ -43999,7 +46266,9 @@ mod tests {
     #[tokio::test(flavor = "multi_thread")]
     async fn ssh_tunnel_error_paths_are_classified() {
         if std::env::var("DBXT_SSH_TEST").ok().as_deref() != Some("1") {
-            eprintln!("skipping ssh_tunnel_error_paths: set DBXT_SSH_TEST=1 (needs a local sshd + MySQL)");
+            eprintln!(
+                "skipping ssh_tunnel_error_paths: set DBXT_SSH_TEST=1 (needs a local sshd + MySQL)"
+            );
             return;
         }
         let ssh_user = std::env::var("DBXT_SSH_TEST_USER").unwrap_or_else(|_| "dbxtjump".into());
@@ -44065,7 +46334,10 @@ mod tests {
 
         // 1. Wrong SSH password → authentication failure.
         let bad_pw = mk("e2e-bad-pw", 22, mysql_port, "definitely-wrong");
-        backend.add_connection_for_mcp(bad_pw.clone()).await.unwrap();
+        backend
+            .add_connection_for_mcp(bad_pw.clone())
+            .await
+            .unwrap();
         let err = backend.list_databases(&bad_pw).await.unwrap_err();
         assert!(classify_ssh_auth_error(&err), "raw: {err}");
         let msg = ssh_connect_error_message(&bad_pw, &err);
@@ -44073,7 +46345,10 @@ mod tests {
 
         // 2. Wrong SSH port → jump host unreachable.
         let bad_host = mk("e2e-bad-host", 2223, mysql_port, &ssh_password);
-        backend.add_connection_for_mcp(bad_host.clone()).await.unwrap();
+        backend
+            .add_connection_for_mcp(bad_host.clone())
+            .await
+            .unwrap();
         let err = backend.list_databases(&bad_host).await.unwrap_err();
         assert!(classify_ssh_host_error(&err), "raw: {err}");
         let msg = ssh_connect_error_message(&bad_host, &err);
@@ -44081,10 +46356,16 @@ mod tests {
 
         // 3. Tunnel up, wrong DB port → remote database unreachable.
         let bad_db = mk("e2e-bad-db", 22, 13399, &ssh_password);
-        backend.add_connection_for_mcp(bad_db.clone()).await.unwrap();
+        backend
+            .add_connection_for_mcp(bad_db.clone())
+            .await
+            .unwrap();
         let err = backend.list_databases(&bad_db).await.unwrap_err();
         let msg = ssh_connect_error_message(&bad_db, &err);
-        assert!(msg.contains("远端数据库不可达"), "raw err: {err}; msg: {msg}");
+        assert!(
+            msg.contains("远端数据库不可达"),
+            "raw err: {err}; msg: {msg}"
+        );
 
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -44104,13 +46385,21 @@ mod tests {
                     .collect()
             })
             .collect();
-        Grid { columns: cols, rows: data, note: String::new() }
+        Grid {
+            columns: cols,
+            rows: data,
+            note: String::new(),
+        }
     }
 
     fn r30_hwm() -> String {
         std::fs::read_to_string("/proc/self/status")
             .ok()
-            .and_then(|s| s.lines().find(|l| l.starts_with("VmHWM:")).map(str::to_string))
+            .and_then(|s| {
+                s.lines()
+                    .find(|l| l.starts_with("VmHWM:"))
+                    .map(str::to_string)
+            })
             .unwrap_or_default()
     }
 
@@ -44192,7 +46481,11 @@ mod tests {
             write_export(&mut w, Some(&cfg), "shop", "r30_big", &types, &grid, fmt).unwrap();
             w.flush().unwrap();
             let bytes = std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
-            eprintln!("BENCH stream-only {name}: bytes={} peak={}", bytes, r30_hwm());
+            eprintln!(
+                "BENCH stream-only {name}: bytes={} peak={}",
+                bytes,
+                r30_hwm()
+            );
         }
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -44351,7 +46644,10 @@ mod tests {
 
     #[test]
     fn canonical_type_maps_the_common_ten() {
-        assert_eq!(canonical_type("varchar(255)").as_deref(), Some("varchar(255)"));
+        assert_eq!(
+            canonical_type("varchar(255)").as_deref(),
+            Some("varchar(255)")
+        );
         assert_eq!(
             canonical_type("character varying(255)").as_deref(),
             Some("varchar(255)")
@@ -44362,15 +46658,24 @@ mod tests {
         assert_eq!(canonical_type("bigint").as_deref(), Some("bigint"));
         assert_eq!(canonical_type("bool").as_deref(), Some("boolean"));
         assert_eq!(canonical_type("boolean").as_deref(), Some("boolean"));
-        assert_eq!(canonical_type("numeric(10, 2)").as_deref(), Some("decimal(10,2)"));
+        assert_eq!(
+            canonical_type("numeric(10, 2)").as_deref(),
+            Some("decimal(10,2)")
+        );
         assert_eq!(
             canonical_type("timestamp with time zone").as_deref(),
             Some("timestamp tz")
         );
-        assert_eq!(canonical_type("timestamptz").as_deref(), Some("timestamp tz"));
+        assert_eq!(
+            canonical_type("timestamptz").as_deref(),
+            Some("timestamp tz")
+        );
         assert_eq!(canonical_type("jsonb").as_deref(), Some("json"));
         assert_eq!(canonical_type("bytea").as_deref(), Some("blob"));
-        assert_eq!(canonical_type("int unsigned").as_deref(), Some("int unsigned"));
+        assert_eq!(
+            canonical_type("int unsigned").as_deref(),
+            Some("int unsigned")
+        );
         assert!(canonical_type("geometry").is_none());
     }
 
@@ -44378,8 +46683,14 @@ mod tests {
     fn type_comparison_is_dialect_aware() {
         // Same dialect: cosmetic display width is ignored, real differences kept.
         assert_eq!(compare_types("int(11)", "int", false), TypeVerdict::Same);
-        assert_eq!(compare_types("varchar(255)", "varchar(200)", false), TypeVerdict::Diff);
-        assert_eq!(compare_types("int unsigned", "int", false), TypeVerdict::Diff);
+        assert_eq!(
+            compare_types("varchar(255)", "varchar(200)", false),
+            TypeVerdict::Diff
+        );
+        assert_eq!(
+            compare_types("int unsigned", "int", false),
+            TypeVerdict::Diff
+        );
         // Cross dialect: the common map bridges the spellings.
         assert_eq!(
             compare_types("varchar(255)", "character varying(255)", true),
@@ -44388,8 +46699,14 @@ mod tests {
         assert_eq!(compare_types("int", "integer", true), TypeVerdict::Same);
         assert_eq!(compare_types("int", "bigint", true), TypeVerdict::Diff);
         // Unmapped: `?` when the spellings differ, equal when they do not.
-        assert_eq!(compare_types("geometry", "integer", true), TypeVerdict::Unknown);
-        assert_eq!(compare_types("geometry", "geometry", true), TypeVerdict::Same);
+        assert_eq!(
+            compare_types("geometry", "integer", true),
+            TypeVerdict::Unknown
+        );
+        assert_eq!(
+            compare_types("geometry", "geometry", true),
+            TypeVerdict::Same
+        );
     }
 
     #[test]
@@ -44455,7 +46772,11 @@ mod tests {
         assert_eq!(count(DiffMark::Same), 1);
         assert_eq!(count(DiffMark::Modify), 1);
         assert_eq!(count(DiffMark::Drop), 1);
-        let changed = diff.idx.iter().find(|r| r.mark == DiffMark::Modify).unwrap();
+        let changed = diff
+            .idx
+            .iter()
+            .find(|r| r.mark == DiffMark::Modify)
+            .unwrap();
         assert!(changed.detail.contains("(name)"));
         assert!(changed.detail.contains("(name, id)"));
     }
@@ -44485,7 +46806,10 @@ mod tests {
             ],
         );
         let sql = generate_alter(&build_table_diff(src, tgt));
-        assert!(sql.contains("ALTER TABLE `b` ADD COLUMN `email` varchar(255);"), "{sql}");
+        assert!(
+            sql.contains("ALTER TABLE `b` ADD COLUMN `email` varchar(255);"),
+            "{sql}"
+        );
         assert!(
             sql.contains("ALTER TABLE `b` MODIFY COLUMN `name` varchar(200) NOT NULL;"),
             "{sql}"
@@ -44500,14 +46824,28 @@ mod tests {
             "shop",
             "public",
             "a",
-            vec![col_full("name", "character varying(200)", false, None, None, false)],
+            vec![col_full(
+                "name",
+                "character varying(200)",
+                false,
+                None,
+                None,
+                false,
+            )],
         );
         let tgt = diff_side(
             "postgres",
             "shop",
             "public",
             "b",
-            vec![col_full("name", "character varying(100)", true, None, None, false)],
+            vec![col_full(
+                "name",
+                "character varying(100)",
+                true,
+                None,
+                None,
+                false,
+            )],
         );
         let sql = generate_alter(&build_table_diff(src, tgt));
         assert!(
@@ -44545,7 +46883,10 @@ mod tests {
             sql.contains("ADD COLUMN \"email\" character varying(255) NOT NULL;"),
             "{sql}"
         );
-        assert!(sql.contains("ADD COLUMN \"flag\" smallint NOT NULL;"), "{sql}");
+        assert!(
+            sql.contains("ADD COLUMN \"flag\" smallint NOT NULL;"),
+            "{sql}"
+        );
 
         // PostgreSQL source → MySQL target.
         let src = diff_side(
@@ -44571,7 +46912,10 @@ mod tests {
         assert!(diff.cross);
         let sql = generate_alter(&diff);
         // The PostgreSQL `::type` default cast is dropped for MySQL.
-        assert!(sql.contains("ADD COLUMN `email` varchar(255) DEFAULT '';"), "{sql}");
+        assert!(
+            sql.contains("ADD COLUMN `email` varchar(255) DEFAULT '';"),
+            "{sql}"
+        );
         assert!(sql.contains("ADD COLUMN `flag` tinyint(1);"), "{sql}");
         assert!(sql.contains("ADD COLUMN `data` json;"), "{sql}");
     }
@@ -44649,7 +46993,14 @@ mod tests {
             vec![
                 col_full("id", "int", false, None, None, true),
                 col_full("name", "varchar(200)", false, Some("''"), None, false),
-                col_full("email", "varchar(255)", true, None, Some("email addr"), false),
+                col_full(
+                    "email",
+                    "varchar(255)",
+                    true,
+                    None,
+                    Some("email addr"),
+                    false,
+                ),
             ],
         );
         let tgt = diff_side(
@@ -44675,7 +47026,14 @@ mod tests {
             scroll: 0,
             alter: String::new(),
         }));
-        let sizes = [(40u16, 12u16), (42, 22), (120, 40), (250, 70), (20, 6), (1, 1)];
+        let sizes = [
+            (40u16, 12u16),
+            (42, 22),
+            (120, 40),
+            (250, 70),
+            (20, 6),
+            (1, 1),
+        ];
         for (w, h) in sizes {
             draw(&mut app, w, h);
         }
@@ -44861,8 +47219,14 @@ mod tests {
         let names: Vec<String> = align.cols.iter().map(|c| c.name.clone()).collect();
         assert_eq!(names, vec!["id", "name"]);
         assert_eq!(align.cols[1].tgt_name, "NAME");
-        assert_eq!(align.src_select(), vec!["id".to_string(), "name".to_string()]);
-        assert_eq!(align.tgt_select(), vec!["id".to_string(), "NAME".to_string()]);
+        assert_eq!(
+            align.src_select(),
+            vec!["id".to_string(), "name".to_string()]
+        );
+        assert_eq!(
+            align.tgt_select(),
+            vec!["id".to_string(), "NAME".to_string()]
+        );
     }
 
     /// R36 seam: when the source PK is `(a, b)` and the target's primary index
@@ -44896,8 +47260,15 @@ mod tests {
         assert!(sql.contains("ORDER BY `a`, `b`"), "{sql}");
         assert!(sql.contains("(`a` > 1) OR (`a` = 1 AND `b` > 2)"), "{sql}");
         // Row values line up positionally: the pk tuple is (a, b) on both sides.
-        let s = [Val::Text("1".into()), Val::Text("2".into()), Val::Text("x".into())];
-        assert_eq!(&s[..align.pk_len], &[Val::Text("1".into()), Val::Text("2".into())]);
+        let s = [
+            Val::Text("1".into()),
+            Val::Text("2".into()),
+            Val::Text("x".into()),
+        ];
+        assert_eq!(
+            &s[..align.pk_len],
+            &[Val::Text("1".into()), Val::Text("2".into())]
+        );
     }
 
     #[test]
@@ -45173,7 +47544,10 @@ mod tests {
     #[test]
     fn null_primary_key_is_detected_before_a_keyset_seek() {
         assert!(pk_tuple_has_null(&[Val::Text("1".into()), Val::Null]));
-        assert!(!pk_tuple_has_null(&[Val::Text("1".into()), Val::Text(String::new())]));
+        assert!(!pk_tuple_has_null(&[
+            Val::Text("1".into()),
+            Val::Text(String::new())
+        ]));
         assert!(!pk_tuple_has_null(&[]));
         // The data-compare predicate renders a NULL key as SQL NULL (never
         // true), which is exactly why the guard exists.
@@ -45250,10 +47624,7 @@ mod tests {
         assert!(feed_chunk(&mut s, short, 1));
         assert!(s.exhausted);
         assert_eq!(s.buf.len(), DATA_CHUNK + 3);
-        assert_eq!(
-            s.last,
-            Some(vec![Val::Text((DATA_CHUNK + 3).to_string())])
-        );
+        assert_eq!(s.last, Some(vec![Val::Text((DATA_CHUNK + 3).to_string())]));
         // An empty chunk yields nothing and leaves the side exhausted.
         assert!(!feed_chunk(&mut s, Vec::new(), 1));
         assert!(s.exhausted);
@@ -45299,7 +47670,14 @@ mod tests {
             scroll: 0,
             sync_sql: String::new(),
         }));
-        let sizes = [(40u16, 12u16), (42, 22), (120, 40), (250, 70), (20, 6), (1, 1)];
+        let sizes = [
+            (40u16, 12u16),
+            (42, 22),
+            (120, 40),
+            (250, 70),
+            (20, 6),
+            (1, 1),
+        ];
         for tab in [
             DataTab::Summary,
             DataTab::OnlySrc,
@@ -45456,7 +47834,15 @@ mod tests {
         let pg = parse_database_type("postgres").unwrap();
         // MySQL → MySQL keeps the dialect verbatim (inline COMMENT + AUTO_INCREMENT).
         let (script, warns) = generate_transfer_create(
-            &cols, &idx, &pk, mysql, mysql, "", "orders_copy", true, true,
+            &cols,
+            &idx,
+            &pk,
+            mysql,
+            mysql,
+            "",
+            "orders_copy",
+            true,
+            true,
         )
         .unwrap();
         assert!(warns.is_empty(), "{warns:?}");
@@ -45466,10 +47852,9 @@ mod tests {
         assert!(script.contains("`name` varchar(50) NOT NULL COMMENT '名称'"));
         assert!(script.contains("CREATE INDEX `idx_name` ON `orders_copy` (`name`);"));
         // MySQL → PostgreSQL maps types, serial and COMMENT ON.
-        let (script, _) = generate_transfer_create(
-            &cols, &idx, &pk, mysql, pg, "", "orders_copy", true, true,
-        )
-        .unwrap();
+        let (script, _) =
+            generate_transfer_create(&cols, &idx, &pk, mysql, pg, "", "orders_copy", true, true)
+                .unwrap();
         assert!(script.contains("CREATE TABLE \"orders_copy\" ("));
         // Cross-dialect auto-increment stays a plain integer (no stale sequence).
         assert!(script.contains("\"seq\" bigint NOT NULL"));
@@ -45489,10 +47874,8 @@ mod tests {
         let pk = vec!["id".to_string()];
         let mysql = parse_database_type("mysql").unwrap();
         let pg = parse_database_type("postgres").unwrap();
-        let (script, _) = generate_transfer_create(
-            &cols, &idx, &pk, mysql, pg, "", "t", false, false,
-        )
-        .unwrap();
+        let (script, _) =
+            generate_transfer_create(&cols, &idx, &pk, mysql, pg, "", "t", false, false).unwrap();
         assert!(script.contains("\"seq\" bigint"));
         assert!(!script.contains("bigserial"));
         assert!(!script.contains("AUTO_INCREMENT"));
@@ -45519,7 +47902,10 @@ mod tests {
             transfer_target_type(&c("varchar(20)"), pg, true, true),
             "character varying(20)"
         );
-        assert_eq!(transfer_target_type(&c("tinyint(1)"), pg, true, true), "smallint");
+        assert_eq!(
+            transfer_target_type(&c("tinyint(1)"), pg, true, true),
+            "smallint"
+        );
         assert_eq!(transfer_target_type(&c("int"), pg, true, true), "integer");
         // Same-dialect PostgreSQL keeps the auto-increment counter as `serial`.
         let auto = ColumnInfo {
@@ -45565,7 +47951,9 @@ mod tests {
         assert_eq!(align.pk_idx, vec![0]);
         assert!(align.keyset());
         assert_eq!(
-            align.pk_of(&[Val::Text("7".into()), Val::Text("x".into())]).unwrap(),
+            align
+                .pk_of(&[Val::Text("7".into()), Val::Text("x".into())])
+                .unwrap(),
             vec![Val::Text("7".into())]
         );
         // A key column missing on the target disables the keyset path.
@@ -45603,13 +47991,22 @@ mod tests {
         assert_eq!(TransferMode::Append.next(), TransferMode::CreateAndCopy);
         let mut app = test_app();
         app.transfer = Some(Box::new(transfer_wizard_fixture()));
-        assert_eq!(app.transfer.as_ref().unwrap().conflict, TransferConflict::Stop);
+        assert_eq!(
+            app.transfer.as_ref().unwrap().conflict,
+            TransferConflict::Stop
+        );
         transfer_cycle_conflict(&mut app);
-        assert_eq!(app.transfer.as_ref().unwrap().conflict, TransferConflict::Drop);
+        assert_eq!(
+            app.transfer.as_ref().unwrap().conflict,
+            TransferConflict::Drop
+        );
         assert_eq!(app.transfer.as_ref().unwrap().step, TransferStep::Confirm);
         let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
         transfer_confirm_key(&mut app, &tx, KeyEvent::from(KeyCode::Esc));
-        assert_eq!(app.transfer.as_ref().unwrap().conflict, TransferConflict::Stop);
+        assert_eq!(
+            app.transfer.as_ref().unwrap().conflict,
+            TransferConflict::Stop
+        );
         assert_eq!(app.transfer.as_ref().unwrap().step, TransferStep::Options);
     }
 
@@ -45629,7 +48026,14 @@ mod tests {
         let mut app = test_app();
         app.selected = Some(test_conn("mysql"));
         app.transfer = Some(Box::new(transfer_wizard_fixture()));
-        let sizes = [(40u16, 12u16), (42, 22), (120, 40), (250, 70), (20, 6), (1, 1)];
+        let sizes = [
+            (40u16, 12u16),
+            (42, 22),
+            (120, 40),
+            (250, 70),
+            (20, 6),
+            (1, 1),
+        ];
         for step in [
             TransferStep::Connection,
             TransferStep::Name,
@@ -45772,7 +48176,10 @@ mod tests {
         assert!(!plain.contains("s3cret"), "password leaked: {plain}");
         assert!(!plain.contains("sshpw"), "ssh password leaked: {plain}");
         assert!(!plain.contains("kp"), "ssh passphrase leaked: {plain}");
-        assert!(!plain.contains("\"password\":"), "password key present: {plain}");
+        assert!(
+            !plain.contains("\"password\":"),
+            "password key present: {plain}"
+        );
 
         let v: serde_json::Value = serde_json::from_str(&plain).unwrap();
         assert_eq!(v["format"], "dbxt-connections");
@@ -45803,7 +48210,10 @@ mod tests {
         assert!(with_pw.contains("s3cret"));
         let (_, conns2) = sniff_connections(&with_pw).unwrap();
         assert_eq!(conns2[0].password.as_deref(), Some("s3cret"));
-        assert_eq!(conns2[0].ssh.as_ref().unwrap().password.as_deref(), Some("sshpw"));
+        assert_eq!(
+            conns2[0].ssh.as_ref().unwrap().password.as_deref(),
+            Some("sshpw")
+        );
     }
 
     #[test]
@@ -45816,7 +48226,10 @@ mod tests {
         assert_eq!(map_driver_to_db_type("mongodb"), Some("mongodb"));
         assert_eq!(map_driver_to_db_type("Redis"), Some("redis"));
         // A canonical dbxt name passes straight through.
-        assert_eq!(map_driver_to_db_type("cloudflare-d1"), Some("cloudflare-d1"));
+        assert_eq!(
+            map_driver_to_db_type("cloudflare-d1"),
+            Some("cloudflare-d1")
+        );
         // An unknown driver maps to nothing (and lands in the skipped list).
         assert_eq!(map_driver_to_db_type("derby"), None);
         assert_eq!(map_driver_to_db_type(""), None);
@@ -46097,7 +48510,8 @@ mod tests {
     /// escapes.
     #[test]
     fn statement_ranges_ignore_literals_and_comments() {
-        let text = "SELECT ';' AS a; SELECT \"b;c\"; -- trailing ; comment\nSELECT 3; /* ; */ SELECT 4";
+        let text =
+            "SELECT ';' AS a; SELECT \"b;c\"; -- trailing ; comment\nSELECT 3; /* ; */ SELECT 4";
         let ranges = statement_ranges(text);
         let chars: Vec<char> = text.chars().collect();
         let stmts: Vec<String> = ranges
@@ -46160,42 +48574,46 @@ mod tests {
     #[test]
     fn alt_digit_switches_connections_and_alt_tab_toggles_back() {
         run_rt(|| {
-        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel::<OpResult>();
-        let mut app = test_app();
-        app.connections = vec![
-            conn("id-a", "A", "mysql"),
-            conn("id-b", "B", "postgres"),
-            conn("id-c", "C", "sqlite"),
-        ];
-        app.conn_list.select(Some(0));
-        app.selected = Some(conn("id-a", "A", "mysql"));
-        app.backend_kind = Backend::Sql;
-        // Alt-3 jumps straight to the third connection.
-        key(
-            &mut app,
-            &tx,
-            KeyEvent::new(KeyCode::Char('3'), KeyModifiers::ALT),
-        );
-        assert_eq!(app.selected.as_ref().unwrap().id, "id-c");
-        assert_eq!(app.last_conn_id.as_deref(), Some("id-a"));
-        // Alt-Tab toggles back to A, and again to C.
-        key(&mut app, &tx, KeyEvent::new(KeyCode::Tab, KeyModifiers::ALT));
-        assert_eq!(app.selected.as_ref().unwrap().id, "id-a");
-        assert_eq!(app.last_conn_id.as_deref(), Some("id-c"));
-        key(
-            &mut app,
-            &tx,
-            KeyEvent::new(KeyCode::Char('`'), KeyModifiers::ALT),
-        );
-        assert_eq!(app.selected.as_ref().unwrap().id, "id-c");
-        // Alt-9 out of range reports instead of switching.
-        key(
-            &mut app,
-            &tx,
-            KeyEvent::new(KeyCode::Char('9'), KeyModifiers::ALT),
-        );
-        assert_eq!(app.selected.as_ref().unwrap().id, "id-c");
-        assert!(app.status.contains("没有第"));
+            let (tx, _rx) = tokio::sync::mpsc::unbounded_channel::<OpResult>();
+            let mut app = test_app();
+            app.connections = vec![
+                conn("id-a", "A", "mysql"),
+                conn("id-b", "B", "postgres"),
+                conn("id-c", "C", "sqlite"),
+            ];
+            app.conn_list.select(Some(0));
+            app.selected = Some(conn("id-a", "A", "mysql"));
+            app.backend_kind = Backend::Sql;
+            // Alt-3 jumps straight to the third connection.
+            key(
+                &mut app,
+                &tx,
+                KeyEvent::new(KeyCode::Char('3'), KeyModifiers::ALT),
+            );
+            assert_eq!(app.selected.as_ref().unwrap().id, "id-c");
+            assert_eq!(app.last_conn_id.as_deref(), Some("id-a"));
+            // Alt-Tab toggles back to A, and again to C.
+            key(
+                &mut app,
+                &tx,
+                KeyEvent::new(KeyCode::Tab, KeyModifiers::ALT),
+            );
+            assert_eq!(app.selected.as_ref().unwrap().id, "id-a");
+            assert_eq!(app.last_conn_id.as_deref(), Some("id-c"));
+            key(
+                &mut app,
+                &tx,
+                KeyEvent::new(KeyCode::Char('`'), KeyModifiers::ALT),
+            );
+            assert_eq!(app.selected.as_ref().unwrap().id, "id-c");
+            // Alt-9 out of range reports instead of switching.
+            key(
+                &mut app,
+                &tx,
+                KeyEvent::new(KeyCode::Char('9'), KeyModifiers::ALT),
+            );
+            assert_eq!(app.selected.as_ref().unwrap().id, "id-c");
+            assert!(app.status.contains("没有第"));
         });
     }
 
@@ -46205,50 +48623,50 @@ mod tests {
     #[test]
     fn connection_switch_restores_a_same_named_table() {
         run_rt(|| {
-        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel::<OpResult>();
-        let mut app = test_app();
-        app.connections = vec![conn("id-a", "A", "mysql"), conn("id-b", "B", "mysql")];
-        app.conn_list.select(Some(0));
-        app.selected = Some(conn("id-a", "A", "mysql"));
-        app.backend_kind = Backend::Sql;
-        app.databases = vec!["shop".into()];
-        app.db_index = 0;
-        app.tables_all = vec![table_info("orders", "TABLE"), table_info("users", "TABLE")];
-        apply_table_filter(&mut app);
-        app.page_state = Some(page_of("orders"));
-        // Alt-2 switches to B, carrying `shop.orders`.
-        key(
-            &mut app,
-            &tx,
-            KeyEvent::new(KeyCode::Char('2'), KeyModifiers::ALT),
-        );
-        assert_eq!(app.selected.as_ref().unwrap().id, "id-b");
-        let gen = app.conn_gen;
-        apply_op_result(
-            &mut app,
-            OpResult::Databases {
-                databases: vec!["shop".into()],
-                warning: None,
-                gen,
-            },
-            &tx,
-        );
-        assert_eq!(app.current_db(), "shop");
-        let tgen = app.tables_gen;
-        apply_op_result(
-            &mut app,
-            OpResult::TablesFor {
-                tables: vec![table_info("orders", "TABLE"), table_info("other", "TABLE")],
-                gen: tgen,
-            },
-            &tx,
-        );
-        assert_eq!(
-            app.page_state.as_ref().map(|p| p.table.as_str()),
-            Some("orders"),
-            "the same-named table is reopened"
-        );
-        assert!(app.nav_landing.as_deref().unwrap_or("").contains("orders"));
+            let (tx, _rx) = tokio::sync::mpsc::unbounded_channel::<OpResult>();
+            let mut app = test_app();
+            app.connections = vec![conn("id-a", "A", "mysql"), conn("id-b", "B", "mysql")];
+            app.conn_list.select(Some(0));
+            app.selected = Some(conn("id-a", "A", "mysql"));
+            app.backend_kind = Backend::Sql;
+            app.databases = vec!["shop".into()];
+            app.db_index = 0;
+            app.tables_all = vec![table_info("orders", "TABLE"), table_info("users", "TABLE")];
+            apply_table_filter(&mut app);
+            app.page_state = Some(page_of("orders"));
+            // Alt-2 switches to B, carrying `shop.orders`.
+            key(
+                &mut app,
+                &tx,
+                KeyEvent::new(KeyCode::Char('2'), KeyModifiers::ALT),
+            );
+            assert_eq!(app.selected.as_ref().unwrap().id, "id-b");
+            let gen = app.conn_gen;
+            apply_op_result(
+                &mut app,
+                OpResult::Databases {
+                    databases: vec!["shop".into()],
+                    warning: None,
+                    gen,
+                },
+                &tx,
+            );
+            assert_eq!(app.current_db(), "shop");
+            let tgen = app.tables_gen;
+            apply_op_result(
+                &mut app,
+                OpResult::TablesFor {
+                    tables: vec![table_info("orders", "TABLE"), table_info("other", "TABLE")],
+                    gen: tgen,
+                },
+                &tx,
+            );
+            assert_eq!(
+                app.page_state.as_ref().map(|p| p.table.as_str()),
+                Some("orders"),
+                "the same-named table is reopened"
+            );
+            assert!(app.nav_landing.as_deref().unwrap_or("").contains("orders"));
         });
     }
 
@@ -46257,31 +48675,31 @@ mod tests {
     #[test]
     fn stale_database_list_is_discarded() {
         run_rt(|| {
-        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel::<OpResult>();
-        let mut app = test_app();
-        app.connections = vec![conn("id-a", "A", "mysql"), conn("id-b", "B", "mysql")];
-        app.selected = Some(conn("id-a", "A", "mysql"));
-        app.conn_gen = 5;
-        apply_op_result(
-            &mut app,
-            OpResult::Databases {
-                databases: vec!["stale".into()],
-                warning: None,
-                gen: 4,
-            },
-            &tx,
-        );
-        assert!(app.databases.is_empty(), "stale reply dropped");
-        apply_op_result(
-            &mut app,
-            OpResult::Databases {
-                databases: vec!["fresh".into()],
-                warning: None,
-                gen: 5,
-            },
-            &tx,
-        );
-        assert_eq!(app.databases, vec!["fresh".to_string()]);
+            let (tx, _rx) = tokio::sync::mpsc::unbounded_channel::<OpResult>();
+            let mut app = test_app();
+            app.connections = vec![conn("id-a", "A", "mysql"), conn("id-b", "B", "mysql")];
+            app.selected = Some(conn("id-a", "A", "mysql"));
+            app.conn_gen = 5;
+            apply_op_result(
+                &mut app,
+                OpResult::Databases {
+                    databases: vec!["stale".into()],
+                    warning: None,
+                    gen: 4,
+                },
+                &tx,
+            );
+            assert!(app.databases.is_empty(), "stale reply dropped");
+            apply_op_result(
+                &mut app,
+                OpResult::Databases {
+                    databases: vec!["fresh".into()],
+                    warning: None,
+                    gen: 5,
+                },
+                &tx,
+            );
+            assert_eq!(app.databases, vec!["fresh".to_string()]);
         });
     }
 
@@ -46298,7 +48716,11 @@ mod tests {
         assert!(!p.expanded, "starts compact");
         // A compact box renders at 42×22 without panicking.
         let rows = draw(&mut app, 42, 22);
-        let text: String = rows.join("\n").chars().filter(|c| !c.is_whitespace()).collect();
+        let text: String = rows
+            .join("\n")
+            .chars()
+            .filter(|c| !c.is_whitespace())
+            .collect();
         assert!(text.contains("执行错误"), "{text}");
         key(&mut app, &tx, KeyEvent::from(KeyCode::Enter));
         assert!(app.error_popup.as_ref().unwrap().expanded, "Enter expands");
@@ -46315,8 +48737,14 @@ mod tests {
         app.form = ConnForm::default();
         app.form.ssh_enabled = true;
         let rows = draw(&mut app, 42, 22);
-        assert!(rows.iter().any(|r| r.contains("ssh.host")), "SSH label abbreviated");
-        assert!(rows.iter().any(|r| r.contains("type")), "db_type abbreviated");
+        assert!(
+            rows.iter().any(|r| r.contains("ssh.host")),
+            "SSH label abbreviated"
+        );
+        assert!(
+            rows.iter().any(|r| r.contains("type")),
+            "db_type abbreviated"
+        );
         // History panel at 42×22 with a long statement: the preview must not
         // push the panel outside the buffer.
         app.page = Page::Browse;
@@ -46330,7 +48758,11 @@ mod tests {
         let rows = draw(&mut app, 42, 22);
         // The TestBackend pads each wide CJK glyph with a space cell, so strip
         // whitespace before matching a multi-character title.
-        let text: String = rows.join("\n").chars().filter(|c| !c.is_whitespace()).collect();
+        let text: String = rows
+            .join("\n")
+            .chars()
+            .filter(|c| !c.is_whitespace())
+            .collect();
         assert!(text.contains("查询历史"), "{text}");
     }
 }
