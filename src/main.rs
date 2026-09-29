@@ -5746,6 +5746,11 @@ enum Op {
     /// every switch so a slow reply for the connection the user just left is
     /// dropped instead of overwriting the new one's list.
     Databases(Box<ConnectionConfig>, u64),
+    /// R52: read the server version once when a connection becomes active — a
+    /// single free metadata query (`SELECT version()`, Redis `INFO server`,
+    /// Mongo `db.version()`) whose reply is cached for the session. A failure is
+    /// not an error the user must see; it just leaves the status bar unnamed.
+    ServerVersion(Box<ConnectionConfig>),
     /// R43: enumerate a non-active connection's databases for the sidebar tree.
     /// `gen` is that connection's own request id, so only the newest reply for
     /// that root is kept.
@@ -6004,6 +6009,12 @@ impl Op {
 
 enum OpResult {
     Connections(Vec<ConnectionConfig>),
+    /// R52: a one-shot server-version read for the connection `id`; `version` is
+    /// `None` when the backend could not answer (the read is best-effort).
+    ServerVersion {
+        id: String,
+        version: Option<String>,
+    },
     /// R48: the parsed desktop sidebar groups (empty = flat list).
     SidebarLayout(Box<SidebarLayout>),
     /// A saved connection was removed (id + name for the status line).
@@ -6646,6 +6657,94 @@ fn keyset_cursor(
     })
 }
 
+/// The free one-liner that names the server for a SQL dialect. SQLite has no
+/// `version()`; every other supported engine spells it `SELECT version()`.
+fn server_version_query(db_type: &str) -> &'static str {
+    match db_type.to_ascii_lowercase().as_str() {
+        // SQLite-family engines expose the version as `sqlite_version()`.
+        "sqlite" | "sqlite3" | "libsql" | "turso" | "rqlite" | "cloudflare-d1" => {
+            "SELECT sqlite_version()"
+        }
+        // SQL Server spells it `@@VERSION` rather than `version()`.
+        "sqlserver" | "mssql" => "SELECT @@VERSION",
+        _ => "SELECT version()",
+    }
+}
+
+/// `redis_version:` out of an `INFO server` reply. The reply arrives as a bulk
+/// string (or, under some drivers, an array of lines), so both shapes are tried.
+fn parse_redis_version(v: &serde_json::Value) -> Option<String> {
+    let text = match v {
+        serde_json::Value::String(s) => s.clone(),
+        serde_json::Value::Array(items) => items
+            .iter()
+            .map(|i| match i {
+                serde_json::Value::String(s) => s.clone(),
+                other => other.to_string(),
+            })
+            .collect::<Vec<_>>()
+            .join("\n"),
+        other => other.to_string(),
+    };
+    text.lines()
+        .find_map(|l| l.trim().strip_prefix("redis_version:"))
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+}
+
+/// Read the active backend's server version once. Best-effort: any error just
+/// yields `None`, so the status bar simply omits the version.
+///
+/// Only the first row of the first column is read, with a short timeout; this is
+/// free metadata, not a scan.
+fn scalar_version(r: dbx_core::db::QueryResult) -> Option<String> {
+    first_cell_text(&r.rows)
+}
+
+/// The trimmed text of the grid's top-left cell, or `None` when the grid is
+/// empty or the cell text is blank. Kept separate from `scalar_version` so the
+/// parsing is unit-testable without building a full `QueryResult`.
+fn first_cell_text(rows: &[Vec<serde_json::Value>]) -> Option<String> {
+    rows.first()
+        .and_then(|row| row.first())
+        .map(value_to_val)
+        .map(|v| v.text().trim().to_string())
+        .filter(|s| !s.is_empty())
+}
+
+async fn fetch_server_version(backend: &LocalBackend, cfg: &ConnectionConfig) -> Option<String> {
+    match cfg.db_type.as_str() {
+        "redis" | "keydb" | "valkey" => backend
+            .execute_redis_command(cfg, 0, "INFO server", true)
+            .await
+            .ok()
+            .and_then(|r| parse_redis_version(&r.value)),
+        "mongodb" | "mongo" => {
+            let db = cfg
+                .database
+                .clone()
+                .filter(|d| !d.trim().is_empty())
+                .unwrap_or_else(|| "admin".to_string());
+            match dbx_core::mongo_shell::parse("db.version()") {
+                Ok(cmd) => backend
+                    .execute_mongo_command(cfg, &db, &cmd)
+                    .await
+                    .ok()
+                    .and_then(scalar_version),
+                Err(_) => None,
+            }
+        }
+        other => {
+            let db = cfg.database.clone().unwrap_or_default();
+            backend
+                .execute_query(cfg, &db, server_version_query(other), Some(1), Some(5))
+                .await
+                .ok()
+                .and_then(scalar_version)
+        }
+    }
+}
+
 async fn run_op(backend: &LocalBackend, op: Op, tx: &Tx) -> OpResult {
     match op {
         Op::ListConnections => match backend.load_connections().await {
@@ -6725,6 +6824,16 @@ async fn run_op(backend: &LocalBackend, op: Op, tx: &Tx) -> OpResult {
                         gen,
                     }
                 }
+            }
+        }
+        // R52: read the server version once, on connect, and cache it. This is
+        // the only version query dbxt ever issues; it never runs on the browse
+        // hot path.
+        Op::ServerVersion(cfg) => {
+            let version = fetch_server_version(backend, &cfg).await;
+            OpResult::ServerVersion {
+                id: cfg.id.clone(),
+                version,
             }
         }
         // R47b: pure registry reads. `is_connection_open` never opens a
@@ -10420,6 +10529,11 @@ struct App {
     /// R47b: connections whose pool is being opened right now (a switch or a
     /// lazy tree expand). Drives the half-filled `◐` status dot.
     conn_connecting: HashSet<String>,
+    /// R52: server version per connection id (session cache). Read once when a
+    /// connection becomes active — a single free metadata query, never on the
+    /// browse hot path — so the status bar can name the environment without
+    /// another terminal. A failed read stays uncached, so a later switch retries.
+    server_versions: HashMap<String, String>,
 
     /// Client-side substring filter over the loaded Redis keys (R42 one-step
     /// type-to-filter, mirrors the sidebar table filter). `redis_scan.keys` is
@@ -10553,6 +10667,15 @@ struct App {
     result_needle: String,
     /// Displayed row index → row index in the unfiltered grid (row filter map).
     result_rows: Vec<usize>,
+    // ── results-pane column filter (`*`) ──
+    /// Column the `*` filter is scoped to, stored by *name* so a hidden-column
+    /// toggle cannot silently retarget it. `None` = no column filter.
+    col_filter_name: Option<String>,
+    /// Active column-filter needle; non-empty keeps only rows whose cell in the
+    /// named column contains it (case-insensitive, client-side).
+    col_filter_needle: String,
+    /// The modal input while the `*` prompt is being typed.
+    col_filter_prompt: Option<TextArea<'static>>,
     // ── grid value locate (`gv` in the results pane) ──
     /// The modal input while `gv` is being typed.
     locate_prompt: Option<TextArea<'static>>,
@@ -11181,6 +11304,7 @@ impl App {
             db_size_gen: std::collections::HashMap::new(),
             conn_live: HashMap::new(),
             conn_connecting: HashSet::new(),
+            server_versions: HashMap::new(),
             side_rows: Vec::new(),
             side_sel: 0,
             side_table_seen: None,
@@ -11246,6 +11370,9 @@ impl App {
             result_filter: None,
             result_needle: String::new(),
             result_rows: Vec::new(),
+            col_filter_name: None,
+            col_filter_needle: String::new(),
+            col_filter_prompt: None,
             locate_prompt: None,
             locate_needle: String::new(),
             locate_col: None,
@@ -11643,6 +11770,13 @@ fn apply_op_result(app: &mut App, res: OpResult, tx: &Tx) {
                 .min(n.saturating_sub(1));
             app.conn_list.select((n > 0).then_some(sel));
             app.status = format!("✓ {}", tf("已删除连接 {}", &[&name]));
+        }
+        // R52: cache the server version under the connection it was read for. A
+        // failed read (`None`) leaves the cache empty, so a later switch retries.
+        OpResult::ServerVersion { id, version } => {
+            if let Some(v) = version {
+                app.server_versions.insert(id, v);
+            }
         }
         OpResult::Databases {
             databases: dbs,
@@ -12119,6 +12253,7 @@ fn apply_op_result(app: &mut App, res: OpResult, tx: &Tx) {
             if cap <= QUERY_MAX_ROWS {
                 app.result_needle.clear();
                 app.result_filter = None;
+                app.clear_col_filter();
             }
             // A statement that returned no columns is a write/DDL, and one that
             // reports affected rows (e.g. `INSERT … RETURNING`) changed data too:
@@ -12191,6 +12326,7 @@ fn apply_op_result(app: &mut App, res: OpResult, tx: &Tx) {
             // (which only applies to a data grid) must not leak into it.
             app.result_needle.clear();
             app.result_filter = None;
+            app.clear_col_filter();
             let n = outcomes.len();
             let errors = outcomes.iter().filter(|o| o.error.is_some()).count();
             let affected: u64 = outcomes.iter().map(|o| o.affected).sum();
@@ -12317,6 +12453,7 @@ fn apply_op_result(app: &mut App, res: OpResult, tx: &Tx) {
             app.col_hidden.clear();
             app.result_needle.clear();
             app.result_filter = None;
+            app.clear_col_filter();
             app.result_tabs.clear();
             app.result_tab = 0;
             app.grid_kind = GridKind::RedisValue;
@@ -12443,6 +12580,7 @@ fn apply_op_result(app: &mut App, res: OpResult, tx: &Tx) {
             app.col_hidden.clear();
             app.result_needle.clear();
             app.result_filter = None;
+            app.clear_col_filter();
             app.result_tabs.clear();
             app.result_tab = 0;
             app.grid_kind = GridKind::MongoDocs;
@@ -13390,6 +13528,9 @@ fn reset_overlays_for_backend_switch(app: &mut App) {
     app.completion = None;
     app.table_prompt = None;
     app.result_filter = None;
+    // R52: a backend switch drops the grid, so the column filter (and its
+    // prompt) must not linger as a bogus marker on whatever renders next.
+    app.clear_col_filter();
     app.locate_prompt = None;
     app.col_jump = None;
     app.mongo_dialog = None;
@@ -13733,6 +13874,12 @@ fn browse_key(app: &mut App, tx: &Tx, k: KeyEvent) {
     // Result-row search prompt (`/` in the results pane) is modal while typing.
     if app.result_filter.is_some() {
         result_filter_key(app, k);
+        return;
+    }
+
+    // Results-specific column filter prompt (`*`) is modal too.
+    if app.col_filter_prompt.is_some() {
+        col_filter_key(app, k);
         return;
     }
 
@@ -15052,6 +15199,7 @@ fn open_table_data(app: &mut App, tx: &Tx) {
         app.pending_focus = Some(Focus::Preview);
         app.result_needle.clear();
         app.result_filter = None;
+        app.clear_col_filter();
         app.pending_table_filter = None;
         remember_recent_table(app, &app.current_db(), "", &table.0);
         open_mongo_collection(app, tx);
@@ -15074,6 +15222,7 @@ fn open_table_data(app: &mut App, tx: &Tx) {
     app.pending_deep_hint = false;
     app.result_needle.clear();
     app.result_filter = None;
+    app.clear_col_filter();
     // A search-hit jump stashes a pre-filter here; consume it once.
     let initial_filter = app.pending_table_filter.take().unwrap_or_default();
     let cur_db = app.current_db();
@@ -15696,23 +15845,65 @@ fn row_matches(row: &[Val], needle: &str) -> bool {
     })
 }
 
-/// Keep only the rows matching the active result-row search. An empty needle (or
-/// one that is all whitespace) returns the grid unchanged, so this is a no-op
-/// when no search is active.
-fn apply_row_search(grid: Grid, needle: &str) -> Grid {
-    let needle = needle.trim().to_lowercase();
+/// True when the cell at `col` in `row` contains `needle` (already lower-cased).
+/// NULL matches the text `null`, so a column filter can find real NULLs too.
+fn cell_matches(row: &[Val], col: usize, needle: &str) -> bool {
     if needle.is_empty() {
+        return true;
+    }
+    row.get(col).is_some_and(|v| {
+        let s = match v {
+            Val::Null => "null",
+            Val::Text(s) => s.as_str(),
+        };
+        s.to_lowercase().contains(needle)
+    })
+}
+
+/// Kept row indices for the two client-side row filters: a whole-row search
+/// needle and an optional single-column filter `(column name, needle)`. Both are
+/// case-insensitive substring matches; an inactive filter keeps everything, so
+/// the result is the identity when neither is set. Pure, so the filter state
+/// machine is unit-testable without a backend.
+fn kept_row_indices(cols: &Grid, row_needle: &str, col: Option<(&str, &str)>) -> Vec<usize> {
+    let row_needle = row_needle.trim().to_lowercase();
+    let col = col.and_then(|(name, needle)| {
+        let needle = needle.trim().to_lowercase();
+        let idx = cols.columns.iter().position(|c| c == name)?;
+        (!needle.is_empty()).then_some((idx, needle))
+    });
+    let row_active = !row_needle.is_empty();
+    cols.rows
+        .iter()
+        .enumerate()
+        .filter(|(_, r)| {
+            if let Some((idx, n)) = &col {
+                if !cell_matches(r, *idx, n) {
+                    return false;
+                }
+            }
+            !row_active || row_matches(r, &row_needle)
+        })
+        .map(|(i, _)| i)
+        .collect()
+}
+
+/// Drop every row rejected by the active result-row search / column filter. An
+/// inactive pair returns the grid unchanged, so this is a no-op with no filter.
+fn apply_row_filters(grid: Grid, row_needle: &str, col: Option<(&str, &str)>) -> Grid {
+    let keep = kept_row_indices(&grid, row_needle, col);
+    if keep.len() == grid.rows.len() {
         return grid;
     }
-    let rows = grid
-        .rows
-        .into_iter()
-        .filter(|r| row_matches(r, &needle))
-        .collect();
-    Grid {
-        columns: grid.columns,
+    let Grid {
+        columns,
         rows,
-        note: grid.note,
+        note,
+    } = grid;
+    Grid {
+        columns,
+        rows: keep.into_iter().map(|i| rows[i].clone()).collect(),
+        note,
     }
 }
 
@@ -15811,7 +16002,11 @@ fn active_grid(app: &App) -> Option<Grid> {
         if let Some(i) = s.drilled {
             let full = s.outcomes.get(i)?.grid.clone();
             let cols = filter_grid(&full, &app.col_hidden);
-            return Some(apply_row_search(cols, &app.result_needle));
+            return Some(apply_row_filters(
+                cols,
+                &app.result_needle,
+                app.col_filter_spec(),
+            ));
         }
     }
     app.grid.clone()
@@ -16074,6 +16269,12 @@ fn activate_connection(
         restore
     };
     app.switch_notice = notice;
+    // R52: name the server once, the first time this connection is used. The
+    // version is session-cached per connection id, so switching back never
+    // re-queries it.
+    if !app.server_versions.contains_key(&cfg.id) {
+        app.spawn(tx, Op::ServerVersion(Box::new(cfg.clone())));
+    }
     app.schemas.clear();
     app.schema.clear();
     app.schemas_db.clear();
@@ -18364,6 +18565,55 @@ fn statement_range_at(ranges: &[(usize, usize)], cursor: usize) -> Option<(usize
         .or_else(|| ranges.last().copied())
 }
 
+/// Index of the statement span `cursor` sits in (or, in the gap before the
+/// first / after the last, the nearest span), so a jump can step relative to it.
+/// `None` only when there is no statement at all.
+fn statement_index_at(ranges: &[(usize, usize)], cursor: usize) -> Option<usize> {
+    if ranges.is_empty() {
+        return None;
+    }
+    Some(ranges.iter().rposition(|&(s, _)| s <= cursor).unwrap_or(0))
+}
+
+/// First char offset in `start..end` that is real code (not whitespace and not
+/// inside a leading comment), so a statement jump lands on the statement's first
+/// token rather than on the comment block above it. Falls back to `start` when
+/// the span is comment-only.
+fn statement_code_start(chars: &[char], mask: &[bool], start: usize, end: usize) -> usize {
+    let end = end.min(chars.len());
+    let mut i = start;
+    while i < end {
+        let c = chars[i];
+        if c.is_whitespace() {
+            i += 1;
+            continue;
+        }
+        // The lexer marks the first char of a comment opener as code (it only
+        // flips state *after* recording the mask), so skip a leading comment
+        // block explicitly here: a statement should reveal its first real token,
+        // not the `--` / `/*` above it.
+        if c == '-' && chars.get(i + 1) == Some(&'-') {
+            while i < end && chars[i] != '\n' {
+                i += 1;
+            }
+            continue;
+        }
+        if c == '/' && chars.get(i + 1) == Some(&'*') {
+            i += 2;
+            while i < end && !(chars[i] == '*' && chars.get(i + 1) == Some(&'/')) {
+                i += 1;
+            }
+            i = (i + 2).min(end);
+            continue;
+        }
+        if mask[i] {
+            return i;
+        }
+        i += 1;
+    }
+    start
+}
+
 /// Offset of the bracket matching the bracket at `pos`, or `None` when it is
 /// unbalanced. Brackets inside strings / comments are ignored, so a `)` in a
 /// literal never pairs with a `(` in code.
@@ -18464,6 +18714,17 @@ fn editor_key(app: &mut App, tx: &Tx, k: KeyEvent) {
         // Alt-L: read a .sql file, preview it, then run it as a script.
         (KeyModifiers::ALT, KeyCode::Char('l')) | (KeyModifiers::ALT, KeyCode::Char('L')) => {
             open_file_load(app)
+        }
+        // R52: Alt-↓ / Alt-↑ step to the next / previous statement start in a
+        // multi-statement script (semicolon-delimited, comments ignored), so a
+        // long script can be inspected one statement at a time without arrowing
+        // through the whole buffer. Free in the editor (Alt-← / Alt-→ stay the
+        // local cursor motion, Alt-↑/↓ are unbound there).
+        (KeyModifiers::ALT, KeyCode::Down) => {
+            jump_statement(app, 1);
+        }
+        (KeyModifiers::ALT, KeyCode::Up) => {
+            jump_statement(app, -1);
         }
         // Ctrl-U: undo the last Alt-F reformat in one step; with no reformat to
         // undo it falls back to the editor's own undo history (tui-textarea),
@@ -19534,9 +19795,10 @@ fn preview_key(app: &mut App, tx: &Tx, k: KeyEvent) {
             _ => app.pending_g = false,
         }
     }
-    // Esc clears an active value locate, then an active result search, before it
-    // does anything else. This applies to the top-level grid and to a drilled
-    // script result; only the script *list* has no search to clear.
+    // Esc clears an active value locate, then an active column filter, then an
+    // active result search, before it does anything else. This applies to the
+    // top-level grid and to a drilled script result; only the script *list* has
+    // no search to clear.
     if k.code == KeyCode::Esc
         && !app.locate_needle.is_empty()
         && !ddl
@@ -19544,6 +19806,19 @@ fn preview_key(app: &mut App, tx: &Tx, k: KeyEvent) {
     {
         clear_locate(app);
         app.status = t("已清除定位").into();
+        return;
+    }
+    if k.code == KeyCode::Esc
+        && app
+            .col_filter_spec()
+            .is_some_and(|(_, n)| !n.trim().is_empty())
+        && !ddl
+        && app.script.as_ref().is_none_or(|s| s.drilled.is_some())
+    {
+        app.clear_col_filter();
+        app.rebuild_view();
+        app.sel = 0;
+        app.status = t("已清除列过滤").into();
         return;
     }
     if k.code == KeyCode::Esc
@@ -19568,6 +19843,7 @@ fn preview_key(app: &mut App, tx: &Tx, k: KeyEvent) {
                     // A result search does not apply to the statement list.
                     app.result_needle.clear();
                     app.result_filter = None;
+                    app.clear_col_filter();
                     return;
                 }
             }
@@ -19603,6 +19879,9 @@ fn preview_key(app: &mut App, tx: &Tx, k: KeyEvent) {
         KeyCode::Char('f') => open_filter_prompt(app),
         // `/` searches the visible result rows (filter-as-you-type).
         KeyCode::Char('/') => open_result_filter(app),
+        // `*` filters to the focused column: type a value (pre-filled from the
+        // cell under the cursor) to keep only rows whose cell contains it.
+        KeyCode::Char('*') => open_col_filter(app),
         // `|` jumps straight to a column by number or name prefix (wide tables).
         KeyCode::Char('|') => open_col_jump(app),
         // `y` in the script *list* copies the focused statement's whole result
@@ -20061,6 +20340,121 @@ fn search_move(app: &mut App, dir: i32) {
     );
 }
 
+// ── results-pane column filter (`*`) ──
+
+/// Display name of the column the `*` filter is scoped to.
+fn col_filter_label(app: &App) -> String {
+    app.col_filter_name
+        .as_deref()
+        .map(fix_double_encoding)
+        .unwrap_or_default()
+}
+
+/// `*` in the results pane: filter the grid to the rows whose cell in the
+/// focused column contains a typed value. The prompt is pre-filled with the
+/// focused cell (truncated), so "show me the rows like this one" is one
+/// keystroke. Client-side only — the page is never re-fetched.
+fn open_col_filter(app: &mut App) {
+    if app.grid_kind == GridKind::Columns {
+        app.status = t("表结构视图不支持列过滤").into();
+        return;
+    }
+    if app.script.as_ref().is_some_and(|s| s.drilled.is_none()) {
+        app.status = t("脚本列表不支持列过滤（先 Enter 进入某条语句的结果）").into();
+        return;
+    }
+    let Some(grid) = active_grid(app) else {
+        app.status = t("没有可过滤的结果").into();
+        return;
+    };
+    let Some(name) = grid.columns.get(app.col_cursor).cloned() else {
+        app.status = t("没有可过滤的结果").into();
+        return;
+    };
+    // `*` and `gv` are mutually exclusive for the same reason `/` and `gv` are:
+    // a value locate wants every row on screen.
+    clear_locate(app);
+    // Seed from the focused cell (a huge / multi-line cell would be useless as a
+    // pre-typed needle), so Enter alone re-runs "find rows like this one".
+    let seed = grid
+        .rows
+        .get(app.sel)
+        .and_then(|r| r.get(app.col_cursor))
+        .map(|v| match v {
+            Val::Null => String::new(),
+            Val::Text(s) => truncate_disp(s.trim(), 48),
+        })
+        .unwrap_or_default();
+    app.col_filter_name = Some(name.clone());
+    app.col_filter_needle = seed.clone();
+    let mut ta = TextArea::from([seed]);
+    ta.set_placeholder_text(t("只显示该列含此值的行…"));
+    ta.move_cursor(CursorMove::End);
+    app.col_filter_prompt = Some(ta);
+    app.rebuild_view();
+    app.sel = 0;
+    app.status = tf(
+        "列过滤「{}」含「{}」· {} 行 · Enter 保留 · Esc 清除",
+        &[
+            &(col_filter_label(app)),
+            &(app.col_filter_needle),
+            &(result_row_count(app)),
+        ],
+    );
+}
+
+/// Prompt handler for `*`. Filters as you type (live hit count); Enter keeps the
+/// filter and closes the prompt, Esc clears it.
+fn col_filter_key(app: &mut App, k: KeyEvent) {
+    match k.code {
+        KeyCode::Enter => {
+            app.col_filter_prompt = None;
+            if app.col_filter_needle.trim().is_empty() {
+                app.clear_col_filter();
+                app.rebuild_view();
+                app.sel = 0;
+                app.status = t("列过滤已清除").into();
+                return;
+            }
+            app.status = tf(
+                "列过滤「{}」含「{}」· {} 行 · Esc 清除",
+                &[
+                    &(col_filter_label(app)),
+                    &(app.col_filter_needle),
+                    &(result_row_count(app)),
+                ],
+            );
+        }
+        KeyCode::Esc => {
+            app.clear_col_filter();
+            app.rebuild_view();
+            app.sel = 0;
+            app.status = t("已清除列过滤").into();
+        }
+        _ => {
+            if let Some(ta) = &mut app.col_filter_prompt {
+                ta.input(k);
+            }
+            app.col_filter_needle = app
+                .col_filter_prompt
+                .as_ref()
+                .map(|t| t.lines().join(" ").trim().to_string())
+                .unwrap_or_default();
+            app.rebuild_view();
+            app.sel = 0;
+            let label = col_filter_label(app);
+            app.status = if app.col_filter_needle.trim().is_empty() {
+                tf("列过滤「{}」· 输入以筛选 · Esc 清除", &[&label])
+            } else {
+                tf(
+                    "列过滤「{}」含「{}」· {} 行",
+                    &[&label, &(app.col_filter_needle), &(result_row_count(app))],
+                )
+            };
+        }
+    }
+}
+
 // ── grid value locate (`gv`) + column jump (`|`) ──
 
 /// The column a `gv` locate searches: an explicit sort column when one is set,
@@ -20152,6 +20546,11 @@ fn open_locate(app: &mut App) {
     if !app.result_needle.is_empty() {
         app.result_needle.clear();
         app.result_filter = None;
+        app.rebuild_view();
+        app.sel = 0;
+    }
+    // A column filter hides rows too, so `gv` clears it for the same reason.
+    if app.clear_col_filter() {
         app.rebuild_view();
         app.sel = 0;
     }
@@ -25240,6 +25639,45 @@ fn editor_selection_text(app: &App) -> Option<String> {
     (!sel.is_empty()).then_some(sel)
 }
 
+/// `Alt-↓` / `Alt-↑` in the editor: move the cursor to the start of the next /
+/// previous statement (semicolon-delimited, literals and comments ignored).
+/// Empty statements are skipped by construction (the splitter never yields
+/// one), and a leading comment block is stepped over so the caret lands on the
+/// statement's first token. The status line reports `语句 i/n`.
+fn jump_statement(app: &mut App, dir: i32) -> bool {
+    let text = app.editor_sql();
+    let chars: Vec<char> = text.chars().collect();
+    let ranges = statement_ranges(&text);
+    let n = ranges.len();
+    if n == 0 {
+        app.status = t("编辑器里没有语句").into();
+        return true;
+    }
+    let (row, col) = app.editor.cursor();
+    let off = text_offset(&text, row, col).unwrap_or(chars.len());
+    let cur = statement_index_at(&ranges, off).unwrap_or(0);
+    let target = if dir > 0 {
+        if cur + 1 >= n {
+            app.status = tf("已是最后一条语句（共 {} 条）", &[&n]);
+            return true;
+        }
+        cur + 1
+    } else {
+        if cur == 0 {
+            app.status = t("已是第一条语句").into();
+            return true;
+        }
+        cur - 1
+    };
+    let (s, e) = ranges[target];
+    let mask = code_mask(&chars);
+    let at = statement_code_start(&chars, &mask, s, e);
+    let (r, c) = offset_to_cursor(&text, at);
+    app.editor.move_cursor(CursorMove::Jump(r as u16, c as u16));
+    app.status = tf("语句 {}/{}", &[&(target + 1), &n]);
+    true
+}
+
 /// The statement under the editor cursor (semicolon-delimited, literals and
 /// comments ignored), trimmed, or `None` when the cursor is not on a statement.
 fn current_statement_text(app: &App) -> Option<String> {
@@ -26949,8 +27387,28 @@ impl App {
         self.locate_needle.clear();
         self.locate_col = None;
         self.locate_prompt = None;
+        self.clear_col_filter();
         self.grid_epoch = self.grid_epoch.wrapping_add(1);
         self.width_cache = None;
+    }
+
+    /// R52: the active column filter as `(column name, needle)` for the row
+    /// filter, or `None` when no column filter is set.
+    fn col_filter_spec(&self) -> Option<(&str, &str)> {
+        let name = self.col_filter_name.as_deref()?;
+        Some((name, self.col_filter_needle.as_str()))
+    }
+
+    /// Drop the column filter (Esc, a new result, or a connection switch).
+    /// Returns `true` when something was actually cleared.
+    fn clear_col_filter(&mut self) -> bool {
+        let had = self.col_filter_name.is_some()
+            || !self.col_filter_needle.is_empty()
+            || self.col_filter_prompt.is_some();
+        self.col_filter_name = None;
+        self.col_filter_needle.clear();
+        self.col_filter_prompt = None;
+        had
     }
 
     /// Re-apply the session column selection to the grid on screen.
@@ -26959,8 +27417,8 @@ impl App {
     }
 
     /// Recompute the displayed grid from `grid_full` by applying the hidden-column
-    /// set and the result-row search, and rebuild the display→source row map that
-    /// the popups and `y` (copy as INSERT) rely on.
+    /// set, the column filter and the result-row search, and rebuild the
+    /// display→source row map that the popups and `y` (copy as INSERT) rely on.
     fn rebuild_view(&mut self) {
         // The displayed grid is about to change: invalidate the width cache.
         self.grid_epoch = self.grid_epoch.wrapping_add(1);
@@ -26975,20 +27433,16 @@ impl App {
         } else {
             filter_grid(&full, &self.col_hidden)
         };
-        let needle = self.result_needle.trim().to_lowercase();
-        if needle.is_empty() || self.grid_kind == GridKind::Columns {
+        let col = self.col_filter_spec();
+        let row_active = !self.result_needle.trim().is_empty();
+        let col_active = col.is_some_and(|(_, n)| !n.trim().is_empty());
+        if self.grid_kind == GridKind::Columns || (!row_active && !col_active) {
             self.result_rows = (0..cols.rows.len()).collect();
             self.grid = Some(cols);
             return;
         }
-        let mut rows = Vec::new();
-        let mut map = Vec::new();
-        for (i, r) in cols.rows.iter().enumerate() {
-            if row_matches(r, &needle) {
-                rows.push(r.clone());
-                map.push(i);
-            }
-        }
+        let map = kept_row_indices(&cols, &self.result_needle, col);
+        let rows = map.iter().map(|&i| cols.rows[i].clone()).collect();
         self.grid = Some(Grid {
             columns: cols.columns,
             rows,
@@ -27020,20 +27474,16 @@ impl App {
         if let Some(s) = &self.script {
             let i = s.drilled?;
             let full = &s.outcomes.get(i)?.grid;
-            let needle = self.result_needle.trim().to_lowercase();
-            if needle.is_empty() {
+            let col = self.col_filter_spec();
+            let row_active = !self.result_needle.trim().is_empty();
+            let col_active = col.is_some_and(|(_, n)| !n.trim().is_empty());
+            if !row_active && !col_active {
                 return (self.sel < full.rows.len()).then_some(self.sel);
             }
             // filter_grid only drops columns, so row indices still line up with
-            // `full.rows`; the map translates the searched display row back.
+            // `full.rows`; the map translates the filtered display row back.
             let cols = filter_grid(full, &self.col_hidden);
-            let map: Vec<usize> = cols
-                .rows
-                .iter()
-                .enumerate()
-                .filter(|(_, r)| row_matches(r, &needle))
-                .map(|(i, _)| i)
-                .collect();
+            let map = kept_row_indices(&cols, &self.result_needle, col);
             return map.get(self.sel).copied();
         }
         if self.result_rows.is_empty() {
@@ -27089,6 +27539,7 @@ impl App {
             // A result search belongs to a data grid, not the script list.
             self.result_needle.clear();
             self.result_filter = None;
+            self.clear_col_filter();
             self.locate_needle.clear();
             self.locate_col = None;
             self.locate_prompt = None;
@@ -29104,6 +29555,19 @@ fn ui(f: &mut Frame, app: &mut App) {
     if app.result_filter.is_some() {
         render_result_filter(f, f.area(), app);
     }
+    if app.col_filter_prompt.is_some() {
+        let title = tf(
+            " 列过滤「{}」· {} 行 · Enter 保留 · Esc 清除 ",
+            &[&(col_filter_label(app)), &(result_row_count(app))],
+        );
+        render_prompt_input(
+            f,
+            f.area(),
+            app.col_filter_prompt.as_mut(),
+            &title,
+            t(" 列过滤 · Enter/Esc "),
+        );
+    }
     if app.locate_prompt.is_some() {
         let hits = locate_hits(app).len();
         render_prompt_input(
@@ -29361,6 +29825,32 @@ fn context_info(app: &App) -> String {
             t("紧凑列 手动").into()
         });
     }
+    // R52: the active connection's server version, read once at connect. A free
+    // environment fact for when the server is not what you assumed. Hidden below
+    // 56 columns (the same rule as the sidebar size column), so a phone status
+    // bar keeps its row / column readout. `term_w == 0` (tests) counts as wide.
+    if app.term_w == 0 || app.term_w >= 56 {
+        if let Some(v) = app
+            .selected
+            .as_ref()
+            .and_then(|c| app.server_versions.get(&c.id))
+        {
+            parts.push(tf("服务器 {}", &[&v]));
+        }
+    }
+    // R52: statement ledger for a multi-statement editor, so Alt-↓ / Alt-↑ has a
+    // persistent anchor. Parsed only while the editor is focused, and reported
+    // only for ≥2 statements (a single statement needs no position).
+    if app.focus == Focus::Editor {
+        let text = app.editor_sql();
+        let ranges = statement_ranges(&text);
+        if ranges.len() > 1 {
+            let (row, col) = app.editor.cursor();
+            let off = text_offset(&text, row, col).unwrap_or(0);
+            let cur = statement_index_at(&ranges, off).unwrap_or(0);
+            parts.push(tf("语句 {}/{}", &[&(cur + 1), &(ranges.len())]));
+        }
+    }
     if !app.col_hidden.is_empty() {
         parts.push(tf("隐藏列 {}", &[&(app.col_hidden.len())]));
     }
@@ -29538,6 +30028,7 @@ enum FooterView {
     RowPopup,
     ErrorBox,
     ResultFilter,
+    ColFilter,
     LocatePrompt,
     ColJump,
     Completion,
@@ -29634,6 +30125,8 @@ fn footer_ctx_inner(app: &App, include_help: bool) -> FooterCtx {
         FooterView::Popup
     } else if app.result_filter.is_some() {
         FooterView::ResultFilter
+    } else if app.col_filter_prompt.is_some() {
+        FooterView::ColFilter
     } else if app.locate_prompt.is_some() {
         FooterView::LocatePrompt
     } else if app.col_jump.is_some() {
@@ -29766,7 +30259,7 @@ fn footer_hints_ctx(ctx: FooterCtx) -> Vec<Hint> {
             ("Esc", t("取消")),
         ],
         FooterView::RedisPrompt => vec![("Enter", t("确认")), ("Esc", t("取消"))],
-        FooterView::TablePrompt | FooterView::ResultFilter => {
+        FooterView::TablePrompt | FooterView::ResultFilter | FooterView::ColFilter => {
             vec![("Enter", t("保留")), ("Esc", t("清除"))]
         }
         FooterView::LocatePrompt => vec![("Enter", t("跳到命中")), ("Esc", t("清除"))],
@@ -30453,14 +30946,26 @@ fn render_results_pane(f: &mut Frame, area: Rect, app: &mut App) {
 /// Leading marker for an active result search, so the indicator stays visible
 /// even when a narrow pane clips the rest of the title.
 fn search_marker(app: &App) -> String {
-    if app.result_needle.trim().is_empty() {
-        String::new()
-    } else {
-        tf(
+    let mut out = String::new();
+    if !app.result_needle.trim().is_empty() {
+        out.push_str(&tf(
             "🔍「{}」{} 命中 · ",
             &[&(app.result_needle), &(result_row_count(app))],
-        )
+        ));
     }
+    // R52 column filter: name the column and the live hit count so a filtered
+    // grid is never mistaken for the whole result.
+    if let Some((name, needle)) = app.col_filter_spec().filter(|(_, n)| !n.trim().is_empty()) {
+        out.push_str(&tf(
+            "▤{}「{}」{} 行 · ",
+            &[
+                &(fix_double_encoding(name)),
+                &(needle),
+                &(result_row_count(app)),
+            ],
+        ));
+    }
+    out
 }
 
 /// Compressed table-browser title for a narrow terminal: table name, page
@@ -30470,6 +30975,12 @@ fn narrow_table_title(app: &App, ps: &PageState) -> String {
     let mut marks = String::new();
     if !app.result_needle.trim().is_empty() {
         marks.push('🔍');
+    }
+    if app
+        .col_filter_spec()
+        .is_some_and(|(_, n)| !n.trim().is_empty())
+    {
+        marks.push('▤');
     }
     if !ps.filter.trim().is_empty() {
         marks.push('⚑');
@@ -35619,6 +36130,10 @@ const HELP_ROWS: &[(&str, &str)] = &[
         "搜索结果行（隐藏不匹配行，输入即筛，Enter 保留，Esc 清除）",
     ),
     (
+        "*",
+        "按当前列过滤：输入值只留该列含值的行（预填当前单元格，Esc 清除）",
+    ),
+    (
         "g v",
         "定位值：在排序列 / 主键列内搜值并跳转，不隐藏行（n/N 循环命中）",
     ),
@@ -35692,6 +36207,10 @@ const HELP_ROWS: &[(&str, &str)] = &[
         "格式化当前 SQL（关键字大写 / 子句换行）；再按压缩为单行",
     ),
     ("Ctrl-U", "撤销上一次 Alt-F 格式化"),
+    (
+        "Alt-↓ / Alt-↑",
+        "跳到下 / 上一条 SQL 语句开头（分号边界，注释/空语句跳过；状态栏显示 语句 i/n）",
+    ),
     (
         "Alt-/",
         "SQL 前缀补全（表名 T / 列名 C / 关键字 K，Tab 上屏）",
@@ -44159,19 +44678,139 @@ mod tests {
             note: String::new(),
         };
         // Empty / whitespace-only needles are a no-op.
-        assert_eq!(apply_row_search(grid.clone(), "").rows.len(), 3);
-        assert_eq!(apply_row_search(grid.clone(), "  ").rows.len(), 3);
+        assert_eq!(apply_row_filters(grid.clone(), "", None).rows.len(), 3);
+        assert_eq!(apply_row_filters(grid.clone(), "  ", None).rows.len(), 3);
         // Case-insensitive substring across any column.
-        let hits = apply_row_search(grid.clone(), "ALICE");
+        let hits = apply_row_filters(grid.clone(), "ALICE", None);
         assert_eq!(hits.rows.len(), 2);
         assert!(matches!(&hits.rows[0][0], Val::Text(s) if s == "Alice"));
         assert!(matches!(&hits.rows[1][0], Val::Text(s) if s == "alice2"));
         // `null` finds real NULLs.
-        assert_eq!(apply_row_search(grid.clone(), "null").rows.len(), 1);
+        assert_eq!(apply_row_filters(grid.clone(), "null", None).rows.len(), 1);
         // No match yields an empty grid (but keeps the columns).
-        let none = apply_row_search(grid, "zzz");
+        let none = apply_row_filters(grid, "zzz", None);
         assert!(none.rows.is_empty());
         assert_eq!(none.columns.len(), 2);
+    }
+
+    /// R52: the single-column filter keeps only the rows whose cell in the named
+    /// column contains the needle, composes (AND) with the whole-row search, and
+    /// resolves the column by *name* so a hidden-column toggle cannot retarget
+    /// it. An unknown / blank column or needle is a no-op.
+    #[test]
+    fn column_filter_scopes_rows_to_one_named_column() {
+        let grid = Grid {
+            columns: vec!["name".into(), "city".into()],
+            rows: vec![
+                vec![Val::Text("Alice".into()), Val::Text("Beijing".into())],
+                vec![Val::Text("Bob".into()), Val::Text("Beijing".into())],
+                vec![Val::Text("alice2".into()), Val::Null],
+            ],
+            note: String::new(),
+        };
+        // `name` containing "alice" keeps Alice + alice2; Bob's city also holds
+        // "Beijing" but the filter only looks at `name`.
+        let by_name = apply_row_filters(grid.clone(), "", Some(("name", "ALICE")));
+        assert_eq!(by_name.rows.len(), 2);
+        // `city` "beijing" keeps the two Beijing rows and drops the NULL city.
+        let by_city = apply_row_filters(grid.clone(), "", Some(("city", "beijing")));
+        assert_eq!(by_city.rows.len(), 2);
+        // NULL matches the text `null`, same as the whole-row search.
+        let nulls = apply_row_filters(grid.clone(), "", Some(("city", "null")));
+        assert_eq!(nulls.rows.len(), 1);
+        // A column filter ANDs with the whole-row search.
+        let both = apply_row_filters(grid.clone(), "bob", Some(("city", "beijing")));
+        assert_eq!(both.rows.len(), 1);
+        assert!(matches!(&both.rows[0][0], Val::Text(s) if s == "Bob"));
+        // An unknown column name (e.g. after a result swap) keeps every row.
+        assert_eq!(
+            apply_row_filters(grid.clone(), "", Some(("missing", "x")))
+                .rows
+                .len(),
+            3
+        );
+        // A blank needle is inactive.
+        assert_eq!(
+            apply_row_filters(grid.clone(), "", Some(("name", "  ")))
+                .rows
+                .len(),
+            3
+        );
+        // The kept-index map lines up with the retained rows.
+        let map = kept_row_indices(&grid, "", Some(("name", "alice")));
+        assert_eq!(map, vec![0, 2]);
+    }
+
+    /// R52: `*` seeds the prompt from the focused cell, and `clear_col_filter`
+    /// reports whether anything was active so a caller only rebuilds when needed.
+    #[test]
+    fn col_filter_state_transitions_and_is_cleared() {
+        let mut app = test_app();
+        assert!(app.col_filter_spec().is_none());
+        assert!(!app.clear_col_filter(), "nothing to clear initially");
+        app.col_filter_name = Some("city".into());
+        app.col_filter_needle = "Beijing".into();
+        assert_eq!(app.col_filter_spec(), Some(("city", "Beijing")));
+        assert!(app.clear_col_filter());
+        assert!(app.col_filter_spec().is_none());
+        assert!(app.col_filter_needle.is_empty());
+        // A prompt-only state (open, not yet typed) still counts as active.
+        app.col_filter_prompt = Some(TextArea::default());
+        assert!(app.clear_col_filter());
+        assert!(app.col_filter_prompt.is_none());
+    }
+
+    /// R52: the statement jumper steps statement by statement and lands on the
+    /// first code char (a leading comment block is skipped over), reporting
+    /// `语句 i/n` in the status line.
+    #[test]
+    fn jump_statement_steps_over_comments_to_code_start() {
+        let mut app = test_app();
+        app.set_editor_text("SELECT 1;\n/* block ; */\nSELECT 2;\n-- note\nSELECT 3");
+        app.editor.move_cursor(CursorMove::Jump(0, 0));
+        assert!(jump_statement(&mut app, 1));
+        // Statement 2's leading comment is skipped: the caret sits on `SELECT`.
+        assert_eq!(app.editor.cursor(), (2, 0));
+        assert_eq!(app.status, "语句 2/3");
+        assert!(jump_statement(&mut app, 1));
+        assert_eq!(app.editor.cursor(), (4, 0));
+        assert_eq!(app.status, "语句 3/3");
+        // At the last statement a further step only reports it.
+        assert!(jump_statement(&mut app, 1));
+        assert_eq!(app.status, "已是最后一条语句（共 3 条）");
+        assert!(jump_statement(&mut app, -1));
+        assert_eq!(app.editor.cursor(), (2, 0));
+        assert_eq!(app.status, "语句 2/3");
+        assert!(jump_statement(&mut app, -1));
+        assert_eq!(app.editor.cursor(), (0, 0));
+        assert!(jump_statement(&mut app, -1));
+        assert_eq!(app.status, "已是第一条语句");
+        // No statement at all is reported, not panicked on.
+        app.set_editor_text("   \n  ");
+        assert!(jump_statement(&mut app, 1));
+        assert_eq!(app.status, "编辑器里没有语句");
+    }
+
+    /// R52: the one-shot version query is dialect-correct and the parsers pull
+    /// the version out of both a scalar row and a Redis `INFO` bulk string.
+    #[test]
+    fn server_version_query_and_parsers() {
+        assert_eq!(server_version_query("sqlite"), "SELECT sqlite_version()");
+        assert_eq!(server_version_query("MySQL"), "SELECT version()");
+        assert_eq!(server_version_query("postgres"), "SELECT version()");
+        assert_eq!(server_version_query("sqlserver"), "SELECT @@VERSION");
+        // A scalar grid's first cell is the version; NULL / empty is `None`.
+        let one = vec![vec![serde_json::json!("8.0.36")]];
+        assert_eq!(first_cell_text(&one), Some("8.0.36".to_string()));
+        assert_eq!(first_cell_text(&[]), None);
+        assert_eq!(first_cell_text(&[vec![serde_json::json!("  ")]]), None);
+        // Redis: `redis_version:` out of a bulk `INFO server` string, whether it
+        // arrives as one string or an array of lines.
+        let info = serde_json::json!("# Server\nredis_version:7.2.4\nos:Linux");
+        assert_eq!(parse_redis_version(&info).as_deref(), Some("7.2.4"));
+        let lines = serde_json::json!(["# Server", "redis_version:6.0.9"]);
+        assert_eq!(parse_redis_version(&lines).as_deref(), Some("6.0.9"));
+        assert_eq!(parse_redis_version(&serde_json::json!("no version")), None);
     }
 
     #[test]
@@ -45663,6 +46302,7 @@ mod tests {
             FooterView::ConnPicker,
             FooterView::TablePrompt,
             FooterView::ResultFilter,
+            FooterView::ColFilter,
             FooterView::Search,
             FooterView::SearchInput,
         ] {
@@ -45739,6 +46379,10 @@ mod tests {
         app.search_input = Some(TextArea::default());
         assert_eq!(footer_ctx(&app).view, FooterView::SearchInput);
         app.search_input = None;
+
+        app.col_filter_prompt = Some(TextArea::default());
+        assert_eq!(footer_ctx(&app).view, FooterView::ColFilter);
+        app.col_filter_prompt = None;
         app.search_open = true;
         assert_eq!(footer_ctx(&app).view, FooterView::Search);
         app.search_open = false;

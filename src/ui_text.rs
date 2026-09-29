@@ -1083,11 +1083,71 @@ pub static ALL_KEYS: &[&str] = &[
     "首行 / 末行（列光标同时回第一列；脚本语句列表同样适用）",
     "过滤历史：匹配语句文本 / 来源连接 / 来源标（大小写不敏感子串）",
     "同一语句多次执行合并为一行并计数（Ctrl-↵ / p 仍直跑该条）",
+    // R52
+    "语句 {}/{}",
+    "服务器 {}",
+    "编辑器里没有语句",
+    "已是第一条语句",
+    "已是最后一条语句（共 {} 条）",
+    "表结构视图不支持列过滤",
+    "脚本列表不支持列过滤（先 Enter 进入某条语句的结果）",
+    "没有可过滤的结果",
+    "只显示该列含此值的行…",
+    "列过滤「{}」含「{}」· {} 行 · Enter 保留 · Esc 清除",
+    "列过滤「{}」含「{}」· {} 行 · Esc 清除",
+    "列过滤已清除",
+    "已清除列过滤",
+    "列过滤「{}」· 输入以筛选 · Esc 清除",
+    "列过滤「{}」含「{}」· {} 行",
+    " 列过滤「{}」· {} 行 · Enter 保留 · Esc 清除 ",
+    " 列过滤 · Enter/Esc ",
+    "▤{}「{}」{} 行 · ",
+    "按当前列过滤：输入值只留该列含值的行（预填当前单元格，Esc 清除）",
+    "跳到下 / 上一条 SQL 语句开头（分号边界，注释/空语句跳过；状态栏显示 语句 i/n）",
 ];
 
 /// The Chinese → English table. Keys must match the source literals exactly.
 fn en_of(zh: &'static str) -> Option<&'static str> {
     match zh {
+        // ── R52: editor statement jump + results column filter + server version ──
+        "语句 {}/{}" => Some("statement {}/{}"),
+        "服务器 {}" => Some("server {}"),
+        "编辑器里没有语句" => Some("No statement in the editor"),
+        "已是第一条语句" => Some("Already at the first statement"),
+        "已是最后一条语句（共 {} 条）" => {
+            Some("Already at the last statement ({} total)")
+        }
+        "表结构视图不支持列过滤" => {
+            Some("Column filter is not available in the structure view")
+        }
+        "脚本列表不支持列过滤（先 Enter 进入某条语句的结果）" => Some(
+            "Column filter is not available in the script list (press Enter to open a statement's result first)",
+        ),
+        "没有可过滤的结果" => Some("No result to filter"),
+        "只显示该列含此值的行…" => Some("Show only rows whose cell contains this value…"),
+        "列过滤「{}」含「{}」· {} 行 · Enter 保留 · Esc 清除" => Some(
+            "Column filter [{}] contains [{}] · {} rows · Enter keep · Esc clear",
+        ),
+        "列过滤「{}」含「{}」· {} 行 · Esc 清除" => {
+            Some("Column filter [{}] contains [{}] · {} rows · Esc clear")
+        }
+        "列过滤已清除" => Some("Column filter cleared"),
+        "已清除列过滤" => Some("Column filter cleared"),
+        "列过滤「{}」· 输入以筛选 · Esc 清除" => {
+            Some("Column filter [{}] · type to filter · Esc clear")
+        }
+        "列过滤「{}」含「{}」· {} 行" => Some("Column filter [{}] contains [{}] · {} rows"),
+        " 列过滤「{}」· {} 行 · Enter 保留 · Esc 清除 " => Some(
+            " Column filter [{}] · {} rows · Enter keep · Esc clear ",
+        ),
+        " 列过滤 · Enter/Esc " => Some(" Column filter · Enter/Esc "),
+        "▤{}「{}」{} 行 · " => Some("▤{}[{}]{} rows · "),
+        "按当前列过滤：输入值只留该列含值的行（预填当前单元格，Esc 清除）" => Some(
+            "Filter by the focused column: type a value to keep only rows whose cell contains it (pre-filled from the current cell, Esc clears)",
+        ),
+        "跳到下 / 上一条 SQL 语句开头（分号边界，注释/空语句跳过；状态栏显示 语句 i/n）" => Some(
+            "Jump to the next / previous SQL statement start (semicolon-delimited; comments/empty statements skipped; the status bar shows statement i/n)",
+        ),
         // ── R48: pinned results pane / zc column-structure popup ──
         "📌 已解除钉住" => Some("📌 Unpinned"),
         "无可钉住的结果（先打开一张表或执行查询）" => {
