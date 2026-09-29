@@ -8756,6 +8756,24 @@ struct Rects {
     /// Tap targets for the `◀` / `▶` pan buttons drawn at either end of the bar.
     hbar_prev: Rect,
     hbar_next: Rect,
+    /// Clickable `[ 执行 ]  [ 取消 ]` button row of the two confirmation layers
+    /// (`confirm` and `history_confirm`), captured during the last render.
+    confirm_ok: Rect,
+    confirm_cancel: Rect,
+    hist_ok: Rect,
+    hist_cancel: Rect,
+    /// The error box: a click is the `Enter` of the key path (widen a compact
+    /// box; page through a long expanded one and close at the end).
+    error_box: Rect,
+    error_inner: Rect,
+    error_max_scroll: u16,
+    /// The row-detail popup. `inner` is the wrapped-line viewport, `scroll` its
+    /// origin; `app.row_popup_hit` maps a physical line back to an entry.
+    row_popup_inner: Rect,
+    row_popup_scroll: u16,
+    row_popup_visible: bool,
+    /// The full-cell popup box (kept for the click geometry tests).
+    cell_popup: Rect,
 }
 
 // ─── touch / swipe gesture layer ─────────────────────────────────────────────
@@ -8907,6 +8925,123 @@ impl PanGesture {
     /// events; otherwise the press itself has to click or tapping would break.
     fn can_defer_tap(&self) -> bool {
         self.saw_up
+    }
+}
+
+/// Two presses at the same spot within this many milliseconds are a double tap
+/// (the mouse / finger equivalent of `Enter` on the focused row). 400 ms is the
+/// value every desktop toolkit settles on and it is short enough that two
+/// deliberate single taps never merge into one.
+const DOUBLE_TAP_MS: u64 = 400;
+/// A finger is not pixel-accurate, so the second tap may drift this far and
+/// still count as the same spot.
+const DOUBLE_TAP_SLOP: i32 = 1;
+
+/// Double-tap / double-click detector.
+///
+/// `feed` is called on every *press* with the session's monotonic millisecond
+/// clock and answers whether that press is the second of a double. Both tap
+/// paths funnel through it: a terminal that reports `Up` feeds on `Down` and
+/// acts on `Up` (so a swipe can still cancel the tap), while a touch terminal
+/// that never reports `Up` feeds and acts on `Down` — either way the two presses
+/// of a double are the two `Down`s, which is exactly what makes tap-tap work on
+/// glass.
+#[derive(Default, Clone, Copy)]
+struct DoubleTap {
+    /// `(clock, column, row)` of the previous, unpaired press.
+    last: Option<(u64, u16, u16)>,
+    /// True once this pair has been reported, so a third press starts a fresh
+    /// pair instead of firing a second double straight away.
+    fired: bool,
+}
+
+impl DoubleTap {
+    fn feed(&mut self, now_ms: u64, col: u16, row: u16) -> bool {
+        let double = matches!(self.last, Some((t, c, r))
+            if !self.fired
+                && now_ms.saturating_sub(t) < DOUBLE_TAP_MS
+                && (col as i32 - c as i32).abs() <= DOUBLE_TAP_SLOP
+                && (row as i32 - r as i32).abs() <= DOUBLE_TAP_SLOP);
+        if double {
+            self.fired = true;
+            self.last = None;
+        } else {
+            self.fired = false;
+            self.last = Some((now_ms, col, row));
+        }
+        double
+    }
+}
+
+/// Mirror of tui-textarea's viewport, so a click inside the editor can be mapped
+/// back to a `(row, col)` even after the text scrolled horizontally.
+///
+/// The widget keeps its scroll origin private, so this replays the same rule it
+/// uses (`next_scroll_top` in tui-textarea's `widget.rs`): `render_main_area`
+/// re-derives it after every frame that draws the editor, and the page-scroll
+/// keys apply their delta here because they move the viewport without moving the
+/// cursor out of it (which the render-time cursor-follow could not see).
+#[derive(Default, Clone, Copy)]
+struct EditorViewport {
+    row: u16,
+    col: u16,
+    /// Size of the viewport on the last frame (0 before the first draw).
+    w: u16,
+    h: u16,
+}
+
+impl EditorViewport {
+    /// The widget's own scroll-origin rule, reproduced exactly (including the
+    /// degenerate zero-size case, so the mirror never drifts from the widget).
+    fn next_top(prev: u16, cursor: u16, len: u16) -> u16 {
+        if cursor < prev {
+            cursor
+        } else if prev.saturating_add(len) <= cursor {
+            cursor + 1 - len
+        } else {
+            prev
+        }
+    }
+
+    fn resize(&mut self, w: u16, h: u16) {
+        self.w = w;
+        self.h = h;
+    }
+
+    /// Follow the cursor after it moved (what the widget does at render time).
+    fn follow(&mut self, cursor: (usize, usize)) {
+        self.row = Self::next_top(self.row, cursor.0 as u16, self.h);
+        self.col = Self::next_top(self.col, cursor.1 as u16, self.w);
+    }
+
+    /// A page scroll moves the origin by a full viewport height.
+    fn page(&mut self, down: bool) {
+        self.row = if down {
+            self.row.saturating_add(self.h)
+        } else {
+            self.row.saturating_sub(self.h)
+        };
+    }
+
+    /// Replay the viewport delta of the page-scroll keys that reach the widget
+    /// (`PageUp` / `PageDown`, plus tui-textarea's built-in `Ctrl-V` = page down).
+    fn note_key(&mut self, k: &KeyEvent) {
+        let ctrl = k.modifiers.contains(KeyModifiers::CONTROL);
+        let alt = k.modifiers.contains(KeyModifiers::ALT);
+        match k.code {
+            KeyCode::PageDown => self.page(true),
+            KeyCode::PageUp => self.page(false),
+            KeyCode::Char('v') if ctrl && !alt => self.page(true),
+            _ => {}
+        }
+    }
+
+    /// The text position under a click `(rel_x, rel_y)` inside the viewport.
+    /// `CursorMove::Jump` clamps the result, so a click past the last line or
+    /// past the end of a line lands on the nearest character (clicking the empty
+    /// space below the text jumps to the end of the buffer).
+    fn text_pos(&self, rel_x: u16, rel_y: u16) -> (u16, u16) {
+        (self.row.saturating_add(rel_y), self.col.saturating_add(rel_x))
     }
 }
 
@@ -9462,8 +9597,22 @@ struct App {
     //   gesture: swipe state for the drag → column-pan path.
     gesture: PanGesture,
     //   pending_tap: a results-pane click waiting for its `Up`, so the press that
-    //   starts a swipe does not also select a row / jump the scrollbar.
-    pending_tap: Option<(u16, u16)>,
+    //   starts a swipe does not also select a row / jump the scrollbar. The bool
+    //   marks the second press of a double tap, which opens the row detail.
+    pending_tap: Option<(u16, u16, bool)>,
+    //   tap / popup_tap: double-tap detectors for the result grid (double click =
+    //   row detail) and for the row-detail popup (double click = drill into the
+    //   cell). Kept apart so a click that opened the popup cannot pair with the
+    //   first click inside it.
+    tap: DoubleTap,
+    popup_tap: DoubleTap,
+    //   mouse_epoch: session monotonic clock the tap detectors time against.
+    mouse_epoch: Instant,
+    //   editor_vp: mirror of tui-textarea's viewport for click-to-place-cursor.
+    editor_vp: EditorViewport,
+    //   row_popup_hit: physical (wrapped) line → entry position, captured by the
+    //   row-popup render so a click selects the entry under the pointer.
+    row_popup_hit: Vec<usize>,
     //   When `DBXT_EVENT_TRACE` is set, mouse/resize events are appended here so a
     //   user can report exactly what their terminal sends. Keystrokes are never
     //   traced (a password field would leak).
@@ -9641,6 +9790,10 @@ struct App {
 }
 
 impl App {
+    /// Session monotonic clock in milliseconds, used to time double taps.
+    fn now_ms(&self) -> u64 {
+        self.mouse_epoch.elapsed().as_millis() as u64
+    }
     fn selected_name(&self) -> String {
         self.selected
             .as_ref()
@@ -10058,6 +10211,11 @@ impl App {
             drag_pan,
             gesture: PanGesture::default(),
             pending_tap: None,
+            tap: DoubleTap::default(),
+            popup_tap: DoubleTap::default(),
+            mouse_epoch: Instant::now(),
+            editor_vp: EditorViewport::default(),
+            row_popup_hit: Vec::new(),
             mouse_debug,
             mouse_log: VecDeque::new(),
             trace_path,
@@ -15200,9 +15358,9 @@ fn mouse(app: &mut App, tx: &Tx, m: MouseEvent) {
             let swipe = app.gesture.is_swipe();
             let _ = app.gesture.feed(m.kind, m.column, m.row, app.drag_pan);
             let tap = app.pending_tap.take();
-            if let Some((cx, cy)) = tap {
+            if let Some((cx, cy, double)) = tap {
                 if !swipe {
-                    result_click(app, cx, cy);
+                    result_tap(app, cx, cy, double);
                 }
             }
             return;
@@ -15220,16 +15378,44 @@ fn mouse(app: &mut App, tx: &Tx, m: MouseEvent) {
 
     match m.kind {
         MouseEventKind::Down(MouseButton::Left) => {
-            if app.confirm.is_some()
-                || app.edit_dialog.is_some()
-                || app.snippet_open
+            // ── the topmost modal owns the press ──
+            //
+            // Every layer below the pointer is hit-tested in the same order the
+            // key router uses, so a click and a key can never disagree about
+            // which surface is in front.
+            if app.ssh_prompt.is_some() || app.edit_dialog.is_some() {
+                return;
+            }
+            if app.confirm.is_some() {
+                confirm_click(app, tx, m.column, m.row);
+                return;
+            }
+            if app.history_confirm.is_some() {
+                history_confirm_click(app, tx, m.column, m.row);
+                return;
+            }
+            if app.error_popup.is_some() {
+                error_popup_click(app, m.column, m.row);
+                return;
+            }
+            // The cell popup sits on top of a drilled row popup; a click closes
+            // it (exactly like `Enter` / `Esc`) and reveals the row underneath.
+            if app.cell_popup.is_some() {
+                app.cell_popup = None;
+                return;
+            }
+            if app.row_popup.is_some() {
+                row_popup_click(app, m.column, m.row);
+                return;
+            }
+            if app.snippet_open
                 || app.col_picker_open
                 || app.recent_open
                 || app.table_prompt.is_some()
+                || app.filter_prompt.is_some()
+                || app.help_open
+                || app.help_mini
             {
-                return;
-            }
-            if app.cell_popup.is_some() || app.row_popup.is_some() || app.error_popup.is_some() {
                 return;
             }
             if r.db_picker_visible && rect_contains(r.db_picker, m.column, m.row) {
@@ -15270,6 +15456,10 @@ fn mouse(app: &mut App, tx: &Tx, m: MouseEvent) {
                     app.pane_override[PANE_EDITOR] = Some(false);
                 }
                 app.focus = Focus::Editor;
+                // A click in the editor also places the caret where it landed
+                // (the pane only has to be on screen for that; a collapsed pane
+                // is opened above and gets its geometry on the next frame).
+                editor_click(app, m.column, m.row);
                 return;
             }
             if rect_contains(r.results, m.column, m.row) {
@@ -15279,14 +15469,18 @@ fn mouse(app: &mut App, tx: &Tx, m: MouseEvent) {
                     return;
                 }
                 app.focus = Focus::Preview;
+                // A second press at the same spot is a double click: it opens the
+                // row detail, the mouse equivalent of `Enter`.
+                let now = app.now_ms();
+                let double = app.tap.feed(now, m.column, m.row);
                 // A touch swipe starts with the same press as a tap, so defer the
                 // click to the matching `Up` and drop it when the gesture becomes a
                 // swipe. Terminals that never send `Up` keep press-to-click
                 // (`can_defer_tap`), so tapping can never regress.
                 if app.gesture.can_defer_tap() {
-                    app.pending_tap = Some((m.column, m.row));
+                    app.pending_tap = Some((m.column, m.row, double));
                 } else {
-                    result_click(app, m.column, m.row);
+                    result_tap(app, m.column, m.row, double);
                 }
                 return;
             }
@@ -15401,6 +15595,118 @@ fn result_click(app: &mut App, x: u16, y: u16) {
     app.sel = idx;
 }
 
+/// A completed tap (or, on a touch terminal that never sends `Up`, a press) in
+/// the results pane. A double tap opens the row detail — the mouse / finger
+/// equivalent of `Enter` — instead of only selecting the row. The grid kinds
+/// (query, table data, Redis value, Mongo documents) all share this path, so the
+/// value views behave exactly like the SQL side.
+fn result_tap(app: &mut App, x: u16, y: u16, double: bool) {
+    result_click(app, x, y);
+    if double {
+        open_row_popup(app);
+    }
+}
+
+/// A press on a red confirmation layer: the two button rectangles act as the
+/// `Enter` (confirm) and `Esc` (cancel) branches. A press anywhere else is
+/// ignored, so the layer cannot be dismissed by a stray tap.
+fn confirm_click(app: &mut App, tx: &Tx, x: u16, y: u16) {
+    let r = app.rects;
+    if rect_contains(r.confirm_ok, x, y) {
+        confirm_key(app, tx, KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+    } else if rect_contains(r.confirm_cancel, x, y) {
+        confirm_key(app, tx, KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+    }
+}
+
+/// The same two buttons for the query-history deletion layer.
+fn history_confirm_click(app: &mut App, tx: &Tx, x: u16, y: u16) {
+    let r = app.rects;
+    if rect_contains(r.hist_ok, x, y) {
+        history_confirm_key(app, tx, KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+    } else if rect_contains(r.hist_cancel, x, y) {
+        history_confirm_key(app, tx, KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+    }
+}
+
+/// A press while the error box is open, with the same meaning as `Enter`
+/// regardless of where it lands (the box owns the screen like it owns the
+/// keyboard): the compact box widens to the full text, and an already-expanded
+/// one pages down through a long error — closing only once the end is on screen,
+/// so a tap can never close a box the user has not finished reading.
+fn error_popup_click(app: &mut App, x: u16, y: u16) {
+    let r = app.rects;
+    let _ = (x, y);
+    let expanded = app.error_popup.as_ref().is_some_and(|p| p.expanded);
+    if !expanded {
+        if let Some(p) = app.error_popup.as_mut() {
+            p.expanded = true;
+        }
+        return;
+    }
+    let scroll = app.error_popup.as_ref().map(|p| p.scroll).unwrap_or(0);
+    if scroll < r.error_max_scroll {
+        let step = r.error_inner.height.max(1);
+        if let Some(p) = app.error_popup.as_mut() {
+            p.scroll = scroll.saturating_add(step).min(r.error_max_scroll);
+        }
+    } else {
+        app.error_popup = None;
+    }
+}
+
+/// A press inside the row-detail popup: select the entry under the pointer, and
+/// on the second press at the same spot drill into the full cell (the mouse
+/// equivalent of `Enter` / `v`).
+fn row_popup_click(app: &mut App, x: u16, y: u16) {
+    let r = app.rects;
+    if !r.row_popup_visible || !rect_contains(r.row_popup_inner, x, y) {
+        return;
+    }
+    // Physical (wrapped) line → entry position, so clicking a value that wrapped
+    // over three rows still selects that value.
+    let line = r.row_popup_scroll as usize + (y - r.row_popup_inner.y) as usize;
+    let Some(&pos) = app.row_popup_hit.get(line) else {
+        return;
+    };
+    if let Some(p) = app.row_popup.as_mut() {
+        p.cursor = pos;
+        p.count.clear();
+    }
+    let now = app.now_ms();
+    if app.popup_tap.feed(now, x, y) {
+        drill_row_popup_cell(app);
+    }
+}
+
+/// Place the editor caret where the click landed. The click is translated
+/// through the mirrored viewport, so it stays correct after the text scrolled
+/// horizontally; `CursorMove::Jump` clamps the result, so a click past the last
+/// line or past the end of a line lands on the nearest character.
+fn editor_click(app: &mut App, x: u16, y: u16) {
+    let area = app.rects.editor;
+    if area.width < 3 || area.height < 3 {
+        return;
+    }
+    let inner = Rect {
+        x: area.x + 1,
+        y: area.y + 1,
+        width: area.width - 2,
+        height: area.height - 2,
+    };
+    if !rect_contains(inner, x, y) {
+        return;
+    }
+    let (row, col) = app.editor_vp.text_pos(x - inner.x, y - inner.y);
+    if row as usize >= app.editor.lines().len() {
+        // Clicking the empty space below the text jumps to the end of the buffer
+        // (`Jump` with an out-of-range position clamps to the last character).
+        app.editor.move_cursor(CursorMove::Jump(u16::MAX, u16::MAX));
+    } else {
+        app.editor.move_cursor(CursorMove::Jump(row, col));
+    }
+}
+
 /// Clicking the horizontal progress bar jumps the column window to the clicked
 /// position. Returns true when the click was on the bar (and handled).
 fn hbar_click(app: &mut App, x: u16, y: u16) -> bool {
@@ -15487,7 +15793,6 @@ fn sidebar_click(app: &mut App, tx: &Tx, x: u16, y: u16) {
     if tree_row < 0 {
         return;
     }
-    let _ = x;
     let cap = (area.height as usize)
         .saturating_sub(2 + filter_rows)
         .max(1);
@@ -15502,11 +15807,62 @@ fn sidebar_click(app: &mut App, tx: &Tx, x: u16, y: u16) {
     if idx >= n {
         return;
     }
+    // The `▸` / `▾` expander is its own hit target: clicking it folds or unfolds
+    // that node even when the row is not the selected one, so a phone can tap a
+    // triangle without first moving the tree cursor. The row's remaining cells
+    // keep the two-tap select-then-activate behaviour.
+    let rel_x = x as i32 - area.x as i32 - 1;
+    if let Some(cols) = side_tri_cols(&app.side_rows[idx]) {
+        if rel_x >= 0 && cols.contains(&(rel_x as u16)) {
+            let open = side_row_open(app, &app.side_rows[idx].clone());
+            app.side_sel = idx;
+            side_mirror_table(app);
+            if open {
+                side_collapse(app);
+            } else {
+                side_expand(app, tx);
+            }
+            return;
+        }
+    }
     if app.side_sel == idx {
         side_activate(app, tx);
     } else {
         app.side_sel = idx;
         side_mirror_table(app);
+    }
+}
+
+/// True when the tree row draws a `▸` / `▾` expander that can be clicked
+/// (connections and databases have children; tables are leaves).
+fn side_row_has_tri(row: &SideRow) -> bool {
+    matches!(row, SideRow::Conn { .. } | SideRow::Db { .. })
+}
+
+/// The two columns the expander occupies on a tree row, relative to the
+/// sidebar's inner (bordered) area — the row is indented two cells per level and
+/// the triangle is drawn before the node's symbol.
+fn side_tri_cols(row: &SideRow) -> Option<std::ops::Range<u16>> {
+    if !side_row_has_tri(row) {
+        return None;
+    }
+    let off = 2 * side_row_depth(row) as u16;
+    Some(off..off + 2)
+}
+
+/// True when this tree row's node is currently expanded (its children are
+/// listed), i.e. it draws `▾`. Mirrors the rule `side_row_line` uses so a click
+/// on the triangle folds exactly what the glyph promises.
+fn side_row_open(app: &App, row: &SideRow) -> bool {
+    match row {
+        SideRow::Conn { idx } => side_conn_open(app, *idx),
+        SideRow::Db { idx, db } => {
+            side_is_active(app, *idx)
+                && *db == app.current_db()
+                && side_root_cfg(app, *idx)
+                    .is_some_and(|c| !app.tree_db_closed.contains(&db_node_key(&c.id, db)))
+        }
+        _ => false,
     }
 }
 
@@ -16356,6 +16712,10 @@ fn editor_key(app: &mut App, tx: &Tx, k: KeyEvent) {
             }
         }
         _ => {
+            // The page-scroll keys move tui-textarea's viewport without moving
+            // the cursor out of it, which the render-time cursor-follow cannot
+            // see; replay the same delta on the click-mapping mirror first.
+            app.editor_vp.note_key(&k);
             app.editor.input(k);
         }
     }
@@ -26440,7 +26800,9 @@ fn ui(f: &mut Frame, app: &mut App) {
     }
     if let Some(popup) = app.cell_popup.as_ref() {
         let cache = &mut app.popup_cache;
-        render_text_popup(f, f.area(), &popup.title, &popup.lines, popup.scroll, cache);
+        let (box_area, _inner, _max) =
+            render_text_popup(f, f.area(), &popup.title, &popup.lines, popup.scroll, cache);
+        app.rects.cell_popup = box_area;
     }
     if app.error_popup.is_some() {
         render_error_popup(f, f.area(), app);
@@ -26482,10 +26844,14 @@ fn ui(f: &mut Frame, app: &mut App) {
         render_edit_dialog(f, f.area(), app);
     }
     if let Some(confirm) = app.confirm.clone() {
-        render_confirm(f, f.area(), &confirm);
+        let (ok, cancel) = render_confirm(f, f.area(), &confirm);
+        app.rects.confirm_ok = ok;
+        app.rects.confirm_cancel = cancel;
     }
     if let Some(hc) = app.history_confirm.clone() {
-        render_history_confirm(f, f.area(), &hc);
+        let (ok, cancel) = render_history_confirm(f, f.area(), &hc);
+        app.rects.hist_ok = ok;
+        app.rects.hist_cancel = cancel;
     }
     if app.ssh_prompt.is_some() {
         render_ssh_prompt(f, f.area(), app);
@@ -27515,6 +27881,14 @@ fn render_main_area(
             .border_set(border::ROUNDED)
             .border_style(border_style(focused));
         app.editor.set_block(block);
+        // Keep the click-to-place-caret mirror in step with the widget: the
+        // bordered inner area is the viewport, and the widget re-derives its own
+        // scroll origin from the previous one plus the cursor on every render.
+        app.editor_vp.resize(
+            main_chunks[0].width.saturating_sub(2),
+            main_chunks[0].height.saturating_sub(2),
+        );
+        app.editor_vp.follow(app.editor.cursor());
         f.render_widget(&app.editor, main_chunks[0]);
     }
 
@@ -29843,7 +30217,9 @@ fn render_history_panel(f: &mut Frame, area: Rect, app: &mut App) {
 }
 
 /// The red confirmation layer for deleting one query-history entry.
-fn render_history_confirm(f: &mut Frame, area: Rect, hc: &HistoryConfirm) {
+/// Returns the `[ 执行 ]` / `[ 取消 ]` hit rectangles (empty when the button row
+/// is clipped away).
+fn render_history_confirm(f: &mut Frame, area: Rect, hc: &HistoryConfirm) -> (Rect, Rect) {
     let w = if area.width < 30 {
         area.width
     } else {
@@ -29870,10 +30246,19 @@ fn render_history_confirm(f: &mut Frame, area: Rect, hc: &HistoryConfirm) {
         )));
     }
     lines.push(Line::from(""));
-    lines.push(Line::from(Span::styled(
-        t("Enter/y 执行   Esc/n 取消"),
-        Style::default().fg(Color::Yellow),
-    )));
+    let inner = Rect {
+        x: box_area.x + 1,
+        y: box_area.y + 1,
+        width: box_area.width.saturating_sub(2),
+        height: box_area.height.saturating_sub(2),
+    };
+    let (buttons, ok, cancel) = confirm_buttons(
+        inner,
+        inner.y + lines.len() as u16,
+        t("Enter/y 执行"),
+        t("Esc/n 取消"),
+    );
+    lines.push(buttons);
     let block = Block::default()
         .borders(Borders::ALL)
         .title(Span::styled(
@@ -29883,6 +30268,7 @@ fn render_history_confirm(f: &mut Frame, area: Rect, hc: &HistoryConfirm) {
         .border_set(border::THICK)
         .border_style(Style::default().fg(Color::Red));
     f.render_widget(Paragraph::new(lines).block(block), box_area);
+    (ok, cancel)
 }
 
 /// The `/` table-name filter prompt, drawn as a one-line box at the bottom.
@@ -31608,6 +31994,10 @@ fn render_snippet_name(f: &mut Frame, area: Rect, app: &mut App) {
 }
 
 /// Shared scrollable text popup used for both cell values and row details.
+///
+/// Returns the drawn box, its inner (scrollable) area and the largest scroll
+/// offset, so a caller can record click geometry (the error box pages on a tap;
+/// the cell popup closes on one).
 fn render_text_popup(
     f: &mut Frame,
     area: Rect,
@@ -31615,7 +32005,7 @@ fn render_text_popup(
     lines: &[PopupLine],
     scroll: u16,
     cache: &mut Option<PopupCache>,
-) {
+) -> (Rect, Rect, u16) {
     let w = overlay_width(area.width, 88, 24);
     let inner_w = w.saturating_sub(4).max(1) as usize;
     // Wrap each logical line on its own so the style that marks NULL / ''
@@ -31656,6 +32046,16 @@ fn render_text_popup(
         ),
         box_area,
     );
+    (
+        box_area,
+        Rect {
+            x: box_area.x + 1,
+            y: box_area.y + 1,
+            width: box_area.width.saturating_sub(2),
+            height: box_area.height.saturating_sub(2),
+        },
+        max_scroll,
+    )
 }
 
 /// R42b: the row-detail popup. A scrollable `column = value` list with a
@@ -31665,7 +32065,9 @@ fn render_row_popup(f: &mut Frame, area: Rect, app: &mut App) {
     let w = overlay_width(area.width, 88, 24);
     let inner_w = w.saturating_sub(4).max(1) as usize;
     // Build the (filtered) body first, tracking where the cursor's entry starts.
-    let (base_title, body, sel_line, filtering, filter, cur, total) = {
+    // `hit` maps each physical (wrapped) line back to its entry position, so a
+    // click can select the value under the pointer even when it wrapped.
+    let (base_title, body, hit, sel_line, filtering, filter, cur, total) = {
         let Some(popup) = app.row_popup.as_ref() else {
             return;
         };
@@ -31677,6 +32079,7 @@ fn render_row_popup(f: &mut Frame, area: Rect, app: &mut App) {
             popup.cursor.min(total - 1)
         };
         let mut body: Vec<Line<'static>> = Vec::new();
+        let mut hit: Vec<usize> = Vec::new();
         let mut sel_line = 0usize;
         for (pos, &ei) in visible.iter().enumerate() {
             let pl = &popup.lines[ei];
@@ -31692,6 +32095,7 @@ fn render_row_popup(f: &mut Frame, area: Rect, app: &mut App) {
             };
             for t in wrap_text(&format!("{marker}{}", pl.text), inner_w) {
                 body.push(Line::from(Span::styled(t, style)));
+                hit.push(pos);
             }
         }
         if body.is_empty() {
@@ -31703,6 +32107,7 @@ fn render_row_popup(f: &mut Frame, area: Rect, app: &mut App) {
         (
             popup.title.clone(),
             body,
+            hit,
             sel_line,
             popup.filtering,
             popup.filter.clone(),
@@ -31710,6 +32115,7 @@ fn render_row_popup(f: &mut Frame, area: Rect, app: &mut App) {
             total,
         )
     };
+    app.row_popup_hit = hit;
     let total_lines = body.len();
     let max_h = area.height.saturating_sub(4).max(3);
     let h = ((total_lines as u16) + 2).min(max_h);
@@ -31732,6 +32138,16 @@ fn render_row_popup(f: &mut Frame, area: Rect, app: &mut App) {
     if let Some(p) = app.row_popup.as_mut() {
         p.scroll = scroll;
     }
+    // Click geometry: the inner area is the wrapped-line viewport and `scroll`
+    // its origin, so a press maps to `row_popup_hit[scroll + rel_y]`.
+    app.rects.row_popup_inner = Rect {
+        x: box_area.x + 1,
+        y: box_area.y + 1,
+        width: box_area.width.saturating_sub(2),
+        height: box_area.height.saturating_sub(2),
+    };
+    app.rects.row_popup_scroll = scroll;
+    app.rects.row_popup_visible = true;
     // Title: base locator · filter · position · hints. The full hint line is
     // swapped for a short one when it would not fit, so a title is never cut.
     let mut base = format!(" {} ", base_title);
@@ -31791,12 +32207,24 @@ fn render_error_popup(f: &mut Frame, area: Rect, app: &mut App) {
             })
             .collect();
         let cache = &mut app.popup_cache;
-        render_text_popup(f, area, t("执行错误"), &lines, popup.scroll, cache);
+        let (box_area, inner, max_scroll) =
+            render_text_popup(f, area, t("执行错误"), &lines, popup.scroll, cache);
+        app.rects.error_box = box_area;
+        app.rects.error_inner = inner;
+        app.rects.error_max_scroll = max_scroll;
         return;
     }
     let w = overlay_width(area.width, 72, 24);
     let inner_w = w.saturating_sub(4).max(1) as usize;
     let box_area = centered_overlay(area, w, 5);
+    app.rects.error_box = box_area;
+    app.rects.error_inner = Rect {
+        x: box_area.x + 1,
+        y: box_area.y + 1,
+        width: box_area.width.saturating_sub(2),
+        height: box_area.height.saturating_sub(2),
+    };
+    app.rects.error_max_scroll = 0;
     f.render_widget(Clear, box_area);
     let first = truncate_disp(popup.lines.first().map(String::as_str).unwrap_or(""), inner_w);
     let hint = if total > 1 {
@@ -32327,7 +32755,7 @@ const HELP_ROWS: &[(&str, &str)] = &[
     ("|", "跳列：输入列号或列名前缀直达该列（宽表横滚）"),
     ("n / Shift-N", "搜索结果或定位命中时：下 / 上一个命中（否则 n 翻页）"),
     ("Ctrl-N", "结果被截断时加载更多行"),
-    ("Enter", "整行详情（纵向，含隐藏列；看某一行从这里进）"),
+    ("Enter", "整行详情（纵向，含隐藏列；看某一行从这里进；结果区双击行同效）"),
     ("v", "完整单元格（任意模式，不进整行弹层）"),
     ("o", "整行详情（与 Enter 等价）"),
     ("e", "编辑单元格 → diff 确认后执行"),
@@ -32450,6 +32878,15 @@ const HELP_ROWS: &[(&str, &str)] = &[
     ("y", "复制整条语句"),
     ("Del", "删除单条历史（红色确认，不影响数据库数据）"),
     ("/", "按语句内容过滤（大小写不敏感子串）"),
+    ("— 鼠标 / 触屏 —", ""),
+    ("点击（结果区）", "选中该行；同一位置 400ms 内再点一次 = 双击，打开整行详情（等价 Enter）"),
+    ("双击（行弹层）", "下钻该值到完整单元格弹层（等价 Enter）；单击 = 光标移到该值"),
+    ("点击（▶ / ▼ 图标）", "折叠 / 展开该连接或库（不必先选中该行）；行其余部分仍是两击选中 + 激活"),
+    ("点击（确认弹层按钮）", "点 [ 执行 ] / [ 取消 ] = Enter / Esc 两条分支"),
+    ("点击（错误弹层）", "紧凑态点开全量；长错误逐页下翻，翻到底再点关闭"),
+    ("点击（单元格弹层）", "关闭，回到下面的行弹层"),
+    ("点击（编辑器）", "聚焦并把光标放到点击处（含横滚偏移；点在文本下方 = 跳文末）"),
+    ("滚轮 / 横滑", "纵向滚行；Shift/Alt/Ctrl+滚轮 或左右滑动 = 横滚列"),
 ];
 
 /// Width of the `?` help overlay. The cheat-sheet has grown a lot (R15–R33),
@@ -32584,11 +33021,73 @@ fn render_help_mini(f: &mut Frame, area: Rect, app: &mut App) {
     );
 }
 
+/// The two button rectangles of a confirmation layer, plus the line to draw.
+///
+/// `inner` is the box's content area and `y` the row the buttons sit on; when the
+/// row is clipped by a very short terminal (or the box is too narrow) the
+/// corresponding rectangle is empty, so a click there can never fire a branch the
+/// user cannot see.
+fn confirm_buttons(
+    inner: Rect,
+    y: u16,
+    ok_label: &str,
+    cancel_label: &str,
+) -> (Line<'static>, Rect, Rect) {
+    let ok = format!("[ {ok_label} ]");
+    let cancel = format!("[ {cancel_label} ]");
+    let gap = 2u16;
+    let empty = Rect {
+        x: inner.x,
+        y,
+        width: 0,
+        height: 0,
+    };
+    let line = Line::from(vec![
+        Span::styled(
+            ok.clone(),
+            Style::default()
+                .fg(Color::Black)
+                .bg(Color::Red)
+                .add_modifier(Modifier::BOLD),
+        ),
+        Span::raw("  "),
+        Span::styled(
+            cancel.clone(),
+            Style::default()
+                .fg(Color::Yellow)
+                .add_modifier(Modifier::BOLD),
+        ),
+    ]);
+    // A row outside the content area is clipped by the widget: report no target.
+    if inner.height == 0 || y >= inner.y + inner.height {
+        return (line, empty, empty);
+    }
+    let ok_w = (disp_width(&ok) as u16).min(inner.width);
+    let cx = inner.x.saturating_add(ok_w).saturating_add(gap);
+    let cancel_w = (disp_width(&cancel) as u16).min((inner.x + inner.width).saturating_sub(cx));
+    (
+        line,
+        Rect {
+            x: inner.x,
+            y,
+            width: ok_w,
+            height: 1,
+        },
+        Rect {
+            x: cx,
+            y,
+            width: cancel_w,
+            height: 1,
+        },
+    )
+}
+
 /// The red layer for deleting a saved connection. Deliberately explicit that
-/// only the connection config is removed, never the database's data.
-fn render_conn_confirm(f: &mut Frame, area: Rect, cc: &ConnConfirm) {
+/// only the connection config is removed, never the database's data. Returns the
+/// `[ 删除 ]` / `[ 取消 ]` hit rectangles.
+fn render_conn_confirm(f: &mut Frame, area: Rect, cc: &ConnConfirm) -> (Rect, Rect) {
     let w = overlay_width(area.width, 72, 30);
-    let lines = vec![
+    let mut lines = vec![
         Line::from(Span::styled(
             tf("将删除连接 {} ({})", &[&cc.name, &cc.db_type]),
             Style::default()
@@ -32601,13 +33100,22 @@ fn render_conn_confirm(f: &mut Frame, area: Rect, cc: &ConnConfirm) {
             Style::default().fg(Color::Yellow),
         )),
         Line::from(""),
-        Line::from(Span::styled(
-            t("Enter/y 删除   Esc/n 取消"),
-            Style::default().fg(Color::Yellow),
-        )),
     ];
-    let h = (lines.len() as u16 + 2).min(area.height).max(3.min(area.height));
+    let h = (lines.len() as u16 + 1 + 2).min(area.height).max(3.min(area.height));
     let box_area = centered_overlay(area, w, h);
+    let inner = Rect {
+        x: box_area.x + 1,
+        y: box_area.y + 1,
+        width: box_area.width.saturating_sub(2),
+        height: box_area.height.saturating_sub(2),
+    };
+    let (buttons, ok, cancel) = confirm_buttons(
+        inner,
+        inner.y + lines.len() as u16,
+        t("Enter/y 删除"),
+        t("Esc/n 取消"),
+    );
+    lines.push(buttons);
     f.render_widget(Clear, box_area);
     let block = Block::default()
         .borders(Borders::ALL)
@@ -32618,12 +33126,15 @@ fn render_conn_confirm(f: &mut Frame, area: Rect, cc: &ConnConfirm) {
         .border_set(border::THICK)
         .border_style(Style::default().fg(Color::Red));
     f.render_widget(Paragraph::new(lines).block(block), box_area);
+    (ok, cancel)
 }
 
-fn render_confirm(f: &mut Frame, area: Rect, confirm: &Confirm) {
+/// Returns the `[ 执行 ]` / `[ 取消 ]` hit rectangles of the confirmation layer
+/// (empty when the button row is clipped away).
+fn render_confirm(f: &mut Frame, area: Rect, confirm: &Confirm) -> (Rect, Rect) {
+    let empty = Rect::default();
     if let Some(cc) = &confirm.conn {
-        render_conn_confirm(f, area, cc);
-        return;
+        return render_conn_confirm(f, area, cc);
     }
     let w = overlay_width(area.width, 72, 30);
     let inner_w = w.saturating_sub(4) as usize;
@@ -32667,10 +33178,15 @@ fn render_confirm(f: &mut Frame, area: Rect, confirm: &Confirm) {
         )));
     }
     lines.push(Line::from(""));
-    lines.push(Line::from(Span::styled(
-        t("Enter/y 执行   Esc/n 取消"),
-        Style::default().fg(Color::Yellow),
-    )));
+    let inner = Rect {
+        x: box_area.x + 1,
+        y: box_area.y + 1,
+        width: box_area.width.saturating_sub(2),
+        height: box_area.height.saturating_sub(2),
+    };
+    let hint_y = inner.y + lines.len() as u16;
+    let (buttons, ok, cancel) = confirm_buttons(inner, hint_y, t("Enter/y 执行"), t("Esc/n 取消"));
+    lines.push(buttons);
 
     let block = Block::default()
         .borders(Borders::ALL)
@@ -32681,6 +33197,10 @@ fn render_confirm(f: &mut Frame, area: Rect, confirm: &Confirm) {
         .border_set(border::THICK)
         .border_style(Style::default().fg(Color::Red));
     f.render_widget(Paragraph::new(lines).block(block), box_area);
+    if ok.width == 0 && cancel.width == 0 {
+        return (empty, empty);
+    }
+    (ok, cancel)
 }
 
 /// The blocking SSH prompt dialog (host-key TOFU / keyboard-interactive).
@@ -35422,6 +35942,404 @@ mod tests {
         assert!(!g.can_defer_tap(), "press-to-click until an Up is proven");
         g.feed(MouseEventKind::Up(MouseButton::Left), 10, 5, DragPan::Button);
         assert!(g.can_defer_tap());
+    }
+
+    // ── R46 double tap / click ──
+
+    #[test]
+    fn double_tap_fires_on_the_second_press_at_the_same_spot() {
+        let mut d = DoubleTap::default();
+        assert!(!d.feed(0, 10, 5), "the first press only arms the pair");
+        assert!(
+            d.feed(DOUBLE_TAP_MS - 1, 10, 5),
+            "a second press inside the window is a double"
+        );
+        // A third press starts a fresh pair instead of firing again straight away.
+        assert!(!d.feed(DOUBLE_TAP_MS, 10, 5));
+        assert!(d.feed(2 * DOUBLE_TAP_MS - 1, 10, 5));
+    }
+
+    #[test]
+    fn double_tap_needs_the_same_spot_and_the_window() {
+        // Two deliberate single taps (past the window) never merge into one.
+        let mut slow = DoubleTap::default();
+        assert!(!slow.feed(0, 10, 5));
+        assert!(!slow.feed(DOUBLE_TAP_MS, 10, 5));
+        // A finger is not pixel-accurate: one cell of drift still counts...
+        let mut drift = DoubleTap::default();
+        assert!(!drift.feed(0, 10, 5));
+        assert!(drift.feed(DOUBLE_TAP_MS - 1, 11, 6));
+        // ... two cells do not, on either axis.
+        let mut far = DoubleTap::default();
+        assert!(!far.feed(0, 10, 5));
+        assert!(!far.feed(10, 12, 5));
+        assert!(!far.feed(20, 10, 8));
+    }
+
+    #[test]
+    fn editor_viewport_follows_the_cursor_and_maps_a_click_back() {
+        let mut vp = EditorViewport::default();
+        vp.resize(50, 3);
+        // A cursor at column 80 on a 50-wide viewport scrolls the origin to 31.
+        vp.follow((0, 80));
+        assert_eq!((vp.row, vp.col), (0, 31));
+        // Clicking the first visible column maps to the scrolled column, not 0.
+        assert_eq!(vp.text_pos(0, 0), (0, 31));
+        assert_eq!(vp.text_pos(4, 1), (1, 35));
+        // A page scroll moves the origin by the viewport height (the widget
+        // scrolls first, then pulls the cursor back into view).
+        vp.page(true);
+        assert_eq!(vp.row, 3);
+        assert_eq!(vp.text_pos(0, 2).0, 5);
+        // PageUp walks it back and stops at the top.
+        vp.page(false);
+        vp.page(false);
+        assert_eq!(vp.row, 0);
+        // The mirror also replays the page-scroll keys' viewport delta.
+        vp.note_key(&KeyEvent::new(KeyCode::PageDown, KeyModifiers::NONE));
+        assert_eq!(vp.row, 3);
+        vp.note_key(&KeyEvent::new(KeyCode::Char('v'), KeyModifiers::CONTROL));
+        assert_eq!(vp.row, 6);
+        vp.note_key(&KeyEvent::new(KeyCode::PageUp, KeyModifiers::SHIFT));
+        assert_eq!(vp.row, 3);
+    }
+
+    #[test]
+    fn confirm_buttons_report_their_hit_rectangles() {
+        let inner = Rect {
+            x: 10,
+            y: 5,
+            width: 40,
+            height: 4,
+        };
+        let (_line, ok, cancel) = confirm_buttons(inner, inner.y + 2, "Enter/y 执行", "Esc/n 取消");
+        assert_eq!((ok.x, ok.y, ok.height), (10, 7, 1));
+        assert_eq!(ok.width as usize, disp_width("[ Enter/y 执行 ]"));
+        assert_eq!(cancel.x, ok.x + ok.width + 2);
+        assert!(cancel.x + cancel.width <= inner.x + inner.width);
+        assert_eq!(cancel.height, 1);
+        // A button row clipped out of the content area has no hit target.
+        let (_l, ok2, cancel2) =
+            confirm_buttons(inner, inner.y + inner.height, "Enter/y 执行", "Esc/n 取消");
+        assert_eq!((ok2.width, cancel2.width), (0, 0));
+        // A narrow box clamps the second button instead of letting a click land
+        // outside the box.
+        let narrow = Rect {
+            x: 0,
+            y: 0,
+            width: 8,
+            height: 2,
+        };
+        let (_l, ok3, cancel3) = confirm_buttons(narrow, 0, "Enter/y 执行", "Esc/n 取消");
+        assert_eq!(ok3.width, 8);
+        assert_eq!(cancel3.width, 0);
+    }
+
+    #[test]
+    fn tree_expander_columns_follow_the_depth() {
+        assert_eq!(side_tri_cols(&SideRow::Conn { idx: 0 }), Some(0..2));
+        assert_eq!(
+            side_tri_cols(&SideRow::Db {
+                idx: 0,
+                db: "shop".into()
+            }),
+            Some(2..4)
+        );
+        // A table is a leaf: there is no expander to click.
+        assert_eq!(
+            side_tri_cols(&SideRow::Table {
+                idx: 0,
+                table: 0,
+                depth: 2
+            }),
+            None
+        );
+        assert!(!side_row_has_tri(&SideRow::ConnLoading { idx: 0 }));
+    }
+
+    /// A drawn query grid, with `rects` populated, ready for a mouse event.
+    fn drawn_preview_app(w: u16, h: u16) -> (App, Tx) {
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel::<OpResult>();
+        let mut app = test_app();
+        app.picker_open = false;
+        app.grid_kind = GridKind::Query;
+        app.set_grid(sample_grid());
+        app.focus = Focus::Preview;
+        draw(&mut app, w, h);
+        (app, tx)
+    }
+
+    fn press(app: &mut App, tx: &Tx, kind: MouseEventKind, x: u16, y: u16) {
+        crate::mouse(app, tx, mouse(kind, x, y));
+    }
+
+    /// The `Up` path (a desktop terminal): press and release twice at the same
+    /// cell. The first click selects, the second opens the row detail.
+    #[test]
+    fn double_click_on_a_result_row_opens_the_row_popup() {
+        let (mut app, tx) = drawn_preview_app(100, 30);
+        let r = app.rects.results;
+        let (x, y) = (r.x + 4, r.y + 2);
+        press(&mut app, &tx, MouseEventKind::Down(MouseButton::Left), x, y);
+        press(&mut app, &tx, MouseEventKind::Up(MouseButton::Left), x, y);
+        assert!(app.row_popup.is_none(), "a single click only selects");
+        press(&mut app, &tx, MouseEventKind::Down(MouseButton::Left), x, y);
+        press(&mut app, &tx, MouseEventKind::Up(MouseButton::Left), x, y);
+        assert!(app.row_popup.is_some(), "a double click opens the row detail");
+        assert_eq!(app.row_popup.as_ref().unwrap().lines.len(), 8);
+    }
+
+    /// The touch path: a terminal that never sends `Up` acts on the press, so the
+    /// two presses of a tap-tap must still open the row detail.
+    #[test]
+    fn tap_tap_without_release_events_opens_the_row_popup() {
+        let (mut app, tx) = drawn_preview_app(100, 30);
+        let r = app.rects.results;
+        let (x, y) = (r.x + 4, r.y + 2);
+        press(&mut app, &tx, MouseEventKind::Down(MouseButton::Left), x, y);
+        assert!(app.row_popup.is_none(), "the first tap only selects");
+        press(&mut app, &tx, MouseEventKind::Down(MouseButton::Left), x, y);
+        assert!(app.row_popup.is_some(), "tap-tap opens the row detail");
+    }
+
+    /// A swipe that happens to end where it started must not be read as a
+    /// double click: the deferred tap is dropped, so no row detail opens.
+    #[test]
+    fn a_swipe_is_never_a_double_click() {
+        let (mut app, tx) = drawn_preview_app(100, 30);
+        // Swipe recognition has to be on for the drag to be seen at all.
+        app.drag_pan = DragPan::Button;
+        let r = app.rects.results;
+        let (x, y) = (r.x + 4, r.y + 2);
+        press(&mut app, &tx, MouseEventKind::Down(MouseButton::Left), x, y);
+        press(&mut app, &tx, MouseEventKind::Up(MouseButton::Left), x, y);
+        // Second press, then a horizontal drag far enough to be a swipe.
+        press(&mut app, &tx, MouseEventKind::Down(MouseButton::Left), x, y);
+        press(&mut app, &tx, MouseEventKind::Drag(MouseButton::Left), x + 6, y);
+        press(&mut app, &tx, MouseEventKind::Up(MouseButton::Left), x + 6, y);
+        assert!(app.row_popup.is_none());
+    }
+
+    /// The Redis value grid shares the results click path, so a double click
+    /// behaves exactly like the SQL side (select, then open).
+    #[test]
+    fn redis_value_grid_double_click_opens_the_row_popup() {
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel::<OpResult>();
+        let mut app = test_app();
+        app.picker_open = false;
+        app.backend_kind = Backend::Redis;
+        app.selected = Some(test_conn("redis"));
+        let view = redis_sample_view();
+        app.grid_kind = GridKind::RedisValue;
+        app.set_grid(view.grid.clone());
+        app.redis_value = Some(view);
+        app.focus = Focus::Preview;
+        draw(&mut app, 100, 30);
+        let r = app.rects.results;
+        let (x, y) = (r.x + 4, r.y + 2);
+        press(&mut app, &tx, MouseEventKind::Down(MouseButton::Left), x, y);
+        press(&mut app, &tx, MouseEventKind::Up(MouseButton::Left), x, y);
+        assert!(app.row_popup.is_none());
+        press(&mut app, &tx, MouseEventKind::Down(MouseButton::Left), x, y);
+        press(&mut app, &tx, MouseEventKind::Up(MouseButton::Left), x, y);
+        assert!(app.row_popup.is_some());
+    }
+
+    /// A click inside the row popup moves its cursor; the second click at the
+    /// same line drills into the full cell popup (the mouse `Enter`).
+    #[test]
+    fn row_popup_click_selects_then_double_click_drills() {
+        let (mut app, tx) = drawn_preview_app(100, 30);
+        open_row_popup(&mut app);
+        draw(&mut app, 100, 30);
+        assert!(app.rects.row_popup_visible);
+        let inner = app.rects.row_popup_inner;
+        let (x, y) = (inner.x + 2, inner.y + 2);
+        assert_eq!(app.row_popup_hit.get(2), Some(&2));
+        press(&mut app, &tx, MouseEventKind::Down(MouseButton::Left), x, y);
+        assert_eq!(app.row_popup.as_ref().unwrap().cursor, 2);
+        assert!(app.cell_popup.is_none(), "one click only moves the cursor");
+        press(&mut app, &tx, MouseEventKind::Down(MouseButton::Left), x, y);
+        assert!(app.cell_popup.is_some(), "a double click drills into the cell");
+        // A press on the cell popup closes it (like Enter) and reveals the row.
+        draw(&mut app, 100, 30);
+        let cb = app.rects.cell_popup;
+        press(&mut app, &tx, MouseEventKind::Down(MouseButton::Left), cb.x + 1, cb.y + 1);
+        assert!(app.cell_popup.is_none());
+        assert!(app.row_popup.is_some());
+    }
+
+    /// The confirm layer's two buttons act as the Enter / Esc branches.
+    #[test]
+    fn confirm_layer_buttons_click_through() {
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel::<OpResult>();
+        let mut app = test_app();
+        app.picker_open = false;
+        app.confirm = Some(Confirm {
+            sql: "DELETE FROM users".into(),
+            reasons: vec!["DELETE 没有 WHERE 子句，会作用于整张表".into()],
+            refresh: false,
+            clear_batch: false,
+            redis: None,
+            mongo: None,
+            conn: None,
+        });
+        draw(&mut app, 100, 30);
+        let cancel = app.rects.confirm_cancel;
+        assert!(cancel.width > 0, "the buttons were laid out");
+        press(&mut app, &tx, MouseEventKind::Down(MouseButton::Left), cancel.x + 1, cancel.y);
+        assert!(app.confirm.is_none(), "the cancel button takes the Esc branch");
+        assert!(app.history.is_empty());
+        // Now the execute button: it takes the Enter branch (the statement is
+        // pushed to history before it runs).
+        app.confirm = Some(Confirm {
+            sql: "DELETE FROM users".into(),
+            reasons: vec!["DELETE 没有 WHERE 子句，会作用于整张表".into()],
+            refresh: false,
+            clear_batch: false,
+            redis: None,
+            mongo: None,
+            conn: None,
+        });
+        draw(&mut app, 100, 30);
+        let ok = app.rects.confirm_ok;
+        assert!(ok.width > 0);
+        press(&mut app, &tx, MouseEventKind::Down(MouseButton::Left), ok.x + 1, ok.y);
+        assert!(app.confirm.is_none());
+        assert_eq!(app.history.len(), 1, "the Enter branch ran");
+        // A press on the layer's body (neither button) is ignored.
+        app.confirm = Some(Confirm {
+            sql: "DELETE FROM users".into(),
+            reasons: vec!["DELETE 没有 WHERE 子句，会作用于整张表".into()],
+            refresh: false,
+            clear_batch: false,
+            redis: None,
+            mongo: None,
+            conn: None,
+        });
+        draw(&mut app, 100, 30);
+        let ok = app.rects.confirm_ok;
+        press(&mut app, &tx, MouseEventKind::Down(MouseButton::Left), ok.x, ok.y + 3);
+        assert!(app.confirm.is_some(), "a stray tap does not dismiss the layer");
+    }
+
+    /// The error box: a click widens a compact box (Enter), pages a long one, and
+    /// closes once the end is on screen.
+    #[test]
+    fn error_box_click_widens_pages_then_closes() {
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel::<OpResult>();
+        let mut app = test_app();
+        app.picker_open = false;
+        open_error_popup(&mut app, "boom: relation does not exist");
+        draw(&mut app, 100, 30);
+        let ebox = app.rects.error_box;
+        press(&mut app, &tx, MouseEventKind::Down(MouseButton::Left), ebox.x + 2, ebox.y + 1);
+        assert!(app.error_popup.as_ref().unwrap().expanded, "a click widens it");
+        draw(&mut app, 100, 30);
+        assert_eq!(app.rects.error_max_scroll, 0, "the text fits");
+        let ebox = app.rects.error_box;
+        press(&mut app, &tx, MouseEventKind::Down(MouseButton::Left), ebox.x + 2, ebox.y + 1);
+        assert!(app.error_popup.is_none(), "a click at the end closes it");
+        // A long error pages instead of closing.
+        let long = (0..60).map(|i| format!("line {i}")).collect::<Vec<_>>().join("\n");
+        open_error_popup(&mut app, &long);
+        draw(&mut app, 100, 30);
+        let ebox = app.rects.error_box;
+        press(&mut app, &tx, MouseEventKind::Down(MouseButton::Left), ebox.x + 2, ebox.y + 1);
+        draw(&mut app, 100, 30);
+        assert!(app.rects.error_max_scroll > 0);
+        let ebox = app.rects.error_box;
+        press(&mut app, &tx, MouseEventKind::Down(MouseButton::Left), ebox.x + 2, ebox.y + 1);
+        assert!(app.error_popup.is_some(), "a long error pages, it does not close");
+        assert!(app.error_popup.as_ref().unwrap().scroll > 0);
+    }
+
+    /// The tree expander is its own hit target: clicking it folds the node even
+    /// when the tree cursor sits somewhere else.
+    #[test]
+    fn tree_expander_click_folds_without_selecting_first() {
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel::<OpResult>();
+        let mut app = tree_app();
+        app.picker_open = false;
+        draw(&mut app, 110, 32);
+        let r = app.rects.sidebar;
+        assert!(r.width > 8, "the sidebar is expanded");
+        // Park the cursor on a table row, far from the database node we click.
+        app.side_sel = 2;
+        // The filter row is first, so tree row 1 (the current database) sits on
+        // the third content line; its expander is indented one level.
+        let (x, y) = (r.x + 1 + 2, r.y + 1 + 1 + 1);
+        assert!(side_row_open(&app, &app.side_rows[1].clone()));
+        press(&mut app, &tx, MouseEventKind::Down(MouseButton::Left), x, y);
+        assert!(
+            app.tree_db_closed
+                .contains(&db_node_key("id-mysql", "shop")),
+            "the database folded"
+        );
+        assert_eq!(app.side_sel, 1, "the cursor followed the clicked node");
+        assert!(
+            !app.side_rows
+                .iter()
+                .any(|r| matches!(r, SideRow::Table { .. })),
+            "the tables are hidden"
+        );
+    }
+
+    /// Clicking the editor focuses it and places the caret where the click
+    /// landed — including through a horizontal scroll, and clamped to the end
+    /// when the click is past the text.
+    #[test]
+    fn editor_click_places_the_caret_through_the_viewport() {
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel::<OpResult>();
+        let mut app = test_app();
+        app.picker_open = false;
+        app.set_editor_text("aaa\nbbb\nccc");
+        draw(&mut app, 100, 30);
+        let ed = app.rects.editor;
+        let inner = Rect {
+            x: ed.x + 1,
+            y: ed.y + 1,
+            width: ed.width - 2,
+            height: ed.height - 2,
+        };
+        press(&mut app, &tx, MouseEventKind::Down(MouseButton::Left), inner.x + 1, inner.y + 1);
+        assert!(app.focus == Focus::Editor);
+        assert_eq!(app.editor.cursor(), (1, 1), "the caret followed the click");
+        // A click past the last line jumps to the end of the text.
+        app.set_editor_text("abcdef");
+        draw(&mut app, 100, 30);
+        let ed = app.rects.editor;
+        let inner = Rect {
+            x: ed.x + 1,
+            y: ed.y + 1,
+            width: ed.width - 2,
+            height: ed.height - 2,
+        };
+        press(
+            &mut app,
+            &tx,
+            MouseEventKind::Down(MouseButton::Left),
+            inner.x + 2,
+            inner.y + inner.height - 1,
+        );
+        assert_eq!(app.editor.cursor(), (0, 6));
+    }
+
+    /// The click-to-caret mapping honours the editor's horizontal scroll: with a
+    /// line wider than the pane, the first visible column is not column 0.
+    #[test]
+    fn editor_click_maps_through_a_horizontal_scroll() {
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel::<OpResult>();
+        let mut app = test_app();
+        app.picker_open = false;
+        let long: String = (0..120).map(|i| char::from(b'a' + (i % 26) as u8)).collect();
+        app.set_editor_text(&long);
+        draw(&mut app, 100, 30);
+        assert!(app.editor_vp.col > 0, "the editor scrolled horizontally");
+        let ed = app.rects.editor;
+        let (x, y) = (ed.x + 1, ed.y + 1);
+        press(&mut app, &tx, MouseEventKind::Down(MouseButton::Left), x, y);
+        assert_eq!(app.editor.cursor(), (0, app.editor_vp.col as usize));
     }
 
     #[test]

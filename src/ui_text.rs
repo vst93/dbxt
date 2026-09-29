@@ -1030,11 +1030,71 @@ pub static ALL_KEYS: &[&str] = &[
     "行首 / 行尾（Home / End 同）",
     "删至行尾（kill line）",
     "删前一个词",
+    // ── R46 mouse / touch ──
+    "Enter/y 执行",
+    "Esc/n 取消",
+    "Enter/y 删除",
+    "— 鼠标 / 触屏 —",
+    "点击（结果区）",
+    "双击（行弹层）",
+    "点击（▶ / ▼ 图标）",
+    "点击（确认弹层按钮）",
+    "点击（错误弹层）",
+    "点击（单元格弹层）",
+    "点击（编辑器）",
+    "滚轮 / 横滑",
+    "选中该行；同一位置 400ms 内再点一次 = 双击，打开整行详情（等价 Enter）",
+    "下钻该值到完整单元格弹层（等价 Enter）；单击 = 光标移到该值",
+    "折叠 / 展开该连接或库（不必先选中该行）；行其余部分仍是两击选中 + 激活",
+    "点 [ 执行 ] / [ 取消 ] = Enter / Esc 两条分支",
+    "紧凑态点开全量；长错误逐页下翻，翻到底再点关闭",
+    "关闭，回到下面的行弹层",
+    "聚焦并把光标放到点击处（含横滚偏移；点在文本下方 = 跳文末）",
+    "纵向滚行；Shift/Alt/Ctrl+滚轮 或左右滑动 = 横滚列",
+    "整行详情（纵向，含隐藏列；看某一行从这里进；结果区双击行同效）",
 ];
 
 /// The Chinese → English table. Keys must match the source literals exactly.
 fn en_of(zh: &'static str) -> Option<&'static str> {
     match zh {
+        // ── R46 mouse / touch ──
+        "Enter/y 执行" => Some("Enter/y execute"),
+        "Esc/n 取消" => Some("Esc/n cancel"),
+        "Enter/y 删除" => Some("Enter/y delete"),
+        "— 鼠标 / 触屏 —" => Some("— Mouse / touch —"),
+        "点击（结果区）" => Some("Click (results)"),
+        "双击（行弹层）" => Some("Double click (row)"),
+        "点击（▶ / ▼ 图标）" => Some("Click (the ▶ / ▼ glyph)"),
+        "点击（确认弹层按钮）" => Some("Click (confirm buttons)"),
+        "点击（错误弹层）" => Some("Click (error box)"),
+        "点击（单元格弹层）" => Some("Click (cell popup)"),
+        "点击（编辑器）" => Some("Click (editor)"),
+        "滚轮 / 横滑" => Some("Wheel / drag"),
+        "选中该行；同一位置 400ms 内再点一次 = 双击，打开整行详情（等价 Enter）" => {
+            Some("Selects the row; a second press at the same spot within 400 ms is a double click that opens the row detail (same as Enter)")
+        }
+        "下钻该值到完整单元格弹层（等价 Enter）；单击 = 光标移到该值" => {
+            Some("Drills into the full cell popup (same as Enter); a single click just moves the cursor to that value")
+        }
+        "折叠 / 展开该连接或库（不必先选中该行）；行其余部分仍是两击选中 + 激活" => {
+            Some("Folds / unfolds that connection or database without selecting the row first; the rest of the row keeps select-then-activate")
+        }
+        "点 [ 执行 ] / [ 取消 ] = Enter / Esc 两条分支" => {
+            Some("Click [ execute ] / [ cancel ] for the Enter / Esc branches")
+        }
+        "紧凑态点开全量；长错误逐页下翻，翻到底再点关闭" => {
+            Some("The compact box opens the full text on a click; a long error pages down and closes once the end is on screen")
+        }
+        "关闭，回到下面的行弹层" => Some("Closes it and returns to the row popup underneath"),
+        "聚焦并把光标放到点击处（含横滚偏移；点在文本下方 = 跳文末）" => {
+            Some("Focuses the editor and puts the caret where you clicked (honouring horizontal scroll; below the text jumps to the end)")
+        }
+        "纵向滚行；Shift/Alt/Ctrl+滚轮 或左右滑动 = 横滚列" => {
+            Some("Scrolls rows; Shift/Alt/Ctrl+wheel or a left/right drag pans columns")
+        }
+        "整行详情（纵向，含隐藏列；看某一行从这里进；结果区双击行同效）" => {
+            Some("Whole-row detail (vertical, hidden columns included; the way in to any row; double-clicking a result row does the same)")
+        }
         // ── R42b single-row discoverability ──
         "Enter 看整行 · v 看单元格" => Some("Enter: whole row · v: cell"),
         "整行" => Some("row"),
