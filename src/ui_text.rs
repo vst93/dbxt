@@ -142,8 +142,17 @@ pub static ALL_KEYS: &[&str] = &[
     "只读连接：拒绝 INSERT/UPDATE/DELETE/DDL（SELECT/SHOW/EXPLAIN 照常；树中显 🔒）",
     "切换 ssh_tunnel / ssl / read_only / 登录方式",
     "拒绝写语句",
-    "✗ 只读连接：拒绝写语句（{}）",
-    "✗ 只读连接：拒绝写语句",
+    "✗ 只读连接「{}」：拒绝写语句（{}）",
+    "✗ 只读连接「{}」：拒绝写语句",
+    "搜索连接 / 库 / 表：输入关键字 · Enter 跳首个命中 · Esc 清除",
+    "搜索「{}」· 0 个命中",
+    "搜索「{}」· {} 个命中 · Enter 跳首个 · Esc 清除",
+    "✓ 跳到 {} · 已清除搜索",
+    "已清除搜索",
+    "没有匹配的连接 / 库 / 表",
+    "f 搜索连接 / 库 / 表",
+    " 搜索连接树 {} 个命中 · Enter 跳首个 · Esc 清除 ",
+    " 搜索连接树 · Enter/Esc ",
     "⚠ 编辑器有未执行语句 · 再按 q / Ctrl-C 退出 · Esc 留下",
     "ALTER … DROP 会删除列 / 约束及其数据",
     "WHERE 谓词：{}",
@@ -1246,10 +1255,12 @@ fn en_of(zh: &'static str) -> Option<&'static str> {
         ),
         // ── R47 safety valves (read-only / quit guard / danger impact) ──
         "拒绝写语句" => Some("refuses write statements"),
-        "✗ 只读连接：拒绝写语句（{}）" => {
-            Some("✗ Read-only connection: write statement refused ({})")
+        "✗ 只读连接「{}」：拒绝写语句（{}）" => {
+            Some("✗ Read-only connection \"{}\": write statement refused ({})")
         }
-        "✗ 只读连接：拒绝写语句" => Some("✗ Read-only connection: write statement refused"),
+        "✗ 只读连接「{}」：拒绝写语句" => {
+            Some("✗ Read-only connection \"{}\": write statement refused")
+        }
         "⚠ 编辑器有未执行语句 · 再按 q / Ctrl-C 退出 · Esc 留下" => {
             Some("⚠ Unrun editor SQL · press q / Ctrl-C again to quit · Esc to stay")
         }
@@ -1555,9 +1566,27 @@ fn en_of(zh: &'static str) -> Option<&'static str> {
         "过滤表名：任意字符一步直达过滤，Enter 打开第一个命中，Esc 清除" => {
             Some("filter tables: any character filters at once, Enter opens the first hit, Esc clears")
         }
-        "清除表过滤（过滤提示框内）" => {
-            Some("clear the table filter (inside the filter prompt)")
+        "清除表过滤 / 树搜索（提示框内）" => {
+            Some("clear the table filter / tree search (inside the prompt)")
         }
+        "快速搜索连接 / 库 / 表名（跨组搜，命中组自动展开；纯客户端不回库，Enter 跳到首个命中并清输入，Esc 清除）" => Some(
+            "quick-search connection / database / table names (across groups; hit groups auto-expand; pure client-side, no queries; Enter jumps to the first hit and clears, Esc clears)",
+        ),
+        "搜索连接 / 库 / 表：输入关键字 · Enter 跳首个命中 · Esc 清除" => {
+            Some("Search connections / databases / tables: type a keyword · Enter jumps to the first hit · Esc clears")
+        }
+        "搜索「{}」· 0 个命中" => Some("Search \"{}\" · 0 hits"),
+        "搜索「{}」· {} 个命中 · Enter 跳首个 · Esc 清除" => {
+            Some("Search \"{}\" · {} hits · Enter jumps to the first · Esc clears")
+        }
+        "✓ 跳到 {} · 已清除搜索" => Some("✓ jumped to {} · search cleared"),
+        "已清除搜索" => Some("search cleared"),
+        "没有匹配的连接 / 库 / 表" => Some("no matching connection / database / table"),
+        "f 搜索连接 / 库 / 表" => Some("f search connections / databases / tables"),
+        " 搜索连接树 {} 个命中 · Enter 跳首个 · Esc 清除 " => {
+            Some(" Search connection tree, {} hits · Enter first · Esc clear ")
+        }
+        " 搜索连接树 · Enter/Esc " => Some(" Search connection tree · Enter/Esc "),
         "表排序：名称 / 类型（TABLE / VIEW）" => {
             Some("table order: name / type (TABLE / VIEW)")
         }

@@ -5365,7 +5365,9 @@ fn readonly_block(app: &mut App, sql: &str) -> bool {
     }
     match readonly_violation(&cfg, sql) {
         Some(verb) => {
-            app.status = tf("✗ 只读连接：拒绝写语句（{}）", &[&verb]);
+            // R54: name the connection, so with several open the user knows
+            // *which* one refused the write.
+            app.status = tf("✗ 只读连接「{}」：拒绝写语句（{}）", &[&cfg.name, &verb]);
             true
         }
         None => false,
@@ -5375,8 +5377,9 @@ fn readonly_block(app: &mut App, sql: &str) -> bool {
 /// Refuse a row-level write gesture (edit / insert / delete) on a read-only
 /// connection before any SQL is generated.
 fn readonly_conn_block(app: &mut App) -> bool {
-    if app.selected.as_ref().is_some_and(|c| c.read_only) {
-        app.status = t("✗ 只读连接：拒绝写语句").into();
+    if let Some(cfg) = app.selected.as_ref().filter(|c| c.read_only) {
+        let name = cfg.name.clone();
+        app.status = tf("✗ 只读连接「{}」：拒绝写语句", &[&name]);
         return true;
     }
     false
@@ -10199,6 +10202,17 @@ enum SideRow {
     },
 }
 
+/// R54: a stable identity for one tree node, so the quick search can find the
+/// same node again after the tree is rebuilt around it (Enter / Esc restore the
+/// full tree and re-seat the cursor).
+#[derive(Clone, PartialEq, Debug)]
+enum SideHit {
+    Group(String),
+    Conn(String),
+    Db { conn: String, db: String },
+    Table(String),
+}
+
 // ── desktop sidebar groups (R48) ──
 
 /// One entry inside a group (or at the top of the desktop sidebar tree): either
@@ -10489,6 +10503,15 @@ struct App {
     /// Active sidebar table-name filter (`/`, filter-as-you-type).
     table_filter: String,
     table_prompt: Option<TextArea<'static>>,
+    /// R54: sidebar tree quick search (`f`). A transient needle over the
+    /// *loaded* tree cache (connection / database / table names); unlike the
+    /// persistent `/` filter it never talks to the server, forces hit groups
+    /// open, and Enter jumps to the first hit then clears the needle.
+    tree_search: String,
+    tree_search_prompt: Option<TextArea<'static>>,
+    /// Row the cursor sat on when the quick search opened, so Esc can put it
+    /// back on that node after the tree is restored.
+    tree_search_prev: Option<SideHit>,
     /// Sidebar table-list order (`s` cycles name / type).
     table_sort: TableSort,
     /// Last first-letter jump (R39): `;` / `,` repeat it forward / backward.
@@ -11299,6 +11322,9 @@ impl App {
             tables_all: Vec::new(),
             table_filter: String::new(),
             table_prompt: None,
+            tree_search: String::new(),
+            tree_search_prompt: None,
+            tree_search_prev: None,
             table_sort: TableSort::Name,
             table_jump_letter: None,
             tree_conn_open: std::collections::HashSet::new(),
@@ -13537,6 +13563,8 @@ fn reset_overlays_for_backend_switch(app: &mut App) {
     app.snippet_name = None;
     app.completion = None;
     app.table_prompt = None;
+    app.tree_search_prompt = None;
+    app.tree_search.clear();
     app.result_filter = None;
     // R52: a backend switch drops the grid, so the column filter (and its
     // prompt) must not linger as a bogus marker on whatever renders next.
@@ -13941,6 +13969,13 @@ fn browse_key(app: &mut App, tx: &Tx, k: KeyEvent) {
     // MongoDB document JSON editor is modal.
     if app.mongo_dialog.is_some() {
         mongo_dialog_key(app, k);
+        return;
+    }
+
+    // Sidebar tree quick search (`f`) is modal while it is being typed; it
+    // checks before the `/` filter prompt because only one can be open.
+    if app.tree_search_prompt.is_some() {
+        tree_search_key(app, k);
         return;
     }
 
@@ -15049,6 +15084,11 @@ fn sidebar_key(app: &mut App, tx: &Tx, k: KeyEvent) {
         // `/` — filter-as-you-type over the tree's visible nodes (vim-style),
         // the fast way to reach a table when the sidebar is long.
         KeyCode::Char('/') => open_table_filter(app),
+        // `f` — R54 quick search over the *loaded* tree cache (connection / db /
+        // table names, across groups). Distinct from `/`: hit groups open
+        // automatically and Enter jumps to the first hit then clears the
+        // needle. Pure client-side, never a query.
+        KeyCode::Char('f') => open_tree_search(app),
         // `t` — jump straight to one of the last five browsed tables.
         KeyCode::Char('t') => open_recent_tables(app),
         // Tree navigation: `j`/`k` walk the whole tree (connections, databases,
@@ -16295,6 +16335,9 @@ fn activate_connection(
     app.tables.clear();
     app.tables_all.clear();
     app.table_list = ListState::default();
+    app.tree_search.clear();
+    app.tree_search_prompt = None;
+    app.tree_search_prev = None;
     app.clear_grid();
     app.pinned_result = None;
     app.script = None;
@@ -16736,6 +16779,9 @@ fn back_to_picker(app: &mut App) {
     app.tables.clear();
     app.tables_all.clear();
     app.table_filter.clear();
+    app.tree_search.clear();
+    app.tree_search_prompt = None;
+    app.tree_search_prev = None;
     app.columns.clear();
     app.databases.clear();
     app.schemas.clear();
@@ -16986,6 +17032,7 @@ fn mouse(app: &mut App, tx: &Tx, m: MouseEvent) {
         || app.col_picker_open
         || app.recent_open
         || app.table_prompt.is_some()
+        || app.tree_search_prompt.is_some()
         || app.help_open
         || app.help_mini;
     match m.kind {
@@ -17099,6 +17146,7 @@ fn mouse(app: &mut App, tx: &Tx, m: MouseEvent) {
                 || app.col_picker_open
                 || app.recent_open
                 || app.table_prompt.is_some()
+                || app.tree_search_prompt.is_some()
                 || app.filter_prompt.is_some()
                 || app.help_open
                 || app.help_mini
@@ -17749,16 +17797,33 @@ fn compute_side_rows(app: &App) -> Vec<SideRow> {
     if app.selected.is_none() {
         return rows;
     }
-    let needle = app.table_filter.trim().to_lowercase();
+    // `f` quick search narrows the whole tree to its hits; `/` keeps the older
+    // filter semantics (see `push_conn_subtree`). Only one is ever active at a
+    // time — `f` and `/` both open a modal prompt.
+    let searching = app.tree_search_prompt.is_some();
+    let needle = if searching {
+        app.tree_search.trim().to_lowercase()
+    } else {
+        app.table_filter.trim().to_lowercase()
+    };
     let mut placed: HashSet<usize> = HashSet::new();
     for group in &app.sidebar_layout.groups {
-        rows.extend(build_group_rows(app, group, 0, &needle, &mut placed));
+        rows.extend(build_group_rows(
+            app,
+            group,
+            0,
+            &needle,
+            &mut placed,
+            searching,
+        ));
     }
     for idx in 0..side_root_count(app) {
         if placed.contains(&idx) {
             continue;
         }
-        push_conn_subtree(app, idx, 0, &needle, false, &mut rows);
+        // A *search* is a result set, so it filters ungrouped roots too; the
+        // persistent `/` filter keeps them as anchors (grouped = false).
+        push_conn_subtree(app, idx, 0, &needle, searching, searching, &mut rows);
     }
     rows
 }
@@ -17821,13 +17886,19 @@ fn build_group_rows(
     depth: usize,
     needle: &str,
     placed: &mut HashSet<usize>,
+    searching: bool,
 ) -> Vec<SideRow> {
     let mut inner: Vec<SideRow> = Vec::new();
     for node in &group.nodes {
         match node {
-            LayoutNode::Group(sub) => {
-                inner.extend(build_group_rows(app, sub, depth + 1, needle, placed))
-            }
+            LayoutNode::Group(sub) => inner.extend(build_group_rows(
+                app,
+                sub,
+                depth + 1,
+                needle,
+                placed,
+                searching,
+            )),
             LayoutNode::Conn(cid) => {
                 let Some(idx) = side_root_index_for_id(app, cid) else {
                     continue;
@@ -17835,7 +17906,7 @@ fn build_group_rows(
                 if !placed.insert(idx) {
                     continue;
                 }
-                push_conn_subtree(app, idx, depth + 1, needle, true, &mut inner);
+                push_conn_subtree(app, idx, depth + 1, needle, true, searching, &mut inner);
             }
         }
     }
@@ -17848,7 +17919,9 @@ fn build_group_rows(
     if !needle.is_empty() && inner.is_empty() {
         return Vec::new();
     }
-    let open = !app.group_closed.contains(&group.id);
+    // A quick search force-opens every group that has a hit, so a match hidden
+    // inside a collapsed group is revealed without an extra key.
+    let open = (searching && !needle.is_empty()) || !app.group_closed.contains(&group.id);
     let mut out = Vec::with_capacity(inner.len() + 1);
     out.push(SideRow::Group {
         id: group.id.clone(),
@@ -17866,12 +17939,15 @@ fn build_group_rows(
 /// Append one connection root and, when it is open, its databases / tables (or
 /// the lazy-loading placeholder). `grouped` connections are subject to the
 /// active filter; ungrouped roots stay as anchors, as they were before R48.
+/// `searching` additionally filters table rows (a quick search is a result set;
+/// the `/` filter relies on `App::tables` already being pre-filtered).
 fn push_conn_subtree(
     app: &App,
     idx: usize,
     depth: usize,
     needle: &str,
     grouped: bool,
+    searching: bool,
     rows: &mut Vec<SideRow>,
 ) {
     let Some(c) = side_root_cfg(app, idx) else {
@@ -17890,6 +17966,9 @@ fn push_conn_subtree(
             // No database layer (SQLite / a test fixture): tables hang
             // directly under the connection.
             for ti in 0..app.tables.len() {
+                if searching && !table_matches_needle(app, ti, needle) {
+                    continue;
+                }
                 rows.push(SideRow::Table {
                     idx,
                     table: ti,
@@ -17916,6 +17995,9 @@ fn push_conn_subtree(
                 });
                 if is_cur_db && !app.tree_db_closed.contains(&db_node_key(&c.id, db)) {
                     for ti in 0..app.tables.len() {
+                        if searching && !table_matches_needle(app, ti, needle) {
+                            continue;
+                        }
                         rows.push(SideRow::Table {
                             idx,
                             table: ti,
@@ -17950,6 +18032,245 @@ fn push_conn_subtree(
                 // in until the lazy list arrives.
                 None => rows.push(SideRow::ConnLoading { idx, depth }),
             },
+        }
+    }
+}
+
+// ── sidebar tree quick search (`f`, R54) ──
+
+/// Whether table `ti` matches the quick-search needle, by the same qualified
+/// `schema.table` spelling the sidebar draws (so `/inv` finds the `inv` schema).
+fn table_matches_needle(app: &App, ti: usize, needle: &str) -> bool {
+    needle.is_empty()
+        || app.tables.get(ti).is_some_and(|t| {
+            qualified_display(&app.schema, &t.name)
+                .to_lowercase()
+                .contains(needle)
+        })
+}
+
+/// A row is a *direct* search hit when its own label matches the needle — a row
+/// kept only as an ancestor (a group header, the active database) is not.
+fn side_row_matches_needle(app: &App, row: &SideRow, needle: &str) -> bool {
+    if needle.is_empty() {
+        return false;
+    }
+    match row {
+        SideRow::Group { name, .. } => name.to_lowercase().contains(needle),
+        SideRow::Conn { idx, .. } => {
+            side_root_cfg(app, *idx).is_some_and(|c| c.name.to_lowercase().contains(needle))
+        }
+        SideRow::Db { db, .. } => fix_double_encoding(db).to_lowercase().contains(needle),
+        SideRow::Table { table, .. } => table_matches_needle(app, *table, needle),
+        SideRow::ConnLoading { .. } | SideRow::ConnError { .. } => false,
+    }
+}
+
+/// Stable identity of a row, used to re-seat the cursor after a rebuild.
+fn side_row_hit(app: &App, row: &SideRow) -> Option<SideHit> {
+    match row {
+        SideRow::Group { id, .. } => Some(SideHit::Group(id.clone())),
+        SideRow::Conn { idx, .. } => side_root_cfg(app, *idx).map(|c| SideHit::Conn(c.id.clone())),
+        SideRow::Db { idx, db, .. } => side_root_cfg(app, *idx).map(|c| SideHit::Db {
+            conn: c.id.clone(),
+            db: db.clone(),
+        }),
+        SideRow::Table { table, .. } => app
+            .tables
+            .get(*table)
+            .map(|t| SideHit::Table(t.name.clone())),
+        SideRow::ConnLoading { .. } | SideRow::ConnError { .. } => None,
+    }
+}
+
+/// Human label for a row, for the landing status message.
+fn side_row_label(app: &App, row: &SideRow) -> String {
+    match row {
+        SideRow::Group { name, .. } => name.clone(),
+        SideRow::Conn { idx, .. } => side_root_cfg(app, *idx)
+            .map(|c| c.name.clone())
+            .unwrap_or_default(),
+        SideRow::Db { db, .. } => fix_double_encoding(db),
+        SideRow::Table { table, .. } => app
+            .tables
+            .get(*table)
+            .map(|t| qualified_display(&app.schema, &t.name))
+            .unwrap_or_default(),
+        SideRow::ConnLoading { .. } | SideRow::ConnError { .. } => String::new(),
+    }
+}
+
+fn find_side_hit(app: &App, rows: &[SideRow], hit: &SideHit) -> Option<usize> {
+    rows.iter()
+        .position(|r| side_row_hit(app, r).as_ref() == Some(hit))
+}
+
+/// Index of the first direct hit in the current (already filtered) tree rows.
+fn tree_search_first_pos(app: &App) -> Option<usize> {
+    let needle = app.tree_search.trim().to_lowercase();
+    if needle.is_empty() {
+        return None;
+    }
+    app.side_rows
+        .iter()
+        .position(|r| side_row_matches_needle(app, r, &needle))
+}
+
+/// Number of direct hits in the current tree rows.
+fn tree_search_hits(app: &App) -> usize {
+    let needle = app.tree_search.trim().to_lowercase();
+    if needle.is_empty() {
+        return 0;
+    }
+    app.side_rows
+        .iter()
+        .filter(|r| side_row_matches_needle(app, r, &needle))
+        .count()
+}
+
+/// Open the `f` tree quick search: a fresh, empty needle over the loaded tree.
+fn open_tree_search(app: &mut App) {
+    if app.selected.is_none() {
+        return;
+    }
+    app.tree_search.clear();
+    app.tree_search_prompt = Some(TextArea::default());
+    app.tree_search_prev = app
+        .side_rows
+        .get(app.side_sel)
+        .and_then(|r| side_row_hit(app, r));
+    rebuild_side_rows(app);
+    app.status = t("搜索连接 / 库 / 表：输入关键字 · Enter 跳首个命中 · Esc 清除").into();
+}
+
+/// Pull the needle out of the prompt (single line), refilter the tree, and put
+/// the cursor on the first hit so Enter's landing is always visible.
+fn apply_tree_search(app: &mut App) {
+    app.tree_search = app
+        .tree_search_prompt
+        .as_ref()
+        .map(|t| t.lines().join(" ").trim().to_string())
+        .unwrap_or_default();
+    rebuild_side_rows(app);
+    if let Some(pos) = tree_search_first_pos(app) {
+        app.side_sel = pos;
+        side_mirror_table(app);
+    }
+    if app.tree_search.is_empty() {
+        app.status = t("搜索连接 / 库 / 表：输入关键字 · Enter 跳首个命中 · Esc 清除").into();
+    } else {
+        let hits = tree_search_hits(app);
+        app.status = if hits == 0 {
+            tf("搜索「{}」· 0 个命中", &[&app.tree_search])
+        } else {
+            tf(
+                "搜索「{}」· {} 个命中 · Enter 跳首个 · Esc 清除",
+                &[&app.tree_search, &hits],
+            )
+        };
+    }
+}
+
+/// The group / connection ancestors of the row at `pos`, so a jump can un-fold
+/// them and actually reveal the hit.
+fn side_hit_ancestors(app: &App, pos: usize) -> (Option<String>, Option<String>) {
+    let Some(_) = app.side_rows.get(pos) else {
+        return (None, None);
+    };
+    let mut group_id = None;
+    let mut conn_id = None;
+    let mut depth = side_row_depth(&app.side_rows[pos]);
+    let mut i = pos;
+    while i > 0 && depth > 0 {
+        i -= 1;
+        let d = side_row_depth(&app.side_rows[i]);
+        if d < depth {
+            match &app.side_rows[i] {
+                SideRow::Group { id, .. } if group_id.is_none() => group_id = Some(id.clone()),
+                SideRow::Conn { idx, .. } if conn_id.is_none() => {
+                    conn_id = side_root_cfg(app, *idx).map(|c| c.id.clone());
+                }
+                _ => {}
+            }
+            depth = d;
+        }
+    }
+    (group_id, conn_id)
+}
+
+/// Enter: jump to the first hit, restore the full tree, drop the needle.
+fn tree_search_confirm(app: &mut App) {
+    let hit = tree_search_first_pos(app).map(|pos| {
+        let row = app.side_rows[pos].clone();
+        (
+            side_row_hit(app, &row),
+            side_row_label(app, &row),
+            side_hit_ancestors(app, pos),
+        )
+    });
+    app.tree_search_prompt = None;
+    app.tree_search.clear();
+    app.tree_search_prev = None;
+    rebuild_side_rows(app);
+    match hit {
+        Some((Some(h), label, (group, conn))) if !label.is_empty() => {
+            // Un-fold the hit's ancestors so the landing is actually visible
+            // (the search had force-opened them only for the duration).
+            if let Some(g) = group {
+                app.group_closed.remove(&g);
+            }
+            if let Some(cid) = conn {
+                app.tree_conn_open.insert(cid.clone());
+                app.tree_conn_closed.remove(&cid);
+            }
+            rebuild_side_rows(app);
+            if let Some(pos) = find_side_hit(app, &app.side_rows, &h) {
+                app.side_sel = pos;
+                side_mirror_table(app);
+            }
+            app.status = tf("✓ 跳到 {} · 已清除搜索", &[&label]);
+        }
+        _ => {
+            app.status = t("没有匹配的连接 / 库 / 表").into();
+        }
+    }
+}
+
+/// Esc: restore the full tree and put the cursor back on the node it started on.
+fn tree_search_cancel(app: &mut App) {
+    let prev = app.tree_search_prev.take();
+    app.tree_search_prompt = None;
+    app.tree_search.clear();
+    rebuild_side_rows(app);
+    if let Some(prev) = prev {
+        if let Some(pos) = find_side_hit(app, &app.side_rows, &prev) {
+            app.side_sel = pos;
+            side_mirror_table(app);
+        }
+    }
+    app.status = t("已清除搜索").into();
+}
+
+/// Modal key handler for the quick search while its prompt is open.
+fn tree_search_key(app: &mut App, k: KeyEvent) {
+    // Ctrl-U / Alt-Backspace clear the needle, like the other filter prompts.
+    if (k.modifiers.contains(KeyModifiers::CONTROL) && k.code == KeyCode::Char('u'))
+        || (k.modifiers.contains(KeyModifiers::ALT) && k.code == KeyCode::Backspace)
+    {
+        app.tree_search_prompt = Some(TextArea::default());
+        app.tree_search.clear();
+        apply_tree_search(app);
+        app.status = t("已清除搜索").into();
+        return;
+    }
+    match k.code {
+        KeyCode::Enter => tree_search_confirm(app),
+        KeyCode::Esc => tree_search_cancel(app),
+        _ => {
+            if let Some(t) = app.tree_search_prompt.as_mut() {
+                t.input(k);
+            }
+            apply_tree_search(app);
         }
     }
 }
@@ -22805,15 +23126,16 @@ fn transfer_confirm_key(app: &mut App, tx: &Tx, k: KeyEvent) {
 /// must pass the wizard's `large_warn` gate first.
 fn start_transfer(app: &mut App, tx: &Tx) {
     // A read-only target connection is a hard stop: the wizard writes to it.
-    if app
+    let ro_target = app
         .transfer
         .as_ref()
-        .is_some_and(|w| w.target_conn.read_only)
-    {
+        .filter(|w| w.target_conn.read_only)
+        .map(|w| w.target_conn.name.clone());
+    if let Some(name) = ro_target {
         if let Some(w) = app.transfer.as_mut() {
             w.error = Some(t("目标连接为只读，拒绝写入").to_string());
         }
-        app.status = t("✗ 只读连接：拒绝写语句").into();
+        app.status = tf("✗ 只读连接「{}」：拒绝写语句", &[&name]);
         return;
     }
     app.transfer_gen += 1;
@@ -24022,14 +24344,196 @@ fn column_names(app: &App) -> Vec<String> {
     out
 }
 
+/// SQL reserved words that must be quoted when they appear as an identifier —
+/// an identifier named `order` / `user` / `key` is otherwise a syntax error or a
+/// different object. A union of the PostgreSQL reserved keywords and the
+/// MySQL-only reserved words, kept small on purpose (this is a completion
+/// convenience, not a SQL parser).
+const SQL_RESERVED_WORDS: &[&str] = &[
+    "all",
+    "analyse",
+    "analyze",
+    "and",
+    "any",
+    "array",
+    "as",
+    "asc",
+    "asymmetric",
+    "authorization",
+    "binary",
+    "both",
+    "case",
+    "cast",
+    "check",
+    "collate",
+    "collation",
+    "column",
+    "concurrently",
+    "constraint",
+    "create",
+    "cross",
+    "current_catalog",
+    "current_date",
+    "current_role",
+    "current_schema",
+    "current_time",
+    "current_timestamp",
+    "current_user",
+    "default",
+    "deferrable",
+    "desc",
+    "distinct",
+    "do",
+    "else",
+    "end",
+    "except",
+    "false",
+    "fetch",
+    "for",
+    "foreign",
+    "freeze",
+    "from",
+    "full",
+    "grant",
+    "group",
+    "having",
+    "ilike",
+    "in",
+    "initially",
+    "inner",
+    "intersect",
+    "into",
+    "is",
+    "isnull",
+    "join",
+    "lateral",
+    "leading",
+    "left",
+    "like",
+    "limit",
+    "localtime",
+    "localtimestamp",
+    "natural",
+    "not",
+    "notnull",
+    "null",
+    "offset",
+    "on",
+    "only",
+    "or",
+    "order",
+    "outer",
+    "overlaps",
+    "placing",
+    "primary",
+    "references",
+    "returning",
+    "right",
+    "select",
+    "session_user",
+    "similar",
+    "some",
+    "symmetric",
+    "system_user",
+    "table",
+    "tablesample",
+    "then",
+    "to",
+    "trailing",
+    "true",
+    "union",
+    "unique",
+    "user",
+    "using",
+    "variadic",
+    "verbose",
+    "when",
+    "where",
+    "window",
+    "with",
+    // MySQL-only reserved words (a superset would be noise; these are the ones
+    // that commonly collide with a real column name).
+    "accessible",
+    "auto_increment",
+    "change",
+    "database",
+    "databases",
+    "describe",
+    "div",
+    "dual",
+    "explain",
+    "force",
+    "fulltext",
+    "ignore",
+    "index",
+    "key",
+    "keys",
+    "kill",
+    "lines",
+    "load",
+    "lock",
+    "mod",
+    "optimize",
+    "outfile",
+    "purge",
+    "range",
+    "regexp",
+    "rename",
+    "replace",
+    "require",
+    "rlike",
+    "schema",
+    "schemas",
+    "show",
+    "spatial",
+    "ssl",
+    "starting",
+    "terminated",
+    "tinyint",
+    "unlock",
+    "unsigned",
+    "use",
+    "values",
+    "varbinary",
+    "varchar",
+    "write",
+    "xor",
+    "zerofill",
+];
+
+/// True when `name` must be quoted to be a valid identifier: it is not a plain
+/// all-lowercase word (`_` / `a-z` / `0-9`) or it is a reserved word. A plain
+/// lowercase name like `users` is left bare, so completion stays readable.
+fn identifier_needs_quote(name: &str) -> bool {
+    let mut chars = name.chars();
+    let plain = chars
+        .next()
+        .is_some_and(|c| c == '_' || c.is_ascii_lowercase())
+        && chars.all(|c| c == '_' || c.is_ascii_lowercase() || c.is_ascii_digit());
+    !plain || SQL_RESERVED_WORDS.contains(&name)
+}
+
+/// R54: a completed identifier, quoted for the connection's dialect only when it
+/// needs it. MySQL-family gets backticks / SQL Server brackets / everything else
+/// double quotes — reuse the kernel's own dialect quoting so the spelling always
+/// matches the SQL builder.
+fn completion_quote(name: &str, dt: Option<DatabaseType>) -> String {
+    if identifier_needs_quote(name) {
+        quote_table_identifier(dt, name)
+    } else {
+        name.to_string()
+    }
+}
+
 fn push_item(
     out: &mut Vec<CompletionItem>,
     seen: &mut HashSet<String>,
+    raw: &str,
     text: &str,
     kind: char,
     needle: &str,
 ) {
-    let lower = text.to_lowercase();
+    let lower = raw.to_lowercase();
     if !seen.insert(lower.clone()) {
         return;
     }
@@ -24047,9 +24551,18 @@ fn push_names(
     names: &[String],
     kind: char,
     needle: &str,
+    dt: Option<DatabaseType>,
 ) {
     for n in names {
-        push_item(out, seen, n, kind, needle);
+        // Keywords go in verbatim; identifiers are quoted on demand, so a
+        // `Users` / `order` name lands insert-ready (R54). The match still runs
+        // against the bare name, so a lowercase prefix finds a quoted candidate.
+        let text = if kind == 'K' {
+            n.clone()
+        } else {
+            completion_quote(n, dt)
+        };
+        push_item(out, seen, n, &text, kind, needle);
     }
 }
 
@@ -24059,6 +24572,7 @@ fn push_names(
 /// Matching is case-insensitive.
 fn completion_candidates(app: &App, ctx: &CompCtx, partial: &str) -> Vec<CompletionItem> {
     let needle = partial.to_lowercase();
+    let dt = app.selected.as_ref().map(|c| c.db_type);
     let mut out: Vec<CompletionItem> = Vec::new();
     let mut seen: HashSet<String> = HashSet::new();
     let cols = column_names(app);
@@ -24083,23 +24597,23 @@ fn completion_candidates(app: &App, ctx: &CompCtx, partial: &str) -> Vec<Complet
             } else {
                 cols.clone()
             };
-            push_names(&mut out, &mut seen, &qcols, 'C', &needle);
+            push_names(&mut out, &mut seen, &qcols, 'C', &needle, dt);
         }
         CompCtx::TableList => {
             // R48: after FROM / JOIN / INTO the candidate list is tables only —
             // a column or a keyword there is almost always a typo, and the
             // narrower list is faster to scan on a phone.
-            push_names(&mut out, &mut seen, &tables, 'T', &needle);
+            push_names(&mut out, &mut seen, &tables, 'T', &needle, dt);
         }
         CompCtx::Column => {
             // R48: after WHERE / ON / SET / SELECT (and after `(`) only columns
             // are offered.
-            push_names(&mut out, &mut seen, &cols, 'C', &needle);
+            push_names(&mut out, &mut seen, &cols, 'C', &needle, dt);
         }
         CompCtx::Any => {
-            push_names(&mut out, &mut seen, &cols, 'C', &needle);
-            push_names(&mut out, &mut seen, &tables, 'T', &needle);
-            push_names(&mut out, &mut seen, &keywords, 'K', &needle);
+            push_names(&mut out, &mut seen, &cols, 'C', &needle, dt);
+            push_names(&mut out, &mut seen, &tables, 'T', &needle, dt);
+            push_names(&mut out, &mut seen, &keywords, 'K', &needle, dt);
         }
     }
     // R48: a narrow phone terminal keeps the popup short (one column, 5 items)
@@ -29682,6 +30196,9 @@ fn ui(f: &mut Frame, app: &mut App) {
     if app.table_prompt.is_some() {
         render_table_filter(f, f.area(), app);
     }
+    if app.tree_search_prompt.is_some() {
+        render_tree_search(f, f.area(), app);
+    }
     if app.mongo_dialog.is_some() {
         render_mongo_dialog(f, f.area(), app);
     }
@@ -30122,22 +30639,29 @@ fn render_status(f: &mut Frame, area: Rect, app: &App) {
     };
     // A colour-coded connection badge leads the status line, so the active
     // connection is visible even while a long status message is truncated.
-    let badge = app
-        .selected
-        .as_ref()
-        .map(|c| (truncate_disp(&c.name, 18), connection_color(c)));
+    // R54: a read-only connection carries its 🔒 here too (not only on the tree
+    // root), so its write policy is visible while the editor is focused.
+    let badge = app.selected.as_ref().map(|c| {
+        let name = truncate_disp(&c.name, 18);
+        let text = if c.read_only {
+            format!("● 🔒 {name} ")
+        } else {
+            format!("● {name} ")
+        };
+        (text, connection_color(c))
+    });
     let prefix_w = badge
         .as_ref()
-        .map(|(n, _)| disp_width(&format!("● {n} ")) as u16)
+        .map(|(t, _)| disp_width(t) as u16)
         .unwrap_or(0);
     let msg = fit_status(
         &app.status,
         chunks[0].width.saturating_sub(prefix_w) as usize,
     );
     let mut left: Vec<Span> = Vec::new();
-    if let Some((name, color)) = badge {
+    if let Some((text, color)) = badge {
         left.push(Span::styled(
-            format!("● {name} "),
+            text,
             Style::default().fg(color).add_modifier(Modifier::BOLD),
         ));
     }
@@ -30296,6 +30820,8 @@ fn footer_ctx_inner(app: &App, include_help: bool) -> FooterCtx {
         FooterView::MongoDoc
     } else if app.table_prompt.is_some() {
         FooterView::TablePrompt
+    } else if app.tree_search_prompt.is_some() {
+        FooterView::LocatePrompt
     } else if app.history_filter.is_some() {
         FooterView::HistoryFilter
     } else if app.history_open {
@@ -30606,6 +31132,7 @@ fn footer_hints_ctx(ctx: FooterCtx) -> Vec<Hint> {
                 ("↑↓", t("树")),
                 ("h l", t("折叠/展开")),
                 ("a-z", t("过滤")),
+                ("f", t("搜索")),
                 ("Enter", t("浏览")),
                 ("r", t("结构")),
                 ("s", t("排序")),
@@ -30841,9 +31368,13 @@ fn render_main_area(
         render_editor_strip(f, main_chunks[0], app);
     } else {
         let focused = app.focus == Focus::Editor;
+        // R54: a read-only connection says so right on the editor title, so the
+        // write policy is visible next to the SQL being typed (not just on the
+        // tree root).
+        let ro = app.selected.as_ref().is_some_and(|c| c.read_only);
         let block = Block::default()
             .borders(Borders::ALL)
-            .title(" SQL ")
+            .title(if ro { " SQL 🔒 " } else { " SQL " })
             .border_set(border::ROUNDED)
             .border_style(border_style(focused));
         app.editor.set_block(block);
@@ -32258,11 +32789,26 @@ fn render_sidebar(f: &mut Frame, area: Rect, app: &mut App) {
     rebuild_side_rows(app);
     let mut lines: Vec<Line> = Vec::new();
 
-    // table-name filter row: shows the active `/` filter, or the hint.
-    let filter_rows = if app.tables_all.is_empty() { 0 } else { 1 };
+    // filter row: the active `/` filter, the `f` quick search, or the hints.
+    let searching = app.tree_search_prompt.is_some();
+    let filter_rows = if app.tables_all.is_empty() && !searching {
+        0
+    } else {
+        1
+    };
     if filter_rows > 0 {
         let w = (area.width as usize).saturating_sub(4).max(6);
-        let (mark, text, style) = if app.table_filter.is_empty() {
+        let (mark, text, style) = if searching {
+            let (mark, text) = if app.tree_search.is_empty() {
+                ("f ", t("f 搜索连接 / 库 / 表").to_string())
+            } else {
+                (
+                    "▸ ",
+                    format!("f{} · {}", app.tree_search, tree_search_hits(app)),
+                )
+            };
+            (mark, text, Style::default().fg(Color::Magenta))
+        } else if app.table_filter.is_empty() {
             (
                 "/ ",
                 t("/ 过滤表名").to_string(),
@@ -32296,7 +32842,11 @@ fn render_sidebar(f: &mut Frame, area: Rect, app: &mut App) {
     } else {
         sel.saturating_sub(cap / 2).min(n - cap)
     };
-    let needle = app.table_filter.trim().to_ascii_lowercase();
+    let needle = if searching {
+        app.tree_search.trim().to_ascii_lowercase()
+    } else {
+        app.table_filter.trim().to_ascii_lowercase()
+    };
     for i in start..(start + cap).min(n) {
         let row = app.side_rows[i].clone();
         lines.push(side_row_line(app, &row, i == sel, &needle, area.width));
@@ -35241,6 +35791,19 @@ fn render_table_filter(f: &mut Frame, area: Rect, app: &mut App) {
     );
 }
 
+/// Bottom prompt for the `f` tree quick search (R54). Mirrors the table filter
+/// prompt, but titles itself as a search and reports the direct-hit count.
+fn render_tree_search(f: &mut Frame, area: Rect, app: &mut App) {
+    let hits = tree_search_hits(app);
+    render_prompt_input(
+        f,
+        area,
+        app.tree_search_prompt.as_mut(),
+        &tf(" 搜索连接树 {} 个命中 · Enter 跳首个 · Esc 清除 ", &[&hits]),
+        t(" 搜索连接树 · Enter/Esc "),
+    );
+}
+
 /// Result-row search prompt (`/` in the results pane), styled like the table
 /// filter so both filter-as-you-type flows feel identical.
 fn render_result_filter(f: &mut Frame, area: Rect, app: &mut App) {
@@ -36238,7 +36801,11 @@ const HELP_ROWS: &[(&str, &str)] = &[
         "a-z / /",
         "过滤：命中表名 / 库名，父节点保留（Enter 打开首个命中，Esc 清除）",
     ),
-    ("Ctrl-U / Alt-⌫", "清除表过滤（过滤提示框内）"),
+    (
+        "f",
+        "快速搜索连接 / 库 / 表名（跨组搜，命中组自动展开；纯客户端不回库，Enter 跳到首个命中并清输入，Esc 清除）",
+    ),
+    ("Ctrl-U / Alt-⌫", "清除表过滤 / 树搜索（提示框内）"),
     ("s", "表排序：名称 / 类型（TABLE / VIEW）"),
     (
         "s（库行）",
@@ -39754,6 +40321,41 @@ mod tests {
         assert!(!readonly_conn_block(&mut app));
     }
 
+    /// R54: with several connections open, a read-only refusal names the
+    /// connection it happened on, and the editor title + status-bar badge both
+    /// carry the 🔒 so the write policy is visible while typing.
+    #[test]
+    fn read_only_refusal_names_the_connection_and_shows_a_lock() {
+        let mut app = test_app();
+        app.picker_open = false;
+        app.backend_kind = Backend::Sql;
+        let mut cfg = test_conn("mysql");
+        cfg.name = "prod-ro".into();
+        cfg.read_only = true;
+        app.selected = Some(cfg);
+        app.focus = Focus::Editor;
+
+        assert!(readonly_block(&mut app, "DELETE FROM t"));
+        assert!(app.status.contains("prod-ro"), "{}", app.status);
+        assert!(app.status.contains("DELETE"), "{}", app.status);
+        assert!(readonly_conn_block(&mut app));
+        assert!(app.status.contains("prod-ro"), "{}", app.status);
+
+        let screen = draw(&mut app, 100, 30).join("\n");
+        assert!(
+            screen.contains("SQL 🔒"),
+            "editor title lock missing:\n{screen}"
+        );
+        assert!(
+            screen.contains("● 🔒"),
+            "status badge lock missing:\n{screen}"
+        );
+        assert!(
+            screen.contains("prod-ro"),
+            "status badge connection name missing:\n{screen}"
+        );
+    }
+
     #[test]
     fn where_predicates_are_extracted_and_truncated() {
         assert_eq!(
@@ -42570,6 +43172,123 @@ mod tests {
             .any(|r| matches!(r, SideRow::Conn { idx: 0, .. })));
     }
 
+    // ── R54: sidebar tree quick search (`f`) ──
+
+    /// Type each character of `text` into the open quick-search prompt.
+    fn tree_search_type(app: &mut App, text: &str) {
+        for ch in text.chars() {
+            tree_search_key(app, KeyEvent::new(KeyCode::Char(ch), KeyModifiers::empty()));
+        }
+    }
+
+    /// `f` searches connections / databases / tables across groups, force-opens
+    /// a hit group, lands the cursor on the first hit, and Enter clears the
+    /// needle (Esc restores the starting row).
+    #[test]
+    fn tree_quick_search_expands_hit_groups_and_clears_input() {
+        let mut app = tree_app();
+        let c2 = app.connections[1].id.clone();
+        app.sidebar_layout = SidebarLayout {
+            groups: vec![group("g1", "生产", vec![LayoutNode::Conn(c2.clone())])],
+        };
+        // The user folded the group; a search inside it must still reveal hits.
+        app.group_closed.insert("g1".into());
+        rebuild_side_rows(&mut app);
+        assert!(!app
+            .side_rows
+            .iter()
+            .any(|r| matches!(r, SideRow::Conn { idx: 1, .. })));
+
+        open_tree_search(&mut app);
+        assert!(app.tree_search_prompt.is_some());
+        assert!(app.tree_search.is_empty());
+        tree_search_type(&mut app, "postgres");
+        assert_eq!(app.tree_search, "postgres");
+        assert!(matches!(
+            app.side_rows[0],
+            SideRow::Group { open: true, .. }
+        ));
+        assert!(app
+            .side_rows
+            .iter()
+            .any(|r| matches!(r, SideRow::Conn { idx: 1, .. })));
+        // The cursor is pulled onto the first direct hit.
+        assert_eq!(
+            side_row_label(&app, &app.side_rows[app.side_sel]),
+            "test-postgres"
+        );
+
+        // Enter jumps and clears the needle; the ancestor group stays open so
+        // the landing is visible.
+        tree_search_key(
+            &mut app,
+            KeyEvent::new(KeyCode::Enter, KeyModifiers::empty()),
+        );
+        assert!(app.tree_search_prompt.is_none());
+        assert!(app.tree_search.is_empty());
+        assert!(app.status.contains("已清除搜索"), "{}", app.status);
+        assert!(app.status.contains("test-postgres"), "{}", app.status);
+        assert!(!app.group_closed.contains("g1"));
+        assert!(app
+            .side_rows
+            .iter()
+            .any(|r| matches!(r, SideRow::Conn { idx: 1, .. })));
+
+        // Esc clears too, and restores the row the search started from.
+        let before = app.side_sel;
+        open_tree_search(&mut app);
+        tree_search_type(&mut app, "orders");
+        assert!(side_row_label(&app, &app.side_rows[app.side_sel]).contains("orders"));
+        tree_search_key(&mut app, KeyEvent::new(KeyCode::Esc, KeyModifiers::empty()));
+        assert!(app.tree_search_prompt.is_none());
+        assert!(app.tree_search.is_empty());
+        assert!(app.status.contains("已清除搜索"), "{}", app.status);
+        assert_eq!(app.side_sel, before, "Esc returns to the starting row");
+
+        // A needle with no hit reports it and Enter clears without moving.
+        open_tree_search(&mut app);
+        tree_search_type(&mut app, "zzz");
+        assert!(app.status.contains("0 个命中"), "{}", app.status);
+        tree_search_key(
+            &mut app,
+            KeyEvent::new(KeyCode::Enter, KeyModifiers::empty()),
+        );
+        assert!(app.tree_search_prompt.is_none());
+        assert!(app.status.contains("没有匹配"), "{}", app.status);
+    }
+
+    /// The quick search also reaches a *database* name loaded for a sibling
+    /// connection (cross-group, client-side cache), and filtering never spawns
+    /// a query — it only reads `tree_dbs`.
+    #[test]
+    fn tree_quick_search_reaches_sibling_databases_from_cache() {
+        let mut app = tree_app();
+        let c2 = app.connections[1].id.clone();
+        app.sidebar_layout = SidebarLayout {
+            groups: vec![group("g1", "生产", vec![LayoutNode::Conn(c2.clone())])],
+        };
+        app.tree_dbs
+            .insert(c2.clone(), vec!["analytics".into(), "billing".into()]);
+        // The sibling root is expanded (its databases are already cached).
+        app.tree_conn_open.insert(c2.clone());
+        app.group_closed.insert("g1".into());
+        rebuild_side_rows(&mut app);
+
+        open_tree_search(&mut app);
+        tree_search_type(&mut app, "analytics");
+        // The group auto-opened and the cached database row is a hit.
+        assert!(app
+            .side_rows
+            .iter()
+            .any(|r| matches!(r, SideRow::Db { idx: 1, db, .. } if db == "analytics")));
+        assert_eq!(tree_search_hits(&app), 1);
+        // The sibling database that does not match is hidden.
+        assert!(!app
+            .side_rows
+            .iter()
+            .any(|r| matches!(r, SideRow::Db { db, .. } if db == "billing")));
+    }
+
     /// R50: `h` / `l` answer the same way on every node type. `l` on a collapsed
     /// parent opens it in place and a second `l` steps into its first child; `h`
     /// on an expanded parent folds it in place and a second `h` climbs to the
@@ -45304,7 +46023,7 @@ mod tests {
         let mut out = Vec::new();
         let mut seen = HashSet::new();
         let names = vec!["id".to_string(), "ID".to_string(), "name".to_string()];
-        push_names(&mut out, &mut seen, &names, 'C', "i");
+        push_names(&mut out, &mut seen, &names, 'C', "i", None);
         // `id` and `ID` collapse to one candidate (case-insensitive dedupe).
         assert_eq!(out.len(), 1);
         assert_eq!(out[0].text, "id");
@@ -45312,10 +46031,61 @@ mod tests {
         // A table candidate keeps its `T` tag and matches case-insensitively.
         let mut out = Vec::new();
         let mut seen = HashSet::new();
-        push_item(&mut out, &mut seen, "Users", 'T', "us");
+        push_item(&mut out, &mut seen, "Users", "Users", 'T', "us");
         assert_eq!(out.len(), 1);
         assert_eq!(out[0].text, "Users");
         assert_eq!(out[0].kind, 'T');
+    }
+
+    /// R54: a completed identifier is quoted only when it needs it — an
+    /// uppercase or reserved name gets the dialect's quote (backtick for MySQL,
+    /// double quote for PostgreSQL), a plain lowercase name stays bare.
+    #[test]
+    fn completion_quotes_uppercase_and_reserved_identifiers_only() {
+        // Plain lowercase names need no quoting.
+        assert!(!identifier_needs_quote("users"));
+        assert!(!identifier_needs_quote("user_id2"));
+        assert!(!identifier_needs_quote("_tmp"));
+        assert_eq!(
+            completion_quote("users", Some(DatabaseType::Mysql)),
+            "users"
+        );
+        // Uppercase, punctuation and reserved words all need it.
+        assert!(identifier_needs_quote("Users"));
+        assert!(identifier_needs_quote("my-table"));
+        assert!(identifier_needs_quote("2fa"));
+        assert!(identifier_needs_quote("order"));
+        assert!(identifier_needs_quote("key"));
+        // Dialect spellings: MySQL backticks, PostgreSQL double quotes.
+        assert_eq!(
+            completion_quote("Users", Some(DatabaseType::Mysql)),
+            "`Users`"
+        );
+        assert_eq!(
+            completion_quote("Users", Some(DatabaseType::Postgres)),
+            "\"Users\""
+        );
+        assert_eq!(
+            completion_quote("order", Some(DatabaseType::Mysql)),
+            "`order`"
+        );
+        assert_eq!(
+            completion_quote("order", Some(DatabaseType::Postgres)),
+            "\"order\""
+        );
+        // A quoted candidate is still found by its lowercase prefix.
+        let mut out = Vec::new();
+        let mut seen = HashSet::new();
+        push_names(
+            &mut out,
+            &mut seen,
+            &["Users".to_string()],
+            'T',
+            "us",
+            Some(DatabaseType::Postgres),
+        );
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].text, "\"Users\"");
     }
 
     // ── R13: persistent config ──
