@@ -295,22 +295,22 @@ pub(crate) fn footer_tiers_cap_hints_by_width() {
     assert_eq!(footer_tier(60), FooterTier::Compact);
     assert_eq!(footer_tier(99), FooterTier::Compact);
     assert_eq!(footer_tier(100), FooterTier::Full);
-    assert_eq!(footer_tier_cap(FooterTier::Mini), Some(4));
-    assert_eq!(footer_tier_cap(FooterTier::Compact), Some(6));
+    assert_eq!(footer_tier_cap(FooterTier::Mini), Some(6));
+    assert_eq!(footer_tier_cap(FooterTier::Compact), Some(8));
     assert_eq!(footer_tier_cap(FooterTier::Full), None);
 
     // Short hints so each tier's width is reached: a narrow footer shows at
-    // most 4 hints, a mid one at most 6, a wide one all of them.
+    // most 6 hints, a mid one at most 8, a wide one all of them.
     let hints: Vec<Hint> = ["a", "b", "c", "d", "e", "f", "g", "h", "i", "j", "k", "l"]
         .into_iter()
         .map(|key| (key, "d"))
         .chain(std::iter::once(("?", "help")))
         .collect();
     let (mini, more) = footer_select(&hints, 42);
-    assert!(mini.len() <= 4, "mini chose {} hints", mini.len());
+    assert!(mini.len() <= 6, "mini chose {} hints", mini.len());
     assert!(more);
     let (mid, more) = footer_select(&hints, 80);
-    assert!(mid.len() <= 6, "mid chose {} hints", mid.len());
+    assert!(mid.len() <= 8, "mid chose {} hints", mid.len());
     assert!(more);
     let (full, more) = footer_select(&hints, 120);
     assert_eq!(full.len(), 12);
@@ -344,6 +344,86 @@ pub(crate) fn footer_help_key_names_the_context_key() {
     assert_eq!(pinned(Focus::Preview), ("?", t("帮助")));
 }
 
+/// R80: the results-pane footer / mini-help group lists every key R51–R79 added
+/// to the grid, so none of them is discoverable only through the full F1 help.
+#[test]
+pub(crate) fn preview_footer_lists_new_result_keys() {
+    let hints = footer_hints_ctx(FooterCtx {
+        view: FooterView::Browse,
+        focus: Focus::Preview,
+        has_connection: true,
+    });
+    let keys: Vec<&str> = hints.iter().map(|h| h.0).collect();
+    for k in [
+        "0", "Alt-0", "#", "%", "gc", "J", "F8/Alt-E", "v", "gv", "\\",
+    ] {
+        assert!(keys.contains(&k), "results footer dropped {k:?}: {keys:?}");
+    }
+    // The lookup keys stay ahead of the new, rarer toggles, so a narrow footer
+    // keeps the search gestures it always had.
+    let pos = |k: &str| keys.iter().position(|x| *x == k).unwrap();
+    assert!(pos("v") < pos("#"));
+    assert!(pos("gv") < pos("#"));
+    assert!(pos("\\") < pos("#"));
+    // Every hint carries a description.
+    for h in &hints {
+        assert!(!h.1.is_empty(), "empty description for {:?}", h.0);
+    }
+}
+
+/// R80: the mini cheat-sheet sizes itself to the screen instead of a fixed ten
+/// rows, so the newer keys are visible on a normal terminal.
+#[test]
+pub(crate) fn mini_help_rows_scale_with_screen_height() {
+    assert_eq!(mini_help_rows(24), 20);
+    assert_eq!(mini_help_rows(16), 12);
+    assert_eq!(mini_help_rows(100), 96);
+    // A short screen still starts from the twelve-row baseline.
+    assert_eq!(mini_help_rows(12), 12);
+    assert_eq!(mini_help_rows(4), 12);
+    assert!(mini_help_rows(24) >= MINI_HELP_MIN_ROWS);
+    const { assert!(MINI_HELP_MIN_ROWS >= 12) };
+}
+
+/// R80: the results-pane group still fits its line at the tier boundaries
+/// (60 / 80 / 110 columns); the width truncation trims hints, never overflows
+/// or splits one.
+#[test]
+pub(crate) fn preview_footer_fits_at_tier_widths() {
+    let hints = footer_hints_ctx(FooterCtx {
+        view: FooterView::Browse,
+        focus: Focus::Preview,
+        has_connection: true,
+    });
+    for width in [60usize, 80, 110] {
+        let (chosen, more) = footer_select(&hints, width);
+        let line = footer_line_width(&chosen, more, "?");
+        assert!(line <= width, "width {width}: line {line}");
+        assert!(!chosen.is_empty(), "width {width}: kept nothing");
+        assert_eq!(*hints.last().unwrap(), ("?", t("帮助")));
+    }
+    // The widened Compact cap is never the binding constraint below it.
+    let (mid, _) = footer_select(&hints, 80);
+    assert!(mid.len() <= 8);
+}
+
+/// R80: the editor footer names the R71 template panel (R79's auto-indent and
+/// auto-pair are `tui.json` switches, so they have no key to list).
+#[test]
+pub(crate) fn editor_footer_lists_template_panel() {
+    let hints = footer_hints_ctx(FooterCtx {
+        view: FooterView::Browse,
+        focus: Focus::Editor,
+        has_connection: true,
+    });
+    let keys: Vec<&str> = hints.iter().map(|h| h.0).collect();
+    assert!(keys.contains(&"Alt-T"), "{keys:?}");
+    assert!(
+        keys.contains(&"Ctrl-J") && keys.contains(&"Alt-/"),
+        "{keys:?}"
+    );
+}
+
 /// `?` opens a context mini sheet first; a second `?` promotes to the full,
 /// scrollable help; Esc closes whichever layer is on top.
 #[test]
@@ -364,15 +444,17 @@ pub(crate) fn mini_help_is_progressive_and_context_aware() {
         "first ? opens the mini sheet"
     );
     assert_eq!(footer_ctx(&app).view, FooterView::HelpMini);
-    // The mini rows come from the current context, capped at ten and never
-    // including the pinned `?` hint itself.
+    // The mini rows come from the current context, sized to the screen height
+    // (at least twelve) and never including the pinned `?` hint itself.
+    let area_h: u16 = 24;
     let mini_rows: Vec<Hint> = footer_hints_ctx(footer_ctx_inner(&app, false))
         .into_iter()
-        .filter(|h| h.0 != "?")
-        .take(10)
+        .filter(|h| h.0 != "?" && h.0 != "F1")
+        .take(mini_help_rows(area_h))
         .collect();
     assert!(!mini_rows.is_empty());
-    assert!(mini_rows.len() <= 10);
+    assert!(mini_rows.len() > 10, "mini sheet should show more than ten");
+    assert!(mini_rows.len() <= mini_help_rows(area_h));
     assert!(mini_rows.iter().any(|h| h.0 == "e"), "results-pane group");
 
     key(&mut app, &tx, q());

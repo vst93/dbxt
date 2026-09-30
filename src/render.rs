@@ -1252,6 +1252,10 @@ pub(crate) fn footer_hints_ctx(ctx: FooterCtx) -> Vec<Hint> {
                 ("Ctrl-J", t("运行")),
                 ("Alt-/", t("补全")),
                 ("Alt-Enter", t("当前句")),
+                // R71: the built-in SQL template panel. R79's auto-indent and
+                // bracket auto-pair are `tui.json` switches, not keys, so they
+                // stay documented in the full help only.
+                ("Alt-T", t("模板")),
                 ("Alt-P", t("片段")),
                 ("Enter", t("换行")),
                 ("↑↓", t("历史")),
@@ -1266,6 +1270,10 @@ pub(crate) fn footer_hints_ctx(ctx: FooterCtx) -> Vec<Hint> {
                 ("Esc", t("编辑器")),
             ],
             Focus::Preview => vec![
+                // R80: the navigation + lookup keys stay first (the footer
+                // shows only the leading hints that fit, so crowding them out
+                // with rare toggles would be a regression). The R51–R79 result
+                // additions follow, ordered by how often they are reached.
                 ("↑↓", t("行")),
                 ("←→", t("列")),
                 ("Enter", t("整行")),
@@ -1279,6 +1287,16 @@ pub(crate) fn footer_hints_ctx(ctx: FooterCtx) -> Vec<Hint> {
                 ("\\", t("查找")),
                 ("gv", t("定位值")),
                 ("|", t("跳列")),
+                // R80 additions: the R51–R79 keys that were missing here.
+                // `v` already leads this group; the epoch preview it shows is
+                // passive (no key), so it stays documented in the full help.
+                ("F8/Alt-E", t("错误定位")),
+                ("gc", t("值分布")),
+                ("J", t("JSON 美化")),
+                ("#", t("数字格式")),
+                ("%", t("斑马纹")),
+                ("0", t("复位列宽")),
+                ("Alt-0", t("清列宽")),
                 ("gd/gt", t("结构/数据")),
                 ("gb", t("切换表")),
                 ("[ ]", t("切标签")),
@@ -1324,10 +1342,14 @@ pub(crate) fn footer_tier(width: usize) -> FooterTier {
 }
 
 /// Maximum number of leading hints a tier shows, or `None` for "show them all".
+/// R80 widened the two small tiers (Mini 4 → 6, Compact 6 → 8): a modern
+/// terminal is at least 80 columns wide, where the six-to-eight highest-priority
+/// hints plus the pinned help hint still fit on one line, so the count cap was
+/// dropping keys the width could have shown.
 pub(crate) fn footer_tier_cap(tier: FooterTier) -> Option<usize> {
     match tier {
-        FooterTier::Mini => Some(4),
-        FooterTier::Compact => Some(6),
+        FooterTier::Mini => Some(6),
+        FooterTier::Compact => Some(8),
         FooterTier::Full => None,
     }
 }

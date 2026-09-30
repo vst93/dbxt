@@ -1145,6 +1145,13 @@ pub static ALL_KEYS: &[&str] = &[
     // R66: `gc` column value distribution (client-side, zero-query)
     "值分布",
     "值分布 · {}",
+    // R80: short footer / mini-help labels for the R51–R79 result-set keys
+    "数字格式",
+    "斑马纹",
+    "复位列宽",
+    "清列宽",
+    "错误定位",
+    "模板",
     "打开表数据后可用",
     "非空 {} · 空 {} · 去重 {}",
     "（非数值列）",
@@ -2535,6 +2542,13 @@ fn en_of(zh: &'static str) -> Option<&'static str> {
         "斑马纹：结果集奇偶行底色微差 开 / 关 · 默认关闭，% 手动开启，跨会话记住" => Some(
             "Zebra stripes: a subtle tint on alternate result rows, on/off · off by default, press `%` to enable, remembered across sessions",
         ),
+        // R80: short footer / mini-help labels for the R51–R79 result-set keys
+        "数字格式" => Some("number format"),
+        "斑马纹" => Some("zebra stripes"),
+        "复位列宽" => Some("reset column width"),
+        "清列宽" => Some("clear column widths"),
+        "错误定位" => Some("locate error"),
+        "模板" => Some("templates"),
         "结构" => Some("structure"),
         "结果" => Some("results"),
         "结果 {}/{}" => Some("results {}/{}"),

@@ -2054,16 +2054,31 @@ pub(crate) fn render_help(f: &mut Frame, area: Rect, app: &mut App) {
     }
 }
 
-/// The context mini cheat-sheet: at most ten keys for the surface that owns the
-/// keyboard right now, sized to fit one screen so it never scrolls. `?` again
-/// widens it to [`render_help`].
+/// R80: minimum number of keys a normal terminal's mini cheat-sheet lists. The
+/// old `take(10)` silently dropped the newest keys on every context; a screen
+/// tall enough for twelve rows always shows at least this many.
+pub(crate) const MINI_HELP_MIN_ROWS: usize = 12;
+
+/// How many context keys the mini cheat-sheet shows on a screen `area_h` rows
+/// tall. The card is `rows + 2` tall (top / bottom border) and the overlay
+/// keeps two rows of breathing room inside the screen, so `h` rows fit `h - 4`
+/// hints; never fewer than [`MINI_HELP_MIN_ROWS`], and the card still never
+/// scrolls (the box height is clamped to the screen).
+pub(crate) fn mini_help_rows(area_h: u16) -> usize {
+    (area_h.saturating_sub(4) as usize).max(MINI_HELP_MIN_ROWS)
+}
+
+/// The context mini cheat-sheet: as many keys for the surface that owns the
+/// keyboard right now as the screen can hold (at least [`MINI_HELP_MIN_ROWS`]),
+/// sized to fit one screen so it never scrolls. `?` again widens it to
+/// [`render_help`].
 pub(crate) fn render_help_mini(f: &mut Frame, area: Rect, app: &mut App) {
     // Reuse the footer's context-aware group for the surface *under* the mini
-    // sheet; drop the pinned `?` hint and cap at ten.
+    // sheet; drop the pinned `?` hint and size the list to the screen height.
     let hints: Vec<Hint> = footer_hints_ctx(footer_ctx_inner(app, false))
         .into_iter()
         .filter(|h| h.0 != "?" && h.0 != "F1")
-        .take(10)
+        .take(mini_help_rows(area.height))
         .collect();
     let key_w = hints
         .iter()
