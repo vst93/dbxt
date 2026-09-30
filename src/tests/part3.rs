@@ -1286,6 +1286,7 @@ pub(crate) fn every_call_site_has_english() {
         include_str!("../transfer.rs"),
         include_str!("../textutil.rs"),
         include_str!("../csv_io.rs"),
+        include_str!("../sqlite_open.rs"),
         include_str!("../redis.rs"),
         include_str!("../tui_config.rs"),
         include_str!("../sqlfmt.rs"),
@@ -7430,4 +7431,250 @@ pub(crate) fn empty_lists_render_next_step_hints() {
             "query empty hint at {w}x{h}: {text}"
         );
     }
+}
+
+// ── R83: SQLite file quick-open (`L`) + page-aware `:` row jump ──
+
+/// R83: the SQLite quick-open accepts only `.db` / `.sqlite` / `.sqlite3`.
+#[test]
+pub(crate) fn sqlite_quick_open_path_validation() {
+    use std::path::Path;
+    assert!(is_sqlite_file(Path::new("/tmp/a.db")));
+    assert!(is_sqlite_file(Path::new("a.SQLITE")));
+    assert!(is_sqlite_file(Path::new("a.sqlite3")));
+    assert!(!is_sqlite_file(Path::new("a.txt")));
+    assert!(!is_sqlite_file(Path::new("a")));
+    assert!(!is_sqlite_file(Path::new("a.db.bak")));
+}
+
+/// R83: the typed path splits into the directory to list, the literal prefix to
+/// re-prepend on `Tab`, and the name filter.
+#[test]
+pub(crate) fn sqlite_split_input_handles_dirs_and_files() {
+    let cwd = std::path::Path::new("/home/u");
+    assert_eq!(
+        sqlite_split_input(cwd, ""),
+        (PathBuf::from("/home/u"), String::new(), String::new())
+    );
+    let (dir, prefix, filter) = sqlite_split_input(cwd, "shop");
+    assert_eq!(dir, PathBuf::from("/home/u"));
+    assert_eq!(prefix, "");
+    assert_eq!(filter, "shop");
+    let (dir, prefix, filter) = sqlite_split_input(cwd, "/tmp/data/ord");
+    assert_eq!(dir, PathBuf::from("/tmp/data"));
+    assert_eq!(prefix, "/tmp/data/");
+    assert_eq!(filter, "ord");
+    // A trailing slash lists the directory with no filter.
+    let (dir, prefix, filter) = sqlite_split_input(cwd, "/var/lib/");
+    assert_eq!(dir, PathBuf::from("/var/lib"));
+    assert_eq!(prefix, "/var/lib/");
+    assert_eq!(filter, "");
+}
+
+/// R83: `common_prefix` is what `Tab` completes to on an ambiguous listing.
+#[test]
+pub(crate) fn common_prefix_for_tab_completion() {
+    assert_eq!(common_prefix(&[]), "");
+    assert_eq!(common_prefix(&["orders.db".to_string()]), "orders.db");
+    assert_eq!(
+        common_prefix(&["orders.db".to_string(), "orders2.db".to_string()]),
+        "orders"
+    );
+    assert_eq!(common_prefix(&["a.db".to_string(), "b.db".to_string()]), "");
+}
+
+/// R83: the recent SQLite list is LRU-capped at five, de-duplicated, and
+/// round-trips through `tui.json` without clobbering another session's list.
+#[test]
+pub(crate) fn sqlite_recent_lru_and_persistence() {
+    let path = std::env::temp_dir().join(format!("dbxt-sqlite-recent-{}.json", Uuid::new_v4()));
+    let mut cfg = TuiConfig::default();
+    for i in 0..8 {
+        cfg.push_sqlite_recent(std::path::Path::new(&format!("/db/f{i}.db")));
+    }
+    assert_eq!(cfg.sqlite_recent.len(), SQLITE_RECENT_MAX);
+    assert_eq!(cfg.sqlite_recent[0], PathBuf::from("/db/f7.db"));
+    // Re-pushing an existing file moves it to the front without growing.
+    cfg.push_sqlite_recent(std::path::Path::new("/db/f5.db"));
+    assert_eq!(cfg.sqlite_recent[0], PathBuf::from("/db/f5.db"));
+    assert_eq!(
+        cfg.sqlite_recent
+            .iter()
+            .filter(|p| *p == std::path::Path::new("/db/f5.db"))
+            .count(),
+        1
+    );
+    cfg.save(&path);
+    let back = TuiConfig::load(&path);
+    assert_eq!(back.sqlite_recent, cfg.sqlite_recent);
+
+    // A second session that never touches the list keeps the first's list.
+    let mut other = TuiConfig::default();
+    other.set_compact(Some(true));
+    other.save(&path);
+    assert_eq!(TuiConfig::load(&path).sqlite_recent, cfg.sqlite_recent);
+
+    // Removing drops just that entry (and marks the list dirty).
+    let mut third = TuiConfig::load(&path);
+    third.remove_sqlite_recent(std::path::Path::new("/db/f5.db"));
+    third.save(&path);
+    let after = TuiConfig::load(&path);
+    assert!(!after.sqlite_recent.contains(&PathBuf::from("/db/f5.db")));
+    assert_eq!(after.sqlite_recent.len(), SQLITE_RECENT_MAX - 1);
+    let _ = std::fs::remove_file(&path);
+}
+
+/// R83: a quick-open connection is session-only — a saved-list reload keeps it
+/// in the live list (no vanishing), yet it is never duplicated, and a fresh
+/// load has no ghost.
+#[test]
+pub(crate) fn temp_sqlite_connection_lifecycle() {
+    let cfg = sqlite_connection_config(std::path::Path::new("/tmp/test.db")).expect("config");
+    assert_eq!(cfg.db_type.as_str(), "sqlite");
+    assert_eq!(cfg.host, "/tmp/test.db");
+    assert_eq!(cfg.name, "test");
+    assert!(!cfg.read_only);
+
+    // A store reload that only knows the saved connections re-attaches the temp.
+    let saved = test_conn("mysql");
+    let mut loaded = vec![saved.clone()];
+    merge_temp_connections(&mut loaded, std::slice::from_ref(&cfg));
+    assert!(loaded.iter().any(|c| c.id == cfg.id));
+    assert_eq!(loaded.iter().filter(|c| c.id == cfg.id).count(), 1);
+    // Re-merging is idempotent.
+    merge_temp_connections(&mut loaded, std::slice::from_ref(&cfg));
+    assert_eq!(loaded.iter().filter(|c| c.id == cfg.id).count(), 1);
+    // A restart has no temp list, so no ghost connection appears.
+    let mut fresh: Vec<ConnectionConfig> = vec![saved];
+    merge_temp_connections(&mut fresh, &[]);
+    assert!(!fresh.iter().any(|c| c.id == cfg.id));
+    assert_eq!(fresh.len(), 1);
+}
+
+/// R83: `L` opens the SQLite picker, Esc closes it, the overlay renders at both
+/// target widths, and the `L` key reaches all three doc surfaces.
+#[test]
+pub(crate) fn sqlite_quick_open_key_and_docs() {
+    let (tx, _rx) = tokio::sync::mpsc::unbounded_channel::<OpResult>();
+    let mut app = test_app();
+    app.picker_open = true;
+    key(
+        &mut app,
+        &tx,
+        KeyEvent::new(KeyCode::Char('L'), KeyModifiers::NONE),
+    );
+    assert!(app.sqlite_open.is_some(), "L opens the SQLite picker");
+    assert_eq!(footer_ctx(&app).view, FooterView::SqliteOpen);
+    // It renders at phone and desktop widths (title carries the name).
+    let phone = draw(&mut app, 42, 22).join("\n");
+    assert!(phone.contains("SQLite"), "{phone}");
+    let _ = draw(&mut app, 110, 30);
+    key(
+        &mut app,
+        &tx,
+        KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE),
+    );
+    assert!(app.sqlite_open.is_none(), "Esc closes the picker");
+
+    // `?` on the empty field opens the mini help over the picker; Esc returns.
+    key(
+        &mut app,
+        &tx,
+        KeyEvent::new(KeyCode::Char('L'), KeyModifiers::NONE),
+    );
+    assert!(app.sqlite_open.is_some());
+    key(
+        &mut app,
+        &tx,
+        KeyEvent::new(KeyCode::Char('?'), KeyModifiers::SHIFT),
+    );
+    assert!(
+        app.help_mini && !app.help_open,
+        "? opens the mini sheet over the picker"
+    );
+    assert_eq!(footer_ctx_inner(&app, false).view, FooterView::SqliteOpen);
+    key(
+        &mut app,
+        &tx,
+        KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE),
+    );
+    assert!(!app.help_mini && app.sqlite_open.is_some());
+    key(
+        &mut app,
+        &tx,
+        KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE),
+    );
+
+    // Footer lists `L` in both the picker and the connected sidebar.
+    for view in [FooterView::ConnPicker, FooterView::Browse] {
+        let hints = footer_hints_ctx(FooterCtx {
+            view,
+            focus: Focus::Sidebar,
+            has_connection: view == FooterView::Browse,
+        });
+        assert!(
+            hints.iter().any(|h| h.0 == "L"),
+            "{view:?} footer lists L: {:?}",
+            hints.iter().map(|h| h.0).collect::<Vec<_>>()
+        );
+    }
+    // Full help documents it.
+    assert!(
+        HELP_ROWS.iter().any(|(k, _)| *k == "L"),
+        "full help documents L"
+    );
+}
+
+/// R83: the results-pane footer exposes the `:` row jump, and the picker footer
+/// group carries the quick-open keys.
+#[test]
+pub(crate) fn row_jump_and_picker_footer_hints() {
+    let preview = footer_hints_ctx(FooterCtx {
+        view: FooterView::Browse,
+        focus: Focus::Preview,
+        has_connection: true,
+    });
+    assert!(preview.iter().any(|h| h.0 == ":"), "preview footer lists :");
+    let picker = footer_hints_ctx(FooterCtx {
+        view: FooterView::SqliteOpen,
+        focus: Focus::Sidebar,
+        has_connection: false,
+    });
+    let keys: Vec<&str> = picker.iter().map(|h| h.0).collect();
+    for k in ["↑↓", "Enter", "Tab", "Del", "Esc"] {
+        assert!(keys.contains(&k), "picker footer dropped {k}: {keys:?}");
+    }
+}
+
+/// R83: the directory listing keeps sub-directories and matching SQLite files
+/// (name-prefix, case-insensitive) and ignores everything else, dot-files
+/// included unless asked for.
+#[test]
+pub(crate) fn sqlite_scan_lists_dirs_and_db_files() {
+    let dir = std::env::temp_dir().join(format!("dbxt-sqlite-scan-{}", Uuid::new_v4()));
+    std::fs::create_dir_all(dir.join("sub")).unwrap();
+    std::fs::write(dir.join("a.db"), b"").unwrap();
+    std::fs::write(dir.join("b.sqlite3"), b"").unwrap();
+    std::fs::write(dir.join("c.txt"), b"").unwrap();
+    std::fs::write(dir.join(".hidden.db"), b"").unwrap();
+    let rows = sqlite_scan(&dir, "").unwrap();
+    let names: Vec<String> = rows
+        .iter()
+        .map(|r| match r {
+            SqliteRow::Dir(p) | SqliteRow::File(p) | SqliteRow::Recent(p) => sqlite_file_name(p),
+        })
+        .collect();
+    assert_eq!(
+        names,
+        vec![
+            "sub".to_string(),
+            "a.db".to_string(),
+            "b.sqlite3".to_string()
+        ]
+    );
+    // Name filter is a case-insensitive prefix.
+    let rows = sqlite_scan(&dir, "B").unwrap();
+    assert_eq!(rows.len(), 1);
+    assert!(matches!(&rows[0], SqliteRow::File(p) if sqlite_file_name(p) == "b.sqlite3"));
+    let _ = std::fs::remove_dir_all(&dir);
 }

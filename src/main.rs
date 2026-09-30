@@ -25,6 +25,7 @@ mod runner;
 mod search;
 mod sidebar;
 mod sqlfmt;
+mod sqlite_open;
 mod state;
 #[cfg(test)]
 mod tests;
@@ -201,6 +202,16 @@ enum Op {
     /// every switch so a slow reply for the connection the user just left is
     /// dropped instead of overwriting the new one's list.
     Databases(Box<ConnectionConfig>, u64),
+    /// R83: register a session-only (quick-open SQLite) connection in the
+    /// kernel's runtime config cache *without* writing it to the store. Every
+    /// store-backed operation resolves a connection by id from that cache, so
+    /// the insert must finish before the first query. The bool activates the
+    /// connection once registered; a plain cache refresh after a saved-list
+    /// reload passes `false`, so re-registering never steals the focus.
+    RegisterTempConn(Box<ConnectionConfig>, bool),
+    /// R83: drop a temporary connection from the runtime cache and close its
+    /// pools (used when the user deletes it). Never touches the store.
+    UnregisterTempConn(String),
     /// R52: read the server version once when a connection becomes active — a
     /// single free metadata query (`SELECT version()`, Redis `INFO server`,
     /// Mongo `db.version()`) whose reply is cached for the session. A failure is
@@ -477,6 +488,14 @@ impl Op {
 
 enum OpResult {
     Connections(Vec<ConnectionConfig>),
+    /// R83: a temporary connection is now in the kernel's runtime cache; the
+    /// UI activates it next when `activate` is true.
+    TempConnRegistered {
+        cfg: Box<ConnectionConfig>,
+        activate: bool,
+    },
+    /// R83: a temporary connection was removed from the runtime cache.
+    TempConnUnregistered,
     /// R52: a one-shot server-version read for the connection `id`; `version` is
     /// `None` when the backend could not answer (the read is best-effort).
     /// R63: `rtt` is how long that same read took — a free connect-time latency
@@ -1252,6 +1271,22 @@ async fn run_op(backend: &LocalBackend, op: Op, tx: &Tx) -> OpResult {
             Ok(cs) => OpResult::Connections(cs),
             Err(e) => OpResult::Error(format!("load connections: {e}")),
         },
+        // R83: inject a quick-open connection into the runtime cache so the
+        // store-backed operations can resolve it by id. Nothing is persisted.
+        Op::RegisterTempConn(cfg, activate) => {
+            backend
+                .state()
+                .configs
+                .write()
+                .await
+                .insert(cfg.id.clone(), (*cfg).clone());
+            OpResult::TempConnRegistered { cfg, activate }
+        }
+        Op::UnregisterTempConn(id) => {
+            backend.state().configs.write().await.remove(&id);
+            backend.state().remove_connection_pools_detached(&id).await;
+            OpResult::TempConnUnregistered
+        }
         // R48: read the desktop sidebar tree. A missing table (a store the
         // desktop never wrote) or an unreadable value is not an error — it just
         // means “no groups”, so the tree stays flat.
@@ -4117,6 +4152,7 @@ impl App {
             focus: Focus::Sidebar,
             quit: false,
             connections: Vec::new(),
+            temp_conns: Vec::new(),
             conn_list: ListState::default(),
             picker_open: true,
             conn_sort: ConnSort::Name,
@@ -4285,6 +4321,7 @@ impl App {
             data_cancel: Arc::new(AtomicBool::new(false)),
             file_load_prompt: None,
             file_load_plan: None,
+            sqlite_open: None,
             filter_prompt: None,
             edit_dialog: None,
             pending_write: false,
@@ -4671,6 +4708,15 @@ fn apply_op_result(app: &mut App, res: OpResult, tx: &Tx) {
                 .and_then(|i| app.connections.get(i))
                 .map(|c| c.id.clone());
             app.connections = cs;
+            // R83: re-attach this session's temporary SQLite quick-open
+            // connections (they are deliberately never written to the store)
+            // and make sure the kernel's runtime cache still knows them (a
+            // `load_connections` sync drops any id the store does not have).
+            merge_temp_connections(&mut app.connections, &app.temp_conns);
+            let temps = app.temp_conns.clone();
+            for cfg in temps {
+                app.spawn(tx, Op::RegisterTempConn(Box::new(cfg), false));
+            }
             sort_connection_list(&mut app.connections, app.conn_sort);
             let sel = keep
                 .and_then(|id| app.connections.iter().position(|c| c.id == id))
@@ -6229,6 +6275,14 @@ fn apply_op_result(app: &mut App, res: OpResult, tx: &Tx) {
         | OpResult::SshNotice(_)
         | OpResult::SearchProgress { .. }
         | OpResult::DataDiffProgress { .. } => {}
+        // R83: the temporary connection is in the kernel cache now. Only the
+        // initial quick-open activates it; a cache refresh leaves the UI alone.
+        OpResult::TempConnRegistered { cfg, activate } => {
+            if activate {
+                activate_connection(app, tx, *cfg, None, None);
+            }
+        }
+        OpResult::TempConnUnregistered => {}
         OpResult::Error(e) => {
             // v0.6.27+ secret-store failures get a human hint (key missing /
             // migration pending); every other error passes through unchanged.

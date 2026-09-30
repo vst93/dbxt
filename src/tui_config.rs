@@ -18,6 +18,10 @@ pub(crate) struct TablePrefs {
 /// so a long-lived config can never grow without bound.
 pub(crate) const COL_WIDTH_MEM_MAX: usize = 200;
 
+/// R83: how many SQLite files the `L` quick-open picker remembers (in
+/// `tui.json`). Kept small — the list sits at the top of the picker.
+pub(crate) const SQLITE_RECENT_MAX: usize = 5;
+
 /// One persisted column-width override (R72). The identity is
 /// `(conn, db, schema, table, col)` — the same scope the session memory uses,
 /// minus the query bucket (a plain query result is never persisted).
@@ -63,6 +67,10 @@ pub(crate) struct TuiConfig {
     pub(crate) editor_indent: Option<bool>,
     /// R79: editor bracket auto-pairing (`None` = default on).
     pub(crate) editor_pairs: Option<bool>,
+    /// R83: the last few SQLite files opened through the `L` quick-open picker,
+    /// most-recent first. These are plain file paths, never connections — a
+    /// quick-open stays out of the connection store entirely.
+    pub(crate) sqlite_recent: Vec<PathBuf>,
     pub(crate) tables: HashMap<(String, String), TablePrefs>,
     /// R72: persisted per-column widths, LRU-ordered (oldest first). Capped at
     /// [`COL_WIDTH_MEM_MAX`] on load and on save.
@@ -84,6 +92,10 @@ pub(crate) struct TuiConfig {
     /// no longer clobber each other's tables; an entry reset to defaults is
     /// removed instead of silently surviving.
     pub(crate) dirty: HashSet<(String, String)>,
+    /// R83: whether this session changed the SQLite recent-files list. Kept
+    /// separate so a session that never used the picker cannot clobber another
+    /// session's list.
+    pub(crate) dirty_sqlite_recent: bool,
 }
 
 impl TuiConfig {
@@ -106,6 +118,17 @@ impl TuiConfig {
             editor_pairs: v.get("editor_pairs").and_then(|b| b.as_bool()),
             ..Self::default()
         };
+        if let Some(arr) = v.get("sqlite_recent").and_then(|a| a.as_array()) {
+            let mut paths: Vec<PathBuf> = arr
+                .iter()
+                .filter_map(|x| x.as_str())
+                .filter(|s| !s.trim().is_empty())
+                .map(PathBuf::from)
+                .collect();
+            // Keep the most recent five; a hand-edited overflow is truncated.
+            paths.truncate(SQLITE_RECENT_MAX);
+            cfg.sqlite_recent = paths;
+        }
         if let Some(tables) = v.get("tables").and_then(|t| t.as_object()) {
             for (db, by_table) in tables {
                 let Some(by_table) = by_table.as_object() else {
@@ -271,6 +294,9 @@ impl TuiConfig {
             merged.num_fmt = self.num_fmt;
             merged.stripe = self.stripe;
         }
+        if self.dirty_sqlite_recent {
+            merged.sqlite_recent = self.sqlite_recent.clone();
+        }
         for key in &self.dirty {
             let all_default = self
                 .tables
@@ -363,6 +389,14 @@ impl TuiConfig {
         if let Some(e) = self.editor_pairs {
             root.insert("editor_pairs".into(), serde_json::Value::Bool(e));
         }
+        if !self.sqlite_recent.is_empty() {
+            let arr: Vec<serde_json::Value> = self
+                .sqlite_recent
+                .iter()
+                .map(|p| serde_json::Value::String(p.to_string_lossy().into_owned()))
+                .collect();
+            root.insert("sqlite_recent".into(), serde_json::Value::Array(arr));
+        }
         root.insert("tables".into(), serde_json::Value::Object(tables));
         if !self.col_widths.is_empty() {
             let arr: Vec<serde_json::Value> = self
@@ -422,6 +456,24 @@ impl TuiConfig {
     pub(crate) fn set_stripe(&mut self, value: bool) {
         self.stripe = Some(value);
         self.dirty_display = true;
+    }
+
+    /// R83: remember a SQLite file as the most recent quick-open, dropping any
+    /// older occurrence and capping the list at [`SQLITE_RECENT_MAX`].
+    pub(crate) fn push_sqlite_recent(&mut self, path: &std::path::Path) {
+        self.sqlite_recent.retain(|p| p != path);
+        self.sqlite_recent.insert(0, path.to_path_buf());
+        self.sqlite_recent.truncate(SQLITE_RECENT_MAX);
+        self.dirty_sqlite_recent = true;
+    }
+
+    /// R83: forget one SQLite file from the recent list.
+    pub(crate) fn remove_sqlite_recent(&mut self, path: &std::path::Path) {
+        let before = self.sqlite_recent.len();
+        self.sqlite_recent.retain(|p| p != path);
+        if self.sqlite_recent.len() != before {
+            self.dirty_sqlite_recent = true;
+        }
     }
 }
 

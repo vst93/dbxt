@@ -75,6 +75,7 @@ pub(crate) use crate::runner::*;
 pub(crate) use crate::search::*;
 pub(crate) use crate::sidebar::*;
 pub(crate) use crate::sqlfmt::*;
+pub(crate) use crate::sqlite_open::*;
 pub(crate) use crate::state::*;
 pub(crate) use crate::textutil::*;
 pub(crate) use crate::transfer::*;

@@ -1417,6 +1417,21 @@ pub static ALL_KEYS: &[&str] = &[
     "{} 年前",
     "{} 年后",
     "刚刚",
+    "路径或文件名…",
+    "打开 SQLite 文件",
+    "打开 SQLite 文件 · 输入路径或 ↑↓ 选择 · Enter 打开 · Esc 取消",
+    "已取消打开 SQLite 文件",
+    "请输入路径或选择文件",
+    "已移除最近文件 {}",
+    "无法读取目录：{}",
+    "文件不存在：{}",
+    "这是目录：{}",
+    "不是普通文件：{}",
+    "不是 SQLite 文件（需 .db / .sqlite / .sqlite3）：{}",
+    "无法打开 SQLite 文件：{}",
+    "没有 .db / .sqlite / .sqlite3 文件 · 输入完整路径或 Tab 补全",
+    "跳到第 {} 行 · 第 {} 页…",
+    "正在加载，稍后再试",
 ];
 
 /// The Chinese → English table. Keys must match the source literals exactly.
@@ -3983,6 +3998,40 @@ fn en_of(zh: &'static str) -> Option<&'static str> {
         "行尾 TTL" => Some("TTL at row end"),
         "紧凑显示 `45s` / `5m` / `2h` / `3d`，`-1` 永久、`-2` 不存在；每秒本地倒计时" => {
             Some("compact `45s` / `5m` / `2h` / `3d`, `-1` permanent, `-2` missing; counts down locally every second")
+        }
+        // ── R83: SQLite file quick-open (`L`) ──
+        "路径或文件名…" => Some("path or file name…"),
+        "打开 SQLite 文件" => Some("Open SQLite file"),
+        "打开 SQLite 文件 {}…" => Some("Opening SQLite file {}…"),
+        "打开 SQLite" => Some("open SQLite"),
+        "打开 SQLite 文件 · 输入路径或 ↑↓ 选择 · Enter 打开 · Esc 取消" => {
+            Some("Open SQLite file · type a path or ↑↓ to select · Enter opens · Esc cancels")
+        }
+        "已取消打开 SQLite 文件" => Some("SQLite file open cancelled"),
+        "请输入路径或选择文件" => Some("enter a path or pick a file"),
+        "已移除最近文件 {}" => Some("removed recent file {}"),
+        "已移除临时连接 {}" => Some("removed temporary connection {}"),
+        "无法读取目录：{}" => Some("cannot read directory: {}"),
+        "文件不存在：{}" => Some("file does not exist: {}"),
+        "这是目录：{}" => Some("this is a directory: {}"),
+        "不是普通文件：{}" => Some("not a regular file: {}"),
+        "不是 SQLite 文件（需 .db / .sqlite / .sqlite3）：{}" => {
+            Some("not a SQLite file (needs .db / .sqlite / .sqlite3): {}")
+        }
+        "无法打开 SQLite 文件：{}" => Some("cannot open SQLite file: {}"),
+        "没有 .db / .sqlite / .sqlite3 文件 · 输入完整路径或 Tab 补全" => {
+            Some("no .db / .sqlite / .sqlite3 file · type a full path or Tab to complete")
+        }
+        "打开" => Some("open"),
+        "移除最近" => Some("remove recent"),
+        "打开 SQLite 文件（.db / .sqlite / .sqlite3）：当前目录起步，输入路径 / ↑↓ 选择 / Tab 补全，Enter 打开；顶部列出最近 5 个（Del 移除）。临时连接不写入配置，重启不残留" => {
+            Some("Open a SQLite file (.db / .sqlite / .sqlite3): starts in the current directory; type a path / ↑↓ to select / Tab to complete, Enter opens. The last five files are listed on top (Del removes). The temporary connection is never saved, so a restart leaves no ghost")
+        }
+        // ── R83: page-aware row jump (`:`) ──
+        "跳到第 {} 行 · 第 {} 页…" => Some("jumping to row {} · page {}…"),
+        "正在加载，稍后再试" => Some("loading, try again in a moment"),
+        "跳行：输入行号直达该行（超出范围钳到末行）；分页表视图按整数行号跳到目标页，:$ 跳末行（结果 / 表 / Redis / Mongo 均可）" => {
+            Some("Row jump: type a row number to go straight there (out-of-range clamps to the last row); in a paginated table view the number is an absolute row and the target page loads on demand; :$ goes to the last row (results / tables / Redis / Mongo)")
         }
         _ => None,
     }

@@ -3478,13 +3478,22 @@ pub(crate) fn help_has_no_bare_uppercase_shortcuts() {
     // deliberate exceptions. `J` (R74, the pretty-JSON toggle inside the cell
     // popup) joins them: its lowercase `j` is the popup's scroll-down. `T`
     // (R81, set the focused key's TTL from the key list) joins too: its
-    // lowercase `t` cycles the client-side type filter.
+    // lowercase `t` cycles the client-side type filter. `L` (R83, quick-open a
+    // SQLite file) joins: a rare, deliberate action like `I`, and its lowercase
+    // `l` is the pane's expand / next-column key.
     for (key, _) in HELP_ROWS {
         if key.starts_with('—') {
             continue;
         }
         for tok in key.split(['/', ' ', '+']).filter(|t| !t.is_empty()) {
-            if tok == "I" || tok == "G" || tok == "Y" || tok == "V" || tok == "J" || tok == "T" {
+            if tok == "I"
+                || tok == "G"
+                || tok == "Y"
+                || tok == "V"
+                || tok == "J"
+                || tok == "T"
+                || tok == "L"
+            {
                 continue;
             }
             assert!(
@@ -5830,24 +5839,37 @@ pub(crate) fn cell_find_paints_hits_and_the_accent_match() {
 }
 
 /// R56: `:` accepts a 1-based row number (`0` / `1` = first) or `$` / `end`
-/// (last); out-of-range and nonsense inputs report instead of jumping.
+/// (last); R83 clamps an out-of-range number to the last row and still reports
+/// nonsense input.
 #[test]
 pub(crate) fn parse_row_jump_covers_bounds_and_last() {
     assert_eq!(parse_row_jump(10, "1"), Ok(0));
     assert_eq!(parse_row_jump(10, "0"), Ok(0));
     assert_eq!(parse_row_jump(10, "10"), Ok(9));
+    assert_eq!(parse_row_jump(10, "11"), Ok(9));
+    assert_eq!(parse_row_jump(10, "9999"), Ok(9));
     assert_eq!(parse_row_jump(10, "$"), Ok(9));
     assert_eq!(parse_row_jump(10, " $ "), Ok(9));
     assert_eq!(parse_row_jump(10, "END"), Ok(9));
-    assert!(parse_row_jump(10, "11").is_err());
     assert!(parse_row_jump(10, "").is_err());
     assert!(parse_row_jump(10, "abc").is_err());
     // No rows is reported, never a silent `sel = 0`.
     assert!(parse_row_jump(0, "1").is_err());
 }
 
-/// R56: `:` in the results pane opens the jump prompt, Enter lands on the
-/// row, an out-of-range input reports and stays put, and Esc cancels.
+/// R83: an absolute row index splits into its page and in-page offset.
+#[test]
+pub(crate) fn row_jump_page_splits_page_and_offset() {
+    assert_eq!(row_jump_page(0, 50), (0, 0));
+    assert_eq!(row_jump_page(49, 50), (0, 49));
+    assert_eq!(row_jump_page(50, 50), (1, 0));
+    assert_eq!(row_jump_page(123, 50), (2, 23));
+    // A zero page size never divides by zero.
+    assert_eq!(row_jump_page(7, 0), (7, 0));
+}
+
+/// R56/R83: `:` in the results pane opens the jump prompt, Enter lands on the
+/// row, an out-of-range input clamps to the last row, and Esc cancels.
 #[test]
 pub(crate) fn colon_jump_lands_on_the_row() {
     let (tx, _rx) = tokio::sync::mpsc::unbounded_channel::<OpResult>();
@@ -5874,34 +5896,53 @@ pub(crate) fn colon_jump_lands_on_the_row() {
     let _ = draw(&mut app, 110, 30);
     goto_row_key(
         &mut app,
+        &tx,
         KeyEvent::new(KeyCode::Char('3'), KeyModifiers::NONE),
     );
-    goto_row_key(&mut app, KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+    goto_row_key(
+        &mut app,
+        &tx,
+        KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+    );
     assert!(app.goto_prompt.is_none());
     assert_eq!(app.sel, 2);
 
-    // Out of range reports and leaves the cursor where it was.
+    // R83: an out-of-range number clamps to the last row instead of reporting.
     app.sel = 0;
     open_goto_row(&mut app);
     goto_row_key(
         &mut app,
+        &tx,
         KeyEvent::new(KeyCode::Char('9'), KeyModifiers::NONE),
     );
-    goto_row_key(&mut app, KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
-    assert_eq!(app.sel, 0);
+    goto_row_key(
+        &mut app,
+        &tx,
+        KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+    );
+    assert_eq!(app.sel, 3);
 
     // `$` goes to the last row.
     open_goto_row(&mut app);
     goto_row_key(
         &mut app,
+        &tx,
         KeyEvent::new(KeyCode::Char('$'), KeyModifiers::NONE),
     );
-    goto_row_key(&mut app, KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+    goto_row_key(
+        &mut app,
+        &tx,
+        KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+    );
     assert_eq!(app.sel, 3);
 
     // Esc cancels.
     open_goto_row(&mut app);
-    goto_row_key(&mut app, KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+    goto_row_key(
+        &mut app,
+        &tx,
+        KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE),
+    );
     assert!(app.goto_prompt.is_none());
 
     // With no rows there is nothing to open.

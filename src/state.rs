@@ -1827,6 +1827,10 @@ pub(crate) struct App {
     pub(crate) quit: bool,
 
     pub(crate) connections: Vec<ConnectionConfig>,
+    /// R83: session-only connections opened through the SQLite quick-open
+    /// (`L`). They live in `connections` for the picker but are deliberately
+    /// never written to the connection store, so a restart shows no ghost.
+    pub(crate) temp_conns: Vec<ConnectionConfig>,
     pub(crate) conn_list: ListState,
     pub(crate) picker_open: bool,
     /// Order of the connection picker (`s` cycles name / type / colour).
@@ -2245,6 +2249,10 @@ pub(crate) struct App {
     pub(crate) file_load_prompt: Option<TextArea<'static>>,
     /// The preview / confirmation layer for a read `.sql` file.
     pub(crate) file_load_plan: Option<Box<FileLoadPlan>>,
+
+    // ── SQLite quick-open (`L`) ──
+    /// The modal file picker overlay (recent files + directory listing).
+    pub(crate) sqlite_open: Option<SqliteOpen>,
 
     // WHERE filter prompt (modal text input)
     pub(crate) filter_prompt: Option<TextArea<'static>>,

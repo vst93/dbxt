@@ -122,6 +122,7 @@ pub(crate) fn reset_overlays_for_backend_switch(app: &mut App) {
     app.history_filter = None;
     app.file_load_prompt = None;
     app.file_load_plan = None;
+    app.sqlite_open = None;
     app.filter_prompt = None;
     app.cell_popup = None;
     app.row_popup = None;
@@ -279,6 +280,30 @@ pub(crate) fn confirm_key(app: &mut App, tx: &Tx, k: KeyEvent) {
                         );
                         return;
                     }
+                    // R83: a temporary SQLite quick-open connection only ever
+                    // lives in memory — deleting it drops it locally instead of
+                    // writing anything to the store.
+                    if app.temp_conns.iter().any(|t| t.id == cc.id) {
+                        app.temp_conns.retain(|t| t.id != cc.id);
+                        app.connections.retain(|c| c.id != cc.id);
+                        app.spawn(tx, Op::UnregisterTempConn(cc.id.clone()));
+                        if app.selected.as_ref().map(|c| c.id.as_str()) == Some(cc.id.as_str()) {
+                            app.selected = None;
+                            app.picker_open = true;
+                        }
+                        app.conn_list.select(if app.connections.is_empty() {
+                            None
+                        } else {
+                            Some(
+                                app.conn_list
+                                    .selected()
+                                    .unwrap_or(0)
+                                    .min(app.connections.len() - 1),
+                            )
+                        });
+                        app.status = tf("已移除临时连接 {}", &[&cc.name]);
+                        return;
+                    }
                     app.status = tf("删除连接 {}…", &[&cc.name]);
                     app.spawn(
                         tx,
@@ -416,6 +441,12 @@ pub(crate) fn browse_key(app: &mut App, tx: &Tx, k: KeyEvent) {
         help_mini_key(app, k);
         return;
     }
+    // R83: the SQLite quick-open picker (`L`) owns the keyboard while it is
+    // open, so `q` / `?` type into the path field instead of acting globally.
+    if app.sqlite_open.is_some() {
+        sqlite_open_key(app, tx, k);
+        return;
+    }
     // CSV import and result export overlays (newest, so checked before the rest).
     if app.import_report.is_some() {
         import_report_key(app, k);
@@ -518,7 +549,7 @@ pub(crate) fn browse_key(app: &mut App, tx: &Tx, k: KeyEvent) {
 
     // R56: the `:` row-number jump prompt is modal too.
     if app.goto_prompt.is_some() {
-        goto_row_key(app, k);
+        goto_row_key(app, tx, k);
         return;
     }
 
@@ -792,6 +823,21 @@ pub(crate) fn browse_key(app: &mut App, tx: &Tx, k: KeyEvent) {
         && app.backend_kind == Backend::Sql
     {
         explain_current(app, tx);
+        return;
+    }
+
+    // `L` opens a SQLite database file directly (R83): pick a
+    // `.db` / `.sqlite` / `.sqlite3` file from the current directory (or type a
+    // path) to browse it without saving a connection. Works from the connection
+    // picker and from the main panes alike; the text inputs keep `L` as a
+    // character.
+    if k.code == KeyCode::Char('L')
+        && !k.modifiers.contains(KeyModifiers::CONTROL)
+        && !k.modifiers.contains(KeyModifiers::ALT)
+        && app.page == Page::Browse
+        && !matches!(app.focus, Focus::Editor | Focus::CmdInput)
+    {
+        open_sqlite_picker(app);
         return;
     }
 

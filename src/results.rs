@@ -1404,11 +1404,32 @@ pub(crate) fn col_jump_key(app: &mut App, k: KeyEvent) {
 
 // ── R56: `:` row-number jump ──
 
+/// R83: the denominator for the row-jump prompt — the current page's row count,
+/// or the whole-table total when a paginated table / document view is open. The
+/// number a user types is the *absolute* row of the table, not of the page.
+pub(crate) fn goto_row_total(app: &App) -> usize {
+    let page_rows = result_row_count(app);
+    if app.script.is_none() {
+        if let Some(total) = app.page_state.as_ref().and_then(|ps| ps.total) {
+            return (total as usize).max(page_rows);
+        }
+    }
+    page_rows
+}
+
+/// R83: split an absolute 0-based row into its page and offset. Pure.
+pub(crate) fn row_jump_page(index: usize, page_size: usize) -> (usize, usize) {
+    let ps = page_size.max(1);
+    (index / ps, index % ps)
+}
+
 /// `:` in the results pane — jump to a row by number (`:12`) or to the last row
 /// (`:$`). Reuses the existing one-line prompt infrastructure; unlike the cell
-/// cursor it never touches the column, so a wide row keeps its place.
+/// cursor it never touches the column, so a wide row keeps its place. When a
+/// paginated table view is open the number is an absolute table row and the
+/// target page is loaded on demand (R83).
 pub(crate) fn open_goto_row(app: &mut App) {
-    let n = result_row_count(app);
+    let n = goto_row_total(app);
     if n == 0 {
         app.status = t("没有可跳转的行").into();
         return;
@@ -1419,9 +1440,10 @@ pub(crate) fn open_goto_row(app: &mut App) {
 }
 
 /// Parse a `:` row-jump input against a row count: a 1-based number (`1` and `0`
-/// both mean the first row) or `$` / `end` for the last row. Out-of-range numbers
-/// are rejected rather than clamped, so a typo reports instead of jumping
-/// somewhere unexpected. Pure so it can be tested directly.
+/// both mean the first row) or `$` / `end` for the last row. R83: an
+/// out-of-range number *clamps* to the last row (the earlier reject-on-typo
+/// behaviour is gone) so a jump is always a jump, never an error. Pure so it can
+/// be tested directly.
 pub(crate) fn parse_row_jump(count: usize, input: &str) -> Result<usize, String> {
     if count == 0 {
         return Err(t("没有可跳转的行").to_string());
@@ -1433,18 +1455,16 @@ pub(crate) fn parse_row_jump(count: usize, input: &str) -> Result<usize, String>
     if q == "$" || q.eq_ignore_ascii_case("end") {
         return Ok(count - 1);
     }
-    if q == "0" || q == "1" {
-        return Ok(0);
-    }
     match q.parse::<usize>() {
-        Ok(n) if n >= 1 && n <= count => Ok(n - 1),
-        Ok(_) => Err(tf("行号超出范围（1-{}）", &[&(count)])),
+        // `n` is 1-based; anything past the last row clamps to it. `0` (and `1`)
+        // both mean the first row.
+        Ok(n) => Ok(n.saturating_sub(1).min(count - 1)),
         Err(_) => Err(tf("无法识别的行号「{}」", &[&(q)])),
     }
 }
 
 /// Prompt handler for `:`: Enter jumps, Esc cancels, anything else is text.
-pub(crate) fn goto_row_key(app: &mut App, k: KeyEvent) {
+pub(crate) fn goto_row_key(app: &mut App, tx: &Tx, k: KeyEvent) {
     match k.code {
         KeyCode::Enter => {
             let input = app
@@ -1453,15 +1473,39 @@ pub(crate) fn goto_row_key(app: &mut App, k: KeyEvent) {
                 .map(|t| t.lines().join(" ").trim().to_string())
                 .unwrap_or_default();
             app.goto_prompt = None;
-            let n = result_row_count(app);
-            match parse_row_jump(n, &input) {
+            let page_rows = result_row_count(app);
+            let total = goto_row_total(app).max(page_rows);
+            match parse_row_jump(total, &input) {
                 Ok(i) => {
+                    // R83: a paginated table view takes an absolute row; load the
+                    // page it lives on and park the cursor at its offset. An
+                    // in-memory result set (query / drilled script) jumps
+                    // directly.
+                    if app.script.is_none() {
+                        if let Some(ps) = app.page_state.clone() {
+                            let (page, off) = row_jump_page(i, ps.page_size);
+                            if page == ps.page {
+                                app.sel = off.min(page_rows.saturating_sub(1));
+                                app.col_cursor = 0;
+                                app.col_offset = 0;
+                                app.status = tf("跳到第 {} 行 / 共 {}", &[&(i + 1), &(total)]);
+                            } else if app.page_pending || !goto_page(app, tx, page, Some(off)) {
+                                app.status = t("正在加载，稍后再试").into();
+                            } else {
+                                app.col_cursor = 0;
+                                app.col_offset = 0;
+                                app.status =
+                                    tf("跳到第 {} 行 · 第 {} 页…", &[&(i + 1), &(page + 1)]);
+                            }
+                            return;
+                        }
+                    }
                     // The column cursor parks on the first column so the jump
                     // lands on a known corner (same rule as `gg` / `G`).
                     app.sel = i;
                     app.col_cursor = 0;
                     app.col_offset = 0;
-                    app.status = tf("跳到第 {} 行 / 共 {}", &[&(i + 1), &(n)]);
+                    app.status = tf("跳到第 {} 行 / 共 {}", &[&(i + 1), &(total)]);
                 }
                 Err(msg) => app.status = msg,
             }

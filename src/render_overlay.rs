@@ -152,6 +152,7 @@ pub(crate) fn render_conn_picker(f: &mut Frame, area: Rect, app: &mut App) {
                         ("Enter", t("连接")),
                         ("c", t("新建")),
                         ("p", t("复制")),
+                        ("L", t("SQLite")),
                         ("s", t("排序")),
                         ("x", t("删除")),
                         ("q", t("显隐")),

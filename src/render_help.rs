@@ -1066,6 +1066,10 @@ pub(crate) const HELP_ROWS: &[(&str, &str)] = &[
         "断开选中连接（关闭连接池，未提交手动事务回滚；配置保留，可重连）",
     ),
     ("q", "折叠 / 展开连接列表"),
+    (
+        "L",
+        "打开 SQLite 文件（.db / .sqlite / .sqlite3）：当前目录起步，输入路径 / ↑↓ 选择 / Tab 补全，Enter 打开；顶部列出最近 5 个（Del 移除）。临时连接不写入配置，重启不残留",
+    ),
     ("— 连接表单 —", ""),
     ("↑ ↓ / Tab", "切换字段：db_type → name → host → port → user → password → database → query_timeout（开启 ssh_tunnel 后自动展开 SSH 段）"),
     ("Enter", "编辑字段 / 切换开关 / 保存连接"),
@@ -1279,7 +1283,7 @@ pub(crate) const HELP_ROWS: &[(&str, &str)] = &[
     ("|", "跳列：输入列号或列名前缀直达该列（宽表横滚）"),
     (
         "(:)",
-        "跳行：输入行号直达该行，:$ 跳末行（结果 / 表 / Redis / Mongo 均可）",
+        "跳行：输入行号直达该行（超出范围钳到末行）；分页表视图按整数行号跳到目标页，:$ 跳末行（结果 / 表 / Redis / Mongo 均可）",
     ),
     (
         "{ }",

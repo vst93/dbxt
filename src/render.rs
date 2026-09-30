@@ -39,6 +39,11 @@ pub(crate) fn ui(f: &mut Frame, app: &mut App) {
     if app.page == Page::Browse && app.picker_open && app.selected.is_none() {
         render_conn_picker(f, f.area(), app);
     }
+    // R83: the SQLite quick-open picker (`L`) draws over the base UI, under the
+    // help layers (matching the key router, which checks help first).
+    if app.sqlite_open.is_some() {
+        render_sqlite_open(f, f.area(), app);
+    }
     // Overlays are drawn lowest-precedence first so the topmost one on screen is
     // the one the key router actually owns (see `footer_ctx`, which lists the
     // same order).
@@ -208,9 +213,10 @@ pub(crate) fn ui(f: &mut Frame, app: &mut App) {
             t(" 跳列 · Enter/Esc "),
         );
     }
-    // R56: `:` row jump in the results pane.
+    // R56: `:` row jump in the results pane. R83: a paginated table view shows
+    // the whole-table total, since the number is an absolute row.
     if app.goto_prompt.is_some() {
-        let n = result_row_count(app);
+        let n = goto_row_total(app);
         render_prompt_input(
             f,
             f.area(),
@@ -732,6 +738,8 @@ pub(crate) enum FooterView {
     HelpFilter,
     Help,
     HelpMini,
+    /// R83: the `L` SQLite file quick-open picker.
+    SqliteOpen,
     ImportReport,
     ImportPlan,
     ImportPrompt,
@@ -836,6 +844,8 @@ pub(crate) fn footer_ctx_inner(app: &App, include_help: bool) -> FooterCtx {
         FooterView::Help
     } else if include_help && app.help_mini {
         FooterView::HelpMini
+    } else if app.sqlite_open.is_some() {
+        FooterView::SqliteOpen
     } else if app.import_report.is_some() {
         FooterView::ImportReport
     } else if app.import_plan.is_some() {
@@ -976,6 +986,14 @@ pub(crate) fn footer_hints_ctx(ctx: FooterCtx) -> Vec<Hint> {
         FooterView::HelpFilter => vec![("Enter", t("保留")), ("Esc", t("清除"))],
         FooterView::Help => vec![("/", t("过滤")), ("↑↓", t("滚动")), ("Esc", t("关闭"))],
         FooterView::HelpMini => vec![("Enter/?", t("全部键位")), ("Esc", t("关闭"))],
+        // R83: the SQLite quick-open picker.
+        FooterView::SqliteOpen => vec![
+            ("↑↓", t("选择")),
+            ("Enter", t("打开")),
+            ("Tab", t("补全")),
+            ("Del", t("移除最近")),
+            ("Esc", t("取消")),
+        ],
         FooterView::Rename => vec![
             ("Enter", t("保存")),
             ("Esc", t("取消")),
@@ -1180,6 +1198,7 @@ pub(crate) fn footer_hints_ctx(ctx: FooterCtx) -> Vec<Hint> {
         FooterView::ConnPicker => vec![
             ("↑↓", t("选择连接")),
             ("Enter", t("连接")),
+            ("L", t("打开 SQLite")),
             ("Alt-1..9", t("直切")),
             ("c", t("新建")),
             ("e", t("编辑")),
@@ -1268,6 +1287,7 @@ pub(crate) fn footer_hints_ctx(ctx: FooterCtx) -> Vec<Hint> {
                 ("Alt+a-z", t("首字母跳")),
                 ("Alt-1..9", t("切连接")),
                 ("d", t("切库")),
+                ("L", t("打开 SQLite")),
                 ("Tab", t("SQL")),
                 ("1-9", t("直跳")),
             ],
@@ -1313,6 +1333,7 @@ pub(crate) fn footer_hints_ctx(ctx: FooterCtx) -> Vec<Hint> {
                 ("\\", t("查找")),
                 ("gv", t("定位值")),
                 ("|", t("跳列")),
+                (":", t("跳行")),
                 // R80 additions: the R51–R79 keys that were missing here.
                 // `v` already leads this group; the epoch preview it shows is
                 // passive (no key), so it stays documented in the full help.
