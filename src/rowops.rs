@@ -48,15 +48,15 @@ pub(crate) fn open_cell_popup(app: &mut App) {
         });
     }
     app.popup_cache = None;
-    app.cell_popup = Some(CellPopup {
+    app.cell_popup = Some(make_cell_popup(
         title,
         lines,
-        scroll: 0,
         col,
         raw,
         pretty,
         show_pretty,
-    });
+        true,
+    ));
 }
 
 /// Open the focused row as a vertical `column = value` list. Uses the unfiltered
@@ -227,18 +227,19 @@ pub(crate) fn drill_row_popup_cell(app: &mut App) {
     let pretty = pretty_json(&text).map(|p| pretty_json_spans(&p));
     let show_pretty = pretty.is_some();
     app.popup_cache = None;
-    app.cell_popup = Some(CellPopup {
+    let lines = vec![PopupLine {
+        text: text.clone(),
+        style,
+    }];
+    app.cell_popup = Some(make_cell_popup(
         title,
-        lines: vec![PopupLine {
-            text: text.clone(),
-            style,
-        }],
-        scroll: 0,
+        lines,
         col,
-        raw: text,
+        text,
         pretty,
         show_pretty,
-    });
+        true,
+    ));
 }
 
 /// `y` / `Y` inside the row popup: copy the selected value, naming the column in

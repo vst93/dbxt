@@ -526,11 +526,44 @@ pub(crate) fn cell_popup_key(app: &mut App, k: KeyEvent) {
         app.flash(t("已关闭单元格").into());
         return;
     }
+    // `U`: cycle the Unicode view — raw → escape-decoded → whole-value
+    // re-escaped (non-ASCII as `\uXXXX`) → raw. A pure-ASCII value has no third
+    // state, so it toggles raw ↔ decoded; a malformed `\u` escape reports an
+    // error and leaves the view alone. Display state only — `y`/`Y` still copy
+    // the raw value.
+    if k.code == KeyCode::Char('U') {
+        let Some(popup) = app.cell_popup.as_mut() else {
+            return;
+        };
+        match advance_u_mode(popup) {
+            Ok(UMode::Raw) => {
+                app.popup_cache = None;
+                app.status = t("Unicode 原值视图 · U 循环 解码 / 重新转义").into();
+            }
+            Ok(UMode::Decoded) => {
+                app.popup_cache = None;
+                app.status = t("Unicode 转义解码视图 · U 下一个").into();
+            }
+            Ok(UMode::Escaped) => {
+                app.popup_cache = None;
+                app.status = t("Unicode 重新转义视图（非 ASCII → \\uXXXX）· U 回原值").into();
+            }
+            Err(()) => {
+                app.status =
+                    t("✗ Unicode 解码失败（孤立代理对 / \\u 转义不完整）· 原值未变且只读").into();
+            }
+        }
+        return;
+    }
     // `J`: switch between the pretty and raw JSON views. A non-JSON value says
     // so instead of silently doing nothing.
     if k.code == KeyCode::Char('J') {
         let status = match &mut app.cell_popup {
             Some(p) if p.pretty.is_some() => {
+                // R89: `J` always lands on the JSON view, so clear any active
+                // Unicode `U` view first (otherwise the `U` body would keep
+                // taking precedence and `J` would look dead).
+                p.u_mode = UMode::Raw;
                 p.show_pretty = !p.show_pretty;
                 p.scroll = 0;
                 Some(if p.show_pretty {

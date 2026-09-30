@@ -391,6 +391,54 @@ pub(crate) struct CellPopup {
     pub(crate) pretty: Option<Vec<Vec<PopupSpan>>>,
     /// True while the pretty body is shown (JSON cells only).
     pub(crate) show_pretty: bool,
+    /// R89: raw text decoded with JSON escape semantics (`Some` even when the
+    /// value carries no escapes, so `U` always has a decoded view); `None` when
+    /// a `\u` escape is malformed.
+    pub(crate) decoded: Option<String>,
+    /// R89: the decoded text re-escaped with `\uXXXX` for every non-ASCII
+    /// character; `None` for a pure-ASCII value (no `U` third state).
+    pub(crate) escaped: Option<String>,
+    /// R89: the grey bottom preview line shown when the raw text contains a
+    /// `\uXXXX` escape; read-only, never changes the value.
+    pub(crate) preview: Option<PopupLine>,
+    /// R89: which of the three `U` views the body currently shows.
+    pub(crate) u_mode: UMode,
+    /// R89: true for a single-value popup (a grid cell / drilled field), false
+    /// for the multi-line data-diff summary (whose `lines` are not one value).
+    pub(crate) single: bool,
+}
+
+/// Build a cell popup, computing the R89 Unicode views for a single-value
+/// popup. The multi-line data-diff summary passes `single = false`, so `U`
+/// stays inert there and its `lines` render verbatim.
+pub(crate) fn make_cell_popup(
+    title: String,
+    lines: Vec<PopupLine>,
+    col: String,
+    raw: String,
+    pretty: Option<Vec<Vec<PopupSpan>>>,
+    show_pretty: bool,
+    single: bool,
+) -> CellPopup {
+    let (decoded, escaped, preview) = if single {
+        unicode_views(&raw)
+    } else {
+        (None, None, None)
+    };
+    CellPopup {
+        title,
+        lines,
+        scroll: 0,
+        col,
+        raw,
+        pretty,
+        show_pretty,
+        decoded,
+        escaped,
+        preview,
+        u_mode: UMode::Raw,
+        single,
+    }
 }
 
 /// A modal showing every column of the focused row, one per line. Beyond
@@ -459,15 +507,7 @@ pub(crate) fn cell_popup_from_lines(title: String, lines: Vec<PopupLine>) -> Cel
         .map(|l| l.text.clone())
         .collect::<Vec<_>>()
         .join("\n");
-    CellPopup {
-        title: title.clone(),
-        lines,
-        scroll: 0,
-        col: title,
-        raw,
-        pretty: None,
-        show_pretty: false,
-    }
+    make_cell_popup(title.clone(), lines, title, raw, None, false, false)
 }
 
 /// Memoised wrap of the modal text popups (R42). A 100 KB cell would otherwise

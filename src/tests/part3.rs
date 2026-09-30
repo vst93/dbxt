@@ -6050,28 +6050,24 @@ pub(crate) fn pretty_json_only_accepts_objects_and_arrays() {
     }
 }
 
-/// R74: the pretty-JSON token scanner colours keys / strings / numbers / literals
-/// and its tokens concatenate back to the pretty text (so wrapping is lossless).
+/// R74/R89: the pretty-JSON spans keep indentation and line breaks but are a
+/// single uncoloured span per line (no token colouring), and concatenate back
+/// to the pretty text (so wrapping is lossless).
 #[test]
-pub(crate) fn json_pretty_spans_colour_tokens_losslessly() {
+pub(crate) fn json_pretty_spans_are_uncoloured_and_lossless() {
     let pretty = pretty_json("{\"n\": 42, \"s\": \"x\", \"b\": true, \"z\": null}").unwrap();
     let lines = pretty_json_spans(&pretty);
-    let all: Vec<&PopupSpan> = lines.iter().flatten().collect();
-    let fg = |t: &str| {
-        all.iter()
-            .find(|s| s.text.contains(t))
-            .and_then(|s| s.style.fg)
-    };
-    assert_eq!(fg("\"n\""), Some(Color::Cyan), "key is cyan");
-    assert_eq!(fg("42"), Some(Color::Yellow), "number is yellow");
-    assert_eq!(fg("\"x\""), Some(Color::Green), "string is green");
-    assert_eq!(fg("true"), Some(Color::Magenta), "bool is magenta");
-    assert_eq!(fg("null"), Some(Color::DarkGray), "null is dim");
+    for line in &lines {
+        assert_eq!(line.len(), 1, "one span per line");
+        assert!(line[0].style.fg.is_none(), "no foreground colour");
+        assert_eq!(line[0].style, Style::default(), "plain style");
+    }
     let joined: Vec<String> = lines
         .iter()
         .map(|sp| sp.iter().map(|s| s.text.as_str()).collect::<String>())
         .collect();
     assert_eq!(joined.join("\n"), pretty);
+    assert!(pretty.contains('\n'), "the pretty form is multi-line");
 }
 
 fn json_cell_app(raw: &str) -> App {
@@ -6169,6 +6165,304 @@ pub(crate) fn cell_popup_j_rejects_non_json() {
     assert!(app.status.contains("不是 JSON"), "{}", app.status);
     assert!(!app.cell_popup.as_ref().unwrap().show_pretty);
     assert!(app.cell_popup.is_some(), "the popup stays open");
+}
+
+// ── R89: Unicode escape decode / re-escape (the `U` view) ────────────────────
+
+/// The decode matrix: BMP escapes, a surrogate pair, the control-class escapes
+/// and mixed literal text all decode; a lone / mispaired surrogate is an error;
+/// a `\u` that is not four hex digits stays literal (a Windows path).
+#[test]
+pub(crate) fn unicode_decode_matrix() {
+    assert_eq!(decode_escapes("\\u4f60\\u597d").unwrap(), "你好");
+    assert_eq!(decode_escapes("\\uD83D\\uDE00").unwrap(), "😀");
+    assert_eq!(decode_escapes("\\u00e9").unwrap(), "é");
+    assert_eq!(
+        decode_escapes("pre \\u4f60 mid \\u597d post").unwrap(),
+        "pre 你 mid 好 post"
+    );
+    // Control-class escapes.
+    assert_eq!(
+        decode_escapes("a\\nb\\tc\\rd\\\"e\\\\f\\/g").unwrap(),
+        "a\nb\tc\rd\"e\\f/g"
+    );
+    assert_eq!(decode_escapes("\\b\\f").unwrap(), "\u{08}\u{0C}");
+    // A surrogate pair split across literal text is still one code point.
+    assert_eq!(decode_escapes("😀 \\uD83D\\uDE00").unwrap(), "😀 😀");
+    // Errors: a lone high / low surrogate, or a high surrogate not followed by
+    // a `\u` escape.
+    assert!(decode_escapes("\\uD83D").is_err());
+    assert!(decode_escapes("\\uDE00").is_err());
+    assert!(decode_escapes("\\uD83Dx").is_err());
+    assert!(decode_escapes("\\uD83D\\uD83D").is_err());
+    // Not a Unicode escape: kept verbatim, not an error.
+    assert_eq!(decode_escapes("C:\\user").unwrap(), "C:\\user");
+    assert_eq!(decode_escapes("\\q").unwrap(), "\\q");
+    assert_eq!(decode_escapes("").unwrap(), "");
+    // Presence detection drives the grey preview line only for a real `\uXXXX`.
+    assert!(has_unicode_escape("ab\\u4f60cd"));
+    assert!(has_unicode_escape("\\uD83D\\uDE00"));
+    assert!(!has_unicode_escape("ab\\u4f6"));
+    assert!(!has_unicode_escape("abc"));
+    assert!(!has_unicode_escape("\\uZZZZ"));
+}
+
+/// Re-escaping turns every non-ASCII character into `\uXXXX` (a surrogate pair
+/// above the BMP) and leaves ASCII alone, so it round-trips a decoded value.
+#[test]
+pub(crate) fn unicode_re_escape_round_trips() {
+    assert_eq!(escape_unicode("你好"), "\\u4F60\\u597D");
+    assert_eq!(escape_unicode("😀"), "\\uD83D\\uDE00");
+    assert_eq!(escape_unicode("abc 1\"2"), "abc 1\"2");
+    let raw = "{\"name\":\"\\u4F60\\u597D\"}";
+    let decoded = decode_escapes(raw).unwrap();
+    assert_eq!(decoded, "{\"name\":\"你好\"}");
+    assert_eq!(escape_unicode(&decoded), raw);
+    // The uppercase hex is stable, so a second escape is a no-op.
+    assert_eq!(escape_unicode(&escape_unicode("你好")), "\\u4F60\\u597D");
+}
+
+/// `U` cycles `raw → decoded → re-escaped → raw`; the body follows the view, the
+/// grey decode line sits at the bottom, and `y`/`Y` still copy the raw value.
+#[test]
+pub(crate) fn cell_popup_unicode_three_state_cycle_and_raw_copy() {
+    let raw = "\\u4f60\\u597d";
+    let mut app = json_cell_app(raw);
+    let (tx, _rx) = tokio::sync::mpsc::unbounded_channel::<OpResult>();
+    key(
+        &mut app,
+        &tx,
+        KeyEvent::new(KeyCode::Char('v'), KeyModifiers::NONE),
+    );
+    let popup = app.cell_popup.as_ref().expect("cell popup");
+    assert_eq!(popup.raw, raw);
+    assert_eq!(popup.u_mode, UMode::Raw);
+    assert_eq!(popup.decoded.as_deref(), Some("你好"));
+    assert_eq!(popup.escaped.as_deref(), Some("\\u4F60\\u597D"));
+    let preview = popup.preview.as_ref().expect("decode preview line");
+    assert!(preview.text.contains("你好"), "{}", preview.text);
+    assert_eq!(preview.style.fg, Some(Color::DarkGray));
+    // The decoded line is visible under the raw body.
+    let rows = draw(&mut app, 60, 20);
+    let flat = |r: &str| r.chars().filter(|c| !c.is_whitespace()).collect::<String>();
+    assert!(rows.iter().any(|r| flat(r).contains("解码")), "{rows:#?}");
+
+    // raw → decoded
+    key(
+        &mut app,
+        &tx,
+        KeyEvent::new(KeyCode::Char('U'), KeyModifiers::NONE),
+    );
+    assert_eq!(app.cell_popup.as_ref().unwrap().u_mode, UMode::Decoded);
+    assert!(app.status.contains("解码"), "{}", app.status);
+    let rows = draw(&mut app, 60, 20);
+    assert!(rows.iter().any(|r| flat(r).contains("你好")), "{rows:#?}");
+
+    // decoded → re-escaped
+    key(
+        &mut app,
+        &tx,
+        KeyEvent::new(KeyCode::Char('U'), KeyModifiers::NONE),
+    );
+    assert_eq!(app.cell_popup.as_ref().unwrap().u_mode, UMode::Escaped);
+    assert!(app.status.contains("转义"), "{}", app.status);
+    let rows = draw(&mut app, 60, 20);
+    assert!(
+        rows.iter().any(|r| r.contains("\\u4F60\\u597D")),
+        "{rows:#?}"
+    );
+
+    // The raw value is untouched, and `y` copies it — never the escaped view.
+    assert_eq!(app.cell_popup.as_ref().unwrap().raw, raw);
+    app.status.clear();
+    key(
+        &mut app,
+        &tx,
+        KeyEvent::new(KeyCode::Char('y'), KeyModifiers::NONE),
+    );
+    assert!(app.status.contains("已复制"), "{}", app.status);
+    assert!(app.status.contains("\\u4f60\\u597d"), "{}", app.status);
+    assert!(
+        !app.status.contains("\\u4F60"),
+        "copy leaked the escaped view: {}",
+        app.status
+    );
+
+    // re-escaped → raw closes the cycle.
+    key(
+        &mut app,
+        &tx,
+        KeyEvent::new(KeyCode::Char('U'), KeyModifiers::NONE),
+    );
+    assert_eq!(app.cell_popup.as_ref().unwrap().u_mode, UMode::Raw);
+}
+
+/// A pure-ASCII value has no re-escape state (escaping non-ASCII is a no-op), so
+/// `U` toggles raw ↔ decoded; its `\n` escape still decodes to a real newline.
+#[test]
+pub(crate) fn cell_popup_unicode_pure_ascii_has_no_third_state() {
+    let mut app = json_cell_app("a\\nb");
+    let (tx, _rx) = tokio::sync::mpsc::unbounded_channel::<OpResult>();
+    key(
+        &mut app,
+        &tx,
+        KeyEvent::new(KeyCode::Char('v'), KeyModifiers::NONE),
+    );
+    {
+        let popup = app.cell_popup.as_ref().unwrap();
+        assert_eq!(popup.decoded.as_deref(), Some("a\nb"));
+        assert!(popup.escaped.is_none(), "pure ASCII has no escaped state");
+        assert!(popup.preview.is_none(), "no \\uXXXX, no decode preview");
+    }
+    key(
+        &mut app,
+        &tx,
+        KeyEvent::new(KeyCode::Char('U'), KeyModifiers::NONE),
+    );
+    assert_eq!(app.cell_popup.as_ref().unwrap().u_mode, UMode::Decoded);
+    key(
+        &mut app,
+        &tx,
+        KeyEvent::new(KeyCode::Char('U'), KeyModifiers::NONE),
+    );
+    assert_eq!(app.cell_popup.as_ref().unwrap().u_mode, UMode::Raw);
+    assert_eq!(app.cell_popup.as_ref().unwrap().raw, "a\\nb");
+}
+
+/// A malformed `\u` escape (a lone surrogate) leaves the view in `raw` and puts
+/// a bilingual error in the status bar instead of panicking.
+#[test]
+pub(crate) fn cell_popup_unicode_decode_error_is_reported_not_fatal() {
+    let mut app = json_cell_app("\\uD83D");
+    let (tx, _rx) = tokio::sync::mpsc::unbounded_channel::<OpResult>();
+    key(
+        &mut app,
+        &tx,
+        KeyEvent::new(KeyCode::Char('v'), KeyModifiers::NONE),
+    );
+    let popup = app.cell_popup.as_ref().unwrap();
+    assert!(popup.decoded.is_none());
+    assert!(popup.preview.is_none());
+    key(
+        &mut app,
+        &tx,
+        KeyEvent::new(KeyCode::Char('U'), KeyModifiers::NONE),
+    );
+    assert!(app.status.contains("解码失败"), "{}", app.status);
+    assert_eq!(app.cell_popup.as_ref().unwrap().u_mode, UMode::Raw);
+    assert!(app.cell_popup.is_some(), "the popup stays open");
+    // The default body still draws (no crash on the malformed value).
+    let rows = draw(&mut app, 60, 20);
+    assert!(rows.iter().any(|r| r.contains("\\uD83D")), "{rows:#?}");
+    // English too.
+    assert!(!ui_text::t_lang(
+        "✗ Unicode 解码失败（孤立代理对 / \\u 转义不完整）· 原值未变且只读",
+        ui_text::Lang::En
+    )
+    .contains("解码"));
+}
+
+/// The grey decode line shows in the pretty view as well: an escaped JSON
+/// object both pretty-prints (serde decodes it) and gets the `解码:` footer.
+#[test]
+pub(crate) fn cell_popup_unicode_preview_shows_in_pretty_view() {
+    let mut app = json_cell_app("{\"name\":\"\\u4f60\\u597d\"}");
+    let (tx, _rx) = tokio::sync::mpsc::unbounded_channel::<OpResult>();
+    key(
+        &mut app,
+        &tx,
+        KeyEvent::new(KeyCode::Char('v'), KeyModifiers::NONE),
+    );
+    {
+        let popup = app.cell_popup.as_ref().unwrap();
+        assert!(popup.show_pretty, "a JSON object opens pretty");
+        assert!(popup.preview.is_some());
+    }
+    let rows = draw(&mut app, 60, 20);
+    let flat = |r: &str| r.chars().filter(|c| !c.is_whitespace()).collect::<String>();
+    assert!(
+        rows.iter().any(|r| flat(r).contains("\"name\":\"你好\"")),
+        "{rows:#?}"
+    );
+    assert!(
+        rows.iter()
+            .any(|r| flat(r).contains("解码:") && flat(r).contains("你好")),
+        "{rows:#?}"
+    );
+    // `J` always lands on the JSON view: it clears an active `U` view so the
+    // pretty toggle can never look dead.
+    let (tx, _rx) = tokio::sync::mpsc::unbounded_channel::<OpResult>();
+    key(
+        &mut app,
+        &tx,
+        KeyEvent::new(KeyCode::Char('U'), KeyModifiers::NONE),
+    );
+    assert_eq!(app.cell_popup.as_ref().unwrap().u_mode, UMode::Decoded);
+    key(
+        &mut app,
+        &tx,
+        KeyEvent::new(KeyCode::Char('J'), KeyModifiers::NONE),
+    );
+    assert_eq!(app.cell_popup.as_ref().unwrap().u_mode, UMode::Raw);
+    assert!(!app.cell_popup.as_ref().unwrap().show_pretty);
+    key(
+        &mut app,
+        &tx,
+        KeyEvent::new(KeyCode::Char('J'), KeyModifiers::NONE),
+    );
+    assert!(app.cell_popup.as_ref().unwrap().show_pretty);
+}
+
+/// R89 smoke: the escaped-JSON popup draws at both a phone and a desktop size,
+/// with the grey decode footer present; the new keys have English forms.
+#[test]
+pub(crate) fn cell_popup_unicode_renders_at_phone_and_desktop_sizes() {
+    let raw = "{\"name\":\"\\u4f60\\u597d\"}";
+    let flat = |r: &str| r.chars().filter(|c| !c.is_whitespace()).collect::<String>();
+    for (w, h) in [(42u16, 22u16), (110, 30)] {
+        let mut app = json_cell_app(raw);
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel::<OpResult>();
+        key(
+            &mut app,
+            &tx,
+            KeyEvent::new(KeyCode::Char('v'), KeyModifiers::NONE),
+        );
+        key(
+            &mut app,
+            &tx,
+            KeyEvent::new(KeyCode::Char('U'), KeyModifiers::NONE),
+        );
+        key(
+            &mut app,
+            &tx,
+            KeyEvent::new(KeyCode::Char('U'), KeyModifiers::NONE),
+        );
+        key(
+            &mut app,
+            &tx,
+            KeyEvent::new(KeyCode::Char('U'), KeyModifiers::NONE),
+        );
+        let rows = draw(&mut app, w, h);
+        assert!(!rows.is_empty());
+        assert!(
+            rows.iter().any(|r| flat(r).contains("解码:")),
+            "decode footer missing at {w}x{h}: {rows:#?}"
+        );
+        assert_eq!(app.cell_popup.as_ref().unwrap().u_mode, UMode::Raw);
+    }
+    assert!(
+        ui_text::t_lang("Unicode 转义解码视图 · U 下一个", ui_text::Lang::En).contains("decoded")
+    );
+    assert!(ui_text::t_lang(
+        "✗ Unicode 解码失败（孤立代理对 / \\u 转义不完整）· 原值未变且只读",
+        ui_text::Lang::En
+    )
+    .contains("decode failed"));
+    assert!(ui_text::t_lang(
+        "Unicode 转义转换：原文 → 转义解码 → 整值重新转义（非 ASCII 全转 \\uXXXX）三态循环；纯 ASCII 值仅原文 ↔ 解码两态；解码失败（孤立代理对等）状态栏双语报错；y / Y 始终复制原值",
+        ui_text::Lang::En
+    )
+    .contains("three-state"));
 }
 
 /// R74: a multi-statement batch reports `3/7` while it runs and the intermediate

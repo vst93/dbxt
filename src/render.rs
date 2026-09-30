@@ -1169,6 +1169,7 @@ pub(crate) fn footer_hints_ctx(ctx: FooterCtx) -> Vec<Hint> {
         FooterView::Popup => vec![
             ("↑↓", t("滚动")),
             ("J", t("JSON 美化")),
+            ("U", t("Unicode")),
             ("y/Y", t("复制原值")),
             ("Esc/Enter", t("关闭")),
         ],

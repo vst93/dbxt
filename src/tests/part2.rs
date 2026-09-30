@@ -3632,7 +3632,10 @@ pub(crate) fn help_has_no_bare_uppercase_shortcuts() {
     // (R81, set the focused key's TTL from the key list) joins too: its
     // lowercase `t` cycles the client-side type filter. `L` (R83, quick-open a
     // SQLite file) joins: a rare, deliberate action like `I`, and its lowercase
-    // `l` is the pane's expand / next-column key.
+    // `l` is the pane's expand / next-column key. `U` (R89, cycle the cell
+    // popup's Unicode view: raw / decoded / re-escaped) joins: its lowercase
+    // `u` is not bound there, but the uppercase keeps the three-way conversion
+    // gesture visually distinct from the `y`/`Y` copy pair.
     for (key, _) in HELP_ROWS {
         if key.starts_with('—') {
             continue;
@@ -3645,6 +3648,7 @@ pub(crate) fn help_has_no_bare_uppercase_shortcuts() {
                 || tok == "J"
                 || tok == "T"
                 || tok == "L"
+                || tok == "U"
             {
                 continue;
             }

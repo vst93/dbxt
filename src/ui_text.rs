@@ -1387,8 +1387,15 @@ pub static ALL_KEYS: &[&str] = &[
     "完整单元格（任意模式，不进整行弹层；JSON 对象/数组自动美化缩进）",
     "— 单元格弹层（v）—",
     "滚动长值（换行结果缓存，100 KB 单元格也不卡）",
-    "JSON 对象/数组：美化 ↔ 原值切换（键/字符串/数字用主题色区分；非 JSON 时提示）",
+    "JSON 对象/数组：美化 ↔ 原值切换（仅缩进 + 换行美化；非 JSON 时提示）",
     "复制原值（美化视图下仍复制原始 JSON，不复制缩进格式）",
+    "解码: {}",
+    "Unicode 原值视图 · U 循环 解码 / 重新转义",
+    "Unicode 转义解码视图 · U 下一个",
+    "Unicode 重新转义视图（非 ASCII → \\uXXXX）· U 回原值",
+    "✗ Unicode 解码失败（孤立代理对 / \\u 转义不完整）· 原值未变且只读",
+    "Unicode 转义转换：原文 → 转义解码 → 整值重新转义（非 ASCII 全转 \\uXXXX）三态循环；纯 ASCII 值仅原文 ↔ 解码两态；解码失败（孤立代理对等）状态栏双语报错；y / Y 始终复制原值",
+    "值内含 \\uXXXX 转义（含代理对）时，弹层底部灰显解码结果（仅预览，不改数据、不进剪贴板）",
     "关闭（从行弹层下钻时先回行弹层）",
     // ── R75: Esc flashes + sidebar table info card (`i`) ──
     "已关闭库列表",
@@ -3950,8 +3957,25 @@ fn en_of(zh: &'static str) -> Option<&'static str> {
         "滚动长值（换行结果缓存，100 KB 单元格也不卡）" => Some(
             "scroll a long value (the wrap is cached, so a 100 KB cell stays smooth)",
         ),
-        "JSON 对象/数组：美化 ↔ 原值切换（键/字符串/数字用主题色区分；非 JSON 时提示）" => Some(
-            "JSON object/array: toggle pretty ↔ raw (keys/strings/numbers use theme colours; a non-JSON cell says so)",
+        "JSON 对象/数组：美化 ↔ 原值切换（仅缩进 + 换行美化；非 JSON 时提示）" => Some(
+            "JSON object/array: toggle pretty ↔ raw (indentation + line breaks only; a non-JSON cell says so)",
+        ),
+        "解码: {}" => Some("decoded: {}"),
+        "Unicode 原值视图 · U 循环 解码 / 重新转义" => {
+            Some("Unicode raw view · U cycles decode / re-escape")
+        }
+        "Unicode 转义解码视图 · U 下一个" => Some("Unicode escape-decoded view · U next"),
+        "Unicode 重新转义视图（非 ASCII → \\uXXXX）· U 回原值" => {
+            Some("Unicode re-escaped view (non-ASCII → \\uXXXX) · U back to raw")
+        }
+        "✗ Unicode 解码失败（孤立代理对 / \\u 转义不完整）· 原值未变且只读" => Some(
+            "✗ Unicode decode failed (lone surrogate / incomplete \\u escape) · value unchanged, read-only",
+        ),
+        "Unicode 转义转换：原文 → 转义解码 → 整值重新转义（非 ASCII 全转 \\uXXXX）三态循环；纯 ASCII 值仅原文 ↔ 解码两态；解码失败（孤立代理对等）状态栏双语报错；y / Y 始终复制原值" => Some(
+            "Unicode escape conversion: raw → escape-decoded → whole-value re-escape (all non-ASCII as \\uXXXX) three-state cycle; a pure-ASCII value has only raw ↔ decoded; a failed decode (e.g. a lone surrogate) reports an error in the status bar; y / Y always copy the raw value",
+        ),
+        "值内含 \\uXXXX 转义（含代理对）时，弹层底部灰显解码结果（仅预览，不改数据、不进剪贴板）" => Some(
+            "when the value contains a \\uXXXX escape (surrogate pairs included), the popup appends a grey decoded line at the bottom (preview only — the value is never changed, nothing reaches the clipboard)",
         ),
         "复制原值（美化视图下仍复制原始 JSON，不复制缩进格式）" => Some(
             "copy the raw value (the pretty view still copies the original JSON, never the indented form)",

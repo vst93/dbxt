@@ -1358,15 +1358,15 @@ pub(crate) fn open_data_row_popup(app: &mut App) {
         .map(|l| l.text.clone())
         .collect::<Vec<_>>()
         .join("\n");
-    app.cell_popup = Some(CellPopup {
-        title: title.clone(),
+    app.cell_popup = Some(make_cell_popup(
+        title.clone(),
         lines,
-        scroll: 0,
-        col: title,
+        title,
         raw,
-        pretty: None,
-        show_pretty: false,
-    });
+        None,
+        false,
+        false,
+    ));
 }
 
 /// `y` in the data-diff overlay: copy the plain-text summary.

@@ -163,9 +163,11 @@ pub(crate) fn render_text_popup(
     render_popup_body(f, area, title, body, scroll)
 }
 
-/// R74: the cell popup, which adds the pretty-JSON view. The body is rebuilt
-/// from the raw or pretty source depending on the `J` toggle; the memoised wrap
-/// is keyed on width only, and the toggle clears `cache` before redrawing.
+/// R74/R89: the cell popup, which adds the pretty-JSON view and the Unicode
+/// `U` views. The body is rebuilt from the pretty source or the current `U`
+/// view depending on the toggles; the memoised wrap is keyed on width only, and
+/// the `J` / `U` toggles clear `cache` before redrawing. The grey decode line is
+/// appended under either body, so it is visible in the pretty view too.
 pub(crate) fn render_cell_popup(
     f: &mut Frame,
     area: Rect,
@@ -174,17 +176,45 @@ pub(crate) fn render_cell_popup(
 ) -> (Rect, Rect, u16) {
     let inner_w = popup_inner_width(area.width);
     if cache.as_ref().is_none_or(|c| c.width != inner_w) {
-        let body = match (&popup.pretty, popup.show_pretty) {
+        // R89: an active Unicode view takes precedence over the pretty JSON
+        // view, so pressing `U` on a JSON object really changes the body; the
+        // pretty body is only used in the plain `Raw` view.
+        let pretty_body = popup.show_pretty && popup.u_mode == UMode::Raw;
+        let mut body = match (&popup.pretty, pretty_body) {
             (Some(pretty), true) => popup_lines_rich(pretty, inner_w),
-            _ => popup_lines_plain(&popup.lines, inner_w),
+            _ => {
+                let mut lines: Vec<PopupLine> = Vec::new();
+                if popup.single {
+                    // R89: the base value line follows the current `U` view (the
+                    // raw / decoded / re-escaped text); any extra lines (the
+                    // epoch preview) and the style are kept verbatim.
+                    if let Some(first) = popup.lines.first() {
+                        lines.push(PopupLine {
+                            text: u_display_text(popup),
+                            style: first.style,
+                        });
+                    }
+                    lines.extend(popup.lines.iter().skip(1).cloned());
+                } else {
+                    lines.extend(popup.lines.iter().cloned());
+                }
+                popup_lines_plain(&lines, inner_w)
+            }
         };
+        // R89: the grey decoded line sits at the bottom; hidden only while the
+        // body already shows the decoded view.
+        if popup.u_mode != UMode::Decoded {
+            if let Some(preview) = &popup.preview {
+                body.extend(popup_lines_plain(std::slice::from_ref(preview), inner_w));
+            }
+        }
         *cache = Some(PopupCache {
             width: inner_w,
             lines: body,
         });
     }
     let title = if popup.pretty.is_some() {
-        if popup.show_pretty {
+        if popup.show_pretty && popup.u_mode == UMode::Raw {
             tf("{} · JSON 美化", &[&popup.title])
         } else {
             tf("{} · JSON 原值", &[&popup.title])
@@ -1443,7 +1473,15 @@ pub(crate) const HELP_ROWS: &[(&str, &str)] = &[
     ("↑ ↓ / j k · PgUp/PgDn", "滚动长值（换行结果缓存，100 KB 单元格也不卡）"),
     (
         "J",
-        "JSON 对象/数组：美化 ↔ 原值切换（键/字符串/数字用主题色区分；非 JSON 时提示）",
+        "JSON 对象/数组：美化 ↔ 原值切换（仅缩进 + 换行美化；非 JSON 时提示）",
+    ),
+    (
+        "U",
+        "Unicode 转义转换：原文 → 转义解码 → 整值重新转义（非 ASCII 全转 \\uXXXX）三态循环；纯 ASCII 值仅原文 ↔ 解码两态；解码失败（孤立代理对等）状态栏双语报错；y / Y 始终复制原值",
+    ),
+    (
+        "Unicode",
+        "值内含 \\uXXXX 转义（含代理对）时，弹层底部灰显解码结果（仅预览，不改数据、不进剪贴板）",
     ),
     (
         "y / Y",
