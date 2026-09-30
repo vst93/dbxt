@@ -1309,6 +1309,7 @@ pub(crate) fn footer_hints_ctx(ctx: FooterCtx) -> Vec<Hint> {
             ("e", t("编辑")),
             ("p", t("复制")),
             ("P", t("探测")),
+            ("Ctrl-P", t("探测全部")),
             ("s", t("排序")),
             ("x", t("删除")),
             ("q", t("显隐")),
@@ -1378,6 +1379,7 @@ pub(crate) fn footer_hints_ctx(ctx: FooterCtx) -> Vec<Hint> {
                 ("c", t("新建")),
                 ("p", t("复制")),
                 ("P", t("探测")),
+                ("Ctrl-P", t("探测全部")),
                 ("d", t("断开连接")),
                 ("q", t("显隐")),
             ],
@@ -1397,6 +1399,10 @@ pub(crate) fn footer_hints_ctx(ctx: FooterCtx) -> Vec<Hint> {
                 ("gt", t("跳表")),
                 // R87: `P` health probe + the session's recent-connection list.
                 ("P", t("探测")),
+                // R96: `Ctrl-P` probes every saved connection at once; `O` then
+                // orders the tree by the cached latency for the session.
+                ("Ctrl-P", t("探测全部")),
+                ("O", t("延迟排序")),
                 ("Alt-⇧H", t("最近连接")),
                 ("d", t("切库")),
                 ("L", t("打开 SQLite")),
@@ -4069,7 +4075,13 @@ pub(crate) fn side_row_line(
                 ));
                 return Line::from(spans);
             }
-            let name_w = inner.saturating_sub(if ro { 2 } else { 0 });
+            // R96: the latency tail sits right after the name (not in the
+            // far-right size column R73 used), so it is readable even on a
+            // narrow sidebar. The name yields the tail's width; a disconnected
+            // root keeps its muted name.
+            let tail = conn_rtt_tail(app, &cid);
+            let tail_w = tail.as_ref().map(|s| disp_width(s) + 1).unwrap_or(0);
+            let name_w = inner.saturating_sub(if ro { 2 } else { 0 } + tail_w);
             // A disconnected root's name is muted grey so it cannot be mistaken
             // for a live connection at a glance.
             let name_style = match status {
@@ -4080,6 +4092,12 @@ pub(crate) fn side_row_line(
                     .add_modifier(Modifier::DIM),
             };
             spans.push(Span::styled(truncate_disp(&name, name_w), mk(name_style)));
+            if let Some(tail) = tail {
+                spans.push(Span::styled(
+                    format!(" {tail}"),
+                    mk(Style::default().fg(Color::DarkGray)),
+                ));
+            }
         }
         SideRow::ConnLoading { .. } => {
             spans.push(Span::styled(
@@ -4186,23 +4204,15 @@ pub(crate) fn side_row_line(
 
 /// The right-aligned cell for a database (`2.1 GB`) or table (`1.2k` row
 /// estimate) row, or `None` when there is nothing (or no room) to show (R45).
-/// R73: a connection root instead shows its connect-time latency (R63 cache),
-/// or `-` when this session never probed it.
+/// R96: a connection root no longer uses this cell — its latency moved to the
+/// muted tail beside the name (see [`conn_rtt_tail`]), so it stays visible on a
+/// narrow sidebar too.
 pub(crate) fn side_row_size(app: &App, row: &SideRow) -> Option<String> {
     // Width first: a narrow screen gives every cell to the name.
     if app.term_w < 56 {
         return None;
     }
     match row {
-        SideRow::Conn { idx, .. } => {
-            let id = side_root_cfg(app, *idx).map(|c| c.id.clone())?;
-            Some(
-                app.server_rtts
-                    .get(&id)
-                    .map(|d| format_rtt(*d))
-                    .unwrap_or_else(|| "-".to_string()),
-            )
-        }
         SideRow::Db { db, .. } => match app.db_size_state.get(db) {
             Some(TreeDbState::Loading) => Some("…".to_string()),
             Some(TreeDbState::Error(_)) => Some("✗".to_string()),

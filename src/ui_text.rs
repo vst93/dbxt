@@ -4463,6 +4463,38 @@ fn en_of(zh: &'static str) -> Option<&'static str> {
         "DBX 桌面的连接分组（▾ 组名 [n]）；h l / ← → 折叠展开，折叠态写入 tui.json 跨会话记忆；无分组则平铺" => {
             Some("DBX Desktop connection groups (▾ name [n]); h l / ← → fold / unfold, the fold state is written to tui.json and remembered across sessions; flat when there are no groups")
         }
+        // ── R96: connection-panel full probe (`Ctrl-P`) + latency view (`O`) ──
+        "探测全部" => Some("probe all"),
+        "延迟排序" => Some("latency sort"),
+        "探测进行中…" => Some("Probe already running…"),
+        "探测中 0/{}" => Some("Probing 0/{}"),
+        "探测中 {}/{}" => Some("Probing {}/{}"),
+        "超时" => Some("timeout"),
+        "O 按延迟排序" => Some("O sort by latency"),
+        "{} 条 · {} 通" => Some("{} total · {} up"),
+        "{} 条 · {} 通 · {} 超时" => Some("{} total · {} up · {} timed out"),
+        "尚未探测 · Ctrl-P 先探测全部连接" => {
+            Some("Nothing probed yet · press Ctrl-P to probe every connection")
+        }
+        "按延迟排序（会话内临时）· O 恢复原序" => {
+            Some("Sorted by latency (this session only) · O restores the original order")
+        }
+        "已恢复原有顺序" => Some("Original order restored"),
+        "全量探测：对全部已保存连接各发一包最小探测（并发 4 路上限，逐条 3s 超时），状态栏显示进度与汇总（连上后可在树里按 O 按延迟排序）；纯用户显式动作，不后台轮询" => Some(
+            "Probe all: send one minimal packet to every saved connection (at most 4 in flight, 3s timeout each); the status bar shows progress and the summary (once probed you can press O in the tree to sort by latency). A purely explicit action, never a background poll",
+        ),
+        "RTT 尾缀（连接根）" => Some("RTT suffix (connection root)"),
+        "连过的连接名后跟缓存 RTT「· 23ms」；探测失败 / 超时显示「· 超时」；从未探测则不显示。纯读 R63 会话缓存，零查询；窄屏同样可见（不再占右对齐尺寸列）" => Some(
+            "A probed connection's name is followed by its cached RTT (· 23ms); a failed / timed-out probe shows · timeout; a connection never probed shows nothing. Pure read of the R63 session cache, zero queries; visible on a narrow sidebar too (no longer taken from the right-aligned size column)",
+        ),
+        "Ctrl-P（连接面板）" => Some("Ctrl-P (connection panel)"),
+        "全量探测：对全部已保存连接各发一包最小探测（并发 4 路上限，逐条 3s 超时），边探测边刷新树尾 RTT 与状态栏进度「探测中 3/8」；完成后汇总「8 条 · 7 通 · 1 超时」。纯用户显式动作，绝不后台轮询（编辑器里 Ctrl-P 仍是 EXPLAIN，两个上下文互斥）" => Some(
+            "Probe all: send one minimal packet to every saved connection (at most 4 in flight, 3s timeout each), refreshing the tree-tail RTT and the progress line (Probing 3/8) as each lands; the final summary reads 8 total · 7 up · 1 timed out. A purely explicit action, never a background poll (in the editor Ctrl-P is still EXPLAIN; the two contexts never overlap)",
+        ),
+        "O（连接树）" => Some("O (connection tree)"),
+        "临时按延迟排序：按缓存 RTT 升序重排连接树（未探测的排最后，稳定排序），再按 O 恢复原序；会话内临时，不写配置、不按延迟改配置顺序；未探测时无效（先按 P 或 Ctrl-P）。取 O 因为小写 o 已是「返回连接列表」" => Some(
+            "Sort by latency for the session: reorder the connection tree by cached RTT ascending (never-probed last, stable sort); press O again to restore the original order. Temporary for the session — never written to config, the configured order never changes by latency; a no-op before any probe (press P or Ctrl-P first). Uses O because lowercase o already means back to the connection list",
+        ),
         // ── R91: reference-row pin (`g s`) + frozen current column (`g f`) ──
         "已取消参照行" => Some("Reference row cleared"),
         "语句列表没有可钉的行" => Some("The statement list has no row to pin"),

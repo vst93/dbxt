@@ -6557,8 +6557,10 @@ pub(crate) fn result_tab_strip_renders_and_folds() {
     assert!(screen.contains('…'), "expected a folded tab: {screen}");
 }
 
-/// R73: the connection picker shows each connection's connect-time latency from
-/// the R63 session cache, and `-` for one never probed. Pure client-side read.
+/// R73 / R96: the connection picker shows each connection's connect-time
+/// latency from the R63 session cache as the same tail the tree uses — the
+/// cached RTT (`· 12ms`), a `· 超时` marker after a failed probe, and nothing at
+/// all for one never probed. Pure client-side read.
 #[test]
 pub(crate) fn conn_picker_shows_latency_column() {
     let mut app = test_app();
@@ -6579,20 +6581,31 @@ pub(crate) fn conn_picker_shows_latency_column() {
     };
     let alpha = mk("id-alpha", "alpha");
     let beta = mk("id-beta", "beta");
-    app.connections = vec![alpha.clone(), beta];
+    let gamma = mk("id-gamma", "gamma");
+    app.connections = vec![alpha.clone(), beta.clone(), gamma];
     app.selected = None;
     app.picker_open = true;
     app.backend_kind = Backend::Sql;
     app.server_rtts
         .insert(alpha.id.clone(), Duration::from_millis(12));
+    app.conn_probe_failed.insert(beta.id.clone());
     let screen = draw(&mut app, 70, 20).join("\n");
+    // Wide CJK glyphs occupy two buffer cells (the second is a space), so the
+    // timeout tail reads `· 超 时` on the raw grid; compare without spaces.
+    let compact: String = screen.chars().filter(|c| !c.is_whitespace()).collect();
     assert!(
-        screen.contains("12ms"),
+        screen.contains("· 12ms"),
         "connected latency missing: {screen}"
     );
     assert!(
-        screen.contains("     -"),
-        "unconnected connection should show `-`: {screen}"
+        compact.contains("·超时"),
+        "failed probe should show the timeout tail: {screen}"
+    );
+    // A never-probed connection carries no tail at all — the old `-` marker is
+    // gone, so the picker and the tree read the same.
+    assert!(
+        !screen.contains("     -"),
+        "the `-` latency marker should be gone: {screen}"
     );
 }
 
@@ -6646,24 +6659,37 @@ pub(crate) fn result_tab_close_refuses_on_table_page() {
     assert!(app.status.contains("不是查询结果"), "{}", app.status);
 }
 
-/// R73: a connection root's right-aligned cell shows its connect-time latency
-/// from the R63 cache, and `-` for one never probed in this session.
+/// R96: a connection root's latency is a muted tail beside the name — the
+/// cached RTT (`· 26ms`), `· 超时` after a failed probe, and nothing when never
+/// probed. It no longer uses the R73 right-aligned size cell (the tail shows on
+/// a narrow sidebar too).
 #[test]
 pub(crate) fn sidebar_connection_row_shows_latency() {
     let mut app = tree_app();
     app.term_w = 100;
     let id = app.selected.as_ref().unwrap().id.clone();
-    app.server_rtts.insert(id, Duration::from_millis(26));
+    app.server_rtts
+        .insert(id.clone(), Duration::from_millis(26));
+    assert_eq!(conn_rtt_tail(&app, &id).as_deref(), Some("· 26ms"));
+    // The old right-aligned latency cell is gone; the tail owns it now.
     assert_eq!(
-        side_row_size(&app, &SideRow::Conn { idx: 0, depth: 0 }).as_deref(),
-        Some("26ms")
+        side_row_size(&app, &SideRow::Conn { idx: 0, depth: 0 }),
+        None
     );
-    assert_eq!(
-        side_row_size(&app, &SideRow::Conn { idx: 1, depth: 0 }).as_deref(),
-        Some("-")
-    );
-    // A narrow sidebar hides the column entirely, exactly like the size cell.
+    // A never-probed connection shows nothing.
+    let other = side_root_cfg(&app, 1).unwrap().id.clone();
+    assert_eq!(conn_rtt_tail(&app, &other), None);
+    // A failed probe reads as a timeout (the reply handler drops any stale RTT).
+    app.conn_probe_failed.insert(other.clone());
+    assert_eq!(conn_rtt_tail(&app, &other).as_deref(), Some("· 超时"));
+    // A later success clears the failure mark and shows the fresh RTT.
+    app.conn_probe_failed.remove(&other);
+    app.server_rtts
+        .insert(other.clone(), Duration::from_millis(41));
+    assert_eq!(conn_rtt_tail(&app, &other).as_deref(), Some("· 41ms"));
+    // A narrow sidebar still shows the tail (the size column would be hidden).
     app.term_w = 42;
+    assert_eq!(conn_rtt_tail(&app, &id).as_deref(), Some("· 26ms"));
     assert_eq!(
         side_row_size(&app, &SideRow::Conn { idx: 0, depth: 0 }),
         None
@@ -10692,4 +10718,233 @@ pub(crate) fn r94_locate_and_summary_keys_are_in_footer_and_full_help() {
         HELP_ROWS.iter().any(|(k, _)| *k == "S"),
         "full help missing the numeric summary"
     );
+}
+
+/// R96:A2/C — the batch probe runs at most `limit` in flight and races each
+/// probe against the per-probe timeout; a timeout is counted as a failure, just
+/// like a driver error. Tested with an in-memory probe (no socket).
+#[test]
+pub(crate) fn r96_probe_batch_limits_concurrency_and_times_out() {
+    use std::sync::atomic::AtomicUsize;
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+
+    // 8 items, 4 in flight: the peak in-flight count must never exceed 4.
+    let inflight = Arc::new(AtomicUsize::new(0));
+    let peak = Arc::new(AtomicUsize::new(0));
+    let done = Arc::new(AtomicUsize::new(0));
+    let (i1, p1, d1) = (inflight.clone(), peak.clone(), done.clone());
+    let (ok, failed) = rt.block_on(probe_batch(
+        (0..8usize).collect::<Vec<_>>(),
+        4,
+        Duration::from_millis(300),
+        move |_i: usize| {
+            let (inf, pk) = (i1.clone(), p1.clone());
+            async move {
+                let cur = inf.fetch_add(1, Ordering::SeqCst) + 1;
+                pk.fetch_max(cur, Ordering::SeqCst);
+                tokio::time::sleep(Duration::from_millis(40)).await;
+                inf.fetch_sub(1, Ordering::SeqCst);
+                Ok(Duration::from_millis(40))
+            }
+        },
+        move |_i: &usize, _r| {
+            d1.fetch_add(1, Ordering::SeqCst);
+        },
+    ));
+    assert_eq!((ok, failed), (8, 0));
+    assert_eq!(done.load(Ordering::SeqCst), 8);
+    assert!(peak.load(Ordering::SeqCst) <= 4, "fan-out exceeded 4");
+
+    // A probe slower than the per-probe ceiling is a timeout (failure), not a
+    // hang: all three finish promptly and count as failed.
+    let (ok, failed) = rt.block_on(probe_batch(
+        (0..3usize).collect::<Vec<_>>(),
+        4,
+        Duration::from_millis(20),
+        |_i: usize| async move {
+            tokio::time::sleep(Duration::from_millis(2_000)).await;
+            Ok(Duration::from_millis(2_000))
+        },
+        |_i: &usize, _r| {},
+    ));
+    assert_eq!((ok, failed), (0, 3));
+}
+
+/// R96:A2 — a `Ctrl-P` full probe fills the tree tails live and summarises
+/// `N 条 · ok 通 · timeout 超时`; a failure clears any stale RTT.
+#[test]
+pub(crate) fn r96_full_probe_updates_tails_and_summary() {
+    run_rt(|| {
+        let (mut app, tx) = r87_tree_app();
+        // Three saved connections so the summary has something to count.
+        let c2 = test_conn("postgres");
+        let c3 = test_conn("redis");
+        app.connections.push(c2.clone());
+        app.connections.push(c3.clone());
+        let c1 = "id-mysql".to_string();
+
+        start_probe_all(&mut app, &tx);
+        assert_eq!(app.probe_all.map(|p| p.total), Some(3));
+        assert!(app.status.contains("0/3"), "{}", app.status);
+
+        apply_op_result(
+            &mut app,
+            OpResult::ProbeAllPartial {
+                id: c1.clone(),
+                rtt: Some(Duration::from_millis(7)),
+            },
+            &tx,
+        );
+        apply_op_result(
+            &mut app,
+            OpResult::ProbeAllPartial {
+                id: c2.id.clone(),
+                rtt: None,
+            },
+            &tx,
+        );
+        assert_eq!(app.probe_all.map(|p| p.done), Some(2));
+        assert!(app.status.contains("2/3"), "{}", app.status);
+        assert_eq!(conn_rtt_tail(&app, &c1).as_deref(), Some("· 7ms"));
+        assert_eq!(conn_rtt_tail(&app, &c2.id).as_deref(), Some("· 超时"));
+
+        apply_op_result(
+            &mut app,
+            OpResult::ProbeAllPartial {
+                id: c3.id.clone(),
+                rtt: Some(Duration::from_millis(30)),
+            },
+            &tx,
+        );
+        apply_op_result(
+            &mut app,
+            OpResult::ProbeAllDone {
+                total: 3,
+                ok: 2,
+                failed: 1,
+            },
+            &tx,
+        );
+        assert!(app.probe_all.is_none());
+        assert!(app.status.contains("3 条"), "{}", app.status);
+        assert!(app.status.contains("2 通"), "{}", app.status);
+        assert!(app.status.contains("1 超时"), "{}", app.status);
+        // Two are up, so the summary points at the latency view.
+        assert!(app.status.contains("O 按延迟排序"), "{}", app.status);
+    });
+}
+
+/// R96:B — `O` sorts the tree by cached RTT ascending (unprobed last) and again
+/// restores the original order; before any probe it is a no-op.
+#[test]
+pub(crate) fn r96_latency_sort_reorders_and_restores() {
+    let mut app = tree_app();
+    app.picker_open = false;
+    let id0 = side_root_cfg(&app, 0).unwrap().id.clone();
+    let id1 = side_root_cfg(&app, 1).unwrap().id.clone();
+    rebuild_side_rows(&mut app);
+    assert_eq!(app.side_rows[0], SideRow::Conn { idx: 0, depth: 0 });
+
+    // A no-op before any probe: the tree keeps its order and says so.
+    toggle_latency_sort(&mut app);
+    assert!(!app.latency_sort);
+    assert!(app.status.contains("尚未探测"), "{}", app.status);
+
+    app.server_rtts.insert(id0, Duration::from_millis(50));
+    app.server_rtts.insert(id1, Duration::from_millis(10));
+    toggle_latency_sort(&mut app);
+    assert!(app.latency_sort);
+    assert_eq!(app.side_rows[0], SideRow::Conn { idx: 1, depth: 0 });
+
+    toggle_latency_sort(&mut app);
+    assert!(!app.latency_sort);
+    assert_eq!(app.side_rows[0], SideRow::Conn { idx: 0, depth: 0 });
+
+    // The routing: `O` in the tree flips the view; a second one restores it.
+    run_rt(|| {
+        let (mut app, tx) = r87_tree_app();
+        app.server_rtts
+            .insert("id-mysql".into(), Duration::from_millis(5));
+        rebuild_side_rows(&mut app);
+        key(
+            &mut app,
+            &tx,
+            KeyEvent::new(KeyCode::Char('O'), KeyModifiers::SHIFT),
+        );
+        assert!(app.latency_sort);
+        key(
+            &mut app,
+            &tx,
+            KeyEvent::new(KeyCode::Char('O'), KeyModifiers::SHIFT),
+        );
+        assert!(!app.latency_sort);
+    });
+}
+
+/// R96:A2 keybinding decision — `Ctrl-P` on the connection panel starts the
+/// full probe; the editor keeps `Ctrl-P` for EXPLAIN (no probe is started).
+#[test]
+pub(crate) fn r96_ctrl_p_probes_all_on_the_panel_only() {
+    run_rt(|| {
+        let (mut app, tx) = r87_tree_app();
+        key(
+            &mut app,
+            &tx,
+            KeyEvent::new(KeyCode::Char('p'), KeyModifiers::CONTROL),
+        );
+        assert!(
+            app.probe_all.is_some(),
+            "panel Ctrl-P must start a full probe"
+        );
+        assert_eq!(app.probe_all.map(|p| p.total), Some(1));
+
+        // In the editor Ctrl-P is EXPLAIN, so no full probe is started.
+        let (mut app2, tx2) = r87_tree_app();
+        app2.focus = Focus::Editor;
+        key(
+            &mut app2,
+            &tx2,
+            KeyEvent::new(KeyCode::Char('p'), KeyModifiers::CONTROL),
+        );
+        assert!(app2.probe_all.is_none(), "editor Ctrl-P must not probe all");
+    });
+}
+
+/// R96:C — the new keys ship in the footer (which the mini sheet reuses) and in
+/// the full `?` sheet, all three at once.
+#[test]
+pub(crate) fn r96_keys_are_in_footer_mini_and_full_help() {
+    // Sidebar tree footer names both `Ctrl-P` and `O`.
+    let (app, _tx) = r87_tree_app();
+    let hints = footer_hints_ctx(footer_ctx_inner(&app, false));
+    let keys: Vec<&str> = hints.iter().map(|h| h.0).collect();
+    assert!(keys.contains(&"Ctrl-P"), "sidebar footer: {keys:?}");
+    assert!(keys.contains(&"O"), "sidebar footer: {keys:?}");
+    assert!(
+        hints
+            .iter()
+            .any(|h| h.0 == "Ctrl-P" && h.1 == t("探测全部")),
+        "sidebar footer label: {hints:?}"
+    );
+
+    // Picker footer names the full probe too.
+    let picker = footer_hints_ctx(FooterCtx {
+        view: FooterView::ConnPicker,
+        focus: Focus::Sidebar,
+        has_connection: false,
+    });
+    assert!(
+        picker.iter().any(|h| h.0 == "Ctrl-P"),
+        "picker footer: {picker:?}"
+    );
+
+    // Full cheat-sheet documents the probe, the ordering and the tail.
+    assert!(HELP_ROWS
+        .iter()
+        .any(|(k, _)| k.starts_with("Ctrl-P（连接面板）")));
+    assert!(HELP_ROWS.iter().any(|(k, _)| k.starts_with("O（连接树）")));
+    assert!(HELP_ROWS.iter().any(|(k, _)| k.starts_with("RTT 尾缀")));
 }

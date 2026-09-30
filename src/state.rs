@@ -1910,6 +1910,17 @@ impl MongoSizeSort {
     }
 }
 
+/// R96: progress of the explicit `Ctrl-P` full-list probe. `done` counts
+/// finished probes (success or timeout), `ok` / `failed` split them, so the
+/// status line can show "探测中 3/8" and the summary can report 7 通 · 1 超时.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+pub(crate) struct ProbeAll {
+    pub(crate) total: usize,
+    pub(crate) done: usize,
+    pub(crate) ok: usize,
+    pub(crate) failed: usize,
+}
+
 pub(crate) struct App {
     pub(crate) backend: Arc<LocalBackend>,
     pub(crate) page: Page,
@@ -2048,6 +2059,16 @@ pub(crate) struct App {
     /// id. Measured once (the same read, no extra query) and shown muted in the
     /// status bar; a failed probe leaves no entry, so nothing is reported.
     pub(crate) server_rtts: HashMap<String, Duration>,
+    /// R96: connection ids whose last explicit probe failed or timed out. Drives
+    /// the muted `· 超时` tail marker on the tree, so a dead link reads at a
+    /// glance instead of only when its row is probed; a later success clears it.
+    pub(crate) conn_probe_failed: HashSet<String>,
+    /// R96: live progress of the `Ctrl-P` full-list probe (`None` when idle).
+    /// Drives the "探测中 3/8" status line while it runs.
+    pub(crate) probe_all: Option<ProbeAll>,
+    /// R96: session-only latency ordering of the tree roots (`O` toggle). Purely
+    /// a re-projection of the same rows — never persisted, never a query.
+    pub(crate) latency_sort: bool,
     /// R63: recency panel ordering — most-recently-browsed first, or by name.
     pub(crate) recent_sort: RecentSort,
 

@@ -103,16 +103,11 @@ pub(crate) fn render_conn_picker(f: &mut Frame, area: Rect, app: &mut App) {
         .iter()
         .map(|c| {
             let color = connection_color(c);
-            // R73: the connect-time latency (R63 cache) sits right-aligned on
-            // every row; a connection never probed in this session shows `-`.
-            // Read from the session cache only, so the list never opens a
-            // socket or issues a probe.
-            let lat = app
-                .server_rtts
-                .get(&c.id)
-                .map(|d| format_rtt(*d))
-                .unwrap_or_else(|| "-".to_string());
-            let lat_field = format!("{:>6}", lat);
+            // R96: same tail as the tree — the cached RTT (`· 23ms`), a
+            // `· 超时` / `· timeout` marker after a failed probe, and nothing at
+            // all when this session never probed it. Read from the session
+            // cache only, so the list never opens a socket or issues a probe.
+            let lat_field = conn_rtt_tail(app, &c.id).unwrap_or_default();
             let name_w = inner_w.saturating_sub(11 + 1 + 1 + disp_width(&lat_field));
             let name = truncate_disp(&c.name, name_w.max(4));
             let used = 11 + 1 + disp_width(&name);
@@ -153,6 +148,7 @@ pub(crate) fn render_conn_picker(f: &mut Frame, area: Rect, app: &mut App) {
                         ("c", t("新建")),
                         ("p", t("复制")),
                         ("L", t("SQLite")),
+                        ("Ctrl-P", t("探测全部")),
                         ("s", t("排序")),
                         ("x", t("删除")),
                         ("q", t("显隐")),

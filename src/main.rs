@@ -151,6 +151,17 @@ const TRANSFER_COUNT_PROBE: u64 = 1_000_001;
 /// A data transfer is a long sequence of chunk reads and batched writes; the
 /// last-resort watchdog is generous (each statement keeps its 60 s timeout).
 const OP_WATCHDOG_TRANSFER: Duration = Duration::from_secs(3600);
+/// R96: the explicit `Ctrl-P` full-list probe runs one minimal packet per saved
+/// connection. At most this many are in flight at once, so probing a long list
+/// stays fast without flooding the server.
+const PROBE_CONCURRENCY: usize = 4;
+/// R96: per-connection ceiling for the full-list probe. A link slower than this
+/// is reported as `超时` / timeout and does not hold up the rest of the batch.
+const PROBE_TIMEOUT: Duration = Duration::from_secs(3);
+/// R96: last-resort watchdog for the full-list probe. With
+/// [`PROBE_CONCURRENCY`] and [`PROBE_TIMEOUT`] a batch takes at most
+/// `ceil(n / 4) * 3 s`; this covers a few hundred connections.
+const OP_WATCHDOG_PROBE_ALL: Duration = Duration::from_secs(600);
 /// R53: how many editor lines above / below the caret the passive bracket
 /// highlight reads. The pair is resolved inside this window only, so the cost of
 /// a frame never depends on the size of the buffer — a SQL file of any length
@@ -227,6 +238,12 @@ enum Op {
     /// automatically — this is the one place the browse redline allows a second
     /// query, and only on a deliberate keystroke.
     HealthProbe(Box<ConnectionConfig>),
+    /// R96: the explicit full-list probe (`Ctrl-P` on the connection panel) —
+    /// one minimal packet per saved connection, at most [`PROBE_CONCURRENCY`] in
+    /// flight and [`PROBE_TIMEOUT`] each. Streams a partial result per finished
+    /// connection so the tree tail and the progress line update live, then a
+    /// final summary. Still a deliberate keystroke — never a background poll.
+    ProbeAll(Vec<ConnectionConfig>),
     /// R43: enumerate a non-active connection's databases for the sidebar tree.
     /// `gen` is that connection's own request id, so only the newest reply for
     /// that root is kept.
@@ -491,6 +508,7 @@ impl Op {
             Op::GlobalSearch { .. } => OP_WATCHDOG_SEARCH,
             Op::DataDiff { .. } => OP_WATCHDOG_DATA_DIFF,
             Op::DataTransfer(_) => OP_WATCHDOG_TRANSFER,
+            Op::ProbeAll(_) => OP_WATCHDOG_PROBE_ALL,
             _ => OP_WATCHDOG_FALLBACK,
         }
     }
@@ -523,6 +541,20 @@ enum OpResult {
         name: String,
         rtt: Option<Duration>,
         error: Option<String>,
+    },
+    /// R96: one connection finished during the `Ctrl-P` full-list probe. Updates
+    /// the RTT cache / failure set and advances the progress line; it is a
+    /// side-channel message, so it never stops the spinner.
+    ProbeAllPartial {
+        id: String,
+        rtt: Option<Duration>,
+    },
+    /// R96: the full-list probe finished — the status bar summarises
+    /// `8 条 · 7 通 · 1 超时` (or the timeout count when some failed).
+    ProbeAllDone {
+        total: usize,
+        ok: usize,
+        failed: usize,
     },
     /// R48/R55: the parsed desktop sidebar groups plus the raw store value.
     /// The raw JSON is kept so a group rename / row move can patch just the
@@ -1351,6 +1383,54 @@ async fn probe_connection(
     .map(|_| started.elapsed())
 }
 
+/// R96: run one probe per item with a bounded fan-out and a per-probe
+/// ceiling. At most `limit` probes are in flight; each is raced against
+/// `per_timeout`, and a timeout becomes an `Err` just like a driver error, so
+/// the caller can count it. `on_done` fires as each probe finishes (whatever
+/// order), which is what drives the live progress line. Returns
+/// `(ok, failed)`. Generic over the item and the probe so it can be unit-tested
+/// without a socket.
+pub(crate) async fn probe_batch<T, P, Fut>(
+    items: Vec<T>,
+    limit: usize,
+    per_timeout: Duration,
+    probe: P,
+    mut on_done: impl FnMut(&T, Result<Duration, String>),
+) -> (usize, usize)
+where
+    T: Clone,
+    P: Fn(T) -> Fut,
+    Fut: std::future::Future<Output = Result<Duration, String>>,
+{
+    let mut stream = futures::stream::iter(items)
+        .map(|item| {
+            let fut = probe(item.clone());
+            async move {
+                let res = match tokio::time::timeout(per_timeout, fut).await {
+                    Ok(r) => r,
+                    Err(_) => Err(PROBE_TIMEOUT_SENTINEL.to_string()),
+                };
+                (item, res)
+            }
+        })
+        .buffer_unordered(limit.max(1));
+    let (mut ok, mut failed) = (0usize, 0usize);
+    while let Some((item, res)) = stream.next().await {
+        if res.is_ok() {
+            ok += 1;
+        } else {
+            failed += 1;
+        }
+        on_done(&item, res);
+    }
+    (ok, failed)
+}
+
+/// R96: the marker a per-probe timeout carries back from [`probe_connections`].
+/// Only used for unit tests / diagnostics — the UI turns any `Err` into the
+/// `· 超时` tail, so the exact text is never shown.
+pub(crate) const PROBE_TIMEOUT_SENTINEL: &str = "__probe_timeout__";
+
 async fn run_op(backend: &LocalBackend, op: Op, tx: &Tx) -> OpResult {
     match op {
         Op::ListConnections => match backend.load_connections().await {
@@ -1497,6 +1577,28 @@ async fn run_op(backend: &LocalBackend, op: Op, tx: &Tx) -> OpResult {
                     }),
                 },
             }
+        }
+        // R96: the explicit full-list probe. Streams a partial result per
+        // finished connection (so the tree tail and progress line update live),
+        // then returns the summary. A timeout at the per-probe ceiling is
+        // reported exactly like a driver error: both mean "this one did not
+        // answer in time".
+        Op::ProbeAll(cfgs) => {
+            let total = cfgs.len();
+            let (ok, failed) = probe_batch(
+                cfgs,
+                PROBE_CONCURRENCY,
+                PROBE_TIMEOUT,
+                |cfg: ConnectionConfig| async move { probe_connection(backend, &cfg).await },
+                |cfg, res| {
+                    let _ = tx.send(OpResult::ProbeAllPartial {
+                        id: cfg.id.clone(),
+                        rtt: res.ok(),
+                    });
+                },
+            )
+            .await;
+            OpResult::ProbeAllDone { total, ok, failed }
         }
         // R47b: pure registry reads. `is_connection_open` never opens a
         // connection, so the status refresh cannot itself change the state it
@@ -4514,6 +4616,9 @@ impl App {
             conn_connecting: HashSet::new(),
             server_versions: HashMap::new(),
             server_rtts: HashMap::new(),
+            conn_probe_failed: HashSet::new(),
+            probe_all: None,
+            latency_sort: false,
             recent_sort: RecentSort::Recent,
             side_rows: Vec::new(),
             side_sel: 0,
@@ -4934,6 +5039,7 @@ fn apply_op_result(app: &mut App, res: OpResult, tx: &Tx) {
             | OpResult::TransferProgress { .. }
             | OpResult::ConnStatus(_)
             | OpResult::SessionRun(_)
+            | OpResult::ProbeAllPartial { .. }
     ) {
         match res {
             // R47b: a background liveness refresh. The kernel is the source of
@@ -4945,6 +5051,29 @@ fn apply_op_result(app: &mut App, res: OpResult, tx: &Tx) {
                         app.conn_connecting.remove(&id);
                     }
                 }
+            }
+            // R96: one connection answered during the full-list probe. Refresh
+            // the RTT cache / failure set in place and advance the progress
+            // line, so the tree tail is correct the moment the packet lands.
+            OpResult::ProbeAllPartial { id, rtt } => {
+                match rtt {
+                    Some(d) => {
+                        app.server_rtts.insert(id.clone(), d);
+                        app.conn_probe_failed.remove(&id);
+                    }
+                    None => {
+                        app.server_rtts.remove(&id);
+                        app.conn_probe_failed.insert(id);
+                    }
+                }
+                let p = app.probe_all.get_or_insert_with(ProbeAll::default);
+                p.done = p.done.saturating_add(1);
+                if rtt.is_some() {
+                    p.ok = p.ok.saturating_add(1);
+                } else {
+                    p.failed = p.failed.saturating_add(1);
+                }
+                app.status = tf("探测中 {}/{}", &[&(p.done), &(p.total)]);
             }
             OpResult::SearchProgress { gen, done, total } => {
                 if gen == app.search_gen {
@@ -5170,13 +5299,36 @@ fn apply_op_result(app: &mut App, res: OpResult, tx: &Tx) {
             error,
         } => match rtt {
             Some(d) => {
-                app.server_rtts.insert(id, d);
+                app.server_rtts.insert(id.clone(), d);
+                app.conn_probe_failed.remove(&id);
                 app.status = tf("✓ {} 探测成功 · RTT {}", &[&name, &format_rtt(d)]);
             }
             None => {
+                app.server_rtts.remove(&id);
+                app.conn_probe_failed.insert(id);
                 app.status = tf("⚠ {} 探测失败：{}", &[&name, &error.unwrap_or_default()]);
             }
         },
+        // R96: the full-list probe finished — summarise it (and point at the
+        // temporary latency ordering now that there is something to order by).
+        // Handled in the side-channel block above; unreachable here, but the
+        // exhaustive match needs the arm.
+        OpResult::ProbeAllPartial { .. } => {}
+        OpResult::ProbeAllDone { total, ok, failed } => {
+            app.probe_all = None;
+            app.status = if failed == 0 {
+                tf("{} 条 · {} 通", &[&total, &ok])
+            } else {
+                tf("{} 条 · {} 通 · {} 超时", &[&total, &ok, &failed])
+            };
+            // Point at the latency view only when the tree is on screen — that
+            // is the one surface `O` reorders, so the picker never advertises a
+            // key it would ignore.
+            if app.selected.is_some() && app.server_rtts.len() > 1 {
+                app.status.push_str(" · ");
+                app.status.push_str(t("O 按延迟排序"));
+            }
+        }
         OpResult::Databases {
             databases: dbs,
             warning,

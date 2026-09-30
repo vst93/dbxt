@@ -881,6 +881,19 @@ pub(crate) fn browse_key(app: &mut App, tx: &Tx, k: KeyEvent) {
         return;
     }
 
+    // R96: Ctrl-P on the connection panel (the tree, or the picker while no
+    // connection is active) is the full-list probe — one minimal packet per
+    // saved connection. The editor keeps Ctrl-P for EXPLAIN; the two surfaces
+    // never overlap because only one pane owns the keyboard at a time.
+    if k.modifiers.contains(KeyModifiers::CONTROL)
+        && !k.modifiers.contains(KeyModifiers::ALT)
+        && k.code == KeyCode::Char('p')
+        && app.focus == Focus::Sidebar
+    {
+        start_probe_all(app, tx);
+        return;
+    }
+
     // Ctrl-P: run the editor's SQL through the dialect's EXPLAIN.
     if k.modifiers.contains(KeyModifiers::CONTROL)
         && !k.modifiers.contains(KeyModifiers::ALT)
@@ -1958,6 +1971,10 @@ pub(crate) fn sidebar_key(app: &mut App, tx: &Tx, k: KeyEvent) {
         // SSH tunnel included) and show the new root immediately (R45).
         KeyCode::Char('Y') => copy_connection_at_cursor(app, tx),
         KeyCode::Char('o') => back_to_picker(app),
+        // R96: `O` toggles the session-only latency ordering of the tree (no
+        // effect before a probe). Lowercase `o` stays "back to the picker", so
+        // the ordering takes the free uppercase sibling.
+        KeyCode::Char('O') => toggle_latency_sort(app),
         // R55: `r` on a connection root / group row renames it in place (Enter
         // saves, Esc cancels). On every other row the long-standing meaning —
         // open the selected table's structure — is unchanged.

@@ -215,6 +215,78 @@ pub(crate) fn probe_picker_connection(app: &mut App, tx: &Tx) {
     app.spawn(tx, Op::HealthProbe(Box::new(cfg)));
 }
 
+/// R96: `Ctrl-P` on the connection panel — probe every saved connection once
+/// (4 in flight, 3s each) and refresh the tree tails in one pass, instead of
+/// pressing `P` row by row. An explicit user action, so it is exempt from the
+/// zero-query browse redline; it never runs on a timer. A second `Ctrl-P` while
+/// one is running is ignored (the first batch is still authoritative).
+pub(crate) fn start_probe_all(app: &mut App, tx: &Tx) {
+    if app.probe_all.is_some() {
+        app.status = t("探测进行中…").into();
+        return;
+    }
+    let cfgs: Vec<ConnectionConfig> = app.connections.clone();
+    if cfgs.is_empty() {
+        app.status = t("没有可探测的连接").into();
+        return;
+    }
+    let total = cfgs.len();
+    app.probe_all = Some(ProbeAll {
+        total,
+        done: 0,
+        ok: 0,
+        failed: 0,
+    });
+    app.status = tf("探测中 0/{}", &[&total]);
+    app.spawn(tx, Op::ProbeAll(cfgs));
+}
+
+/// R96: the muted tail marker for a connection root — the cached RTT
+/// (`· 23ms`), a timeout marker after a failed probe (`· 超时`), or `None` when
+/// this session never probed it. Pure cache read: never opens a socket.
+pub(crate) fn conn_rtt_tail(app: &App, id: &str) -> Option<String> {
+    if let Some(d) = app.server_rtts.get(id) {
+        return Some(format!("· {}", format_rtt(*d)));
+    }
+    if app.conn_probe_failed.contains(id) {
+        return Some(format!("· {}", t("超时")));
+    }
+    None
+}
+
+/// R96: `O` — toggle the session-only latency ordering of the tree roots. Only
+/// meaningful once a probe (single `P` or the `Ctrl-P` batch) filled the cache;
+/// before that it reports and does nothing, so it can never silently reorder an
+/// unordered tree. Never persisted, never a query; the cursor follows the row
+/// it was on across the re-sort.
+pub(crate) fn toggle_latency_sort(app: &mut App) {
+    if !app.latency_sort && app.server_rtts.is_empty() {
+        app.status = t("尚未探测 · Ctrl-P 先探测全部连接").into();
+        return;
+    }
+    let hit = app
+        .side_rows
+        .get(app.side_sel)
+        .and_then(|r| side_row_hit(app, r));
+    app.latency_sort = !app.latency_sort;
+    rebuild_side_rows(app);
+    if let Some(hit) = hit {
+        if let Some(i) = app
+            .side_rows
+            .iter()
+            .position(|r| side_row_hit(app, r).as_ref() == Some(&hit))
+        {
+            app.side_sel = i;
+            side_mirror_table(app);
+        }
+    }
+    app.status = if app.latency_sort {
+        t("按延迟排序（会话内临时）· O 恢复原序").into()
+    } else {
+        t("已恢复原有顺序").into()
+    };
+}
+
 /// Where the user currently is, for the per-connection restore memory.
 pub(crate) fn snapshot_pointer(app: &App) -> ConnPointer {
     ConnPointer {
@@ -1836,6 +1908,16 @@ pub(crate) fn side_row_depth(r: &SideRow) -> usize {
 /// databases (or, for engines without a database layer, its tables) show
 /// immediately; other connections expand on demand and lazily load their
 /// database list, so a failure shows an error row instead of breaking the tree.
+/// R96: sort key for the latency view — cached RTTs first (ascending), then
+/// everything never probed this session. A stable sort keeps the original order
+/// among ties, so the view never shuffles rows that look equal.
+pub(crate) fn latency_sort_key(app: &App, idx: usize) -> (u8, u128) {
+    match side_root_cfg(app, idx).and_then(|c| app.server_rtts.get(&c.id)) {
+        Some(d) => (0, d.as_millis()),
+        None => (1, 0),
+    }
+}
+
 pub(crate) fn compute_side_rows(app: &App) -> Vec<SideRow> {
     let mut rows = Vec::new();
     if app.selected.is_none() {
@@ -1850,6 +1932,17 @@ pub(crate) fn compute_side_rows(app: &App) -> Vec<SideRow> {
     } else {
         app.table_filter.trim().to_lowercase()
     };
+    // R96: the session-only latency view (`O`) re-projects the same rows flat —
+    // groups are set aside and roots are ordered by the cached RTT (ascending,
+    // never-probed last). Purely a re-projection: no query, nothing persisted.
+    if app.latency_sort {
+        let mut order: Vec<usize> = (0..side_root_count(app)).collect();
+        order.sort_by_key(|&i| latency_sort_key(app, i));
+        for idx in order {
+            push_conn_subtree(app, idx, 0, &needle, searching, searching, &mut rows);
+        }
+        return rows;
+    }
     let mut placed: HashSet<usize> = HashSet::new();
     for group in &app.sidebar_layout.groups {
         rows.extend(build_group_rows(
