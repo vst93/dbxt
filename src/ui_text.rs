@@ -1104,7 +1104,14 @@ pub static ALL_KEYS: &[&str] = &[
     "切换表",
     "列 {} 不在当前视图（可能已隐藏）",
     "切换同库其他表：输入即过滤的浮层（复用最近表样式，↑↓/j/k 选），Enter 打开该表数据",
-    "列结构弹层：列名 / 类型 / 键(PRI/UNI/MUL) / 默认值 / 可空 / 注释（缓存元数据，不额外查库；/ 过滤列名；Enter 跳到该列）",
+    "列结构弹层：列名 / 类型 / 键(PRI/UNI/MUL) / 默认值 / 可空 / 注释；右侧就地显示选中列的值分布（非空/空/去重，数值列 min/max/avg；缓存元数据+已加载数据，不额外查库；/ 过滤列名；Enter 跳到该列）",
+    // R66: `gc` column value distribution (client-side, zero-query)
+    "值分布",
+    "值分布 · {}",
+    "打开表数据后可用",
+    "非空 {} · 空 {} · 去重 {}",
+    "（非数值列）",
+    "（按前 {} 行统计）",
     // R51: connection-form defaults / history counts / grid Home-End column reset
     "切换字段：db_type → name → host → port → user → password → database → query_timeout（开启 ssh_tunnel 后自动展开 SSH 段）",
     "查询超时秒数：留空=默认 60s，0=不限；PostgreSQL 同时以 statement_timeout 连接选项生效（连接级，不逐条查询）",
@@ -1394,9 +1401,17 @@ fn en_of(zh: &'static str) -> Option<&'static str> {
         "分组行无连接池：x 无动作（不会误进表过滤）" => Some(
             "A group row has no connection pool: x does nothing (it no longer leaks into the table filter)",
         ),
-        "列结构弹层：列名 / 类型 / 键(PRI/UNI/MUL) / 默认值 / 可空 / 注释（缓存元数据，不额外查库；/ 过滤列名；Enter 跳到该列）" => Some(
-            "Column-structure popup: name / type / key (PRI/UNI/MUL) / default / nullable / comment (cached metadata, no extra query; / filters by name; Enter jumps to that column)",
+        "列结构弹层：列名 / 类型 / 键(PRI/UNI/MUL) / 默认值 / 可空 / 注释；右侧就地显示选中列的值分布（非空/空/去重，数值列 min/max/avg；缓存元数据+已加载数据，不额外查库；/ 过滤列名；Enter 跳到该列）" => Some(
+            "Column-structure popup: name / type / key (PRI/UNI/MUL) / default / nullable / comment; the selected column's value distribution is shown in place (non-null/null/distinct; min/max/avg for a numeric column; cached metadata + loaded rows, no extra query; / filters by name; Enter jumps to that column)",
         ),
+        // ── R66: `gc` column value distribution (client-side, zero-query) ──
+        "值分布" => Some("Value distribution"),
+        "值分布 · {}" => Some("Value distribution · {}"),
+        "打开表数据后可用" => Some("Available after opening table data"),
+        "非空 {} · 空 {} · 去重 {}" => Some("non-null {} · null {} · distinct {}"),
+        "min {} · max {} · avg {}" => Some("min {} · max {} · avg {}"),
+        "（非数值列）" => Some("(non-numeric column)"),
+        "（按前 {} 行统计）" => Some("(stats over the first {} rows)"),
         "钉住 / 解除当前结果区（钉住后切换表/库仍显示，上下对照）" => Some(
             "Pin / unpin the current results pane (a pinned grid stays visible after switching tables/DBs, for up-and-down comparison)",
         ),

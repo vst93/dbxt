@@ -121,6 +121,14 @@ const SEARCH_MAX_HITS: usize = 500;
 /// is the highlight/jump list; beyond this many matches the list stops growing
 /// and the status bar says so. `DBXT_CELL_FIND_LIMIT` overrides it.
 const DEFAULT_CELL_FIND_LIMIT: usize = 500;
+/// R66: rows the `g c` popup's column-value stats scan. The stats are computed
+/// in place from the already-loaded page (never a query); a page larger than
+/// this is sampled to its first `COL_STATS_SCAN_LIMIT` rows and the popup says
+/// so instead of scanning unbounded data every frame.
+const COL_STATS_SCAN_LIMIT: usize = 5000;
+/// R66: minimum `g c` popup inner width for the stats to sit *beside* the column
+/// list; below it they stack under the list, so a phone still shows them.
+const COL_STATS_SIDE_MIN: usize = 64;
 /// A `.sql` file larger than this warns before its script is executed.
 const FILE_LOAD_WARN_BYTES: u64 = 2 * 1024 * 1024;
 /// Rows fetched per chunk from each side of a data compare. Small enough to
@@ -23527,6 +23535,165 @@ fn cols_popup_hits(app: &App) -> (usize, usize) {
     (hits, total)
 }
 
+/// R66: one column's distribution over the already-loaded rows. Everything here
+/// is derived in place from the page dbxt already holds — the popup never issues
+/// a query. `truncated` marks the case where the page was larger than
+/// [`COL_STATS_SCAN_LIMIT`] and only the first `scanned` rows were read.
+#[derive(Clone, Debug, PartialEq)]
+struct ColStats {
+    non_null: usize,
+    nulls: usize,
+    distinct: usize,
+    /// True when every non-null value parsed as a finite number.
+    numeric: bool,
+    min: f64,
+    max: f64,
+    avg: f64,
+    scanned: usize,
+    truncated: bool,
+}
+
+/// Parse one cell as a finite number for the stats. A blank, a non-numeric text
+/// or `inf` / `nan` all return `None`, so a text column never accidentally gains
+/// a `min` / `max`.
+fn parse_stat_num(s: &str) -> Option<f64> {
+    let t = s.trim();
+    if t.is_empty() {
+        return None;
+    }
+    let v: f64 = t.parse().ok()?;
+    v.is_finite().then_some(v)
+}
+
+/// R66: count the non-null / null / distinct values of one column and, when
+/// every non-null value is numeric, its min / max / average. `limit` bounds the
+/// scan (the loaded page is only ever a sample of a big table anyway).
+fn col_stats(grid: &Grid, col: usize, limit: usize) -> ColStats {
+    let scanned = grid.rows.len().min(limit);
+    let truncated = grid.rows.len() > scanned;
+    let mut non_null = 0usize;
+    let mut nulls = 0usize;
+    let mut distinct: HashSet<String> = HashSet::new();
+    let mut num_min = f64::INFINITY;
+    let mut num_max = f64::NEG_INFINITY;
+    let mut num_sum = 0.0f64;
+    let mut all_numeric = true;
+    for row in grid.rows.iter().take(scanned) {
+        match row.get(col) {
+            None | Some(Val::Null) => nulls += 1,
+            Some(Val::Text(s)) => {
+                non_null += 1;
+                distinct.insert(s.clone());
+                match parse_stat_num(s) {
+                    Some(v) => {
+                        num_min = num_min.min(v);
+                        num_max = num_max.max(v);
+                        num_sum += v;
+                    }
+                    None => all_numeric = false,
+                }
+            }
+        }
+    }
+    let numeric = non_null > 0 && all_numeric;
+    ColStats {
+        non_null,
+        nulls,
+        distinct: distinct.len(),
+        numeric,
+        min: if numeric { num_min } else { 0.0 },
+        max: if numeric { num_max } else { 0.0 },
+        avg: if numeric {
+            num_sum / non_null as f64
+        } else {
+            0.0
+        },
+        scanned,
+        truncated,
+    }
+}
+
+/// Render a float for the stats pane: an integer stays bare (`12`), a fraction
+/// keeps up to four decimals with the trailing zeros trimmed (`4.5`).
+fn fmt_stat_num(v: f64) -> String {
+    if !v.is_finite() {
+        return "—".into();
+    }
+    if v.fract() == 0.0 && v.abs() < 1e15 {
+        format!("{}", v as i64)
+    } else {
+        let s = format!("{v:.4}");
+        s.trim_end_matches('0').trim_end_matches('.').to_string()
+    }
+}
+
+/// R66: the stats for the popup's highlighted column. The lookup is name-based
+/// against the *unfiltered* grid (a column hidden by the picker still has data),
+/// and the whole scan is client-side. `None` means the column is not part of the
+/// loaded page at all.
+fn cols_popup_stats(app: &App, name: &str) -> Option<ColStats> {
+    let grid = full_grid(app)?;
+    let idx = col_index_by_name(&grid.columns, name)?;
+    Some(col_stats(&grid, idx, COL_STATS_SCAN_LIMIT))
+}
+
+/// R66: the stats pane's lines, clipped to `width`. An unknown column (no data
+/// loaded, or a metadata column absent from the page) degrades to an explicit
+/// hint instead of a blank pane.
+fn col_stats_lines(name: &str, stats: Option<&ColStats>, width: usize) -> Vec<Line<'static>> {
+    let title = if name.is_empty() {
+        t("值分布").to_string()
+    } else {
+        tf("值分布 · {}", &[&name])
+    };
+    let mut out: Vec<Line<'static>> = vec![Line::from(Span::styled(
+        truncate_disp(&title, width),
+        Style::default()
+            .fg(Color::Cyan)
+            .add_modifier(Modifier::BOLD),
+    ))];
+    match stats {
+        None => out.push(Line::from(Span::styled(
+            truncate_disp(t("打开表数据后可用"), width),
+            Style::default().fg(Color::DarkGray),
+        ))),
+        Some(s) => {
+            out.push(Line::from(truncate_disp(
+                &tf(
+                    "非空 {} · 空 {} · 去重 {}",
+                    &[&s.non_null, &s.nulls, &s.distinct],
+                ),
+                width,
+            )));
+            if s.numeric {
+                out.push(Line::from(truncate_disp(
+                    &tf(
+                        "min {} · max {} · avg {}",
+                        &[
+                            &fmt_stat_num(s.min),
+                            &fmt_stat_num(s.max),
+                            &fmt_stat_num(s.avg),
+                        ],
+                    ),
+                    width,
+                )));
+            } else {
+                out.push(Line::from(Span::styled(
+                    truncate_disp(t("（非数值列）"), width),
+                    Style::default().fg(Color::DarkGray),
+                )));
+            }
+            if s.truncated {
+                out.push(Line::from(Span::styled(
+                    truncate_disp(&tf("（按前 {} 行统计）", &[&s.scanned]), width),
+                    Style::default().fg(Color::DarkGray),
+                )));
+            }
+        }
+    }
+    out
+}
+
 /// Fixed widths for the popup table: the name and type columns are padded so the
 /// rows line up, while the key / default / flags / comment tail flows after them
 /// and is clipped last. A narrow terminal shrinks the type before the name (and
@@ -37323,7 +37490,36 @@ fn render_cols_popup(f: &mut Frame, area: Rect, app: &mut App) {
     } else {
         area.width.min(96)
     };
-    let (y, h) = overlay_list_box(rows.len().max(1), area);
+    let inner_w = w.saturating_sub(2) as usize;
+    // R66: the value stats follow the highlighted row. The lookup is client-side
+    // over the loaded page only; on a wide popup the stats sit in a right pane,
+    // on a phone they stack under the list.
+    let sel = app.cols_popup_sel.min(rows.len().saturating_sub(1));
+    let sel_name = rows.get(sel).map(|r| r.name.clone());
+    let stats = sel_name.as_deref().and_then(|n| cols_popup_stats(app, n));
+    let side_by_side = inner_w >= COL_STATS_SIDE_MIN && !rows.is_empty();
+    let stats_text_w = if side_by_side {
+        (inner_w / 3).clamp(18, 32)
+    } else {
+        inner_w.saturating_sub(2).max(8)
+    };
+    let stats_lines: Vec<Line> = if rows.is_empty() {
+        Vec::new()
+    } else {
+        col_stats_lines(
+            sel_name.as_deref().unwrap_or(""),
+            stats.as_ref(),
+            stats_text_w,
+        )
+    };
+    let total_lines = if stats_lines.is_empty() {
+        rows.len().max(1)
+    } else if side_by_side {
+        rows.len().max(1).max(stats_lines.len())
+    } else {
+        rows.len().max(1) + stats_lines.len() + 1
+    };
+    let (y, h) = overlay_list_box(total_lines, area);
     let x = area.x + (area.width.saturating_sub(w)) / 2;
     let box_area = Rect {
         x,
@@ -37332,19 +37528,6 @@ fn render_cols_popup(f: &mut Frame, area: Rect, app: &mut App) {
         height: h,
     };
     f.render_widget(Clear, box_area);
-    let inner_w = box_area.width.saturating_sub(2) as usize;
-    let inner_h = h.saturating_sub(2) as usize;
-    // R65: the highlighted row is a cursor now, so the scroll window follows it
-    // (and both stay clamped to the filtered list).
-    let sel = app.cols_popup_sel.min(rows.len().saturating_sub(1));
-    let max_scroll = rows.len().saturating_sub(inner_h.max(1)) as u16;
-    let mut scroll = app.cols_popup_scroll.min(max_scroll);
-    if sel < scroll as usize {
-        scroll = sel as u16;
-    } else if inner_h > 0 && sel >= scroll as usize + inner_h {
-        scroll = (sel + 1 - inner_h) as u16;
-    }
-    app.cols_popup_scroll = scroll.min(max_scroll);
     let table = app
         .table_meta
         .as_ref()
@@ -37362,13 +37545,93 @@ fn render_cols_popup(f: &mut Frame, area: Rect, app: &mut App) {
             &[&table, &rows.len(), &all_rows.len(), &needle],
         )
     };
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .title(fit_title(&full, t(" 列结构 · j/k · Esc "), box_area.width))
+        .border_set(border::ROUNDED)
+        .border_style(Style::default().fg(Color::Cyan));
+    let inner = block.inner(box_area);
+    f.render_widget(block, box_area);
+    // Split the interior. Side by side keeps the list and the stats visible at
+    // once; stacked reserves the bottom for the stats and lets the list scroll.
+    let (list_area, stats_area) = if stats_lines.is_empty() {
+        (inner, None)
+    } else if side_by_side {
+        let stats_area_w = stats_text_w + 2;
+        let list_w = inner_w.saturating_sub(stats_area_w + 1);
+        let list_area = Rect {
+            x: inner.x,
+            y: inner.y,
+            width: list_w as u16,
+            height: inner.height,
+        };
+        let sep_x = inner.x + list_w as u16;
+        f.render_widget(
+            Block::default()
+                .borders(Borders::LEFT)
+                .border_style(Style::default().fg(Color::DarkGray)),
+            Rect {
+                x: sep_x,
+                y: inner.y,
+                width: 1,
+                height: inner.height,
+            },
+        );
+        let stats_area = Rect {
+            x: sep_x + 2,
+            y: inner.y,
+            width: stats_text_w as u16,
+            height: inner.height,
+        };
+        (list_area, Some(stats_area))
+    } else {
+        let stats_h = stats_lines.len() as u16;
+        let list_h = inner.height.saturating_sub(stats_h + 1).max(1);
+        let list_area = Rect {
+            x: inner.x,
+            y: inner.y,
+            width: inner.width,
+            height: list_h,
+        };
+        let sep_y = inner.y + list_h;
+        f.render_widget(
+            Block::default()
+                .borders(Borders::TOP)
+                .border_style(Style::default().fg(Color::DarkGray)),
+            Rect {
+                x: inner.x,
+                y: sep_y,
+                width: inner.width,
+                height: 1,
+            },
+        );
+        let stats_area = Rect {
+            x: inner.x,
+            y: sep_y + 1,
+            width: inner.width,
+            height: inner.height.saturating_sub(list_h + 1),
+        };
+        (list_area, Some(stats_area))
+    };
+    // R65: the highlighted row is a cursor now, so the scroll window follows it
+    // (and both stay clamped to the filtered list).
+    let list_h = list_area.height as usize;
+    let max_scroll = rows.len().saturating_sub(list_h.max(1)) as u16;
+    let mut scroll = app.cols_popup_scroll.min(max_scroll);
+    if sel < scroll as usize {
+        scroll = sel as u16;
+    } else if list_h > 0 && sel >= scroll as usize + list_h {
+        scroll = (sel + 1 - list_h) as u16;
+    }
+    app.cols_popup_scroll = scroll.min(max_scroll);
+    let list_w = list_area.width as usize;
     let items: Vec<Line> = if rows.is_empty() {
         vec![Line::from(Span::styled(
             t("（没有匹配的列）").to_string(),
             Style::default().fg(Color::DarkGray),
         ))]
     } else {
-        let layout = cols_popup_layout(&rows, inner_w);
+        let layout = cols_popup_layout(&rows, list_w);
         rows.iter()
             .enumerate()
             .map(|(i, r)| {
@@ -37381,22 +37644,17 @@ fn render_cols_popup(f: &mut Frame, area: Rect, app: &mut App) {
                 } else {
                     Style::default()
                 };
-                Line::from(Span::styled(cols_popup_line(r, &layout, inner_w), style))
+                Line::from(Span::styled(cols_popup_line(r, &layout, list_w), style))
             })
             .collect()
     };
     f.render_widget(
-        Paragraph::new(items)
-            .block(
-                Block::default()
-                    .borders(Borders::ALL)
-                    .title(fit_title(&full, t(" 列结构 · j/k · Esc "), box_area.width))
-                    .border_set(border::ROUNDED)
-                    .border_style(Style::default().fg(Color::Cyan)),
-            )
-            .scroll((app.cols_popup_scroll, 0)),
-        box_area,
+        Paragraph::new(items).scroll((app.cols_popup_scroll, 0)),
+        list_area,
     );
+    if let Some(sa) = stats_area {
+        f.render_widget(Paragraph::new(stats_lines), sa);
+    }
 }
 
 fn render_col_picker(f: &mut Frame, area: Rect, app: &mut App) {
@@ -40650,7 +40908,7 @@ const HELP_ROWS: &[(&str, &str)] = &[
     ("g d / g t", "跳表结构视图 / 回表数据"),
     (
         "g c",
-        "列结构弹层：列名 / 类型 / 键(PRI/UNI/MUL) / 默认值 / 可空 / 注释（缓存元数据，不额外查库；/ 过滤列名；Enter 跳到该列）",
+        "列结构弹层：列名 / 类型 / 键(PRI/UNI/MUL) / 默认值 / 可空 / 注释；右侧就地显示选中列的值分布（非空/空/去重，数值列 min/max/avg；缓存元数据+已加载数据，不额外查库；/ 过滤列名；Enter 跳到该列）",
     ),
     (
         "g b",
@@ -48994,6 +49252,188 @@ mod tests {
         cols_popup_key(&mut app, KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
         assert!(app.cols_popup_open, "a missing column keeps the popup open");
         assert!(app.status.contains("不在当前视图"), "{}", app.status);
+    }
+
+    // ── R66: `gc` column value distribution (client-side stats) ──
+
+    /// R66: the stats count non-null / null / distinct and, when every non-null
+    /// value parses as a number, the min / max / average.
+    #[test]
+    fn col_stats_counts_nulls_distinct_and_numbers() {
+        let grid = Grid {
+            columns: vec!["n".into(), "s".into()],
+            rows: vec![
+                vec![Val::Text("1".into()), Val::Text("a".into())],
+                vec![Val::Text("2".into()), Val::Text("a".into())],
+                vec![Val::Text("2".into()), Val::Text("b".into())],
+                vec![Val::Null, Val::Null],
+                vec![Val::Text(" 3 ".into()), Val::Text(String::new())],
+            ],
+            note: String::new(),
+        };
+        let n = col_stats(&grid, 0, 100);
+        assert_eq!(n.non_null, 4);
+        assert_eq!(n.nulls, 1);
+        assert_eq!(n.distinct, 3);
+        assert!(n.numeric);
+        assert_eq!(n.min, 1.0);
+        assert_eq!(n.max, 3.0);
+        assert_eq!(n.avg, 2.0);
+        assert!(!n.truncated);
+
+        let s = col_stats(&grid, 1, 100);
+        assert_eq!(s.non_null, 4);
+        assert_eq!(s.nulls, 1);
+        assert_eq!(s.distinct, 3, "a, b and the empty string");
+        assert!(!s.numeric, "a text column has no min/max");
+
+        // A missing cell counts as null, like an explicit NULL.
+        let short = Grid {
+            columns: vec!["n".into()],
+            rows: vec![vec![Val::Text("1".into())], vec![]],
+            note: String::new(),
+        };
+        assert_eq!(col_stats(&short, 0, 100).nulls, 1);
+    }
+
+    /// R66: a page larger than the scan limit is sampled and flagged so the
+    /// popup can say "over the first N rows".
+    #[test]
+    fn col_stats_scan_limit_truncates() {
+        let grid = Grid {
+            columns: vec!["n".into()],
+            rows: (1..=5).map(|i| vec![Val::Text(i.to_string())]).collect(),
+            note: String::new(),
+        };
+        let s = col_stats(&grid, 0, 3);
+        assert!(s.truncated);
+        assert_eq!(s.scanned, 3);
+        assert_eq!(s.non_null, 3);
+        assert_eq!(s.min, 1.0);
+        assert_eq!(s.max, 3.0);
+        assert_eq!(s.avg, 2.0);
+
+        let full = col_stats(&grid, 0, 10);
+        assert!(!full.truncated);
+        assert_eq!(full.scanned, 5);
+        assert_eq!(full.max, 5.0);
+        assert_eq!(full.avg, 3.0);
+    }
+
+    /// R66: numbers format as bare integers or trimmed fractions.
+    #[test]
+    fn fmt_stat_num_trims_and_keeps_integers_bare() {
+        assert_eq!(fmt_stat_num(12.0), "12");
+        assert_eq!(fmt_stat_num(4.5), "4.5");
+        assert_eq!(fmt_stat_num(1.0 / 3.0), "0.3333");
+        assert_eq!(fmt_stat_num(-0.25), "-0.25");
+    }
+
+    /// R66: the stats lines show the counts, a numeric tail, the non-numeric
+    /// note or the no-data hint, and the sample note when truncated.
+    #[test]
+    fn col_stats_lines_cover_each_state() {
+        let num = ColStats {
+            non_null: 4,
+            nulls: 1,
+            distinct: 3,
+            numeric: true,
+            min: 1.0,
+            max: 3.0,
+            avg: 2.0,
+            scanned: 5,
+            truncated: false,
+        };
+        let joined = col_stats_lines("total", Some(&num), 40)
+            .iter()
+            .map(|l| l.to_string())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(joined.contains("值分布 · total"), "{joined}");
+        assert!(joined.contains("非空 4"), "{joined}");
+        assert!(joined.contains("min 1 · max 3 · avg 2"), "{joined}");
+
+        let text = ColStats {
+            numeric: false,
+            truncated: true,
+            scanned: 5000,
+            ..num.clone()
+        };
+        let joined = col_stats_lines("name", Some(&text), 40)
+            .iter()
+            .map(|l| l.to_string())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(joined.contains("（非数值列）"), "{joined}");
+        assert!(joined.contains("（按前 5000 行统计）"), "{joined}");
+
+        let none = col_stats_lines("name", None, 40)
+            .iter()
+            .map(|l| l.to_string())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(none.contains("打开表数据后可用"), "{none}");
+    }
+
+    /// R66: the popup draws the value stats — beside the list on a wide terminal,
+    /// stacked under it on a phone — and hints when no data is loaded.
+    #[test]
+    fn cols_popup_renders_value_stats() {
+        let mut app = test_app();
+        app.picker_open = false;
+        app.selected = Some(test_conn("mysql"));
+        app.backend_kind = Backend::Sql;
+        app.grid_kind = GridKind::TableData;
+        app.set_grid(Grid {
+            columns: vec!["total".into(), "note".into()],
+            rows: vec![
+                vec![Val::Text("10".into()), Val::Text("a".into())],
+                vec![Val::Text("20".into()), Val::Text("b".into())],
+                vec![Val::Null, Val::Text("a".into())],
+            ],
+            note: String::new(),
+        });
+        app.table_meta = Some(TableMeta {
+            table: "orders".into(),
+            schema: String::new(),
+            columns: vec![col_info("total", "int"), col_info("note", "text")],
+            indexes: Vec::new(),
+        });
+        open_cols_popup(&mut app);
+        // CJK glyphs occupy two cells, so compare on a whitespace-stripped copy.
+        let compact = |rows: Vec<String>| -> String {
+            rows.join("\n")
+                .chars()
+                .filter(|c| !c.is_whitespace())
+                .collect()
+        };
+        // Wide: the stats sit in a right pane.
+        let wide = compact(draw(&mut app, 110, 30));
+        assert!(wide.contains("值分布·total"), "{wide}");
+        assert!(wide.contains("min10·max20"), "{wide}");
+        assert!(wide.contains("avg15"), "{wide}");
+        // `j` moves to the text column: the counts stay, the numeric tail turns
+        // into a non-numeric note.
+        cols_popup_key(
+            &mut app,
+            KeyEvent::new(KeyCode::Char('j'), KeyModifiers::NONE),
+        );
+        let wide2 = compact(draw(&mut app, 110, 30));
+        assert!(wide2.contains("值分布·note"), "{wide2}");
+        assert!(wide2.contains("（非数值列）"), "{wide2}");
+        // Phone: the same stats stack under the list (both stay on screen).
+        let phone = compact(draw(&mut app, 42, 22));
+        assert!(phone.contains("值分布·note"), "{phone}");
+        assert!(phone.contains("非空3"), "{phone}");
+
+        // No loaded data: the popup still opens from the cached metadata and
+        // hints instead of showing an empty stats pane.
+        app.cols_popup_open = false;
+        app.clear_grid();
+        open_cols_popup(&mut app);
+        assert!(app.cols_popup_open);
+        let empty = compact(draw(&mut app, 110, 30));
+        assert!(empty.contains("打开表数据后可用"), "{empty}");
     }
 
     /// R65: `g b` opens a type-to-filter table switcher over the current
