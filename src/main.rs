@@ -4107,7 +4107,7 @@ impl App {
     ) -> Self {
         let config_compact = config.compact;
         let config_num_fmt = config.num_fmt.unwrap_or_default();
-        let config_stripe = config.stripe.unwrap_or(true);
+        let config_stripe = config.stripe.unwrap_or(false);
         let mut app = Self {
             backend,
             page: Page::Browse,

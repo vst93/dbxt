@@ -1307,11 +1307,11 @@ pub(crate) const HELP_ROWS: &[(&str, &str)] = &[
     ),
     (
         "#",
-        "大数字显示：原样 → 千分位 → 缩写 三档循环（1,234,567 / 1.2M；仅数字列，复制 / 编辑仍用原值，跨会话记住）",
+        "大数字显示：原样 → 千分位 → 缩写 三档循环（1,234,567 / 1.2M；仅数字列，复制 / 编辑仍用原值）· 默认关闭，# 手动开启，跨会话记住",
     ),
     (
         "%",
-        "斑马纹：结果集奇偶行底色微差 开 / 关（默认开，跨会话记住）",
+        "斑马纹：结果集奇偶行底色微差 开 / 关 · 默认关闭，% 手动开启，跨会话记住",
     ),
     (
         "< / > / 0",
@@ -2054,7 +2054,7 @@ pub(crate) fn render_help_mini(f: &mut Frame, area: Rect, app: &mut App) {
     // sheet; drop the pinned `?` hint and cap at ten.
     let hints: Vec<Hint> = footer_hints_ctx(footer_ctx_inner(app, false))
         .into_iter()
-        .filter(|h| h.0 != "?")
+        .filter(|h| h.0 != "?" && h.0 != "F1")
         .take(10)
         .collect();
     let key_w = hints

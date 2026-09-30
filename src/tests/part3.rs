@@ -272,7 +272,7 @@ pub(crate) fn footer_keeps_help_visible_and_fits() {
     assert_eq!(*hints.last().unwrap(), ("?", "help"));
     for width in [42usize, 60, 80, 110] {
         let (chosen, more) = footer_select(&hints, width);
-        let line_w = footer_line_width(&chosen, more);
+        let line_w = footer_line_width(&chosen, more, "?");
         assert!(
             line_w <= width,
             "width {width}: line {line_w} chosen {chosen:?}"
@@ -283,7 +283,7 @@ pub(crate) fn footer_keeps_help_visible_and_fits() {
     let (chosen, more) = footer_select(&hints, 10);
     assert!(chosen.is_empty());
     assert!(more);
-    assert!(footer_line_width(&chosen, more) <= 10);
+    assert!(footer_line_width(&chosen, more, "?") <= 10);
 }
 
 /// The width tiers cap the hint count so a small screen only shows the
@@ -316,8 +316,32 @@ pub(crate) fn footer_tiers_cap_hints_by_width() {
     assert_eq!(full.len(), 12);
     assert!(!more);
     // The pinned hint's label flips to `更多` when anything is hidden.
-    assert_eq!(footer_help_hint(true).1, t("更多"));
-    assert_eq!(footer_help_hint(false).1, t("帮助"));
+    assert_eq!(footer_help_hint(true, "?").1, t("更多"));
+    assert_eq!(footer_help_hint(false, "?").1, t("帮助"));
+}
+
+/// R78: the pinned help hint names the key that actually opens help in the
+/// current focus. `?` is a literal character in the editor and the command
+/// line (R70 moved invocation to F1), so the hint must say `F1` there.
+#[test]
+pub(crate) fn footer_help_key_names_the_context_key() {
+    assert_eq!(footer_help_key(Focus::Editor), "F1");
+    assert_eq!(footer_help_key(Focus::CmdInput), "F1");
+    assert_eq!(footer_help_key(Focus::Sidebar), "?");
+    assert_eq!(footer_help_key(Focus::Preview), "?");
+
+    let pinned = |focus| {
+        *footer_hints_ctx(FooterCtx {
+            view: FooterView::Browse,
+            focus,
+            has_connection: true,
+        })
+        .last()
+        .expect("footer always pins a help hint")
+    };
+    assert_eq!(pinned(Focus::Editor), ("F1", t("帮助")));
+    assert_eq!(pinned(Focus::CmdInput), ("F1", t("帮助")));
+    assert_eq!(pinned(Focus::Preview), ("?", t("帮助")));
 }
 
 /// `?` opens a context mini sheet first; a second `?` promotes to the full,
@@ -6142,7 +6166,7 @@ pub(crate) fn buffer_text(buf: &ratatui::buffer::Buffer) -> String {
 
 #[test]
 pub(crate) fn numfmt_cycles_groups_and_abbreviates() {
-    assert_eq!(NumFmt::default(), NumFmt::Thousands);
+    assert_eq!(NumFmt::default(), NumFmt::Original);
     assert_eq!(NumFmt::Original.next(), NumFmt::Thousands);
     assert_eq!(NumFmt::Thousands.next(), NumFmt::Abbrev);
     assert_eq!(NumFmt::Abbrev.next(), NumFmt::Original);
@@ -6311,6 +6335,40 @@ pub(crate) fn stripe_bands_alternate_rows_and_can_be_disabled() {
     }
 }
 
+/// R78: zebra banding and big-number formatting are both opt-in now. A missing
+/// `tui.json` value means off / raw, while an explicit value still wins.
+#[test]
+pub(crate) fn stripe_and_numfmt_default_to_off_and_honour_explicit_config() {
+    // No persisted pref: banding off, numbers exactly as the driver sent them.
+    let cfg = TuiConfig::default();
+    assert_eq!(cfg.stripe, None);
+    let app = App::new(test_backend(), cfg, None, false, None, DragPan::Off);
+    assert!(!app.stripe, "zebra stripes default off");
+    assert_eq!(app.num_fmt, NumFmt::Original, "numbers default to raw");
+
+    // An explicit `tui.json` value is still honoured, both ways.
+    let on = TuiConfig {
+        stripe: Some(true),
+        ..TuiConfig::default()
+    };
+    let app_on = App::new(test_backend(), on, None, false, None, DragPan::Off);
+    assert!(app_on.stripe, "explicit stripe=true wins");
+
+    let off = TuiConfig {
+        stripe: Some(false),
+        ..TuiConfig::default()
+    };
+    let app_off = App::new(test_backend(), off, None, false, None, DragPan::Off);
+    assert!(!app_off.stripe, "explicit stripe=false wins");
+
+    let grouped = TuiConfig {
+        num_fmt: Some(NumFmt::Thousands),
+        ..TuiConfig::default()
+    };
+    let app_grouped = App::new(test_backend(), grouped, None, false, None, DragPan::Off);
+    assert_eq!(app_grouped.num_fmt, NumFmt::Thousands);
+}
+
 #[test]
 pub(crate) fn hash_and_percent_keys_cycle_display_and_flash() {
     let (tx, _rx) = tokio::sync::mpsc::unbounded_channel::<OpResult>();
@@ -6355,15 +6413,9 @@ pub(crate) fn hash_and_percent_keys_cycle_display_and_flash() {
         app.status
     );
 
-    // `%` toggles the stripes and flashes the bilingual state.
-    assert!(app.stripe, "the stripe switch defaults on");
-    key(
-        &mut app,
-        &tx,
-        KeyEvent::new(KeyCode::Char('%'), KeyModifiers::NONE),
-    );
-    assert!(!app.stripe);
-    assert_eq!(app.status, t("斑马纹 关（% 开启）"));
+    // `%` toggles the stripes and flashes the bilingual state. The default is
+    // now off (R78), so the first press turns them on.
+    assert!(!app.stripe, "the stripe switch defaults off");
     key(
         &mut app,
         &tx,
@@ -6371,6 +6423,13 @@ pub(crate) fn hash_and_percent_keys_cycle_display_and_flash() {
     );
     assert!(app.stripe);
     assert_eq!(app.status, t("斑马纹 开（% 关闭）"));
+    key(
+        &mut app,
+        &tx,
+        KeyEvent::new(KeyCode::Char('%'), KeyModifiers::NONE),
+    );
+    assert!(!app.stripe);
+    assert_eq!(app.status, t("斑马纹 关（% 开启）"));
 }
 
 #[test]

@@ -559,10 +559,10 @@ pub static ALL_KEYS: &[&str] = &[
     "千分位",
     "缩写",
     "大数字显示 · {}",
-    "大数字显示：原样 → 千分位 → 缩写 三档循环（1,234,567 / 1.2M；仅数字列，复制 / 编辑仍用原值，跨会话记住）",
+    "大数字显示：原样 → 千分位 → 缩写 三档循环（1,234,567 / 1.2M；仅数字列，复制 / 编辑仍用原值）· 默认关闭，# 手动开启，跨会话记住",
     "斑马纹 开（% 关闭）",
     "斑马纹 关（% 开启）",
-    "斑马纹：结果集奇偶行底色微差 开 / 关（默认开，跨会话记住）",
+    "斑马纹：结果集奇偶行底色微差 开 / 关 · 默认关闭，% 手动开启，跨会话记住",
     "结构",
     "结果",
     "结果 {}/{}",
@@ -2525,13 +2525,13 @@ fn en_of(zh: &'static str) -> Option<&'static str> {
         "千分位" => Some("Thousands"),
         "缩写" => Some("Abbrev"),
         "大数字显示 · {}" => Some("Big numbers · {}"),
-        "大数字显示：原样 → 千分位 → 缩写 三档循环（1,234,567 / 1.2M；仅数字列，复制 / 编辑仍用原值，跨会话记住）" => Some(
-            "Big-number display: raw → thousands → abbreviated (1,234,567 / 1.2M); numeric columns only, copy / edit still use the raw value, remembered across sessions",
+        "大数字显示：原样 → 千分位 → 缩写 三档循环（1,234,567 / 1.2M；仅数字列，复制 / 编辑仍用原值）· 默认关闭，# 手动开启，跨会话记住" => Some(
+            "Big-number display: raw → thousands → abbreviated (1,234,567 / 1.2M); numeric columns only, copy / edit still use the raw value · off by default, press `#` to enable, remembered across sessions",
         ),
         "斑马纹 开（% 关闭）" => Some("Zebra stripes on (% to turn off)"),
         "斑马纹 关（% 开启）" => Some("Zebra stripes off (% to turn on)"),
-        "斑马纹：结果集奇偶行底色微差 开 / 关（默认开，跨会话记住）" => Some(
-            "Zebra stripes: a subtle tint on alternate result rows, on/off (on by default, remembered across sessions)",
+        "斑马纹：结果集奇偶行底色微差 开 / 关 · 默认关闭，% 手动开启，跨会话记住" => Some(
+            "Zebra stripes: a subtle tint on alternate result rows, on/off · off by default, press `%` to enable, remembered across sessions",
         ),
         "结构" => Some("structure"),
         "结果" => Some("results"),

@@ -1284,8 +1284,10 @@ pub(crate) fn footer_hints_ctx(ctx: FooterCtx) -> Vec<Hint> {
             ],
         },
     };
-    // The help key is the one hint that is never dropped.
-    v.push(("?", t("帮助")));
+    // The help key is the one hint that is never dropped; in the two text
+    // entry contexts `?` is a literal character, so the pinned hint names F1
+    // there (matching the R70 invocation key).
+    v.push((footer_help_key(ctx.focus), t("帮助")));
     v
 }
 
@@ -1327,13 +1329,23 @@ pub(crate) fn footer_tier_cap(tier: FooterTier) -> Option<usize> {
     }
 }
 
+/// The key that opens help in a given focus. `?` is a literal character inside
+/// the editor and the command line (R70 moved invocation to F1), so the pinned
+/// hint must name `F1` there and `?` everywhere else.
+pub(crate) fn footer_help_key(focus: Focus) -> &'static str {
+    match focus {
+        Focus::Editor | Focus::CmdInput => "F1",
+        _ => "?",
+    }
+}
+
 /// The pinned final hint. When the tier hid some keys the label invites a second
 /// look (`? 更多`) rather than merely naming the help overlay.
-pub(crate) fn footer_help_hint(more: bool) -> Hint {
+pub(crate) fn footer_help_hint(more: bool, key: &'static str) -> Hint {
     if more {
-        ("?", t("更多"))
+        (key, t("更多"))
     } else {
-        ("?", t("帮助"))
+        (key, t("帮助"))
     }
 }
 
@@ -1369,8 +1381,8 @@ pub(crate) fn footer_select<'a>(hints: &'a [Hint], width: usize) -> (Vec<&'a Hin
 /// Display width of the rendered footer line for a chosen set, used by tests.
 /// Mirrors exactly what [`render_footer`] draws: the chosen hints, the pinned
 /// help hint (whose label depends on `more`), and one `" · "` per gap.
-pub(crate) fn footer_line_width(chosen: &[&Hint], more: bool) -> usize {
-    let help = footer_help_hint(more);
+pub(crate) fn footer_line_width(chosen: &[&Hint], more: bool, key: &'static str) -> usize {
+    let help = footer_help_hint(more, key);
     let w: usize = chosen.iter().map(|h| hint_width(h)).sum::<usize>() + hint_width(&help);
     w + chosen.len() * 3
 }
@@ -1378,7 +1390,7 @@ pub(crate) fn footer_line_width(chosen: &[&Hint], more: bool) -> usize {
 pub(crate) fn render_footer(f: &mut Frame, area: Rect, app: &App) {
     let hints = footer_hints(app);
     let (chosen, more) = footer_select(&hints, area.width as usize);
-    let help = footer_help_hint(more);
+    let help = footer_help_hint(more, footer_help_key(app.focus));
     let mut spans: Vec<Span> = Vec::new();
     let sep = Span::styled(" · ", Style::default().fg(Color::DarkGray));
     let key_style = Style::default()

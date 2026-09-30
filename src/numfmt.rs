@@ -16,9 +16,10 @@ use crate::prelude::*;
 /// large value to a base-1000 suffix (`1.2M`). Persisted in `tui.json`.
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
 pub(crate) enum NumFmt {
-    Original,
-    /// The default: readability first, and the value stays recognisable.
+    /// The default: the driver's own text, with no grouping or shortening.
     #[default]
+    Original,
+    /// Readability first, and the value stays recognisable.
     Thousands,
     Abbrev,
 }
