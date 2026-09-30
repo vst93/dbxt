@@ -2179,10 +2179,28 @@ pub(crate) fn spawn_table_page(app: &mut App, tx: &Tx, page: usize) {
     }
     app.page_pending = true;
     app.loading = true;
-    app.status = tf(
-        "加载 {} 第 {} 页…",
-        &[&(fix_double_encoding(&ps.table)), &(page + 1)],
-    );
+    // R84: the page load already refreshes the status in place; add the absolute
+    // row window so a deep page reads as a batch ("第 21-40 行") without
+    // touching the load logic itself (pure status text).
+    let from = page * ps.page_size + 1;
+    let mut to = from + ps.page_size - 1;
+    let mut show_window = true;
+    match ps.total {
+        Some(0) => show_window = false,
+        Some(total) => to = to.min(total as usize),
+        None => {}
+    }
+    app.status = if show_window && to >= from {
+        tf(
+            "加载 {} 第 {} 页…（第 {}-{} 行）",
+            &[&(fix_double_encoding(&ps.table)), &(page + 1), &from, &to],
+        )
+    } else {
+        tf(
+            "加载 {} 第 {} 页…",
+            &[&(fix_double_encoding(&ps.table)), &(page + 1)],
+        )
+    };
     let known = app.cached_count(&app.current_db(), &ps.schema, &ps.table, &ps.filter);
     app.page_gen += 1;
     let gen = app.page_gen;

@@ -393,7 +393,7 @@ pub(crate) fn history_key(app: &mut App, tx: &Tx, k: KeyEvent) {
             app.status = tf("已回填历史语句（{} 字符）", &[&(sql.chars().count())]);
         }
         KeyCode::Char('f') => history_toggle_favorite(app, tx),
-        KeyCode::Char('y') => {
+        KeyCode::Char('y') | KeyCode::Char('Y') => {
             let Some(row) = history_selected_row(app) else {
                 app.status = t("没有可复制的历史").into();
                 return;
@@ -415,6 +415,12 @@ pub(crate) fn history_key(app: &mut App, tx: &Tx, k: KeyEvent) {
                 app.status = t("没有可删除的历史").into();
                 return;
             };
+            // R84: session rows live in memory only, so there is nothing to
+            // delete from the store; they clear themselves when dbxt exits.
+            if row.session {
+                app.status = t("会话记录仅在内存中（退出即清空），无需删除").into();
+                return;
+            }
             app.history_confirm = Some(HistoryConfirm {
                 id: row.id.clone(),
                 sql: row.sql.clone(),

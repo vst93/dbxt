@@ -611,6 +611,10 @@ enum OpResult {
     },
     Query(Box<dbx_core::db::QueryResult>, String, usize),
     Script(Vec<StmtOutcome>),
+    /// R84: one statement dbxt itself just sent to the server (success or
+    /// failure), for the in-memory session run log the Alt-H panel shows at the
+    /// top. Client-side bookkeeping only; never persisted and triggers no query.
+    SessionRun(Box<SessionRun>),
     Redis(String),
     Mongo(String),
     RedisKeys {
@@ -846,6 +850,27 @@ async fn record_history(
         mcp_session_id: None,
     };
     let _ = backend.state().storage.save_history_entry(&entry).await;
+}
+
+/// R84: wrap a just-finished server run as a [`OpResult::SessionRun`] message so
+/// the UI thread can push it onto the in-memory session log. Kept separate from
+/// [`record_history`] (which persists to DBX's store) so a storage hiccup can
+/// never cost the session log, and vice versa.
+fn session_run_msg(
+    sql: &str,
+    duration_ms: u64,
+    success: bool,
+    origin: &'static str,
+    connection_name: &str,
+) -> OpResult {
+    OpResult::SessionRun(Box::new(SessionRun {
+        sql: sql.to_string(),
+        executed_at: now_iso8601(),
+        duration_ms,
+        success,
+        origin,
+        connection_name: connection_name.to_string(),
+    }))
 }
 
 fn note_of(r: &dbx_core::db::QueryResult) -> String {
@@ -1746,6 +1771,8 @@ async fn run_op(backend: &LocalBackend, op: Op, tx: &Tx) -> OpResult {
                         }
                         if record {
                             record_history(backend, &cfg, &db, &sql, None, total_ms, origin).await;
+                            let _ =
+                                tx.send(session_run_msg(&sql, total_ms, true, origin, &cfg.name));
                         }
                         OpResult::Script(outcomes)
                     }
@@ -1753,6 +1780,7 @@ async fn run_op(backend: &LocalBackend, op: Op, tx: &Tx) -> OpResult {
                         if record {
                             record_history(backend, &cfg, &db, &sql, Some(e.clone()), 0, origin)
                                 .await;
+                            let _ = tx.send(session_run_msg(&sql, 0, false, origin, &cfg.name));
                         }
                         OpResult::Error(format!("script: {}", query_error_text(&e, timeout)))
                     }
@@ -1774,6 +1802,13 @@ async fn run_op(backend: &LocalBackend, op: Op, tx: &Tx) -> OpResult {
                                 origin,
                             )
                             .await;
+                            let _ = tx.send(session_run_msg(
+                                &sql,
+                                r.execution_time_ms as u64,
+                                true,
+                                origin,
+                                &cfg.name,
+                            ));
                         }
                         OpResult::Query(Box::new(r), sql, cap)
                     }
@@ -1781,6 +1816,7 @@ async fn run_op(backend: &LocalBackend, op: Op, tx: &Tx) -> OpResult {
                         if record {
                             record_history(backend, &cfg, &db, &sql, Some(e.clone()), 0, origin)
                                 .await;
+                            let _ = tx.send(session_run_msg(&sql, 0, false, origin, &cfg.name));
                         }
                         OpResult::Error(format!("query: {}", query_error_text(&e, timeout)))
                     }
@@ -2123,9 +2159,10 @@ async fn run_op(backend: &LocalBackend, op: Op, tx: &Tx) -> OpResult {
                 .await
             {
                 Ok(entries) => {
-                    // Newest first (DBX returns descending order). Repeated
-                    // statements are merged by `merge_history_rows` below, which
-                    // keeps one row per statement and counts the repeats (`×n`).
+                    // Newest first (DBX returns descending order). The rows stay
+                    // *raw* (unmerged) here: `App::rebuild_history_rows` merges
+                    // them with the in-memory session log in one pass, so the
+                    // `×n` repeat counts survive (R84).
                     let mut raw: Vec<HistoryRow> = Vec::new();
                     for e in entries {
                         let sql = e.sql.trim().to_string();
@@ -2145,12 +2182,13 @@ async fn run_op(backend: &LocalBackend, op: Op, tx: &Tx) -> OpResult {
                             },
                             origin: history_origin_from_details(e.details_json.as_deref()),
                             count: 1,
+                            session: false,
                         });
                         if raw.len() >= 300 {
                             break;
                         }
                     }
-                    let rows = merge_history_rows(raw);
+                    let rows = raw;
                     let favorites = match backend.state().storage.load_saved_sql_library().await {
                         Ok(lib) => lib
                             .files
@@ -4225,6 +4263,8 @@ impl App {
             history_open: false,
             history_list: ListState::default(),
             history_rows: Vec::new(),
+            history_persisted: Vec::new(),
+            session_runs: Vec::new(),
             history_favorites: HashSet::new(),
             history_needle: String::new(),
             history_filter: None,
@@ -4602,6 +4642,7 @@ fn apply_op_result(app: &mut App, res: OpResult, tx: &Tx) {
             | OpResult::DataDiffProgress { .. }
             | OpResult::TransferProgress { .. }
             | OpResult::ConnStatus(_)
+            | OpResult::SessionRun(_)
     ) {
         match res {
             // R47b: a background liveness refresh. The kernel is the source of
@@ -4639,6 +4680,14 @@ fn apply_op_result(app: &mut App, res: OpResult, tx: &Tx) {
             }
             OpResult::QueryProgress { done, total } => {
                 app.status = tf("执行中… {}/{}", &[&done, &total]);
+            }
+            OpResult::SessionRun(run) => {
+                // R84: in-memory session log (Alt-H panel, zero query). Rebuild
+                // the display rows so an open panel reflects the run at once.
+                app.push_session_run(*run);
+                if app.history_open {
+                    recompute_history_view(app);
+                }
             }
             OpResult::TransferProgress {
                 gen,
@@ -5743,7 +5792,8 @@ fn apply_op_result(app: &mut App, res: OpResult, tx: &Tx) {
             app.history_idx = None;
         }
         OpResult::HistoryPanel { rows, favorites } => {
-            app.history_rows = rows;
+            app.history_persisted = rows;
+            app.rebuild_history_rows();
             app.history_favorites = favorites.into_iter().collect();
             // The panel may have been closed before the reply landed; only
             // refresh the visible state when it is still open. The needle is
@@ -5751,10 +5801,13 @@ fn apply_op_result(app: &mut App, res: OpResult, tx: &Tx) {
             if app.history_open {
                 recompute_history_view(app);
                 let n = app.history_rows.len();
+                let session = app.session_runs.len();
                 app.status = if n == 0 {
                     t("没有查询历史（执行一条 SQL 后再按 Alt-H）").into()
+                } else if session > 0 {
+                    tf("查询历史 · {} 条（含本次会话 {}）· Enter 回填 · Ctrl-↵ 直跑 · f 收藏 · Del 删除 · y/Y 复制 · / 搜索", &[&n, &session])
                 } else {
-                    tf("查询历史 · {} 条 · Enter 回填 · Ctrl-↵ 直跑 · f 收藏 · Del 删除 · y 复制 · / 搜索", &[&n])
+                    tf("查询历史 · {} 条 · Enter 回填 · Ctrl-↵ 直跑 · f 收藏 · Del 删除 · y/Y 复制 · / 搜索", &[&n])
                 };
             }
         }
@@ -5975,6 +6028,8 @@ fn apply_op_result(app: &mut App, res: OpResult, tx: &Tx) {
         }
         OpResult::ImportProgress { .. } => {}
         OpResult::QueryProgress { .. } => {}
+        // R84: handled as a side-channel above; unreachable here.
+        OpResult::SessionRun(_) => {}
         OpResult::TransferProgress { .. } => {}
         OpResult::ExportDone {
             format,

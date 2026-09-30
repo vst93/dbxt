@@ -1281,6 +1281,47 @@ pub(crate) struct HistoryRow {
     /// The panel keeps one row per statement (newest first) and shows `×n` when
     /// it ran more than once, so a re-run loop does not flood the list.
     pub(crate) count: usize,
+    /// R84: this row comes from the in-memory *session* run log (a statement
+    /// dbxt itself just sent to the server), not from DBX's persisted history.
+    /// Session rows carry no store id, so the delete gesture declines them.
+    pub(crate) session: bool,
+}
+
+/// R84: one statement dbxt itself sent to the server during this session
+/// (newest first, at most [`SESSION_RUN_MAX`]). Kept purely in memory — the
+/// panel can show it instantly, before the persisted store answers, and it is
+/// never written to disk.
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) struct SessionRun {
+    pub(crate) sql: String,
+    /// RFC3339 timestamp, so the panel reuses its `MM-DD HH:MM` label.
+    pub(crate) executed_at: String,
+    pub(crate) duration_ms: u64,
+    pub(crate) success: bool,
+    /// `editor` / `script` / `direct`.
+    pub(crate) origin: &'static str,
+    pub(crate) connection_name: String,
+}
+
+/// R84: how many session runs the in-memory log keeps (LRU window).
+pub(crate) const SESSION_RUN_MAX: usize = 20;
+
+impl SessionRun {
+    /// Render one session run as the history row the panel draws: a synthetic
+    /// `session:` id makes it recognisable without touching the store.
+    pub(crate) fn to_row(&self, idx: usize) -> HistoryRow {
+        HistoryRow {
+            id: format!("session:{idx}"),
+            sql: self.sql.clone(),
+            executed_at: self.executed_at.clone(),
+            connection_name: self.connection_name.clone(),
+            success: self.success,
+            duration_ms: self.duration_ms,
+            origin: self.origin.to_string(),
+            count: 1,
+            session: true,
+        }
+    }
 }
 
 /// R51: collapse repeated statements in a newest-first history window into a
@@ -2019,6 +2060,13 @@ pub(crate) struct App {
     pub(crate) history_list: ListState,
     /// Recent entries loaded from DBX's shared history (newest first, unique SQL).
     pub(crate) history_rows: Vec<HistoryRow>,
+    /// R84: the raw persisted rows as loaded from the store (unmerged), so a
+    /// session run can be re-merged on top without losing the `×n` counts.
+    pub(crate) history_persisted: Vec<HistoryRow>,
+    /// R84: statements dbxt sent to the server during this session (newest
+    /// first, LRU [`SESSION_RUN_MAX`]). In-memory only; the panel shows them
+    /// instantly and they are never written to disk by dbxt.
+    pub(crate) session_runs: Vec<SessionRun>,
     /// SQL texts already saved as DBX favourites, for the `★` marker and the `f`
     /// toggle.
     pub(crate) history_favorites: HashSet<String>,
@@ -2589,6 +2637,41 @@ impl App {
     pub(crate) fn editor_sql(&self) -> String {
         self.editor.lines().join("\n")
     }
+    /// R84: record one statement dbxt just sent to the server in the session
+    /// run log. Dedup-promote: a re-run of an earlier statement removes the old
+    /// entry and floats the fresh one to the top (LRU, most recent first),
+    /// capped at [`SESSION_RUN_MAX`]. Purely in memory — nothing is persisted.
+    pub(crate) fn push_session_run(&mut self, mut run: SessionRun) {
+        let sql = run.sql.trim().to_string();
+        if sql.is_empty() {
+            return;
+        }
+        run.sql = sql.clone();
+        if let Some(pos) = self.session_runs.iter().position(|r| r.sql == sql) {
+            self.session_runs.remove(pos);
+        }
+        if self.session_runs.len() >= SESSION_RUN_MAX {
+            self.session_runs.truncate(SESSION_RUN_MAX - 1);
+        }
+        self.session_runs.insert(0, run);
+        self.rebuild_history_rows();
+    }
+
+    /// R84: rebuild the panel's display rows from the in-memory session log plus
+    /// the raw persisted rows. Session runs come first (they are the newest) and
+    /// a repeated statement collapses into one row with a `×n` count, so the
+    /// session entry wins and the persisted duplicate folds into it.
+    pub(crate) fn rebuild_history_rows(&mut self) {
+        let mut rows: Vec<HistoryRow> = self
+            .session_runs
+            .iter()
+            .enumerate()
+            .map(|(i, r)| r.to_row(i))
+            .collect();
+        rows.extend(self.history_persisted.iter().cloned());
+        self.history_rows = merge_history_rows(rows);
+    }
+
     pub(crate) fn push_history(&mut self, sql: &str) {
         let sql = sql.trim();
         if sql.is_empty() {

@@ -384,6 +384,7 @@ pub static ALL_KEYS: &[&str] = &[
     "加入批量队列（Ctrl-S 打包事务提交）",
     "加载 SQL 片段…",
     "加载 {} 第 {} 页…",
+    "加载 {} 第 {} 页…（第 {}-{} 行）",
     "加载 {} 结构…",
     "加载 {} 表…",
     "加载更多… (上限 {} 行)",
@@ -1033,7 +1034,7 @@ pub static ALL_KEYS: &[&str] = &[
     "…（预览截断，共 {} 行）",
     "⚠ 将删除这条查询历史（不可撤销；不影响数据库数据）",
     " ⚠ 删除历史确认 ",
-    "查询历史面板（最近 300 条：时间 / 摘要 / 来源连接）",
+    "查询历史面板（最近 300 条：时间 / 摘要 / 来源连接；顶部 ● 为本次会话内存记录）",
     "格式化当前 SQL（关键字大写 / 子句换行）；再按压缩为单行",
     "撤销（Alt-F 格式化或编辑历史；状态栏提示已撤销 / 没有可撤销的）",
     "重做上一次撤销（状态栏提示已重做 / 没有可重做的；编辑器内 Ctrl-Y 原为内部 yank，改到 Alt-Y）",
@@ -1043,14 +1044,17 @@ pub static ALL_KEYS: &[&str] = &[
     "回填到编辑器（关面板，光标到末尾）",
     "收藏 / 取消收藏该条（同一 DBX saved_sql_files 存储）",
     "复制整条语句",
+    "青色圆点 = 本次会话内 dbxt 自己发到服务端的语句（内存 LRU 20，重复语句去重上浮；只读内存不落盘、不发查询，退出即清空）",
     "删除单条历史（红色确认，不影响数据库数据）",
     "按语句内容过滤（大小写不敏感子串）",
     "直跑",
     "编",
     "脚",
     "直",
-    "查询历史 · {} 条 · Enter 回填 · Ctrl-↵ 直跑 · f 收藏 · Del 删除 · y 复制 · / 搜索",
-    " 查询历史 · {} 条 · Enter 回填 · Ctrl-↵ 直跑 · f 收藏 · Del 删除 · y 复制 · / 搜索 · Esc 关 ",
+    "查询历史 · {} 条 · Enter 回填 · Ctrl-↵ 直跑 · f 收藏 · Del 删除 · y/Y 复制 · / 搜索",
+    "查询历史 · {} 条（含本次会话 {}）· Enter 回填 · Ctrl-↵ 直跑 · f 收藏 · Del 删除 · y/Y 复制 · / 搜索",
+    "会话记录仅在内存中（退出即清空），无需删除",
+    " 查询历史 · {} 条 · Enter 回填 · Ctrl-↵ 直跑 · f 收藏 · Del 删除 · y/Y 复制 · / 搜索 · Esc 关 ",
     " 查询历史 · Enter 回填 · Ctrl-↵ 直跑 · Esc ",
     "★ 收藏 · {}",
     "─ 时间序 · {}",
@@ -2392,6 +2396,7 @@ fn en_of(zh: &'static str) -> Option<&'static str> {
         "加入批量队列（Ctrl-S 打包事务提交）" => Some("Add to batch queue (Ctrl-S commits as one transaction)"),
         "加载 SQL 片段…" => Some("Loading SQL snippets…"),
         "加载 {} 第 {} 页…" => Some("Loading {} page {}…"),
+        "加载 {} 第 {} 页…（第 {}-{} 行）" => Some("Loading {} page {}… (rows {}-{})"),
         "加载 {} 结构…" => Some("Loading {} structure…"),
         "加载 {} 表…" => Some("Loading {} tables…"),
         "加载更多… (上限 {} 行)" => Some("Load more… (cap {} rows)"),
@@ -3148,7 +3153,9 @@ fn en_of(zh: &'static str) -> Option<&'static str> {
         "…（预览截断，共 {} 行）" => Some("… (preview truncated, {} lines total)"),
         "⚠ 将删除这条查询历史（不可撤销；不影响数据库数据）" => Some("⚠ This query-history entry will be deleted (irreversible; database data untouched)"),
         " ⚠ 删除历史确认 " => Some(" ⚠ Confirm history deletion "),
-        "查询历史面板（最近 300 条：时间 / 摘要 / 来源连接）" => Some("Query-history panel (latest 300: time / summary / source connection)"),
+        "查询历史面板（最近 300 条：时间 / 摘要 / 来源连接；顶部 ● 为本次会话内存记录）" => {
+            Some("Query-history panel (latest 300: time / summary / source connection; the top ● rows are this session's in-memory runs)")
+        }
         "格式化当前 SQL（关键字大写 / 子句换行）；再按压缩为单行" => Some("Format the current SQL (keywords upper-cased, clauses on their own lines); press again to compress to one line"),
         "撤销（Alt-F 格式化或编辑历史；状态栏提示已撤销 / 没有可撤销的）" => {
             Some("Undo (an Alt-F reformat or one edit-history step; the status bar reports undone / nothing to undo)")
@@ -3164,6 +3171,9 @@ fn en_of(zh: &'static str) -> Option<&'static str> {
         "回填到编辑器（关面板，光标到末尾）" => Some("Recall into the editor (closes the panel, cursor at the end)"),
         "收藏 / 取消收藏该条（同一 DBX saved_sql_files 存储）" => Some("Favorite / unfavorite this entry (same DBX saved_sql_files store)"),
         "复制整条语句" => Some("Copy the whole statement"),
+        "青色圆点 = 本次会话内 dbxt 自己发到服务端的语句（内存 LRU 20，重复语句去重上浮；只读内存不落盘、不发查询，退出即清空）" => {
+            Some("A cyan dot marks a statement dbxt itself sent to the server this session (in-memory LRU 20, repeats deduped and floated up; memory only, never persisted and triggers no query; cleared on exit)")
+        }
         "删除单条历史（红色确认，不影响数据库数据）" => Some("Delete one history entry (red confirmation; database data untouched)"),
         "按语句内容过滤（大小写不敏感子串）" => Some("Filter by statement text (case-insensitive substring)"),
         "过滤历史：匹配语句文本 / 来源连接 / 来源标（大小写不敏感子串）" => {
@@ -3538,11 +3548,17 @@ fn en_of(zh: &'static str) -> Option<&'static str> {
         "脚" => Some("S"),
         "直" => Some("D"),
         "直跑" => Some("run"),
-        "查询历史 · {} 条 · Enter 回填 · Ctrl-↵ 直跑 · f 收藏 · Del 删除 · y 复制 · / 搜索" => {
-            Some("Query history · {} · Enter recall · Ctrl-↵ run · f favorite · Del delete · y copy · / search")
+        "查询历史 · {} 条 · Enter 回填 · Ctrl-↵ 直跑 · f 收藏 · Del 删除 · y/Y 复制 · / 搜索" => {
+            Some("Query history · {} · Enter recall · Ctrl-↵ run · f favorite · Del delete · y/Y copy · / search")
         }
-        " 查询历史 · {} 条 · Enter 回填 · Ctrl-↵ 直跑 · f 收藏 · Del 删除 · y 复制 · / 搜索 · Esc 关 " => {
-            Some(" Query history · {} · Enter recall · Ctrl-↵ run · f favorite · Del delete · y copy · / search · Esc close ")
+        "查询历史 · {} 条（含本次会话 {}）· Enter 回填 · Ctrl-↵ 直跑 · f 收藏 · Del 删除 · y/Y 复制 · / 搜索" => {
+            Some("Query history · {} ({} from this session) · Enter recall · Ctrl-↵ run · f favorite · Del delete · y/Y copy · / search")
+        }
+        "会话记录仅在内存中（退出即清空），无需删除" => {
+            Some("Session runs live in memory only (cleared on exit) — nothing to delete")
+        }
+        " 查询历史 · {} 条 · Enter 回填 · Ctrl-↵ 直跑 · f 收藏 · Del 删除 · y/Y 复制 · / 搜索 · Esc 关 " => {
+            Some(" Query history · {} · Enter recall · Ctrl-↵ run · f favorite · Del delete · y/Y copy · / search · Esc close ")
         }
         " 查询历史 · Enter 回填 · Ctrl-↵ 直跑 · Esc " => {
             Some(" Query history · Enter recall · Ctrl-↵ run · Esc ")

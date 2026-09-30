@@ -2409,6 +2409,7 @@ pub(crate) fn history_row(id: &str, sql: &str) -> HistoryRow {
         duration_ms: 0,
         origin: String::new(),
         count: 1,
+        session: false,
     }
 }
 
@@ -2683,6 +2684,157 @@ pub(crate) fn history_favorites_sort_to_the_top_and_toggle_moves() {
     recompute_history_view_keep(&mut app, "SELECT 3");
     assert_eq!(app.history_view, vec![0, 1, 2]);
     assert_eq!(history_fav_count(&app), 1);
+}
+
+// ── R84: in-memory session run log (Alt-H panel, zero query) ──
+
+fn session_run(sql: &str, ms: u64, success: bool) -> SessionRun {
+    SessionRun {
+        sql: sql.into(),
+        executed_at: "2026-06-27T12:34:56Z".into(),
+        duration_ms: ms,
+        success,
+        origin: "editor",
+        connection_name: "prod".into(),
+    }
+}
+
+/// R84: the session log is an LRU window — a re-run of an earlier statement is
+/// promoted to the top (dedup), and the log caps at [`SESSION_RUN_MAX`].
+#[test]
+pub(crate) fn session_run_log_is_lru_with_dedup_promote() {
+    let mut app = test_app();
+    for i in 0..3 {
+        app.push_session_run(session_run(&format!("SELECT {i}"), i as u64, true));
+    }
+    // Newest first.
+    let sqls: Vec<&str> = app.session_runs.iter().map(|r| r.sql.as_str()).collect();
+    assert_eq!(sqls, vec!["SELECT 2", "SELECT 1", "SELECT 0"]);
+    // Re-running SELECT 0 floats it to the top without duplicating it.
+    app.push_session_run(session_run("SELECT 0", 9, false));
+    let sqls: Vec<&str> = app.session_runs.iter().map(|r| r.sql.as_str()).collect();
+    assert_eq!(sqls, vec!["SELECT 0", "SELECT 2", "SELECT 1"]);
+    assert_eq!(app.session_runs.len(), 3, "dedup, not append");
+    assert!(!app.session_runs[0].success, "the fresh outcome wins");
+    assert_eq!(app.session_runs[0].duration_ms, 9);
+    // Empty statements are never logged.
+    app.push_session_run(session_run("   ", 0, true));
+    assert_eq!(app.session_runs.len(), 3);
+    // The window is capped at SESSION_RUN_MAX, oldest evicted.
+    for i in 0..SESSION_RUN_MAX + 5 {
+        app.push_session_run(session_run(&format!("INSERT {i}"), 1, true));
+    }
+    assert_eq!(app.session_runs.len(), SESSION_RUN_MAX);
+    // The oldest of the survivors is the newest of the first batch that still
+    // fits; the very first statements are gone.
+    assert!(!app.session_runs.iter().any(|r| r.sql == "SELECT 1"));
+}
+
+/// R84: the display rows merge the session log with the raw persisted rows in
+/// one pass, so a statement that ran this session shows once (the session row
+/// wins, the persisted duplicate folds into its `×n` count).
+#[test]
+pub(crate) fn session_runs_merge_on_top_of_persisted_history() {
+    let mut app = test_app();
+    // Two persisted rows, one of them a repeat of a session statement.
+    app.history_persisted = vec![history_row("p1", "SELECT 1"), history_row("p2", "SELECT 2")];
+    app.push_session_run(session_run("SELECT 2", 4, true));
+    let rows: Vec<&str> = app.history_rows.iter().map(|r| r.sql.as_str()).collect();
+    assert_eq!(rows, vec!["SELECT 2", "SELECT 1"], "session row first");
+    assert!(app.history_rows[0].session, "marked as a session run");
+    assert_eq!(app.history_rows[0].duration_ms, 4);
+    assert_eq!(app.history_rows[0].count, 2, "persisted repeat folded in");
+    assert!(!app.history_rows[1].session);
+}
+
+/// R84: a session row carries no store id, so the delete gesture declines it
+/// (nothing to persist-remove); Esc/Enter/y still work. `Y` also copies, and
+/// Enter recalls into the editor with the caret at the end.
+#[test]
+pub(crate) fn session_row_delete_declines_and_enter_recalls_to_end() {
+    let (tx, _rx) = tokio::sync::mpsc::unbounded_channel::<OpResult>();
+    let mut app = test_app();
+    app.push_session_run(session_run("SELECT 42", 3, true));
+    app.history_open = true;
+    recompute_history_view(&mut app);
+    app.history_list.select(Some(0));
+    assert!(app.history_rows[0].session);
+    // Delete declines a session row instead of opening the red confirmation.
+    history_key(
+        &mut app,
+        &tx,
+        KeyEvent::new(KeyCode::Delete, KeyModifiers::NONE),
+    );
+    assert!(
+        app.history_confirm.is_none(),
+        "no red confirm for a session row"
+    );
+    assert!(app.status.contains("内存"), "status: {}", app.status);
+    // Enter recalls the statement and parks the caret at the end of the buffer.
+    history_key(
+        &mut app,
+        &tx,
+        KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+    );
+    assert!(!app.history_open);
+    assert_eq!(app.editor_sql(), "SELECT 42");
+    let (row, col) = app.editor.cursor();
+    assert_eq!(app.editor.lines().len(), 1);
+    assert_eq!((row, col), (0, "SELECT 42".chars().count()));
+}
+
+/// R84: a `SessionRun` op result is the only writer of the session log, so the
+/// panel refreshes live (and only the UI thread mutates the log).
+#[test]
+pub(crate) fn session_run_op_result_feeds_the_panel() {
+    let (tx, _rx) = tokio::sync::mpsc::unbounded_channel::<OpResult>();
+    let mut app = test_app();
+    app.history_open = true;
+    apply_op_result(
+        &mut app,
+        OpResult::SessionRun(Box::new(session_run("SELECT 7", 2, true))),
+        &tx,
+    );
+    assert_eq!(app.session_runs.len(), 1);
+    assert_eq!(app.history_rows.len(), 1);
+    assert!(app.history_rows[0].session);
+    assert_eq!(app.history_view, vec![0], "the open panel sees it at once");
+}
+
+/// R84 (B): opening a table keeps updating the status in place, and now shows
+/// the absolute row window so a deep page reads as the batch it is.
+#[tokio::test(flavor = "multi_thread")]
+async fn page_load_status_shows_the_row_window() {
+    let (tx, _rx) = tokio::sync::mpsc::unbounded_channel::<OpResult>();
+    let mut app = test_app();
+    app.selected = Some(test_conn("mysql"));
+    app.backend_kind = Backend::Sql;
+    let page_state = |page: usize, total: Option<u64>| PageState {
+        table: "big".into(),
+        schema: String::new(),
+        table_type: None,
+        page,
+        page_size: 50,
+        total,
+        total_lower_bound: false,
+        has_next: true,
+        filter: String::new(),
+        order_by: None,
+        keyset: None,
+    };
+    app.page_state = Some(page_state(2, Some(1234)));
+    spawn_table_page(&mut app, &tx, 2);
+    assert!(app.status.contains("第 3 页"), "{}", app.status);
+    assert!(app.status.contains("第 101-150 行"), "{}", app.status);
+    // The last page clamps the window to the real total.
+    app.page_state = Some(page_state(24, Some(1234)));
+    spawn_table_page(&mut app, &tx, 24);
+    assert!(app.status.contains("第 1201-1234 行"), "{}", app.status);
+    // An empty table shows no bogus window.
+    app.page_state = Some(page_state(0, Some(0)));
+    spawn_table_page(&mut app, &tx, 0);
+    assert!(app.status.contains("第 1 页"), "{}", app.status);
+    assert!(!app.status.contains("行"), "{}", app.status);
 }
 
 // ── R59: SQL favourites (Ctrl-O list) ──

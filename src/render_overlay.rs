@@ -1036,7 +1036,8 @@ pub(crate) fn history_list_item(app: &App, ri: usize, list_w: usize) -> ListItem
         + 2
         + disp_width(&duration)
         + disp_width(&origin)
-        + disp_width(&count);
+        + disp_width(&count)
+        + if r.session { 2 } else { 0 };
     let summary = truncate_disp(
         &history_summary(&r.sql),
         list_w.saturating_sub(reserved).max(8),
@@ -1054,8 +1055,13 @@ pub(crate) fn history_list_item(app: &App, ri: usize, list_w: usize) -> ListItem
             Style::default().fg(Color::Yellow),
         ),
         Span::raw(" "),
-        Span::styled(summary, sum_style),
     ];
+    // R84: a cyan dot marks a run from the in-memory session log, so the user
+    // can tell "what I just ran" from DBX's persisted history at a glance.
+    if r.session {
+        spans.push(Span::styled("● ", Style::default().fg(Color::Cyan)));
+    }
+    spans.push(Span::styled(summary, sum_style));
     if !count.is_empty() {
         spans.push(Span::styled(
             format!(" {count}"),
@@ -1106,7 +1112,7 @@ pub(crate) fn render_history_panel(f: &mut Frame, area: Rect, app: &mut App) {
     let title = if app.history_needle.trim().is_empty() {
         fit_title(
             &tf(
-                " 查询历史 · {} 条 · Enter 回填 · Ctrl-↵ 直跑 · f 收藏 · Del 删除 · y 复制 · / 搜索 · Esc 关 ",
+                " 查询历史 · {} 条 · Enter 回填 · Ctrl-↵ 直跑 · f 收藏 · Del 删除 · y/Y 复制 · / 搜索 · Esc 关 ",
                 &[&total],
             ),
             t(" 查询历史 · Enter 回填 · Ctrl-↵ 直跑 · Esc "),

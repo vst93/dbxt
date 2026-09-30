@@ -1313,6 +1313,7 @@ pub(crate) fn overlays_render_at_extreme_sizes() {
                             duration_ms: if i % 3 == 0 { 12 } else { 0 },
                             origin: if i % 2 == 0 { "editor".into() } else { String::new() },
                             count: 1,
+                            session: false,
                         })
                         .collect();
                 a.history_view = (0..a.history_rows.len()).collect();
@@ -1332,6 +1333,7 @@ pub(crate) fn overlays_render_at_extreme_sizes() {
                     duration_ms: 0,
                     origin: String::new(),
                     count: 1,
+                    session: false,
                 }];
                 a.history_view = vec![0];
                 a.history_list.select(Some(0));

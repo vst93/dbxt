@@ -1059,7 +1059,7 @@ pub(crate) fn footer_hints_ctx(ctx: FooterCtx) -> Vec<Hint> {
             ("Enter", t("回填编辑器")),
             ("Ctrl-↵", t("直跑")),
             ("f", t("收藏")),
-            ("y", t("复制语句")),
+            ("y/Y", t("复制语句")),
             ("Del", t("删除")),
             ("/", t("搜索")),
             ("Esc", t("关闭")),
