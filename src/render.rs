@@ -250,6 +250,26 @@ pub(crate) fn ui(f: &mut Frame, app: &mut App) {
         };
         render_prompt_input(f, f.area(), app.editor_find.as_mut(), &title, &short);
     }
+    // R82: the MongoDB document-grid prompts (`gf` field jump, `c` path copy).
+    // Both are bottom-bar inputs and sit under the row popup.
+    if app.mongo_field_prompt.is_some() {
+        render_prompt_input(
+            f,
+            f.area(),
+            app.mongo_field_prompt.as_mut(),
+            t(" 字段跳转（已加载页）· Enter 跳转 · Esc 取消 "),
+            t(" 字段跳转 · Enter/Esc "),
+        );
+    }
+    if app.mongo_path_prompt.is_some() {
+        render_prompt_input(
+            f,
+            f.area(),
+            app.mongo_path_prompt.as_mut(),
+            t(" 提取点路径 a.b.0.name · Enter 复制 · Esc 取消 "),
+            t(" 路径提取 · Enter/Esc "),
+        );
+    }
     // The row popup draws first so a drilled cell popup sits on top of it.
     if app.row_popup.is_some() {
         render_row_popup(f, f.area(), app);
@@ -1214,6 +1234,9 @@ pub(crate) fn footer_hints_ctx(ctx: FooterCtx) -> Vec<Hint> {
             ("Enter", t("整行")),
             ("v", t("单元格")),
             ("y", t("复制 JSON")),
+            ("gf", t("字段跳转")),
+            ("c", t("路径提取")),
+            ("Ctrl-S", t("大小排序")),
             ("e", t("编辑")),
             ("i", t("插入")),
             ("Del", t("删文档")),
@@ -2369,8 +2392,15 @@ pub(crate) fn grid_title(app: &App) -> String {
             } else {
                 tf(" · 过滤 {}", &[&(truncate_disp(&ps.filter, 24))])
             };
+            // R82: echo the active client-side size ordering so the header never
+            // hides that the rows are not in arrival order.
+            let sort = if app.mongo_size_sort == MongoSizeSort::Natural {
+                String::new()
+            } else {
+                tf(" · {}", &[&(app.mongo_size_sort.label())])
+            };
             tf(
-                " {}{}.{} · 第 {} 页 · {}–{} / {} · {}{}{} ",
+                " {}{}.{} · 第 {} 页 · {}–{} / {} · {}{}{}{} ",
                 &[
                     &(search_marker(app)),
                     &(fix_double_encoding(&app.current_db())),
@@ -2386,6 +2416,7 @@ pub(crate) fn grid_title(app: &App) -> String {
                         .unwrap_or_default()),
                     &(more),
                     &(filt),
+                    &(sort),
                 ],
             )
         }
@@ -2409,10 +2440,23 @@ pub(crate) fn render_grid(
         .border_style(border_style(focused));
 
     if grid.columns.is_empty() {
-        let body = if grid.note.is_empty() {
-            "OK".to_string()
+        // R82: an empty list always names its next step instead of a bare `OK`.
+        let base = if grid.note.is_empty() {
+            String::new()
         } else {
             grid.note.clone()
+        };
+        let hint = match kind {
+            GridKind::MongoDocs => t("无文档 · f JSON 过滤 · i 插入文档"),
+            GridKind::TableData | GridKind::Query => t("无结果 · 修改 SQL 后 Ctrl-J 重新执行"),
+            GridKind::RedisValue => t("无数据"),
+            GridKind::Columns => "",
+        };
+        let body = match (base.is_empty(), hint.is_empty()) {
+            (true, true) => "OK".to_string(),
+            (false, true) => base,
+            (true, false) => hint.to_string(),
+            (false, false) => format!("{base}\n{hint}"),
         };
         f.render_widget(
             Paragraph::new(body)
@@ -2641,6 +2685,28 @@ pub(crate) fn render_grid(
             .column_spacing(1);
             f.render_widget(rtable, right_area);
         }
+    }
+
+    // ── empty-result guidance (R82) ──
+    // A grid with columns but no rows still shows its header; one gray line
+    // names the next action so a zero-row result is never a dead end.
+    if nrows == 0 && inner.height >= 2 {
+        let hint = match kind {
+            GridKind::MongoDocs => t("无匹配文档 · f 改过滤 · i 插入文档"),
+            GridKind::TableData => t("0 行 · f 改过滤 / Ctrl-R 清除"),
+            GridKind::RedisValue => t("无数据"),
+            _ => t("0 行 · 修改 SQL 后 Ctrl-J 重新执行"),
+        };
+        let hint_area = Rect {
+            x: inner.x,
+            y: inner.y + 1,
+            width: inner.width,
+            height: 1,
+        };
+        f.render_widget(
+            Paragraph::new(hint).style(Style::default().fg(Color::DarkGray)),
+            hint_area,
+        );
     }
 
     // ── horizontal scroll progress bar (drawn on the bottom border) ──

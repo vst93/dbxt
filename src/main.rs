@@ -1911,7 +1911,7 @@ async fn run_op(backend: &LocalBackend, op: Op, tx: &Tx) -> OpResult {
                     let mut docs = r.documents;
                     let has_next = docs.len() > page_size;
                     docs.truncate(page_size);
-                    let grid = mongo_docs_grid(&docs);
+                    let grid = mongo_docs_grid_with_sizes(&docs);
                     OpResult::MongoDocs {
                         grid: Box::new(grid),
                         total,
@@ -4375,6 +4375,10 @@ impl App {
             mongo_filter: String::new(),
             mongo_gen: 0,
             mongo_docs: Vec::new(),
+            mongo_docs_base: Vec::new(),
+            mongo_size_sort: MongoSizeSort::Natural,
+            mongo_field_prompt: None,
+            mongo_path_prompt: None,
             mongo_dialog: None,
             form: ConnForm::default(),
             ssh_prompt: None,
@@ -5612,7 +5616,13 @@ fn apply_op_result(app: &mut App, res: OpResult, tx: &Tx) {
             app.set_grid(*grid);
             app.mongo_page = page;
             app.mongo_filter = filter.clone();
+            // R82: keep the arrival order for `Ctrl-S`, and start each page in
+            // that order with no stale prompt/ordering from the previous one.
+            app.mongo_docs_base = docs.clone();
             app.mongo_docs = docs;
+            app.mongo_size_sort = MongoSizeSort::Natural;
+            app.mongo_field_prompt = None;
+            app.mongo_path_prompt = None;
             app.page_state = Some(PageState {
                 table: collection.clone(),
                 schema: String::new(),

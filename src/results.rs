@@ -135,6 +135,13 @@ pub(crate) fn preview_key(app: &mut App, tx: &Tx, k: KeyEvent) {
                 preview_home(app);
                 return;
             }
+            // R82: `gf` is only meaningful in the MongoDB document grid, which
+            // resolves the chord before this block; elsewhere it stays a no-op
+            // rather than silently opening the WHERE filter.
+            KeyCode::Char('f') if k.modifiers.is_empty() => {
+                app.pending_g = false;
+                return;
+            }
             KeyCode::Esc => {
                 app.pending_g = false;
                 return;

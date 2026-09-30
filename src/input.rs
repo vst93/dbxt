@@ -473,6 +473,16 @@ pub(crate) fn browse_key(app: &mut App, tx: &Tx, k: KeyEvent) {
         cell_popup_key(app, k);
         return;
     }
+    // R82: the MongoDB field-jump / path-copy prompts sit on top of the grid and
+    // the row popup, so they own the keyboard while open.
+    if app.mongo_field_prompt.is_some() {
+        mongo_field_key(app, k);
+        return;
+    }
+    if app.mongo_path_prompt.is_some() {
+        mongo_path_key(app, k);
+        return;
+    }
     if app.row_popup.is_some() {
         row_popup_key(app, k);
         return;
@@ -700,6 +710,8 @@ pub(crate) fn browse_key(app: &mut App, tx: &Tx, k: KeyEvent) {
             | KeyCode::Char('c')
             | KeyCode::Char('b')
             | KeyCode::Char('g')
+            // R82: `gf` jumps to a field in the MongoDB document grid.
+            | KeyCode::Char('f')
                 if k.modifiers.is_empty() =>
             {
                 preview_key(app, tx, k);
@@ -810,8 +822,14 @@ pub(crate) fn browse_key(app: &mut App, tx: &Tx, k: KeyEvent) {
         return;
     }
 
-    // transactional batch queue: Ctrl-S commits, Ctrl-X discards
-    if k.modifiers.contains(KeyModifiers::CONTROL) && k.code == KeyCode::Char('s') {
+    // transactional batch queue: Ctrl-S commits, Ctrl-X discards. R82: the
+    // MongoDB document grid reuses Ctrl-S for its client-side size ordering, so
+    // the global commit yields there (the batch queue belongs to the SQL editor,
+    // not the document list).
+    if k.modifiers.contains(KeyModifiers::CONTROL)
+        && k.code == KeyCode::Char('s')
+        && !(app.backend_kind == Backend::Mongo && app.grid_kind == GridKind::MongoDocs)
+    {
         commit_batch(app);
         return;
     }

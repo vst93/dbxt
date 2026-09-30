@@ -166,6 +166,19 @@ pub(crate) fn render_conn_picker(f: &mut Frame, area: Rect, app: &mut App) {
                 .add_modifier(Modifier::BOLD),
         );
     f.render_stateful_widget(list, box_area, &mut app.conn_list);
+    // R82: an empty picker names its next step instead of showing a blank box.
+    if app.connections.is_empty() && box_area.height > 2 {
+        let hint_area = Rect {
+            x: box_area.x + 1,
+            y: box_area.y + box_area.height / 2,
+            width: box_area.width.saturating_sub(2),
+            height: 1,
+        };
+        f.render_widget(
+            Paragraph::new(t("还没有连接 · c 新建")).style(Style::default().fg(Color::DarkGray)),
+            hint_area,
+        );
+    }
 }
 
 pub(crate) fn render_db_picker(f: &mut Frame, area: Rect, app: &mut App) {

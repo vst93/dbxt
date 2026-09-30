@@ -7138,3 +7138,296 @@ pub(crate) fn editor_input_prefs_round_trip_through_config() {
 
     let _ = std::fs::remove_file(&path);
 }
+
+// ── R82: MongoDB field jump (`gf`), document sizes (`Ctrl-S`) and path copy (`c`) ──
+
+/// A MongoDB document-grid fixture with two loaded documents, wired so the real
+/// key router can be exercised without a socket.
+pub(crate) fn mongo_docs_app() -> (App, Tx) {
+    let (tx, _rx) = tokio::sync::mpsc::unbounded_channel::<OpResult>();
+    let mut app = test_app();
+    app.picker_open = false;
+    app.selected = Some(test_conn("mongodb"));
+    app.backend_kind = Backend::Mongo;
+    app.focus = Focus::Preview;
+    app.grid_kind = GridKind::MongoDocs;
+    let docs = vec![
+        serde_json::json!({
+            "_id": 1,
+            "name": "Ada",
+            "tags": ["x", "y"],
+            "nested": { "deep": { "v": 42 } }
+        }),
+        serde_json::json!({ "_id": 2, "age": 30 }),
+    ];
+    app.mongo_docs_base = docs.clone();
+    app.mongo_docs = docs.clone();
+    app.set_grid(mongo_docs_grid_with_sizes(&docs));
+    app.page_state = Some(PageState {
+        table: "people".into(),
+        schema: String::new(),
+        table_type: None,
+        page: 0,
+        page_size: MONGO_PAGE,
+        total: Some(2),
+        total_lower_bound: false,
+        has_next: false,
+        filter: String::new(),
+        order_by: None,
+        keyset: None,
+    });
+    (app, tx)
+}
+
+/// The `size(B)` column is appended after the document's own fields, matches the
+/// compact JSON byte length, and an empty page keeps zero columns (so the
+/// empty-state hint still gets to render).
+#[test]
+pub(crate) fn mongo_size_column_reports_compact_json_bytes() {
+    let docs = vec![
+        serde_json::json!({"_id": 1, "name": "Ada"}),
+        serde_json::json!({"_id": 2}),
+    ];
+    let grid = mongo_docs_grid_with_sizes(&docs);
+    assert_eq!(
+        grid.columns.last().map(String::as_str),
+        Some(MONGO_SIZE_COLUMN)
+    );
+    let size_idx = grid.columns.len() - 1;
+    assert_eq!(
+        grid.rows[0][size_idx].text().parse::<usize>().unwrap(),
+        mongo_doc_size_bytes(&docs[0])
+    );
+    assert!(mongo_doc_size_bytes(&docs[0]) > mongo_doc_size_bytes(&docs[1]));
+    // No `size` column leaks into a document whose own field is called `size`.
+    let with_size = vec![serde_json::json!({"_id": 3, "size": 7})];
+    let grid2 = mongo_docs_grid_with_sizes(&with_size);
+    assert_eq!(grid2.columns, vec!["_id", "size", MONGO_SIZE_COLUMN]);
+    // An empty page stays column-less.
+    assert!(mongo_docs_grid_with_sizes(&[]).columns.is_empty());
+}
+
+/// `Ctrl-S` cycles natural → largest first → smallest first → natural, and the
+/// natural state restores the arrival order exactly (pure local, never a query).
+#[test]
+pub(crate) fn mongo_size_sort_cycles_and_restores_arrival_order() {
+    let (mut app, tx) = mongo_docs_app();
+    let ids = |a: &App| {
+        a.mongo_docs
+            .iter()
+            .map(|d| d["_id"].as_i64().unwrap())
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(ids(&app), vec![1, 2]);
+    let ctrl_s = KeyEvent::new(KeyCode::Char('s'), KeyModifiers::CONTROL);
+
+    key(&mut app, &tx, ctrl_s);
+    assert_eq!(app.mongo_size_sort, MongoSizeSort::SizeDesc);
+    assert_eq!(ids(&app), vec![1, 2], "doc 1 is larger, so it stays first");
+    key(&mut app, &tx, ctrl_s);
+    assert_eq!(app.mongo_size_sort, MongoSizeSort::SizeAsc);
+    assert_eq!(ids(&app), vec![2, 1], "smallest first");
+    key(&mut app, &tx, ctrl_s);
+    assert_eq!(app.mongo_size_sort, MongoSizeSort::Natural);
+    assert_eq!(ids(&app), vec![1, 2], "natural order restored");
+    // The grid's `size(B)` column tracks the current order.
+    let grid = app.grid.as_ref().unwrap();
+    let size_idx = grid.columns.len() - 1;
+    assert_eq!(
+        grid.rows[0][size_idx].text().parse::<usize>().unwrap(),
+        mongo_doc_size_bytes(&app.mongo_docs[0])
+    );
+}
+
+/// `gf` jumps the cursor to the first loaded document that carries the field;
+/// a miss reports an error instead of moving.
+#[test]
+pub(crate) fn mongo_field_jump_moves_to_first_hit() {
+    let (mut app, tx) = mongo_docs_app();
+    let ch = |c: char| KeyEvent::new(KeyCode::Char(c), KeyModifiers::NONE);
+
+    key(&mut app, &tx, ch('g'));
+    assert!(app.pending_g, "g starts the chord");
+    key(&mut app, &tx, ch('f'));
+    assert!(app.mongo_field_prompt.is_some(), "gf opens the prompt");
+    assert!(!app.pending_g, "the chord is consumed");
+
+    for c in "age".chars() {
+        key(&mut app, &tx, ch(c));
+    }
+    key(&mut app, &tx, KeyEvent::from(KeyCode::Enter));
+    assert_eq!(app.sel, 1, "the second document has `age`");
+    assert!(app.mongo_field_prompt.is_none());
+
+    // A top-level miss reports and keeps the cursor put.
+    key(&mut app, &tx, ch('g'));
+    key(&mut app, &tx, ch('f'));
+    for c in "missing".chars() {
+        key(&mut app, &tx, ch(c));
+    }
+    key(&mut app, &tx, KeyEvent::from(KeyCode::Enter));
+    assert_eq!(app.sel, 1, "a miss leaves the cursor alone");
+    assert!(
+        app.status.contains("没有已加载文档含字段"),
+        "{}",
+        app.status
+    );
+}
+
+/// The dotted-path walker handles nested objects and array indices, and reports
+/// a missing path rather than panicking.
+#[test]
+pub(crate) fn mongo_path_lookup_handles_nesting_and_arrays() {
+    let doc = serde_json::json!({
+        "a": { "b": [ { "name": "Ada" }, { "name": "Bob" } ] },
+        "s": "hi"
+    });
+    assert_eq!(mongo_path_lookup(&doc, "s"), Some(&serde_json::json!("hi")));
+    assert_eq!(
+        mongo_path_lookup(&doc, "a.b.0.name"),
+        Some(&serde_json::json!("Ada"))
+    );
+    assert_eq!(mongo_path_lookup(&doc, "a.b.1.name").unwrap(), "Bob");
+    assert_eq!(
+        mongo_path_copy_text(mongo_path_lookup(&doc, "s").unwrap()),
+        "hi"
+    );
+    assert_eq!(
+        mongo_path_copy_text(mongo_path_lookup(&doc, "a.b.0").unwrap()),
+        "{\"name\":\"Ada\"}"
+    );
+    assert!(
+        mongo_path_lookup(&doc, "a.b.9").is_none(),
+        "index out of range"
+    );
+    assert!(mongo_path_lookup(&doc, "a.x.y").is_none(), "missing key");
+    assert!(
+        mongo_path_lookup(&doc, "s.0").is_none(),
+        "scalar has no children"
+    );
+    assert!(mongo_path_lookup(&doc, "").is_none());
+    assert!(mongo_path_lookup(&doc, "a..b").is_none(), "empty segment");
+    assert!(mongo_doc_has_field(&doc, "a.b.0.name"));
+    assert!(mongo_doc_has_field(&doc, "A"));
+    assert!(!mongo_doc_has_field(&doc, "z"));
+}
+
+/// `c` extracts a dotted sub-value and copies it; an unknown path reports a
+/// bilingual error in the status line. Works from the grid and the row popup.
+#[test]
+pub(crate) fn mongo_path_copy_reports_hit_and_miss() {
+    let (mut app, tx) = mongo_docs_app();
+    let ch = |c: char| KeyEvent::new(KeyCode::Char(c), KeyModifiers::NONE);
+
+    key(&mut app, &tx, ch('c'));
+    assert!(app.mongo_path_prompt.is_some(), "c opens the path prompt");
+    for c in "nested.deep.v".chars() {
+        key(&mut app, &tx, ch(c));
+    }
+    key(&mut app, &tx, KeyEvent::from(KeyCode::Enter));
+    assert!(app.mongo_path_prompt.is_none());
+    assert!(
+        app.status.contains("已提取 nested.deep.v"),
+        "{}",
+        app.status
+    );
+
+    // A bad path keeps the document and reports it.
+    key(&mut app, &tx, ch('c'));
+    for c in "nested.nope".chars() {
+        key(&mut app, &tx, ch(c));
+    }
+    key(&mut app, &tx, KeyEvent::from(KeyCode::Enter));
+    assert!(app.status.contains("路径不存在"), "{}", app.status);
+
+    // From the row popup too.
+    open_row_popup(&mut app);
+    assert!(app.row_popup.is_some());
+    key(&mut app, &tx, ch('c'));
+    assert!(
+        app.mongo_path_prompt.is_some(),
+        "row popup c opens the prompt"
+    );
+    key(&mut app, &tx, KeyEvent::from(KeyCode::Esc));
+    assert!(app.mongo_path_prompt.is_none());
+    assert!(app.row_popup.is_some(), "Esc only closes the prompt");
+}
+
+/// R82: the MongoDB footer / mini-help group lists the three new keys, and the
+/// full cheat-sheet documents them.
+#[test]
+pub(crate) fn mongo_footer_and_help_list_new_document_keys() {
+    let hints = footer_hints_ctx(FooterCtx {
+        view: FooterView::MongoDocs,
+        focus: Focus::Preview,
+        has_connection: true,
+    });
+    let keys: Vec<&str> = hints.iter().map(|h| h.0).collect();
+    for k in ["gf", "c", "Ctrl-S"] {
+        assert!(keys.contains(&k), "mongo footer dropped {k:?}: {keys:?}");
+    }
+    // Mini help reuses the same group (it only drops the pinned `?`).
+    let mini: Vec<&str> = hints
+        .iter()
+        .filter(|h| h.0 != "?" && h.0 != "F1")
+        .map(|h| h.0)
+        .collect();
+    for k in ["gf", "c", "Ctrl-S"] {
+        assert!(mini.contains(&k), "mini help dropped {k:?}");
+    }
+    // The full cheat-sheet documents each of them too.
+    for k in ["g f", "c", "Ctrl-S"] {
+        assert!(
+            HELP_ROWS.iter().any(|(key, _)| *key == k),
+            "full help missing {k:?}"
+        );
+    }
+    // The Mongo footer still fits a phone width trim without splitting a hint.
+    for width in [42usize, 60, 110] {
+        let (chosen, more) = footer_select(&hints, width);
+        let line = footer_line_width(&chosen, more, "?");
+        assert!(line <= width, "width {width}: line {line}");
+        assert!(!chosen.is_empty());
+    }
+}
+
+/// R82: the empty lists name their next step on both screen tiers — an empty
+/// MongoDB page and a zero-row SQL result each render a readable hint.
+#[test]
+pub(crate) fn empty_lists_render_next_step_hints() {
+    let strip = |rows: Vec<String>| -> String {
+        rows.join("\n")
+            .chars()
+            .filter(|c| !c.is_whitespace())
+            .collect()
+    };
+    // Empty MongoDB page: zero columns, so the note line carries the hint.
+    let (mut app, _tx) = mongo_docs_app();
+    app.mongo_docs.clear();
+    app.mongo_docs_base.clear();
+    app.set_grid(mongo_docs_grid_with_sizes(&[]));
+    for (w, h) in [(42u16, 22u16), (110, 30)] {
+        let text = strip(draw(&mut app, w, h));
+        assert!(
+            text.contains("无文档"),
+            "mongo empty hint at {w}x{h}: {text}"
+        );
+    }
+    // Zero-row SQL result: headers still render, one gray line names the action.
+    let mut q = tree_app();
+    q.focus = Focus::Preview;
+    q.grid_kind = GridKind::Query;
+    q.set_grid(Grid {
+        columns: vec!["id".into(), "name".into()],
+        types: Vec::new(),
+        rows: Vec::new(),
+        note: String::new(),
+    });
+    for (w, h) in [(42u16, 22u16), (110, 30)] {
+        let text = strip(draw(&mut q, w, h));
+        assert!(
+            text.contains("0行") && text.contains("Ctrl-J"),
+            "query empty hint at {w}x{h}: {text}"
+        );
+    }
+}

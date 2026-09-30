@@ -310,6 +310,12 @@ pub(crate) fn row_popup_key(app: &mut App, k: KeyEvent) {
             popup.count.clear();
             copy_row_popup_value(app);
         }
+        // R82: `c` in a MongoDB document's row popup prompts for a dotted path
+        // and copies the extracted sub-value (client-side over the loaded page).
+        KeyCode::Char('c') if app.grid_kind == GridKind::MongoDocs => {
+            popup.count.clear();
+            open_mongo_path_prompt(app);
+        }
         // `?` from inside the popup opens the context mini help (which shows
         // this popup's own keys); Esc returns to the row.
         KeyCode::Char('?') => {

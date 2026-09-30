@@ -1793,6 +1793,33 @@ impl RedisSort {
     }
 }
 
+/// R82: ordering of the loaded MongoDB documents (`Ctrl-S`). `Natural` keeps the
+/// order the page arrived in; the size modes re-sort the already-loaded window
+/// in place (never a query), so a collection can be eyeballed by document size.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum MongoSizeSort {
+    Natural,
+    SizeAsc,
+    SizeDesc,
+}
+
+impl MongoSizeSort {
+    pub(crate) fn next(self) -> Self {
+        match self {
+            MongoSizeSort::Natural => MongoSizeSort::SizeDesc,
+            MongoSizeSort::SizeDesc => MongoSizeSort::SizeAsc,
+            MongoSizeSort::SizeAsc => MongoSizeSort::Natural,
+        }
+    }
+    pub(crate) fn label(self) -> &'static str {
+        match self {
+            MongoSizeSort::Natural => t("原始顺序"),
+            MongoSizeSort::SizeAsc => t("大小升序"),
+            MongoSizeSort::SizeDesc => t("大小降序"),
+        }
+    }
+}
+
 pub(crate) struct App {
     pub(crate) backend: Arc<LocalBackend>,
     pub(crate) page: Page,
@@ -2413,6 +2440,15 @@ pub(crate) struct App {
     /// Documents of the current page, so `e` / `Del` can map a grid row back to
     /// its source document.
     pub(crate) mongo_docs: Vec<serde_json::Value>,
+    /// R82: the page's documents in arrival order, so `Ctrl-S` can re-sort the
+    /// loaded window by size and restore the natural order without a query.
+    pub(crate) mongo_docs_base: Vec<serde_json::Value>,
+    /// R82: active client-side size ordering of the loaded documents.
+    pub(crate) mongo_size_sort: MongoSizeSort,
+    /// R82: the `gf` field-name jump prompt (client-side over the loaded page).
+    pub(crate) mongo_field_prompt: Option<TextArea<'static>>,
+    /// R82: the `c` dotted-path extraction prompt (client-side, then copy).
+    pub(crate) mongo_path_prompt: Option<TextArea<'static>>,
     /// The JSON editor dialog for a MongoDB document edit / insert.
     pub(crate) mongo_dialog: Option<MongoDocDialog>,
 

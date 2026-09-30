@@ -597,6 +597,104 @@ pub(crate) fn mongo_docs_grid(docs: &[serde_json::Value]) -> Grid {
     }
 }
 
+/// R82: the trailing grid column carrying each document's byte size (compact
+/// `serde_json` length of the already-loaded value). The name carries the unit
+/// and cannot collide with a real field called `size`.
+pub(crate) const MONGO_SIZE_COLUMN: &str = "size(B)";
+
+/// R82: the loaded document's serialized byte length. Computed from the value
+/// already in memory — never a server round-trip.
+pub(crate) fn mongo_doc_size_bytes(doc: &serde_json::Value) -> usize {
+    serde_json::to_string(doc)
+        .map(|s| s.len())
+        .unwrap_or_default()
+}
+
+/// R82: [`mongo_docs_grid`] plus the trailing `size(B)` column. Kept as a
+/// wrapper so the pure grid function stays the single source of truth for the
+/// document's own fields.
+pub(crate) fn mongo_docs_grid_with_sizes(docs: &[serde_json::Value]) -> Grid {
+    let mut grid = mongo_docs_grid(docs);
+    // An empty page keeps zero columns so the empty-state hint can render.
+    if docs.is_empty() {
+        return grid;
+    }
+    grid.columns.push(MONGO_SIZE_COLUMN.to_string());
+    for (row, doc) in grid.rows.iter_mut().zip(docs.iter()) {
+        row.push(Val::Text(mongo_doc_size_bytes(doc).to_string()));
+    }
+    grid
+}
+
+/// R82: re-order the loaded documents by compact serialized size. `Natural`
+/// returns the arrival order untouched; the size modes are stable so equal
+/// sizes keep their relative order.
+pub(crate) fn mongo_docs_sorted_by_size(
+    docs: &[serde_json::Value],
+    sort: MongoSizeSort,
+) -> Vec<serde_json::Value> {
+    let mut out = docs.to_vec();
+    match sort {
+        MongoSizeSort::Natural => {}
+        MongoSizeSort::SizeAsc => out.sort_by_key(mongo_doc_size_bytes),
+        MongoSizeSort::SizeDesc => {
+            out.sort_by_key(|d| std::cmp::Reverse(mongo_doc_size_bytes(d)));
+        }
+    }
+    out
+}
+
+/// R82: true when a document has the named field. A dotted name is treated as a
+/// nested path (`a.b.0.name`); a bare name matches a top-level key,
+/// case-insensitively. Client-side over the already-loaded page.
+pub(crate) fn mongo_doc_has_field(doc: &serde_json::Value, name: &str) -> bool {
+    let name = name.trim();
+    if name.is_empty() {
+        return false;
+    }
+    if name.contains('.') {
+        return mongo_path_lookup(doc, name).is_some();
+    }
+    match doc {
+        serde_json::Value::Object(map) => map.keys().any(|k| k.eq_ignore_ascii_case(name)),
+        _ => false,
+    }
+}
+
+/// R82: walk a dotted path into a JSON value. Object segments are field names;
+/// array segments are decimal indices. Any missing segment (or a non-numeric
+/// index into an array) yields `None`.
+pub(crate) fn mongo_path_lookup<'a>(
+    doc: &'a serde_json::Value,
+    path: &str,
+) -> Option<&'a serde_json::Value> {
+    if path.trim().is_empty() {
+        return None;
+    }
+    let mut cur = doc;
+    for seg in path.split('.') {
+        if seg.is_empty() {
+            return None;
+        }
+        cur = match cur {
+            serde_json::Value::Object(map) => map.get(seg)?,
+            serde_json::Value::Array(arr) => arr.get(seg.parse::<usize>().ok()?)?,
+            _ => return None,
+        };
+    }
+    Some(cur)
+}
+
+/// R82: the clipboard text for an extracted sub-value. A JSON string copies as
+/// the raw string (the same convention as a cell value); anything else copies
+/// its compact JSON.
+pub(crate) fn mongo_path_copy_text(v: &serde_json::Value) -> String {
+    match v {
+        serde_json::Value::String(s) => s.clone(),
+        other => serde_json::to_string(other).unwrap_or_else(|_| other.to_string()),
+    }
+}
+
 /// True when `s` looks like a 24-char hex ObjectId. A genuine string `_id` with
 /// that shape must be marked so the driver does not reinterpret it.
 pub(crate) fn is_object_id_hex(s: &str) -> bool {
