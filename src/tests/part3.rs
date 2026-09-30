@@ -10016,3 +10016,247 @@ pub(crate) fn r93_comment_and_ring_keys_are_in_footer_mini_and_full_help() {
         );
     }
 }
+
+// ── R94 row-detail locate (`\`) and the numeric summary (`S`) ──
+
+/// A four-field row popup whose name and value channels can each match, used by
+/// the locate tests below.
+pub(crate) fn r94_popup() -> RowPopup {
+    let lines: Vec<PopupLine> = [
+        "id = 4821",
+        "name = Ada",
+        "city = Beijing",
+        "amount = 1,234",
+    ]
+    .iter()
+    .map(|s| PopupLine {
+        text: (*s).to_string(),
+        style: Style::default(),
+    })
+    .collect();
+    RowPopup {
+        title: "第 7 行".into(),
+        lines,
+        cols: vec!["id".into(), "name".into(), "city".into(), "amount".into()],
+        shown: vec![
+            "4821".into(),
+            "Ada".into(),
+            "Beijing".into(),
+            "1,234".into(),
+        ],
+        values: vec!["4821".into(), "Ada".into(), "Beijing".into(), "1234".into()],
+        pretty: vec![None; 4],
+        expanded: vec![false; 4],
+        row_abs: 7,
+        scroll: 0,
+        cursor: 0,
+        filter: String::new(),
+        filtering: false,
+        search: String::new(),
+        searching: false,
+        hits: Vec::new(),
+        hit_idx: 0,
+        count: String::new(),
+    }
+}
+
+#[test]
+pub(crate) fn r94_row_locate_matches_field_names_and_values() {
+    let p = r94_popup();
+    // The value channel (case-insensitive).
+    assert_eq!(row_popup_match_hits(&p, "ada"), vec![1]);
+    // The field-name channel.
+    assert_eq!(row_popup_match_hits(&p, "CITY"), vec![2]);
+    // Both channels at once, in field order ("name" and "Beijing" both hold e).
+    assert_eq!(row_popup_match_hits(&p, "e"), vec![1, 2]);
+    // An empty / whitespace needle is no locate at all.
+    assert!(row_popup_match_hits(&p, "").is_empty());
+    assert!(row_popup_match_hits(&p, "   ").is_empty());
+}
+
+#[test]
+pub(crate) fn r94_row_locate_cycles_hits_and_clears_marks() {
+    let mut app = test_app();
+    app.row_popup = Some(r94_popup());
+    // `\` opens the prompt; typing filters the marks live (no cursor jump yet).
+    row_popup_key(
+        &mut app,
+        KeyEvent::new(KeyCode::Char('\\'), KeyModifiers::NONE),
+    );
+    assert!(app.row_popup.as_ref().unwrap().searching);
+    row_popup_key(
+        &mut app,
+        KeyEvent::new(KeyCode::Char('e'), KeyModifiers::NONE),
+    );
+    let p = app.row_popup.as_ref().unwrap();
+    assert_eq!(p.hits, vec![1, 2], "marks update while typing");
+    assert_eq!(p.cursor, 0, "typing does not move the cursor");
+    // Enter commits and jumps to the first hit.
+    row_popup_key(&mut app, KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+    let p = app.row_popup.as_ref().unwrap();
+    assert!(!p.searching);
+    assert_eq!(p.search, "e");
+    assert_eq!(p.cursor, 1);
+    assert_eq!(p.hit_idx, 0);
+    // `n` / `N` cycle the hits, wrapping.
+    for (k, want_cursor) in [('n', 2usize), ('n', 1), ('N', 2), ('N', 1)] {
+        row_popup_key(
+            &mut app,
+            KeyEvent::new(KeyCode::Char(k), KeyModifiers::NONE),
+        );
+        assert_eq!(
+            app.row_popup.as_ref().unwrap().cursor,
+            want_cursor,
+            "after {k}"
+        );
+    }
+    // Esc clears the marks first, keeps the popup; a second Esc closes it.
+    row_popup_key(&mut app, KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+    let p = app.row_popup.as_ref().unwrap();
+    assert!(p.search.is_empty() && p.hits.is_empty());
+    // With no locate, `n` is the ordinary next-field motion again.
+    row_popup_key(
+        &mut app,
+        KeyEvent::new(KeyCode::Char('n'), KeyModifiers::NONE),
+    );
+    row_popup_key(&mut app, KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+    assert!(app.row_popup.is_none());
+}
+
+#[test]
+pub(crate) fn r94_row_locate_marks_matching_fields_in_the_body() {
+    let mut p = r94_popup();
+    p.search = "e".into();
+    p.hits = vec![1, 2];
+    let (body, _, _) = row_popup_body(&p, 76);
+    let text = body
+        .iter()
+        .map(|l| {
+            l.spans
+                .iter()
+                .map(|s| s.content.as_ref())
+                .collect::<String>()
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(text.contains("› name = Ada"), "{text}");
+    assert!(text.contains("› city = Beijing"), "{text}");
+    assert!(!text.contains("› id"), "non-hit must stay unmarked: {text}");
+}
+
+#[test]
+pub(crate) fn r94_thousands_parse_is_strict_but_tolerant() {
+    assert_eq!(parse_stat_num("1,234"), Some(1234.0));
+    assert_eq!(parse_stat_num("-12,345.6"), Some(-12345.6));
+    assert_eq!(parse_stat_num(" 1,234 "), Some(1234.0));
+    // Malformed grouping is still rejected, so a stray comma never parses.
+    assert_eq!(parse_stat_num("1,2"), None);
+    assert_eq!(parse_stat_num("1,2345"), None);
+    assert_eq!(parse_stat_num(",123"), None);
+    assert_eq!(parse_stat_num("1,"), None);
+    assert_eq!(parse_stat_num(""), None);
+    assert_eq!(parse_stat_num("  "), None);
+    assert_eq!(parse_stat_num("abc"), None);
+}
+
+#[test]
+pub(crate) fn r94_numeric_summary_skips_nulls_blanks_and_tolerates_thousands() {
+    let grid = Grid {
+        columns: vec!["n".into(), "s".into()],
+        rows: vec![
+            vec![Val::Text("12".into()), Val::Text("x".into())],
+            vec![Val::Text("98".into()), Val::Text("y".into())],
+            vec![Val::Text("1,234".into()), Val::Text(String::new())],
+            vec![Val::Text(String::new()), Val::Text("z".into())],
+            vec![Val::Null, Val::Text("w".into())],
+        ],
+        note: String::new(),
+        types: Vec::new(),
+    };
+    let s = numeric_summary(&grid, 0, COL_STATS_SCAN_LIMIT).expect("numeric column");
+    assert_eq!(s.count, 3);
+    assert_eq!(s.min, 12.0);
+    assert_eq!(s.max, 1234.0);
+    assert_eq!(s.avg, (12.0 + 98.0 + 1234.0) / 3.0);
+    // A pure text column has no numeric value -> no summary.
+    assert!(numeric_summary(&grid, 1, COL_STATS_SCAN_LIMIT).is_none());
+}
+
+#[test]
+pub(crate) fn r94_numeric_summary_is_off_by_default_and_toggles_with_s() {
+    let (tx, _rx) = tokio::sync::mpsc::unbounded_channel::<OpResult>();
+    let mut app = test_app();
+    app.focus = Focus::Preview;
+    app.grid_kind = GridKind::Query;
+    app.set_grid(Grid {
+        columns: vec!["n".into(), "s".into()],
+        rows: vec![
+            vec![Val::Text("12".into()), Val::Text("x".into())],
+            vec![Val::Text("98".into()), Val::Text("y".into())],
+            vec![Val::Text("1,234".into()), Val::Text(String::new())],
+            vec![Val::Text(String::new()), Val::Text("z".into())],
+            vec![Val::Null, Val::Text("w".into())],
+        ],
+        note: String::new(),
+        types: Vec::new(),
+    });
+    app.col_cursor = 0;
+    // Off by default: the status bar carries no summary text.
+    assert!(!app.num_summary);
+    assert!(num_summary_text(&app).is_none());
+    key(
+        &mut app,
+        &tx,
+        KeyEvent::new(KeyCode::Char('S'), KeyModifiers::NONE),
+    );
+    assert!(app.num_summary, "S turns the summary on");
+    let s = num_summary_text(&app).expect("summary text");
+    assert!(s.contains("min 12"), "{s}");
+    assert!(s.contains("max 1234"), "{s}");
+    assert!(s.contains("avg 448"), "{s}");
+    // A focused text column has no numeric value -> nothing shown.
+    app.col_cursor = 1;
+    assert!(num_summary_text(&app).is_none());
+    // `S` again turns it off, and the summary text disappears.
+    app.col_cursor = 0;
+    key(
+        &mut app,
+        &tx,
+        KeyEvent::new(KeyCode::Char('S'), KeyModifiers::NONE),
+    );
+    assert!(!app.num_summary);
+    assert!(num_summary_text(&app).is_none());
+}
+
+/// R94: the row-popup locate and the numeric-summary toggle ship in the footer
+/// (which the mini sheet reuses) and in the full `?` sheet together.
+#[test]
+pub(crate) fn r94_locate_and_summary_keys_are_in_footer_and_full_help() {
+    // Row popup: the footer names the locate alongside the filter.
+    let row_hints = footer_hints_ctx(FooterCtx {
+        view: FooterView::RowPopup,
+        focus: Focus::Preview,
+        has_connection: true,
+    });
+    let row_keys: Vec<&str> = row_hints.iter().map(|h| h.0).collect();
+    assert!(row_keys.contains(&"/ \\"), "row footer: {row_keys:?}");
+    // Results pane: the opt-in numeric summary is in the footer.
+    let res_hints = footer_hints_ctx(FooterCtx {
+        view: FooterView::Browse,
+        focus: Focus::Preview,
+        has_connection: true,
+    });
+    let res_keys: Vec<&str> = res_hints.iter().map(|h| h.0).collect();
+    assert!(res_keys.contains(&"S"), "results footer: {res_keys:?}");
+    // The full cheat-sheet documents both gestures.
+    assert!(
+        HELP_ROWS
+            .iter()
+            .any(|(k, d)| *k == "\\" && d.contains("定位字段")),
+        "full help missing the row locate"
+    );
+    assert!(
+        HELP_ROWS.iter().any(|(k, _)| *k == "S"),
+        "full help missing the numeric summary"
+    );
+}

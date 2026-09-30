@@ -270,6 +270,9 @@ pub(crate) fn preview_key(app: &mut App, tx: &Tx, k: KeyEvent) {
                 t("g… d=表结构 t=表数据 v=定位值 c=列结构 b=切换表 f=冻结列 s=钉行 w=适配列宽 W=全列适配").into();
         }
         KeyCode::Char('s') => sort_column(app, tx, false),
+        // R94: `S` toggles the status-bar numeric summary (min / max / avg of the
+        // focused column's loaded window). Off by default; `s` stays the sort.
+        KeyCode::Char('S') => toggle_num_summary(app),
         KeyCode::Char('f') => open_filter_prompt(app),
         // `/` searches the visible result rows (filter-as-you-type).
         KeyCode::Char('/') => open_result_filter(app),
@@ -1852,14 +1855,62 @@ pub(crate) struct ColStats {
 
 /// Parse one cell as a finite number for the stats. A blank, a non-numeric text
 /// or `inf` / `nan` all return `None`, so a text column never accidentally gains
-/// a `min` / `max`.
+/// a `min` / `max`. R94: a thousands-separated number (`1,234` / `12,345.68`) is
+/// tolerated too, but only when the comma groups are well-formed, so `1,2` or a
+/// stray `,` is still rejected.
 pub(crate) fn parse_stat_num(s: &str) -> Option<f64> {
     let t = s.trim();
     if t.is_empty() {
         return None;
     }
-    let v: f64 = t.parse().ok()?;
-    v.is_finite().then_some(v)
+    if let Ok(v) = t.parse::<f64>() {
+        return v.is_finite().then_some(v);
+    }
+    parse_grouped_num(t).filter(|v| v.is_finite())
+}
+
+/// Parse a thousands-separated decimal (`1,234`, `-12,345.6`). Returns `None`
+/// unless every comma group is well-formed: the first group 1..=3 digits, every
+/// later group exactly 3, an optional sign and an optional dot fraction of
+/// digits only. Deliberately strict so a normal parsed float is never altered.
+fn parse_grouped_num(t: &str) -> Option<f64> {
+    let (sign, rest) = match t.strip_prefix('-') {
+        Some(r) => ("-", r),
+        None => match t.strip_prefix('+') {
+            Some(r) => ("+", r),
+            None => ("", t),
+        },
+    };
+    let (int_part, frac_part) = match rest.split_once('.') {
+        Some((i, f)) => (i, Some(f)),
+        None => (rest, None),
+    };
+    if !int_part.contains(',') {
+        return None;
+    }
+    let groups: Vec<&str> = int_part.split(',').collect();
+    if groups.len() < 2 {
+        return None;
+    }
+    let first = groups[0];
+    if first.is_empty() || first.len() > 3 || !first.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    for g in &groups[1..] {
+        if g.len() != 3 || !g.bytes().all(|b| b.is_ascii_digit()) {
+            return None;
+        }
+    }
+    let mut plain = String::from(sign);
+    plain.push_str(&groups.join(""));
+    if let Some(f) = frac_part {
+        if f.is_empty() || !f.bytes().all(|b| b.is_ascii_digit()) {
+            return None;
+        }
+        plain.push('.');
+        plain.push_str(f);
+    }
+    plain.parse::<f64>().ok()
 }
 
 /// R66: count the non-null / null / distinct values of one column and, when
@@ -1993,6 +2044,109 @@ pub(crate) fn fmt_stat_num(v: f64) -> String {
     } else {
         let s = format!("{v:.4}");
         s.trim_end_matches('0').trim_end_matches('.').to_string()
+    }
+}
+
+// ── R94: focused-column numeric summary for the status bar (`S`) ──
+
+/// The numeric snapshot of one loaded-column window: the smallest, largest and
+/// mean of every finite value that parsed (NULL / blank / non-numeric cells are
+/// skipped) plus how many values fed it.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(crate) struct NumSummary {
+    pub(crate) min: f64,
+    pub(crate) max: f64,
+    pub(crate) avg: f64,
+    pub(crate) count: usize,
+}
+
+/// R94: min / max / avg over the numeric values of one column in the already
+/// loaded window. `None` when the column holds no numeric value at all (so a
+/// pure text column never gains a summary). NULL, blanks and thousands-separated
+/// text are tolerated via [`parse_stat_num`]. Pure and client-side.
+pub(crate) fn numeric_summary(grid: &Grid, col: usize, limit: usize) -> Option<NumSummary> {
+    let scanned = grid.rows.len().min(limit);
+    let mut min = f64::INFINITY;
+    let mut max = f64::NEG_INFINITY;
+    let mut sum = 0.0f64;
+    let mut count = 0usize;
+    for row in grid.rows.iter().take(scanned) {
+        let Some(s) = row.get(col).and_then(|v| match v {
+            Val::Text(s) => Some(s.as_str()),
+            _ => None,
+        }) else {
+            continue;
+        };
+        if let Some(v) = parse_stat_num(s) {
+            min = min.min(v);
+            max = max.max(v);
+            sum += v;
+            count += 1;
+        }
+    }
+    if count == 0 {
+        return None;
+    }
+    Some(NumSummary {
+        min,
+        max,
+        avg: sum / count as f64,
+        count,
+    })
+}
+
+/// R94: the focused column's numeric summary over the grid on screen, or `None`
+/// when there is no result grid / the cursor is past the columns / the column
+/// has no numeric value. Zero queries — the loaded window only.
+pub(crate) fn col_numeric_summary(app: &App) -> Option<NumSummary> {
+    if app.grid_kind == GridKind::Columns {
+        return None;
+    }
+    // The displayed grid is already on hand during the status render, so borrow
+    // it instead of cloning the full page every frame.
+    let grid = app.grid.as_ref()?;
+    if app.col_cursor >= grid.columns.len() {
+        return None;
+    }
+    numeric_summary(grid, app.col_cursor, COL_STATS_SCAN_LIMIT)
+}
+
+/// R94: the status-bar text `min a · max b · avg c` when the `S` summary is on
+/// and the focused column has at least one numeric value.
+pub(crate) fn num_summary_text(app: &App) -> Option<String> {
+    if !app.num_summary {
+        return None;
+    }
+    let s = col_numeric_summary(app)?;
+    Some(tf(
+        "min {} · max {} · avg {}",
+        &[
+            &fmt_stat_num(s.min),
+            &fmt_stat_num(s.max),
+            &fmt_stat_num(s.avg),
+        ],
+    ))
+}
+
+/// R94: `S` — toggle the status-bar numeric summary. Off by default (it changes
+/// persistent status-bar content, which is a visual change). The status message
+/// names the column's state so a press on a text column is never a silent no-op.
+pub(crate) fn toggle_num_summary(app: &mut App) {
+    app.num_summary = !app.num_summary;
+    if !app.num_summary {
+        app.flash(t("数值摘要 关").into());
+        return;
+    }
+    match col_numeric_summary(app) {
+        Some(s) => app.flash(tf(
+            "数值摘要 开 · min {} · max {} · avg {}",
+            &[
+                &fmt_stat_num(s.min),
+                &fmt_stat_num(s.max),
+                &fmt_stat_num(s.avg),
+            ],
+        )),
+        None => app.flash(t("数值摘要 开 · 当前列无数值").into()),
     }
 }
 

@@ -2201,6 +2201,10 @@ pub(crate) struct App {
     pub(crate) num_fmt: NumFmt,
     /// R76: alternate-row banding in the result grid (config, default on).
     pub(crate) stripe: bool,
+    /// R94: show the focused numeric column's min / max / avg in the status bar
+    /// (`S` toggles it). Session-only and off by default — it changes persistent
+    /// status-bar content, so it is opt-in (the visual red line).
+    pub(crate) num_summary: bool,
     /// R79: auto-indent the new line after `Enter` inside a SQL block (input
     /// behaviour, default on; `tui.json` can turn it off).
     pub(crate) editor_indent: bool,

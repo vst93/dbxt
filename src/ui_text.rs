@@ -1938,6 +1938,22 @@ fn en_of(zh: &'static str) -> Option<&'static str> {
         "看值" => Some("view value"),
         "过滤列" => Some("filter columns"),
         "过滤名/值" => Some("filter name/value"),
+        "过滤·定位" => Some("filter · locate"),
+        "过滤/定位" => Some("filter/locate"),
+        "已取消定位" => Some("locate cancelled"),
+        "定位「{}」· 无命中" => Some("locate [{}] · no match"),
+        "定位「{}」· 命中 {}/{}" => Some("locate [{}] · match {}/{}"),
+        "定位「{}」· {} 命中 · n/N 跳转 · Esc 清除" => {
+            Some("locate [{}] · {} matches · n/N to jump · Esc clears")
+        }
+        "已清除定位标记" => Some("cleared locate marks"),
+        "数值摘要 关" => Some("numeric summary off"),
+        "数值摘要 开 · min {} · max {} · avg {}" => {
+            Some("numeric summary on · min {} · max {} · avg {}")
+        }
+        "数值摘要 开 · 当前列无数值" => {
+            Some("numeric summary on · no numeric value in this column")
+        }
         "（无匹配列）" => Some("(no matching column)"),
         "（无匹配字段）" => Some("(no matching field)"),
         "没有可复制的列" => Some("no column to copy"),
@@ -1964,6 +1980,12 @@ fn en_of(zh: &'static str) -> Option<&'static str> {
         }
         "按列名或值过滤（输入即筛；宽表 40+ 列找列）" => {
             Some("filter by column name or value (as you type; find a column in a 40+ column table)")
+        }
+        "按列名或值过滤（输入即筛；宽表 40+ 列找列；\\ 是不隐藏字段的定位）" => {
+            Some("filter by column name or value (as you type; find a column in a 40+ column table; \\ locates without hiding fields)")
+        }
+        "定位字段：按列名或值找并跳到首个命中（n/N 循环，Esc 清除标记；不隐藏字段，与 / 过滤互补）" => {
+            Some("locate a field by column name or value and jump to the first hit (n/N cycles, Esc clears the marks; fields stay visible, complementing the / filter)")
         }
         "窄屏：每行「字段:」+ 缩进值单列自适应" => {
             Some("narrow: one field per line, \"field:\" then the indented value")
@@ -2788,6 +2810,10 @@ fn en_of(zh: &'static str) -> Option<&'static str> {
         "斑马纹：结果集奇偶行底色微差 开 / 关 · 默认关闭，% 手动开启，跨会话记住" => Some(
             "Zebra stripes: a subtle tint on alternate result rows, on/off · off by default, press `%` to enable, remembered across sessions",
         ),
+        "数值摘要开关：选中列有数值时状态栏显示 min / max / avg（扫描已加载窗口，NULL / 空串 / 千分位容忍；纯客户端零查询）· 默认关闭，S 手动开启，仅本次会话" => Some(
+            "Numeric summary toggle: with a numeric column selected the status bar shows min / max / avg (scans the loaded window, tolerating NULL / blanks / thousands separators; client-side, zero queries) · off by default, press `S` to enable, this session only",
+        ),
+        "数值摘要" => Some("numeric summary"),
         // R80: short footer / mini-help labels for the R51–R79 result-set keys
         "数字格式" => Some("number format"),
         "斑马纹" => Some("zebra stripes"),

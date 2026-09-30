@@ -473,6 +473,17 @@ pub(crate) struct RowPopup {
     pub(crate) filter: String,
     /// True while the `/` filter is being typed, so `j`/`k` are text.
     pub(crate) filtering: bool,
+    /// R94: active locate needle (`\`), matched against a field's name *or*
+    /// displayed value; empty when no locate is active. Unlike `filter` it never
+    /// hides a field — it only marks and jumps.
+    pub(crate) search: String,
+    /// R94: true while the `\` locate input is being typed, so every printable
+    /// key extends the needle.
+    pub(crate) searching: bool,
+    /// R94: entry indices matched by `search`, in field order.
+    pub(crate) hits: Vec<usize>,
+    /// R94: index into [`RowPopup::hits`] the cursor last landed on.
+    pub(crate) hit_idx: usize,
     /// Pending vim count prefix for `j`/`k` / `PageDown`.
     pub(crate) count: String,
 }
@@ -495,6 +506,10 @@ pub(crate) fn row_popup_from_lines(title: String, lines: Vec<PopupLine>) -> RowP
         cursor: 0,
         filter: String::new(),
         filtering: false,
+        search: String::new(),
+        searching: false,
+        hits: Vec::new(),
+        hit_idx: 0,
         count: String::new(),
     }
 }

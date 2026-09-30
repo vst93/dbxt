@@ -579,6 +579,12 @@ pub(crate) fn context_info(app: &App) -> String {
         }
         parts.push(s);
     }
+    // R94: the focused numeric column's snapshot (`S`), off by default. Placed
+    // ahead of the identity fields so it survives the status bar's tail
+    // truncation on a narrow terminal — the user explicitly turned it on.
+    if let Some(s) = num_summary_text(app) {
+        parts.push(s);
+    }
     // R65: where the open data view lives (`db.table`, table alone when narrow).
     // The connection name leads the left block, so only the location is added
     // here. Sits ahead of the other persistent fields so the identity survives
@@ -1249,7 +1255,7 @@ pub(crate) fn footer_hints_ctx(ctx: FooterCtx) -> Vec<Hint> {
             ("↑↓/n p", t("移动")),
             ("Enter/v", t("看值")),
             ("y/Y", t("复制值")),
-            ("/", t("过滤名/值")),
+            ("/ \\", t("过滤/定位")),
             ("Esc", t("关闭")),
         ],
         FooterView::ErrorBox => vec![
@@ -1442,6 +1448,8 @@ pub(crate) fn footer_hints_ctx(ctx: FooterCtx) -> Vec<Hint> {
                 ("J", t("JSON 美化")),
                 ("#", t("数字格式")),
                 ("%", t("斑马纹")),
+                // R94: the opt-in numeric summary toggle.
+                ("S", t("数值摘要")),
                 ("0", t("复位列宽")),
                 ("Alt-0", t("清列宽")),
                 ("gd/gt", t("结构/数据")),

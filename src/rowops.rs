@@ -214,6 +214,10 @@ pub(crate) fn open_row_popup(app: &mut App) {
         cursor: 0,
         filter: String::new(),
         filtering: false,
+        search: String::new(),
+        searching: false,
+        hits: Vec::new(),
+        hit_idx: 0,
         count: String::new(),
     });
 }
@@ -291,6 +295,84 @@ pub(crate) fn row_popup_visible(popup: &RowPopup) -> Vec<usize> {
         })
         .map(|(i, _)| i)
         .collect()
+}
+
+/// R94: entry indices (into `popup.lines`) whose column name or displayed value
+/// contains `needle` (case-insensitive substring), in field order. Pure, so the
+/// multi-hit cycle is unit-testable without a renderer. An empty / whitespace
+/// needle matches nothing (no locate).
+pub(crate) fn row_popup_match_hits(popup: &RowPopup, needle: &str) -> Vec<usize> {
+    let n = needle.trim().to_lowercase();
+    if n.is_empty() {
+        return Vec::new();
+    }
+    popup
+        .cols
+        .iter()
+        .enumerate()
+        .filter(|(i, c)| {
+            c.to_lowercase().contains(&n)
+                || popup
+                    .shown
+                    .get(*i)
+                    .is_some_and(|v| v.to_lowercase().contains(&n))
+        })
+        .map(|(i, _)| i)
+        .collect()
+}
+
+/// The visible-list position of entry `ei` (`None` when a filter hides it).
+fn row_popup_pos_of(popup: &RowPopup, ei: usize) -> Option<usize> {
+    row_popup_visible(popup).iter().position(|&e| e == ei)
+}
+
+/// R94: `n` / `N` with a locate active — step the cursor to the next / previous
+/// matching field, wrapping. When the current field is not itself a hit the step
+/// anchors on the first match (forward) or the last (backward). Pure client-side
+/// over the already-loaded row.
+pub(crate) fn row_popup_search_step(app: &mut App, dir: i32) {
+    let (needle, count) = {
+        let Some(popup) = app.row_popup.as_mut() else {
+            return;
+        };
+        popup.count.clear();
+        let n = popup.hits.len();
+        if n == 0 {
+            (popup.search.clone(), 0usize)
+        } else {
+            let visible = row_popup_visible(popup);
+            let cur_pos = popup.cursor.min(visible.len().saturating_sub(1));
+            let cur_entry = visible.get(cur_pos).copied();
+            let pos = cur_entry.and_then(|e| popup.hits.iter().position(|&h| h == e));
+            let idx = match pos {
+                Some(p) => {
+                    if dir > 0 {
+                        (p + 1) % n
+                    } else {
+                        (p + n - 1) % n
+                    }
+                }
+                None => {
+                    if dir > 0 {
+                        0
+                    } else {
+                        n - 1
+                    }
+                }
+            };
+            popup.hit_idx = idx;
+            if let Some(new_pos) = row_popup_pos_of(popup, popup.hits[idx]) {
+                popup.cursor = new_pos;
+            }
+            (popup.search.clone(), n)
+        }
+    };
+    if count == 0 {
+        app.status = tf("定位「{}」· 0 命中", &[&needle]);
+    } else {
+        let idx = app.row_popup.as_ref().map(|p| p.hit_idx + 1).unwrap_or(1);
+        app.status = tf("定位「{}」· 命中 {}/{}", &[&needle, &idx, &count]);
+    }
 }
 
 /// The selected entry index (into `lines`) of the row popup, if any.
@@ -406,13 +488,27 @@ pub(crate) fn row_popup_key(app: &mut App, k: KeyEvent) {
     // place. Handled before the mutable borrow below (while a `/` filter is
     // being typed, `J` stays a literal character).
     let filtering = app.row_popup.as_ref().is_some_and(|p| p.filtering);
+    let searching = app.row_popup.as_ref().is_some_and(|p| p.searching);
     if !filtering
+        && !searching
         && !k
             .modifiers
             .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT)
         && k.code == KeyCode::Char('J')
     {
         toggle_row_popup_json(app);
+        return;
+    }
+    // R94: `n` / `N` cycle the locate hits while a locate is active; with no
+    // locate they keep their old meaning (`n` = down, `N` unused).
+    let locating = app.row_popup.as_ref().is_some_and(|p| {
+        !p.searching && !p.filtering && !p.search.trim().is_empty() && !p.hits.is_empty()
+    });
+    if locating
+        && k.modifiers.is_empty()
+        && matches!(k.code, KeyCode::Char('n') | KeyCode::Char('N'))
+    {
+        row_popup_search_step(app, if k.code == KeyCode::Char('N') { -1 } else { 1 });
         return;
     }
     let Some(popup) = app.row_popup.as_mut() else {
@@ -448,6 +544,66 @@ pub(crate) fn row_popup_key(app: &mut App, k: KeyEvent) {
         }
         return;
     }
+    // R94: typing the `\` locate. Printable keys extend the needle and the hit
+    // marks update live; Enter commits (jumping to the first hit), Esc cancels.
+    if popup.searching {
+        match k.code {
+            KeyCode::Esc => {
+                popup.searching = false;
+                popup.search.clear();
+                popup.hits.clear();
+                popup.hit_idx = 0;
+                popup.count.clear();
+                app.flash(t("已取消定位").into());
+            }
+            KeyCode::Enter => {
+                popup.searching = false;
+                popup.count.clear();
+                let needle = popup.search.trim().to_string();
+                popup.search = needle.clone();
+                let hits = row_popup_match_hits(popup, &needle);
+                popup.hits = hits;
+                popup.hit_idx = 0;
+                if popup.hits.is_empty() {
+                    popup.search.clear();
+                    app.flash(tf("定位「{}」· 无命中", &[&needle]));
+                } else {
+                    let first = popup.hits[0];
+                    if let Some(pos) = row_popup_pos_of(popup, first) {
+                        popup.cursor = pos;
+                    }
+                    let n = popup.hits.len();
+                    app.flash(tf(
+                        "定位「{}」· {} 命中 · n/N 跳转 · Esc 清除",
+                        &[&needle, &n],
+                    ));
+                }
+            }
+            KeyCode::Backspace => {
+                popup.search.pop();
+                popup.count.clear();
+                let needle = popup.search.trim().to_lowercase();
+                let hits = row_popup_match_hits(popup, &needle);
+                popup.hits = hits;
+                popup.hit_idx = 0;
+            }
+            KeyCode::Char(c)
+                if !c.is_control()
+                    && !k
+                        .modifiers
+                        .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) =>
+            {
+                popup.search.push(c);
+                popup.count.clear();
+                let needle = popup.search.trim().to_lowercase();
+                let hits = row_popup_match_hits(popup, &needle);
+                popup.hits = hits;
+                popup.hit_idx = 0;
+            }
+            _ => {}
+        }
+        return;
+    }
     // A leading digit is a count prefix for the next motion (5j).
     if let KeyCode::Char(c @ '1'..='9') = k.code {
         if k.modifiers.is_empty() && popup.count.len() < 4 {
@@ -460,6 +616,14 @@ pub(crate) fn row_popup_key(app: &mut App, k: KeyEvent) {
     let last = visible.len().saturating_sub(1);
     let cur = popup.cursor.min(last);
     match k.code {
+        // R94: an active locate marker is cleared first; a second Esc closes.
+        KeyCode::Esc | KeyCode::Char('q') if !popup.search.is_empty() || !popup.hits.is_empty() => {
+            popup.search.clear();
+            popup.hits.clear();
+            popup.hit_idx = 0;
+            popup.count.clear();
+            app.flash(t("已清除定位标记").into());
+        }
         KeyCode::Esc | KeyCode::Char('q') => {
             app.row_popup = None;
             app.flash(t("已关闭行详情").into());
@@ -486,8 +650,27 @@ pub(crate) fn row_popup_key(app: &mut App, k: KeyEvent) {
         }
         KeyCode::Char('/') => {
             popup.count.clear();
+            // A locate and a filter are two ways to narrow the same list; only
+            // one owns the marks at a time.
+            popup.searching = false;
+            popup.search.clear();
+            popup.hits.clear();
+            popup.hit_idx = 0;
             popup.filtering = true;
             popup.filter.clear();
+            popup.cursor = 0;
+            popup.scroll = 0;
+        }
+        // R94: `\` locates a field by name or value without hiding the others:
+        // matches get a `›` mark and `n`/`N` cycle them (Esc clears).
+        KeyCode::Char('\\') => {
+            popup.count.clear();
+            popup.filtering = false;
+            popup.filter.clear();
+            popup.searching = true;
+            popup.search.clear();
+            popup.hits.clear();
+            popup.hit_idx = 0;
             popup.cursor = 0;
             popup.scroll = 0;
         }

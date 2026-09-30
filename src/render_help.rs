@@ -384,7 +384,17 @@ pub(crate) fn row_popup_body(
         if selected {
             sel_line = body.len();
         }
-        let marker = if selected { "▶ " } else { "  " };
+        // R94: a located field carries a quiet `›` at the line head (the
+        // selected field keeps its `▶`), so a match in a wide row is visible
+        // without hiding the fields around it. `Esc` clears the marks.
+        let located = !popup.search.is_empty() && popup.hits.contains(&ei);
+        let marker = if selected {
+            "▶ "
+        } else if located {
+            "› "
+        } else {
+            "  "
+        };
         let style = if selected {
             pl.style.add_modifier(Modifier::BOLD)
         } else {
@@ -470,7 +480,20 @@ pub(crate) fn render_row_popup(f: &mut Frame, area: Rect, app: &mut App) {
     // Build the (filtered) body first, tracking where the cursor's entry starts.
     // `hit` maps each physical (wrapped) line back to its entry position, so a
     // click can select the value under the pointer even when it wrapped.
-    let (base_title, body, hit, sel_line, filtering, filter, cur, total) = {
+    let (
+        base_title,
+        body,
+        hit,
+        sel_line,
+        filtering,
+        filter,
+        searching,
+        search,
+        search_pos,
+        search_total,
+        cur,
+        total,
+    ) = {
         let Some(popup) = app.row_popup.as_ref() else {
             return;
         };
@@ -481,6 +504,14 @@ pub(crate) fn render_row_popup(f: &mut Frame, area: Rect, app: &mut App) {
             popup.cursor.min(total - 1)
         };
         let (body, hit, sel_line) = row_popup_body(popup, inner_w);
+        let (search_pos, search_total) = if popup.hits.is_empty() {
+            (0, 0)
+        } else {
+            (
+                popup.hit_idx.min(popup.hits.len() - 1) + 1,
+                popup.hits.len(),
+            )
+        };
         (
             popup.title.clone(),
             body,
@@ -488,6 +519,10 @@ pub(crate) fn render_row_popup(f: &mut Frame, area: Rect, app: &mut App) {
             sel_line,
             popup.filtering,
             popup.filter.clone(),
+            popup.searching,
+            popup.search.clone(),
+            search_pos,
+            search_total,
             if total == 0 { 0 } else { cursor + 1 },
             total,
         )
@@ -533,13 +568,20 @@ pub(crate) fn render_row_popup(f: &mut Frame, area: Rect, app: &mut App) {
     } else if !filter.is_empty() {
         base.push_str(&format!("· /{} ", filter));
     }
+    // R94: the locate needle and its hit position, shown while typing and while
+    // the marks stay on.
+    if searching {
+        base.push_str(&format!("· \\{}_ ", search));
+    } else if !search.is_empty() {
+        base.push_str(&format!("· \\{} {}/{} ", search, search_pos, search_total));
+    }
     base.push_str(&format!("· {}/{} ", cur, total));
     let full = format!(
-        "{base}· ↑↓/n p {} · Enter/v {} · y/Y {} · / {} · Esc {} ",
+        "{base}· ↑↓/n p {} · Enter/v {} · y/Y {} · / \\ {} · Esc {} ",
         t("移动"),
         t("看值"),
         t("复制值"),
-        t("过滤名/值"),
+        t("过滤·定位"),
         t("关闭")
     );
     let short = format!("{}· Esc {} ", base, t("关闭"));
@@ -1435,6 +1477,10 @@ pub(crate) const HELP_ROWS: &[(&str, &str)] = &[
         "斑马纹：结果集奇偶行底色微差 开 / 关 · 默认关闭，% 手动开启，跨会话记住",
     ),
     (
+        "S",
+        "数值摘要开关：选中列有数值时状态栏显示 min / max / avg（扫描已加载窗口，NULL / 空串 / 千分位容忍；纯客户端零查询）· 默认关闭，S 手动开启，仅本次会话",
+    ),
+    (
         "< / > / 0",
         "收窄 / 加宽 / 复位当前列（按 库.表+列名 记忆并跨会话持久化；0 复位当前列）",
     ),
@@ -1470,6 +1516,10 @@ pub(crate) const HELP_ROWS: &[(&str, &str)] = &[
     ("— 行详情浮层（Enter / o）—", ""),
     ("↑ ↓ / j k / n p · 5j", "移动选中列（计数前缀：5j 跳 5 列；n/p 与 j/k 同义）"),
     (
+        "\\",
+        "定位字段：按列名或值找并跳到首个命中（n/N 循环，Esc 清除标记；不隐藏字段，与 / 过滤互补）",
+    ),
+    (
         "Enter / v",
         "下钻完整单元格（Esc 返回行弹层，再 Esc 回表格）",
     ),
@@ -1478,7 +1528,7 @@ pub(crate) const HELP_ROWS: &[(&str, &str)] = &[
         "J",
         "JSON 字段就地展开 / 收起（对象 / 数组；缩进多行块，超出弹层可滚动；y / Y 始终复制原始值）",
     ),
-    ("/", "按列名或值过滤（输入即筛；宽表 40+ 列找列）"),
+    ("/", "按列名或值过滤（输入即筛；宽表 40+ 列找列；\\ 是不隐藏字段的定位）"),
     ("< 56 cols", "窄屏：每行「字段:」+ 缩进值单列自适应"),
     ("标题", "主键定位：第 12 行 · id=4821"),
     ("— 单元格弹层（v）—", ""),

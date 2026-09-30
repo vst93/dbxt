@@ -3635,7 +3635,9 @@ pub(crate) fn help_has_no_bare_uppercase_shortcuts() {
     // `l` is the pane's expand / next-column key. `U` (R89, cycle the cell
     // popup's Unicode view: raw / decoded / re-escaped) joins: its lowercase
     // `u` is not bound there, but the uppercase keeps the three-way conversion
-    // gesture visually distinct from the `y`/`Y` copy pair.
+    // gesture visually distinct from the `y`/`Y` copy pair. `S` (R94, the
+    // status-bar numeric-summary toggle) joins: its lowercase `s` is the result
+    // grid's sort, so the uppercase carries the deliberate, opt-in summary.
     for (key, _) in HELP_ROWS {
         if key.starts_with('—') {
             continue;
@@ -3649,6 +3651,7 @@ pub(crate) fn help_has_no_bare_uppercase_shortcuts() {
                 || tok == "T"
                 || tok == "L"
                 || tok == "U"
+                || tok == "S"
             {
                 continue;
             }

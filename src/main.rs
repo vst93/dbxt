@@ -4576,6 +4576,7 @@ impl App {
             compact: config_compact,
             num_fmt: config_num_fmt,
             stripe: config_stripe,
+            num_summary: false,
             editor_indent: config_editor_indent,
             editor_pairs: config_editor_pairs,
             stmt_gutter: config_stmt_gutter,
