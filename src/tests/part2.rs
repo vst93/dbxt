@@ -2526,6 +2526,207 @@ pub(crate) fn editor_alt_s_opens_the_favourite_name_prompt() {
     assert!(empty.snippet_name.is_none());
 }
 
+// ── R71: built-in SQL template panel (`Alt-T` in the editor) ──
+
+/// The pure scanner finds every `{{name}}` token and nothing else: an empty
+/// `{{}}`, an unterminated `{{x` and a nested brace are not placeholders.
+#[test]
+pub(crate) fn editor_placeholders_scans_tokens_only() {
+    let lines = vec![
+        "SELECT {{col}} FROM {{table}}".to_string(),
+        "WHERE a = '{{}}' OR b = '{{x'".to_string(),
+    ];
+    let phs = editor_placeholders(&lines);
+    assert_eq!(phs.len(), 2);
+    assert_eq!((phs[0].row, phs[0].col, phs[0].len), (0, 7, 7));
+    assert_eq!((phs[1].row, phs[1].col, phs[1].len), (0, 20, 9));
+}
+
+/// `Alt-T` with the editor focused opens the template panel; with any other
+/// pane focused it keeps its data-transfer role.
+#[test]
+pub(crate) fn editor_alt_t_opens_the_template_panel_only_in_the_editor() {
+    let (tx, _rx) = tokio::sync::mpsc::unbounded_channel::<OpResult>();
+    let mut app = test_app();
+    app.focus = Focus::Editor;
+    key(
+        &mut app,
+        &tx,
+        KeyEvent::new(KeyCode::Char('t'), KeyModifiers::ALT),
+    );
+    assert!(app.template_open);
+    assert!(app.transfer.is_none());
+
+    let mut side = test_app();
+    side.focus = Focus::Sidebar;
+    key(
+        &mut side,
+        &tx,
+        KeyEvent::new(KeyCode::Char('t'), KeyModifiers::ALT),
+    );
+    assert!(!side.template_open);
+}
+
+/// Enter on a template inserts its text at the caret and selects the first
+/// `{{…}}` placeholder, so the next keystroke replaces it; `template_active`
+/// gates the Tab walk and the highlight.
+#[test]
+pub(crate) fn template_enter_inserts_and_selects_the_first_placeholder() {
+    let mut app = test_app();
+    open_template_panel(&mut app);
+    // Move to the UPDATE template (index 2) and insert it.
+    app.template_list.select(Some(2));
+    template_key(&mut app, KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+    assert!(app.editor_sql().contains("UPDATE {{table}}"));
+    assert!(!app.template_open);
+    assert!(app.template_active);
+    // "UPDATE " is 7 chars, so `{{table}}` starts at col 7 and is 9 long.
+    assert_eq!(app.template_ph_start, Some((0, 7)));
+    assert_eq!(app.editor.selection_range(), Some(((0, 7), (0, 16))));
+}
+
+/// `Tab` walks the placeholders in order and wraps; once every `{{…}}` has been
+/// replaced it falls back to the normal pane switch and drops the mode.
+#[test]
+pub(crate) fn template_tab_walks_placeholders_then_releases_the_key() {
+    let (tx, _rx) = tokio::sync::mpsc::unbounded_channel::<OpResult>();
+    let mut app = test_app();
+    app.set_editor_text("{{a}} {{b}}");
+    app.template_active = true;
+    app.focus = Focus::Editor;
+    // Select the first, then Tab to the second, then wrap back to the first.
+    select_placeholder(
+        &mut app,
+        Placeholder {
+            row: 0,
+            col: 0,
+            len: 5,
+        },
+    );
+    key(
+        &mut app,
+        &tx,
+        KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE),
+    );
+    assert_eq!(app.template_ph_start, Some((0, 6)));
+    assert!(app.status.contains("2/2"), "status: {}", app.status);
+    key(
+        &mut app,
+        &tx,
+        KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE),
+    );
+    assert_eq!(app.template_ph_start, Some((0, 0)), "wraps to the first");
+
+    // Fill both placeholders: Tab is a pane switch again and the mode is off.
+    app.set_editor_text("x y");
+    app.template_active = true;
+    key(
+        &mut app,
+        &tx,
+        KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE),
+    );
+    assert!(!app.template_active);
+    assert!(app.focus == Focus::Preview);
+}
+
+/// The `/` filter narrows by label (English or Chinese) or SQL text,
+/// case-insensitively, and the list *is* the filter view.
+#[test]
+pub(crate) fn template_filter_is_case_insensitive_over_label_and_sql() {
+    let mut app = test_app();
+    open_template_panel(&mut app);
+    assert_eq!(app.template_view.len(), TEMPLATES.len());
+    app.template_needle = "insert".into();
+    recompute_template_view(&mut app);
+    assert_eq!(app.template_view.len(), 1);
+    assert_eq!(
+        ui_text::t_lang(TEMPLATES[app.template_view[0]].label, ui_text::Lang::En),
+        "INSERT"
+    );
+    app.template_needle = "truncate".into();
+    recompute_template_view(&mut app);
+    assert_eq!(app.template_view.len(), 1);
+    app.template_needle = "zzz".into();
+    recompute_template_view(&mut app);
+    assert!(app.template_view.is_empty());
+    assert_eq!(app.template_list.selected(), None);
+    app.template_needle.clear();
+    recompute_template_view(&mut app);
+    assert_eq!(app.template_view.len(), TEMPLATES.len());
+}
+
+/// The `/` filter state machine: open, narrow, keep the needle on Enter, clear
+/// it on Esc (restoring the full list).
+#[test]
+pub(crate) fn template_filter_state_machine() {
+    let mut app = test_app();
+    open_template_panel(&mut app);
+    let press = |app: &mut App, code: KeyCode| {
+        template_key(app, KeyEvent::new(code, KeyModifiers::NONE));
+    };
+    press(&mut app, KeyCode::Char('/'));
+    assert!(app.template_filter.is_some());
+    for c in "drop".chars() {
+        press(&mut app, KeyCode::Char(c));
+    }
+    assert_eq!(app.template_needle, "drop");
+    assert_eq!(app.template_view.len(), 1);
+    press(&mut app, KeyCode::Enter);
+    assert!(app.template_filter.is_none());
+    assert_eq!(app.template_needle, "drop");
+    press(&mut app, KeyCode::Char('/'));
+    press(&mut app, KeyCode::Esc);
+    assert!(app.template_filter.is_none());
+    assert_eq!(app.template_needle, "");
+    assert_eq!(app.template_view.len(), TEMPLATES.len());
+}
+
+/// Every built-in template label has an English translation (so the panel is
+/// bilingual) and its SQL is pure text with no query side effect.
+#[test]
+pub(crate) fn template_labels_are_translated() {
+    for tpl in TEMPLATES {
+        assert_ne!(
+            ui_text::t_lang(tpl.label, ui_text::Lang::En),
+            tpl.label,
+            "missing English for {:?}",
+            tpl.label
+        );
+        assert!(!tpl.sql.trim().is_empty());
+    }
+}
+
+/// The `{{…}}` placeholders are painted into the editor cells (a distinct
+/// background), and the highlight is gone once the token is replaced.
+#[test]
+pub(crate) fn template_placeholders_are_painted_then_cleared() {
+    let mut app = test_app();
+    app.picker_open = false;
+    app.focus = Focus::Editor;
+    open_template_panel(&mut app);
+    app.template_list.select(Some(2)); // UPDATE
+    template_key(&mut app, KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+    let buf = draw_buffer(&mut app, 80, 30);
+    let ed = app.rects.editor;
+    let cell = |dx: u16| buf.cell((ed.x + 1 + dx, ed.y + 1)).unwrap();
+    // "UPDATE " is 7 cells; the placeholder spans the next 9.
+    assert_eq!(cell(7).bg, Color::LightMagenta, "placeholder start");
+    assert_eq!(cell(15).bg, Color::LightMagenta, "placeholder end");
+    assert_ne!(cell(0).bg, Color::LightMagenta, "plain SQL stays plain");
+
+    // Replacing the last token retires the mode; nothing is painted after.
+    app.set_editor_text("UPDATE users SET x = 1");
+    app.template_active = true;
+    sync_editor_template(&mut app);
+    assert!(!app.template_active);
+    let buf = draw_buffer(&mut app, 80, 30);
+    let ed = app.rects.editor;
+    assert_ne!(
+        buf.cell((ed.x + 1, ed.y + 1)).unwrap().bg,
+        Color::LightMagenta
+    );
+}
+
 // ── R59: `}` / `{` non-blank row jump ──
 
 pub(crate) fn blank_aware_grid() -> Grid {

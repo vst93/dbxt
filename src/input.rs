@@ -12,11 +12,15 @@ pub(crate) fn handle_event(app: &mut App, tx: &Tx, ev: Event) {
             // recall, completion accept, …) invalidates the editor find
             // highlight, not only the keys routed through `editor_key`.
             sync_editor_find(app);
+            // R71: the same hook retires the template placeholder mode once the
+            // last `{{…}}` has been filled in.
+            sync_editor_template(app);
         }
         Event::Paste(s) => match app.focus {
             Focus::Editor => {
                 app.editor.insert_str(s);
                 sync_editor_find(app);
+                sync_editor_template(app);
             }
             Focus::CmdInput => {
                 app.cmd_input.insert_str(s);
@@ -82,6 +86,12 @@ pub(crate) fn reset_overlays_for_backend_switch(app: &mut App) {
     app.snippet_filter = None;
     app.snippet_view.clear();
     app.snippet_confirm = None;
+    app.template_open = false;
+    app.template_filter = None;
+    app.template_needle.clear();
+    app.template_view.clear();
+    app.template_active = false;
+    app.template_ph_start = None;
     app.completion = None;
     app.table_prompt = None;
     app.tree_search_prompt = None;
@@ -512,6 +522,12 @@ pub(crate) fn browse_key(app: &mut App, tx: &Tx, k: KeyEvent) {
         return;
     }
 
+    // R71: the built-in SQL template panel (`Alt-T` in the editor) is modal too.
+    if app.template_open {
+        template_key(app, k);
+        return;
+    }
+
     // Database switcher overlay (`d`) is modal.
     if app.db_picker_open {
         db_picker_key(app, tx, k);
@@ -852,10 +868,16 @@ pub(crate) fn browse_key(app: &mut App, tx: &Tx, k: KeyEvent) {
                 open_diff_picker(app, DiffPickMode::Table, DiffKind::Data);
                 return;
             }
-            // Alt-T: copy a table's structure and/or rows to another SQL
-            // connection (cross-dialect supported).
+            // Alt-T: with the editor focused it opens the built-in SQL template
+            // panel (R71); everywhere else it is the data-transfer wizard, which
+            // needs a focused table and is useless from the editor. Both share
+            // the mnemonic because only one of them can apply at a time.
             KeyCode::Char('t') | KeyCode::Char('T') => {
-                open_transfer_wizard(app);
+                if app.focus == Focus::Editor {
+                    open_template_panel(app);
+                } else {
+                    open_transfer_wizard(app);
+                }
                 return;
             }
             // Alt-E: export every saved connection as a JSON bundle.
@@ -917,7 +939,13 @@ pub(crate) fn browse_key(app: &mut App, tx: &Tx, k: KeyEvent) {
     }
 
     // Tab / Shift-Tab cycle panes; B toggles the focused pane's collapse state.
+    // R71: while a just-inserted template still has `{{…}}` placeholders, Tab
+    // walks them instead — the editor keeps Tab for the placeholder jump, and
+    // falls through to the pane switch once the last one is filled.
     if k.code == KeyCode::Tab && k.modifiers.is_empty() {
+        if app.focus == Focus::Editor && app.template_active && jump_next_placeholder(app) {
+            return;
+        }
         cycle_focus(app, true);
         return;
     }

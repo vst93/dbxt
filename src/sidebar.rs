@@ -881,6 +881,7 @@ pub(crate) fn mouse(app: &mut App, tx: &Tx, m: MouseEvent) {
         || app.filter_prompt.is_some()
         || app.db_picker_open
         || app.snippet_open
+        || app.template_open
         || app.col_picker_open
         || app.recent_open
         || app.table_jump_open
@@ -996,6 +997,7 @@ pub(crate) fn mouse(app: &mut App, tx: &Tx, m: MouseEvent) {
                 return;
             }
             if app.snippet_open
+                || app.template_open
                 || app.col_picker_open
                 || app.recent_open
                 || app.table_jump_open

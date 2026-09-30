@@ -1243,6 +1243,30 @@ pub static ALL_KEYS: &[&str] = &[
     " SQL 收藏 · Enter 插入 · Esc ",
     " SQL 收藏 · 过滤「{}」 {}/{} · Esc 关 ",
     " SQL 收藏（已过滤）· Esc ",
+    "SQL 模板 · 内置只读 · Enter 插入光标处 · / 过滤",
+    "按名称 / SQL 内容过滤模板 · Enter 保留 · Esc 清除",
+    "✓ 已插入模板「{}」· Tab 跳占位符",
+    "✓ 已插入模板「{}」",
+    "已关闭 SQL 模板",
+    "模板过滤「{}」· 命中 {}",
+    "已清除模板过滤",
+    " SQL 模板 · 内置只读 · {} 个 · Enter 插入 · / 过滤 · Esc 关 ",
+    " SQL 模板 · Enter 插入 · Esc ",
+    " SQL 模板 · 过滤「{}」 {}/{} · Esc 关 ",
+    " SQL 模板（已过滤）· Esc ",
+    "内置只读模板 · 自存片段见 Ctrl-O（可编辑）",
+    "暂无内置模板",
+    "（没有匹配的模板）",
+    "占位符 {}/{} · 替换后执行",
+    "占位符已填完 · Tab 切栏",
+    "SELECT 查询（WHERE）",
+    "INSERT 插入",
+    "UPDATE 更新（WHERE）",
+    "DELETE 删除（WHERE）",
+    "CREATE INDEX 建索引",
+    "ALTER ADD COLUMN 加列",
+    "TRUNCATE 清空表",
+    "DROP TABLE 删表",
     "语句列表没有单元格可跳",
     "没有可跳转的结果",
     "第 {} 行 · {} 非空（跳过 {} 个空单元格）",
@@ -3241,7 +3265,7 @@ fn en_of(zh: &'static str) -> Option<&'static str> {
         "✗ 中止于源行 {}: {}" => Some("✗ Aborted at source row {}: {}"),
         "跳过源行 {}: {}" => Some("Skipped source row {}: {}"),
         "— 数据搬运（Alt-T）—" => Some("— Data transfer (Alt-T) —"),
-        "跨库搬数据：源 = 当前表，目标可同连接或跨连接/跨方言（MySQL↔PG 双向）" => Some("Copy data across databases: source = current table; target may be the same connection or cross-connection/cross-dialect (MySQL↔PG both ways)"),
+        "跨库搬数据：源 = 当前表，目标可同连接或跨连接/跨方言（MySQL↔PG 双向）；编辑器内 Alt-T 为内置模板面板" => Some("Copy data across databases: source = current table; target may be the same connection or cross-connection/cross-dialect (MySQL↔PG both ways); in the editor Alt-T opens the built-in template panel"),
         "① 选目标连接" => Some("① pick target connection"),
         "Enter 下一步；默认当前连接（同方言）" => Some("Enter next; defaults to the current connection (same dialect)"),
         "② 目标库/表" => Some("② target db/table"),
@@ -3519,6 +3543,49 @@ fn en_of(zh: &'static str) -> Option<&'static str> {
             Some(" SQL favourites · filter \"{}\" {}/{} · Esc close ")
         }
         " SQL 收藏（已过滤）· Esc " => Some(" SQL favourites (filtered) · Esc "),
+        // ── R71: built-in SQL template panel (Alt-T in the editor) ──
+        "SQL 模板 · 内置只读 · Enter 插入光标处 · / 过滤" => {
+            Some("SQL templates · built-in, read-only · Enter insert at cursor · / filter")
+        }
+        "按名称 / SQL 内容过滤模板 · Enter 保留 · Esc 清除" => {
+            Some("Filter templates by name / SQL text · Enter keep · Esc clear")
+        }
+        "✓ 已插入模板「{}」· Tab 跳占位符" => {
+            Some("✓ Inserted template [{}] · Tab jumps placeholders")
+        }
+        "✓ 已插入模板「{}」" => Some("✓ Inserted template [{}]"),
+        "已关闭 SQL 模板" => Some("SQL templates closed"),
+        "模板过滤「{}」· 命中 {}" => Some("Template filter [{}] · {} hit"),
+        "已清除模板过滤" => Some("Template filter cleared"),
+        " SQL 模板 · 内置只读 · {} 个 · Enter 插入 · / 过滤 · Esc 关 " => {
+            Some(" SQL templates · built-in, read-only · {} · Enter insert · / filter · Esc close ")
+        }
+        " SQL 模板 · Enter 插入 · Esc " => Some(" SQL templates · Enter insert · Esc "),
+        " SQL 模板 · 过滤「{}」 {}/{} · Esc 关 " => {
+            Some(" SQL templates · filter \"{}\" {}/{} · Esc close ")
+        }
+        " SQL 模板（已过滤）· Esc " => Some(" SQL templates (filtered) · Esc "),
+        "内置只读模板 · 自存片段见 Ctrl-O（可编辑）" => {
+            Some("built-in, read-only templates · your own SQL lives in Ctrl-O (editable)")
+        }
+        "暂无内置模板" => Some("No built-in templates"),
+        "（没有匹配的模板）" => Some("(no matching templates)"),
+        "占位符 {}/{} · 替换后执行" => {
+            Some("placeholder {}/{} · replace it, then run")
+        }
+        "占位符已填完 · Tab 切栏" => Some("placeholders filled · Tab switches panes"),
+        "SELECT 查询（WHERE）" => Some("SELECT query (WHERE)"),
+        "INSERT 插入" => Some("INSERT"),
+        "UPDATE 更新（WHERE）" => Some("UPDATE (WHERE)"),
+        "DELETE 删除（WHERE）" => Some("DELETE (WHERE)"),
+        "CREATE INDEX 建索引" => Some("CREATE INDEX"),
+        "ALTER ADD COLUMN 加列" => Some("ALTER ADD COLUMN"),
+        "TRUNCATE 清空表" => Some("TRUNCATE table"),
+        "DROP TABLE 删表" => Some("DROP TABLE"),
+        "Alt-T（编辑器）" => Some("Alt-T (editor)"),
+        "常用 SQL 模板面板（内置只读；Enter 插入光标处并选中第一个 {{}} 占位符，Tab 跳下一个；片段 Ctrl-O 为用户自存）" => {
+            Some("built-in SQL template panel (read-only; Enter inserts at the cursor and selects the first {{}} placeholder, Tab jumps to the next; Ctrl-O holds your own favourites)")
+        }
         "语句列表没有单元格可跳" => Some("The statement list has no cells to jump"),
         "没有可跳转的结果" => Some("No result rows to jump"),
         "第 {} 行 · {} 非空（跳过 {} 个空单元格）" => {

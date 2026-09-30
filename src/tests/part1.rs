@@ -796,6 +796,12 @@ pub(crate) fn overlays_render_at_extreme_sizes() {
         app.snippet_filter = None;
         app.snippet_view.clear();
         app.snippet_confirm = None;
+        app.template_open = false;
+        app.template_filter = None;
+        app.template_needle.clear();
+        app.template_view.clear();
+        app.template_active = false;
+        app.template_ph_start = None;
         app.table_prompt = None;
         app.result_filter = None;
         app.locate_prompt = None;
@@ -1151,6 +1157,22 @@ pub(crate) fn overlays_render_at_extreme_sizes() {
         (
             "snippet-name",
             Box::new(|a| a.snippet_name = Some(TextArea::default())),
+        ),
+        (
+            "templates",
+            Box::new(|a| {
+                open_template_panel(a);
+                a.template_list.select(Some(1));
+            }),
+        ),
+        (
+            "template-filter",
+            Box::new(|a| {
+                open_template_panel(a);
+                a.template_needle = "update".into();
+                recompute_template_view(a);
+                a.template_filter = Some(TextArea::from(["update"]));
+            }),
         ),
         (
             "table-prompt",

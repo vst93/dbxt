@@ -334,6 +334,119 @@ pub(crate) fn render_snippets(f: &mut Frame, area: Rect, app: &mut App) {
     }
 }
 
+/// R71: built-in SQL template panel (`Alt-T` in the editor). Read-only: Enter
+/// inserts the highlighted template at the editor caret, `/` filters. A header
+/// line spells out the division from the user-owned `Ctrl-O` favourites so the
+/// two panels are never confused.
+pub(crate) fn render_templates(f: &mut Frame, area: Rect, app: &mut App) {
+    let w = area.width.min(if app.layout_mode == LayoutMode::Narrow {
+        area.width
+    } else {
+        64
+    });
+    let total = TEMPLATES.len();
+    let shown = app.template_view.len();
+    let filter_h = if app.template_filter.is_some() { 1 } else { 0 };
+    // +1 for the "built-in vs favourites" header line inside the box.
+    let (y, h) = overlay_list_box(shown.max(1) + filter_h + 1, area);
+    let x = area.x + (area.width.saturating_sub(w)) / 2;
+    let box_area = Rect {
+        x,
+        y,
+        width: w,
+        height: h,
+    };
+    f.render_widget(Clear, box_area);
+    let title = if app.template_needle.trim().is_empty() {
+        fit_title(
+            &tf(
+                " SQL 模板 · 内置只读 · {} 个 · Enter 插入 · / 过滤 · Esc 关 ",
+                &[&total],
+            ),
+            t(" SQL 模板 · Enter 插入 · Esc "),
+            box_area.width,
+        )
+    } else {
+        fit_title(
+            &tf(
+                " SQL 模板 · 过滤「{}」 {}/{} · Esc 关 ",
+                &[&(app.template_needle), &shown, &total],
+            ),
+            t(" SQL 模板（已过滤）· Esc "),
+            box_area.width,
+        )
+    };
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .title(Span::styled(title, Style::default().fg(Color::Cyan)))
+        .border_set(border::ROUNDED)
+        .border_style(Style::default().fg(Color::Cyan));
+    let inner = block.inner(box_area);
+    f.render_widget(block, box_area);
+    if inner.width < 4 || inner.height < 2 {
+        return;
+    }
+    // Header, then the list, then (while typing) the `/` filter line.
+    let chunks = Layout::vertical([
+        Constraint::Length(1),
+        Constraint::Min(1),
+        Constraint::Length(filter_h as u16),
+    ])
+    .split(inner);
+    let header = Paragraph::new(Line::from(Span::styled(
+        truncate_disp(
+            t("内置只读模板 · 自存片段见 Ctrl-O（可编辑）"),
+            inner.width as usize,
+        ),
+        Style::default().fg(Color::DarkGray),
+    )));
+    f.render_widget(header, chunks[0]);
+    let items: Vec<ListItem> = if shown == 0 {
+        let hint = if total == 0 {
+            t("暂无内置模板")
+        } else {
+            t("（没有匹配的模板）")
+        };
+        vec![ListItem::new(Line::from(Span::styled(
+            hint,
+            Style::default().fg(Color::DarkGray),
+        )))]
+    } else {
+        app.template_view
+            .iter()
+            .filter_map(|&i| TEMPLATES.get(i))
+            .map(|s| {
+                let head = s.sql.lines().next().unwrap_or("").trim();
+                ListItem::new(Line::from(vec![
+                    Span::styled(
+                        format!("{:22}", truncate_disp(t(s.label), 22)),
+                        Style::default()
+                            .fg(Color::Cyan)
+                            .add_modifier(Modifier::BOLD),
+                    ),
+                    Span::raw(" "),
+                    Span::styled(
+                        truncate_disp(head, (box_area.width as usize).saturating_sub(26)),
+                        Style::default().fg(Color::DarkGray),
+                    ),
+                ]))
+            })
+            .collect()
+    };
+    let list = List::new(items).highlight_style(
+        Style::default()
+            .bg(Color::DarkGray)
+            .add_modifier(Modifier::BOLD),
+    );
+    f.render_stateful_widget(list, chunks[1], &mut app.template_list);
+    if app.template_filter.is_some() {
+        if let Some(ta) = app.template_filter.as_mut() {
+            ta.set_block(Block::default());
+            f.render_widget(&*ta, chunks[2]);
+        }
+    }
+}
+
 /// The `d` delete confirmation for a saved SQL favourite (keyboard-only, like
 /// the history delete layer; the overlay swallows mouse input anyway).
 pub(crate) fn render_snippet_confirm(f: &mut Frame, area: Rect) {

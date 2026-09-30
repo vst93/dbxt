@@ -2194,6 +2194,24 @@ pub(crate) struct App {
     /// Name prompt shown when saving the editor's SQL as a DBX favourite.
     pub(crate) snippet_name: Option<TextArea<'static>>,
 
+    // R71: built-in SQL template panel (`Alt-T` in the editor; read-only, pure
+    // text — never touches the connection). The panel is the single-statement
+    // counterpart to the R57 batch TSV/DELETE/UPDATE generators.
+    pub(crate) template_open: bool,
+    pub(crate) template_list: ListState,
+    /// `/` filter needle for the template list (label or SQL text).
+    pub(crate) template_needle: String,
+    /// The modal input while `/` is being typed.
+    pub(crate) template_filter: Option<TextArea<'static>>,
+    /// Filtered display index → index into `TEMPLATES`.
+    pub(crate) template_view: Vec<usize>,
+    /// True while a just-inserted template still has `{{…}}` placeholders, so
+    /// `Tab` jumps between them and the placeholder paint is on.
+    pub(crate) template_active: bool,
+    /// Start (row, col) of the placeholder the caret last selected, so `Tab`
+    /// can find the *next* one even right after the token was replaced.
+    pub(crate) template_ph_start: Option<(usize, usize)>,
+
     // column metadata for the table currently open in the data browser
     pub(crate) table_meta: Option<TableMeta>,
     // session cache of row counts, keyed by db/table/filter; the bool marks a

@@ -692,6 +692,105 @@ pub(crate) fn editor_find_hits(lines: &[String], needle: &str) -> Vec<FindHit> {
     hits
 }
 
+// ── R71: built-in template placeholders (`{{name}}`) ─────────────────────────
+
+/// One `{{name}}` placeholder in the editor buffer: a run of `len` chars starting
+/// at char column `col` on line `row` (columns are char indices, matching
+/// tui-textarea and [`editor_display_col`]).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) struct Placeholder {
+    pub(crate) row: usize,
+    pub(crate) col: usize,
+    pub(crate) len: usize,
+}
+
+/// Scan the buffer for `{{name}}` tokens (the placeholders a template writes).
+/// Pure and client-side: a token is `{{`, one or more chars that are neither
+/// `{` nor `}`, then `}}` — all on one line, so a stray `{{` never swallows the
+/// rest of the buffer. Used both to jump the caret and to paint the highlight.
+pub(crate) fn editor_placeholders(lines: &[String]) -> Vec<Placeholder> {
+    let mut out = Vec::new();
+    for (row, line) in lines.iter().enumerate() {
+        let chars: Vec<char> = line.chars().collect();
+        let mut i = 0;
+        while i + 1 < chars.len() {
+            if chars[i] == '{' && chars[i + 1] == '{' {
+                let mut j = i + 2;
+                while j < chars.len() && chars[j] != '}' && chars[j] != '{' {
+                    j += 1;
+                }
+                if j + 1 < chars.len() && chars[j] == '}' && chars[j + 1] == '}' && j > i + 2 {
+                    out.push(Placeholder {
+                        row,
+                        col: i,
+                        len: j + 2 - i,
+                    });
+                    i = j + 2;
+                    continue;
+                }
+            }
+            i += 1;
+        }
+    }
+    out
+}
+
+/// Put the caret on placeholder `p` and select the whole token, so typing
+/// replaces `{{name}}` in one gesture. Records the start so [`jump_next_placeholder`]
+/// can find the following token even after the text changed.
+pub(crate) fn select_placeholder(app: &mut App, p: Placeholder) {
+    app.editor.cancel_selection();
+    app.editor
+        .move_cursor(CursorMove::Jump(p.row as u16, p.col as u16));
+    app.editor.start_selection();
+    app.editor
+        .move_cursor(CursorMove::Jump(p.row as u16, (p.col + p.len) as u16));
+    app.template_ph_start = Some((p.row, p.col));
+}
+
+/// R71 `Tab`: move to the next `{{…}}` placeholder, wrapping to the first. The
+/// anchor is the placeholder the caret last selected (falling back to the
+/// caret), so a just-typed replacement does not make it skip a token. Returns
+/// false when the buffer has no placeholder left, so the caller can fall back
+/// to the normal pane switch.
+pub(crate) fn jump_next_placeholder(app: &mut App) -> bool {
+    let lines = app.editor.lines().to_vec();
+    let phs = editor_placeholders(&lines);
+    if phs.is_empty() {
+        app.template_active = false;
+        app.template_ph_start = None;
+        return false;
+    }
+    let anchor = app.template_ph_start;
+    let next = phs
+        .iter()
+        .find(|p| Some((p.row, p.col)) > anchor)
+        .or_else(|| phs.first())
+        .copied();
+    if let Some(p) = next {
+        select_placeholder(app, p);
+        let idx = phs.iter().position(|q| *q == p).unwrap_or(0);
+        app.status = tf("占位符 {}/{} · 替换后执行", &[&(idx + 1), &(phs.len())]);
+        true
+    } else {
+        false
+    }
+}
+
+/// Drop the placeholder mode once the buffer holds no `{{…}}` token (every
+/// placeholder has been filled), so `Tab` returns to pane switching. Runs after
+/// every key, the same hook as the editor-find invalidation.
+pub(crate) fn sync_editor_template(app: &mut App) {
+    if !app.template_active {
+        return;
+    }
+    if editor_placeholders(app.editor.lines()).is_empty() {
+        app.template_active = false;
+        app.template_ph_start = None;
+        app.status = t("占位符已填完 · Tab 切栏").into();
+    }
+}
+
 /// Outcome of an editor undo, so the caller can name what happened.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub(crate) enum EditorUndo {

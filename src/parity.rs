@@ -3336,6 +3336,201 @@ pub(crate) fn snippet_name_key(app: &mut App, tx: &Tx, k: KeyEvent) {
     }
 }
 
+// ── R71: built-in SQL template panel (`Alt-T` in the editor) ────────────────
+
+/// One built-in SQL template. Pure text with `{{…}}` placeholders: inserting it
+/// is a buffer edit, never a query, so the panel works offline / on a read-only
+/// connection. The list is read-only — user-owned SQL lives in the `Ctrl-O`
+/// favourites, and the panel title says so.
+pub(crate) struct SqlTemplate {
+    /// Chinese label, run through [`t`] for the bilingual UI.
+    pub(crate) label: &'static str,
+    pub(crate) sql: &'static str,
+}
+
+/// The built-in templates, ordered from read to destructive. `{{table}}` /
+/// `{{col}}` / `{{value}}` / `{{type}}` / `{{name}}` are the placeholders the
+/// caret walks with Tab.
+pub(crate) static TEMPLATES: &[SqlTemplate] = &[
+    SqlTemplate {
+        label: "SELECT 查询（WHERE）",
+        sql: "SELECT {{col}}\nFROM {{table}}\nWHERE {{col}} = {{value}};",
+    },
+    SqlTemplate {
+        label: "INSERT 插入",
+        sql: "INSERT INTO {{table}} ({{col}})\nVALUES ({{value}});",
+    },
+    SqlTemplate {
+        label: "UPDATE 更新（WHERE）",
+        sql: "UPDATE {{table}}\nSET {{col}} = {{value}}\nWHERE {{col}} = {{value}};",
+    },
+    SqlTemplate {
+        label: "DELETE 删除（WHERE）",
+        sql: "DELETE FROM {{table}}\nWHERE {{col}} = {{value}};",
+    },
+    SqlTemplate {
+        label: "CREATE INDEX 建索引",
+        sql: "CREATE INDEX {{name}}\nON {{table}} ({{col}});",
+    },
+    SqlTemplate {
+        label: "ALTER ADD COLUMN 加列",
+        sql: "ALTER TABLE {{table}}\nADD COLUMN {{col}} {{type}};",
+    },
+    SqlTemplate {
+        label: "TRUNCATE 清空表",
+        sql: "TRUNCATE TABLE {{table}};",
+    },
+    SqlTemplate {
+        label: "DROP TABLE 删表",
+        sql: "DROP TABLE {{table}};",
+    },
+];
+
+/// `Alt-T` in the editor: open the built-in template panel. No connection is
+/// needed — the templates are pure text.
+pub(crate) fn open_template_panel(app: &mut App) {
+    app.template_needle.clear();
+    app.template_filter = None;
+    app.template_view = (0..TEMPLATES.len()).collect();
+    app.template_list.select(Some(0));
+    app.template_open = true;
+    app.focus = Focus::Editor;
+    app.status = t("SQL 模板 · 内置只读 · Enter 插入光标处 · / 过滤").into();
+}
+
+/// Rebuild `template_view` from the `/` needle (case-insensitive substring on
+/// the label or the SQL text), keeping the cursor on a valid row.
+pub(crate) fn recompute_template_view(app: &mut App) {
+    let needle = app.template_needle.trim().to_lowercase();
+    app.template_view = TEMPLATES
+        .iter()
+        .enumerate()
+        .filter(|(_, s)| {
+            needle.is_empty()
+                || t(s.label).to_lowercase().contains(&needle)
+                || s.label.to_lowercase().contains(&needle)
+                || s.sql.to_lowercase().contains(&needle)
+        })
+        .map(|(i, _)| i)
+        .collect();
+    let n = app.template_view.len();
+    if n == 0 {
+        app.template_list.select(None);
+    } else {
+        let sel = app.template_list.selected().unwrap_or(0).min(n - 1);
+        app.template_list.select(Some(sel));
+    }
+}
+
+/// The template under the panel cursor (indexes through the filter view).
+pub(crate) fn template_selected(app: &App) -> Option<&'static SqlTemplate> {
+    let sel = app.template_list.selected()?;
+    let idx = *app.template_view.get(sel)?;
+    TEMPLATES.get(idx)
+}
+
+pub(crate) fn template_key(app: &mut App, k: KeyEvent) {
+    // The `/` filter is a modal layer on top of the list.
+    if app.template_filter.is_some() {
+        template_filter_key(app, k);
+        return;
+    }
+    let n = app.template_view.len();
+    match k.code {
+        KeyCode::Esc | KeyCode::Char('q') => {
+            app.template_open = false;
+            app.template_needle.clear();
+            app.status = t("已关闭 SQL 模板").into();
+        }
+        KeyCode::Up | KeyCode::Char('k') => {
+            let i = app
+                .template_list
+                .selected()
+                .map(|i| i.saturating_sub(1))
+                .unwrap_or(0);
+            if n > 0 {
+                app.template_list.select(Some(i));
+            }
+        }
+        KeyCode::Down | KeyCode::Char('j') => {
+            let i = app
+                .template_list
+                .selected()
+                .map(|i| (i + 1).min(n.saturating_sub(1)))
+                .unwrap_or(0);
+            if n > 0 {
+                app.template_list.select(Some(i));
+            }
+        }
+        // `/`: filter the list by label / SQL text (as-you-type).
+        KeyCode::Char('/') if k.modifiers.is_empty() => {
+            let mut ta = TextArea::from([app.template_needle.clone()]);
+            ta.move_cursor(CursorMove::End);
+            app.template_filter = Some(ta);
+            app.status = t("按名称 / SQL 内容过滤模板 · Enter 保留 · Esc 清除").into();
+        }
+        KeyCode::Enter => {
+            let Some(tpl) = template_selected(app) else {
+                return;
+            };
+            let sql = tpl.sql;
+            let label = t(tpl.label);
+            // Pure text into the buffer: no connection, no query (zero-query
+            // red line). The caret lands on the first `{{…}}` placeholder and
+            // selects it, so typing replaces it; Tab walks the rest.
+            app.editor.insert_str(sql);
+            app.focus = Focus::Editor;
+            app.template_open = false;
+            app.template_needle.clear();
+            app.template_filter = None;
+            app.template_active = true;
+            let phs = editor_placeholders(app.editor.lines());
+            if let Some(p) = phs.first().copied() {
+                select_placeholder(app, p);
+                app.status = tf("✓ 已插入模板「{}」· Tab 跳占位符", &[&(label)]);
+            } else {
+                app.template_active = false;
+                app.status = tf("✓ 已插入模板「{}」", &[&(label)]);
+            }
+        }
+        _ => {}
+    }
+}
+
+/// The `/` filter input: as-you-type narrowing, Enter keeps the needle, Esc
+/// clears it (same state machine as the favourites panel's filter).
+pub(crate) fn template_filter_key(app: &mut App, k: KeyEvent) {
+    match k.code {
+        KeyCode::Enter => {
+            app.template_filter = None;
+            app.status = tf(
+                "模板过滤「{}」· 命中 {}",
+                &[&(app.template_needle), &(app.template_view.len())],
+            );
+        }
+        KeyCode::Esc => {
+            app.template_filter = None;
+            app.template_needle.clear();
+            recompute_template_view(app);
+            app.status = t("已清除模板过滤").into();
+        }
+        _ => {
+            if let Some(ta) = app.template_filter.as_mut() {
+                ta.input(k);
+            }
+            app.template_needle = app
+                .template_filter
+                .as_ref()
+                .and_then(|ta| ta.lines().first().cloned())
+                .unwrap_or_default();
+            recompute_template_view(app);
+            if !app.template_view.is_empty() {
+                app.template_list.select(Some(0));
+            }
+        }
+    }
+}
+
 /// `p` in the connection picker: pre-fill the form with a copy of a connection.
 pub(crate) fn duplicate_connection(app: &mut App) {
     let Some(idx) = app.conn_list.selected() else {

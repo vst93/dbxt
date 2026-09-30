@@ -114,6 +114,9 @@ pub(crate) fn ui(f: &mut Frame, app: &mut App) {
     if app.snippet_open {
         render_snippets(f, f.area(), app);
     }
+    if app.template_open {
+        render_templates(f, f.area(), app);
+    }
     if app.snippet_name.is_some() {
         render_snippet_name(f, f.area(), app);
     }
@@ -734,6 +737,10 @@ pub(crate) enum FooterView {
     SnippetFilter,
     /// R59: the `d` delete confirmation over the favourites list.
     SnippetConfirm,
+    /// R71: the built-in SQL template panel (`Alt-T` in the editor).
+    Templates,
+    /// R71: the `/` filter input over the template list.
+    TemplateFilter,
     DbPicker,
     RedisPrompt,
     MongoDoc,
@@ -853,6 +860,10 @@ pub(crate) fn footer_ctx_inner(app: &App, include_help: bool) -> FooterCtx {
         FooterView::SnippetConfirm
     } else if app.snippet_open {
         FooterView::Snippets
+    } else if app.template_filter.is_some() {
+        FooterView::TemplateFilter
+    } else if app.template_open {
+        FooterView::Templates
     } else if app.db_picker_open {
         FooterView::DbPicker
     } else if app.redis_filter_prompt.is_some() {
@@ -1090,6 +1101,13 @@ pub(crate) fn footer_hints_ctx(ctx: FooterCtx) -> Vec<Hint> {
             ("r", t("刷新")),
             ("Esc", t("关闭")),
         ],
+        FooterView::Templates => vec![
+            ("↑↓", t("选择")),
+            ("Enter", t("插入编辑器")),
+            ("/", t("过滤")),
+            ("Esc", t("关闭")),
+        ],
+        FooterView::TemplateFilter => vec![("Enter", t("保留")), ("Esc", t("清除"))],
         FooterView::FilterPrompt => {
             vec![("Enter", t("应用")), ("Esc", t("取消")), ("⏎", t("清除"))]
         }
@@ -1464,6 +1482,9 @@ pub(crate) fn render_main_area(
         // on last so their background wins over both.
         paint_statement_dim(f, main_chunks[0], app);
         paint_bracket_pair(f, main_chunks[0], app);
+        // R71: `{{…}}` placeholders sit on top of the dim / bracket marks but
+        // under the find highlight.
+        paint_editor_placeholders(f, main_chunks[0], app);
         paint_editor_find(f, main_chunks[0], app);
     }
 
@@ -1635,6 +1656,65 @@ pub(crate) fn paint_editor_find(f: &mut Frame, area: Rect, app: &App) {
                 if current {
                     cell.modifier.insert(Modifier::BOLD);
                 }
+            }
+        }
+    }
+}
+
+/// R71: paint the `{{…}}` placeholders a just-inserted template left in the
+/// buffer, straight into the frame after the textarea (and the dim / bracket
+/// marks) drew, so they read as "fill me". Purely presentational: no key, no
+/// state change, no query. Only active while `template_active` is on, so a
+/// hand-typed `{{x}}` is never highlighted. Char columns map through
+/// [`editor_display_col`], so tabs and wide CJK glyphs highlight real cells.
+pub(crate) fn paint_editor_placeholders(f: &mut Frame, area: Rect, app: &App) {
+    if !app.template_active {
+        return;
+    }
+    let phs = editor_placeholders(app.editor.lines());
+    if phs.is_empty() {
+        return;
+    }
+    // tui-textarea draws the text inside the `Borders::ALL` block dbxt sets on
+    // it, so the glyph area is the block's inner rect.
+    let inner = Rect {
+        x: area.x.saturating_add(1),
+        y: area.y.saturating_add(1),
+        width: area.width.saturating_sub(2),
+        height: area.height.saturating_sub(2),
+    };
+    if inner.width == 0 || inner.height == 0 {
+        return;
+    }
+    let top_row = app.editor_vp.row as usize;
+    let top_col = app.editor_vp.col as usize;
+    let lines = app.editor.lines();
+    for p in &phs {
+        let Some(line) = lines.get(p.row) else {
+            continue;
+        };
+        if p.row < top_row || p.row - top_row >= inner.height as usize {
+            continue;
+        }
+        let y = inner.y + (p.row - top_row) as u16;
+        for k in 0..p.len {
+            let dcol = editor_display_col(line, p.col + k);
+            if dcol < top_col || dcol - top_col >= inner.width as usize {
+                continue;
+            }
+            // The next char's display column minus this one is the exact cell
+            // span (a tab is 1..4 cells, a wide CJK glyph 2, a combining mark 0).
+            let dnext = editor_display_col(line, p.col + k + 1);
+            let span = dnext.saturating_sub(dcol).max(1);
+            let x0 = inner.x + (dcol - top_col) as u16;
+            for dx in 0..span as u16 {
+                if x0 + dx >= inner.x + inner.width {
+                    break;
+                }
+                let cell = &mut f.buffer_mut()[(x0 + dx, y)];
+                cell.fg = Color::Black;
+                cell.bg = Color::LightMagenta;
+                cell.modifier.insert(Modifier::BOLD);
             }
         }
     }
