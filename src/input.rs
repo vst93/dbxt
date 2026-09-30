@@ -12,6 +12,9 @@ pub(crate) fn handle_event(app: &mut App, tx: &Tx, ev: Event) {
             // recall, completion accept, …) invalidates the editor find
             // highlight, not only the keys routed through `editor_key`.
             sync_editor_find(app);
+            // R77: the same hook retires the located execution-error highlight
+            // once the buffer no longer matches what ran.
+            sync_editor_errors(app);
             // R71: the same hook retires the template placeholder mode once the
             // last `{{…}}` has been filled in.
             sync_editor_template(app);
@@ -20,6 +23,7 @@ pub(crate) fn handle_event(app: &mut App, tx: &Tx, ev: Event) {
             Focus::Editor => {
                 app.editor.insert_str(s);
                 sync_editor_find(app);
+                sync_editor_errors(app);
                 sync_editor_template(app);
             }
             Focus::CmdInput => {
@@ -105,6 +109,8 @@ pub(crate) fn reset_overlays_for_backend_switch(app: &mut App) {
     app.goto_prompt = None;
     // R61: drop the editor find highlight with the rest of the overlays.
     clear_editor_find(app);
+    // R77: the located execution-error highlight is tied to the connection too.
+    clear_editor_errors(app);
     app.mongo_dialog = None;
     app.redis_prompt = None;
     app.help_open = false;
@@ -718,6 +724,33 @@ pub(crate) fn browse_key(app: &mut App, tx: &Tx, k: KeyEvent) {
         || k.code == KeyCode::F(5)
     {
         run_current(app, tx);
+        return;
+    }
+
+    // R77: step through the statements that failed in the last editor run.
+    // `F8` / `Shift-F8` is the free, industry-standard "next / previous problem"
+    // key and works from any pane (it focuses the editor). `Alt-E` shares the
+    // connection-export mnemonic but only intercepts while a located error
+    // exists and the focus is not the connection sidebar — the two contexts are
+    // mutually exclusive, the same rule that lets `Alt-T` mean the template
+    // panel in the editor and the transfer wizard elsewhere.
+    if k.code == KeyCode::F(8) {
+        let dir = if k.modifiers.contains(KeyModifiers::SHIFT) {
+            -1
+        } else {
+            1
+        };
+        if !cycle_editor_error(app, dir) {
+            app.status = t("没有可定位的执行错误").into();
+        }
+        return;
+    }
+    if k.modifiers.contains(KeyModifiers::ALT)
+        && matches!(k.code, KeyCode::Char('e') | KeyCode::Char('E'))
+        && !app.editor_error_spans.is_empty()
+        && !matches!(app.focus, Focus::Sidebar | Focus::CmdInput)
+    {
+        cycle_editor_error(app, 1);
         return;
     }
 

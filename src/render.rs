@@ -1502,6 +1502,9 @@ pub(crate) fn render_main_area(
         // under the find highlight.
         paint_editor_placeholders(f, main_chunks[0], app);
         paint_editor_find(f, main_chunks[0], app);
+        // R77: the located execution-error statements sit on top of everything,
+        // so a failure is never hidden by a find highlight or placeholder mark.
+        paint_editor_errors(f, main_chunks[0], app);
     }
 
     if has_cmd {
@@ -1670,6 +1673,62 @@ pub(crate) fn paint_editor_find(f: &mut Frame, area: Rect, app: &App) {
                     Color::Yellow
                 };
                 if current {
+                    cell.modifier.insert(Modifier::BOLD);
+                }
+            }
+        }
+    }
+}
+
+/// R77: paint the statements that failed in the last editor run straight into
+/// the frame buffer, after every other editor layer, so a failure is never
+/// hidden. Every failing statement gets a red block; the one `Alt-E` / `F8`
+/// landed on gets the brighter accent. Purely presentational — no key, no state
+/// change, no query — and char columns map through [`editor_display_col`], so
+/// tabs and wide CJK glyphs highlight their real cells.
+pub(crate) fn paint_editor_errors(f: &mut Frame, area: Rect, app: &App) {
+    if app.editor_error_spans.is_empty() {
+        return;
+    }
+    // tui-textarea draws the text inside the `Borders::ALL` block dbxt sets on
+    // it, so the glyph area is the block's inner rect.
+    let inner = Rect {
+        x: area.x.saturating_add(1),
+        y: area.y.saturating_add(1),
+        width: area.width.saturating_sub(2),
+        height: area.height.saturating_sub(2),
+    };
+    if inner.width == 0 || inner.height == 0 {
+        return;
+    }
+    let top_row = app.editor_vp.row as usize;
+    let top_col = app.editor_vp.col as usize;
+    let lines = app.editor.lines();
+    for (i, span) in app.editor_error_spans.iter().enumerate() {
+        let current = i == app.editor_error_idx;
+        for (row, c0, c1) in char_range_rows(lines, span.start, span.end) {
+            if row < top_row || row - top_row >= inner.height as usize {
+                continue;
+            }
+            let Some(line) = lines.get(row) else {
+                continue;
+            };
+            let y = inner.y + (row - top_row) as u16;
+            for col in c0..c1 {
+                let dcol = editor_display_col(line, col);
+                if dcol < top_col || dcol - top_col >= inner.width as usize {
+                    continue;
+                }
+                let dnext = editor_display_col(line, col + 1);
+                let span_w = dnext.saturating_sub(dcol).max(1);
+                let x0 = inner.x + (dcol - top_col) as u16;
+                for dx in 0..span_w as u16 {
+                    if x0 + dx >= inner.x + inner.width {
+                        break;
+                    }
+                    let cell = &mut f.buffer_mut()[(x0 + dx, y)];
+                    cell.fg = Color::White;
+                    cell.bg = if current { Color::LightRed } else { Color::Red };
                     cell.modifier.insert(Modifier::BOLD);
                 }
             }

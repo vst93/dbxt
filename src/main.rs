@@ -4177,6 +4177,10 @@ impl App {
             editor_find_needle: String::new(),
             editor_find_idx: None,
             editor_find_snapshot: Vec::new(),
+            editor_error_spans: Vec::new(),
+            editor_error_idx: 0,
+            editor_error_snapshot: Vec::new(),
+            editor_error_base: String::new(),
             history_open: false,
             history_list: ListState::default(),
             history_rows: Vec::new(),
@@ -5321,6 +5325,15 @@ fn apply_op_result(app: &mut App, res: OpResult, tx: &Tx) {
             let errors = outcomes.iter().filter(|o| o.error.is_some()).count();
             let affected: u64 = outcomes.iter().map(|o| o.affected).sum();
             let total_ms: u64 = outcomes.iter().map(|o| o.ms as u64).sum();
+            // R77: capture the per-statement SQL + failures before the outcomes
+            // are moved into the script view, so a failure can be located back in
+            // the editor buffer (text only, zero queries).
+            let stmt_sqls: Vec<String> = outcomes.iter().map(|o| o.sql.clone()).collect();
+            let error_list: Vec<(usize, String)> = outcomes
+                .iter()
+                .enumerate()
+                .filter_map(|(i, o)| o.error.clone().map(|e| (i, e)))
+                .collect();
             let was_batch = app.pending_write;
             app.pending_write = false;
             app.query_more = None;
@@ -5371,6 +5384,13 @@ fn apply_op_result(app: &mut App, res: OpResult, tx: &Tx) {
                         &history_duration_label(total_ms),
                     ],
                 );
+            }
+            // R77: locate the failing statements back in the editor (when it
+            // still holds exactly what ran) and append `第 N 条语句` to the
+            // status line. `F8` / `Shift-F8` and `Alt-E` then cycle them.
+            let base = app.status.clone();
+            if record_editor_errors(app, &stmt_sqls, &error_list, &base) {
+                apply_editor_error_status(app);
             }
         }
         OpResult::Redis(s) => {
@@ -6237,7 +6257,27 @@ fn apply_op_result(app: &mut App, res: OpResult, tx: &Tx) {
             {
                 open_error_popup(app, &e);
             }
-            app.status = format!("✗ {e}");
+            let status = format!("✗ {e}");
+            // R77: a failed single statement is located back in the editor too
+            // (a multi-statement script lands in `Script`). When the editor no
+            // longer holds what ran, `record_editor_errors` clears the highlight
+            // and the plain error status stands.
+            let mut located = false;
+            if e.starts_with("query:") {
+                if let Some(exec) = app.last_executed.clone() {
+                    located = record_editor_errors(
+                        app,
+                        std::slice::from_ref(&exec),
+                        &[(0, e.clone())],
+                        &status,
+                    );
+                }
+            }
+            if located {
+                apply_editor_error_status(app);
+            } else {
+                app.status = status;
+            }
         }
     }
 }

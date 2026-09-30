@@ -6418,3 +6418,327 @@ pub(crate) fn numfmt_and_stripe_persist_without_clobbering_compact() {
     assert_eq!(bad.stripe, None);
     let _ = std::fs::remove_file(&path);
 }
+
+// ── R77: execution-error statement location + epoch preview ──────────────────
+
+/// The two driver error shapes actually carried by the bundled drivers parse to
+/// a line number; anything else stays `None`.
+#[test]
+pub(crate) fn error_line_is_parsed_from_mysql_and_pg_messages() {
+    assert_eq!(
+        extract_error_line(
+            "You have an error in your SQL syntax; check the manual ... near 'FORM t' at line 3"
+        ),
+        Some(3)
+    );
+    assert_eq!(
+        extract_error_line("syntax error at or near \"FORM\"\nLINE 2: SELECT * FORM t\n        ^"),
+        Some(2)
+    );
+    assert_eq!(extract_error_line("LINE 1: select"), Some(1));
+    assert_eq!(
+        extract_error_line("ERROR: relation \"x\" does not exist"),
+        None
+    );
+    // A line number is 1-based: `at line 0` is not a location.
+    assert_eq!(extract_error_line("near 'x' at line 0"), None);
+    // A stray `line` word with no digits/colon is not a location.
+    assert_eq!(extract_error_line("deadline exceeded"), None);
+}
+
+/// Each statement the engine ran maps back to its own char span in the buffer,
+/// even when the counts disagree (the engine stopped early).
+#[test]
+pub(crate) fn failing_statements_map_to_editor_spans() {
+    let text = "SELECT 1;\nSELECT * FORM a;\nSELECT 3;";
+    let stmts = vec![
+        "SELECT 1".to_string(),
+        "SELECT * FORM a".to_string(),
+        "SELECT 3".to_string(),
+    ];
+    let spans = locate_statement_spans(text, &stmts);
+    assert_eq!(spans.len(), 3);
+    let chars: Vec<char> = text.chars().collect();
+    let got: String = {
+        let (s, e) = spans[1].expect("statement 2 located");
+        chars[s..e].iter().collect()
+    };
+    assert_eq!(got.trim(), "SELECT * FORM a");
+    assert_eq!(offset_to_cursor(text, spans[1].unwrap().0), (1, 0));
+
+    // A shorter engine split (stopped after the failure) still matches by text.
+    let short = vec!["SELECT 1".to_string(), "SELECT * FORM a".to_string()];
+    let spans = locate_statement_spans(text, &short);
+    assert_eq!(spans[0], locate_statement_spans(text, &stmts)[0]);
+    assert_eq!(spans[1], locate_statement_spans(text, &stmts)[1]);
+}
+
+fn script_outcome(sql: &str, error: Option<&str>) -> StmtOutcome {
+    StmtOutcome {
+        sql: sql.to_string(),
+        grid: Grid {
+            columns: Vec::new(),
+            rows: Vec::new(),
+            note: String::new(),
+            types: Vec::new(),
+        },
+        error: error.map(str::to_string),
+        affected: 0,
+        ms: 1,
+    }
+}
+
+/// A multi-statement run that fails twice highlights both failing statements,
+/// parks the caret on the first, keeps the error message in the status line and
+/// cycles with `Alt-E` / `F8`.
+#[test]
+pub(crate) fn script_errors_highlight_and_cycle_in_the_editor() {
+    let mut app = test_app();
+    app.picker_open = false;
+    app.selected = Some(test_conn("postgres"));
+    let sql = "SELECT * FORM a;\nSELECT 2;\nSELECT * FORM b;";
+    app.set_editor_text(sql);
+    app.last_executed = Some(app.editor_sql().trim().to_string());
+    let (tx, _rx) = tokio::sync::mpsc::unbounded_channel::<OpResult>();
+    apply_op_result(
+        &mut app,
+        OpResult::Script(vec![
+            script_outcome(
+                "SELECT * FORM a",
+                Some("syntax error\nLINE 1: SELECT * FORM a"),
+            ),
+            script_outcome("SELECT 2", None),
+            script_outcome(
+                "SELECT * FORM b",
+                Some("syntax error near 'FORM' at line 1"),
+            ),
+        ]),
+        &tx,
+    );
+
+    assert_eq!(app.editor_error_spans.len(), 2, "two failures located");
+    assert_eq!(app.editor_error_spans[0].ordinal, 1);
+    assert_eq!(app.editor_error_spans[1].ordinal, 3);
+    assert_eq!(app.editor_error_spans[0].err_line, Some(1));
+    assert_eq!(app.editor.cursor().0, 0, "caret on the first failing line");
+    assert!(
+        app.status.contains(&tf("第 {} 条语句", &[&1u64])),
+        "status names the failing statement: {}",
+        app.status
+    );
+    let base = tf(
+        "脚本 · {} 条语句 · 影响 {} 行 · {} 错误 · {} · Enter 看结果",
+        &[&3u64, &0u64, &2u64, &history_duration_label(3)],
+    );
+    assert!(
+        app.status.starts_with(&base),
+        "existing script summary kept: {} vs {}",
+        app.status,
+        base
+    );
+
+    // The current failure is painted with the accent, the other with plain red.
+    let buf = draw_buffer(&mut app, 100, 30);
+    let mut accent = 0usize;
+    let mut plain = 0usize;
+    for y in 0..buf.area.height {
+        for x in 0..buf.area.width {
+            match buf.cell((x, y)).map(|c| c.bg) {
+                Some(Color::LightRed) => accent += 1,
+                Some(Color::Red) => plain += 1,
+                _ => {}
+            }
+        }
+    }
+    assert!(accent > 0, "current error statement highlighted");
+    assert!(plain > 0, "the other failing statement highlighted too");
+
+    // Alt-E cycles to the second failure (focus is Preview after a run).
+    key(
+        &mut app,
+        &tx,
+        KeyEvent::new(KeyCode::Char('e'), KeyModifiers::ALT),
+    );
+    assert!(app.focus == Focus::Editor);
+    assert_eq!(app.editor_error_idx, 1);
+    assert_eq!(app.editor.cursor().0, 2);
+    assert!(
+        app.status
+            .contains(&tf("第 {} 条语句（{}/{}）", &[&3u64, &2u64, &2u64])),
+        "status names 2/2: {}",
+        app.status
+    );
+
+    // F8 wraps back to the first.
+    key(
+        &mut app,
+        &tx,
+        KeyEvent::new(KeyCode::F(8), KeyModifiers::NONE),
+    );
+    assert_eq!(app.editor_error_idx, 0);
+
+    // Editing the buffer drops the whole highlight.
+    app.set_editor_text("SELECT 1;");
+    sync_editor_errors(&mut app);
+    assert!(app.editor_error_spans.is_empty());
+}
+
+/// A single-statement failure is located too, and the status keeps the driver
+/// message while appending the ordinal.
+#[test]
+pub(crate) fn single_query_error_is_located_and_status_appended() {
+    let mut app = test_app();
+    app.picker_open = false;
+    app.selected = Some(test_conn("mysql"));
+    app.set_editor_text("SELECT * FORM t");
+    app.last_executed = Some(app.editor_sql().trim().to_string());
+    let (tx, _rx) = tokio::sync::mpsc::unbounded_channel::<OpResult>();
+    apply_op_result(
+        &mut app,
+        OpResult::Error(
+            "query: You have an error in your SQL syntax; ... near 'FORM t' at line 1".into(),
+        ),
+        &tx,
+    );
+    assert_eq!(app.editor_error_spans.len(), 1);
+    assert_eq!(app.editor_error_spans[0].ordinal, 1);
+    assert_eq!(app.editor_error_spans[0].err_line, Some(1));
+    assert!(
+        app.status.contains(&tf("第 {} 条语句", &[&1u64])),
+        "{}",
+        app.status
+    );
+    assert!(app.status.contains("syntax"), "error kept: {}", app.status);
+}
+
+/// The epoch range is checked strictly and only numeric columns opt in; the
+/// underlying value is never rewritten.
+#[test]
+pub(crate) fn epoch_range_is_checked_and_gated_on_numeric_columns() {
+    assert_eq!(parse_epoch_secs("1000000000"), Some(1_000_000_000));
+    assert_eq!(parse_epoch_secs(" 1700000000 "), Some(1_700_000_000));
+    assert_eq!(parse_epoch_secs("+1700000000"), Some(1_700_000_000));
+    assert_eq!(parse_epoch_secs("40000000000"), Some(40_000_000_000));
+    assert_eq!(parse_epoch_secs("999999999"), None);
+    assert_eq!(parse_epoch_secs("40000000001"), None);
+    assert_eq!(parse_epoch_secs("1700000000.5"), None);
+    assert_eq!(parse_epoch_secs("1.7e9"), None);
+    assert_eq!(parse_epoch_secs("1700000000 "), Some(1_700_000_000));
+    assert_eq!(parse_epoch_secs("abc"), None);
+    assert_eq!(parse_epoch_secs(""), None);
+
+    let v = Val::Text("1700000000".into());
+    assert_eq!(
+        epoch_secs_from_cell(&v, Some("bigint")),
+        Some(1_700_000_000)
+    );
+    assert_eq!(
+        epoch_secs_from_cell(&v, Some("INT UNSIGNED")),
+        Some(1_700_000_000)
+    );
+    assert_eq!(epoch_secs_from_cell(&v, Some("varchar")), None);
+    assert_eq!(epoch_secs_from_cell(&v, Some("text")), None);
+    assert_eq!(epoch_secs_from_cell(&v, None), None);
+    assert_eq!(epoch_secs_from_cell(&Val::Null, Some("bigint")), None);
+}
+
+/// Relative-time labels are deterministic (timezone-free arithmetic).
+#[test]
+pub(crate) fn relative_time_labels_are_humanized() {
+    let now = 1_700_000_000i64;
+    assert_eq!(relative_time_label(now - 30, now), t("刚刚").to_string());
+    assert_eq!(
+        relative_time_label(now - 90, now),
+        tf("{} 分钟前", &[&1u64])
+    );
+    assert_eq!(
+        relative_time_label(now - 3 * 86_400, now),
+        tf("{} 天前", &[&3u64])
+    );
+    assert_eq!(
+        relative_time_label(now + 2 * 3_600, now),
+        tf("{} 小时后", &[&2u64])
+    );
+    assert_eq!(
+        relative_time_label(now - 400 * 86_400, now),
+        tf("{} 年前", &[&1u64])
+    );
+}
+
+/// The epoch preview line is appended to the cell popup, gray, and the raw value
+/// stays exactly what the driver returned.
+#[test]
+pub(crate) fn cell_popup_appends_epoch_preview_without_touching_the_value() {
+    let mut app = test_app();
+    app.picker_open = false;
+    app.selected = Some(test_conn("mysql"));
+    app.grid_kind = GridKind::Query;
+    app.set_grid(Grid {
+        columns: vec!["created_at".into()],
+        rows: vec![vec![Val::Text("1700000000".into())]],
+        note: String::new(),
+        types: vec!["bigint".into()],
+    });
+    app.focus = Focus::Preview;
+    app.sel = 0;
+    app.col_cursor = 0;
+    let (tx, _rx) = tokio::sync::mpsc::unbounded_channel::<OpResult>();
+    key(
+        &mut app,
+        &tx,
+        KeyEvent::new(KeyCode::Char('v'), KeyModifiers::NONE),
+    );
+    let popup = app.cell_popup.as_ref().expect("cell popup");
+    assert_eq!(popup.raw, "1700000000", "raw value untouched");
+    assert_eq!(popup.lines.len(), 2, "value + epoch preview");
+    assert!(
+        popup.lines[1].text.contains('🕒'),
+        "{}",
+        popup.lines[1].text
+    );
+    assert!(
+        popup.lines[1].text.contains(':') && popup.lines[1].text.contains('-'),
+        "timestamp present: {}",
+        popup.lines[1].text
+    );
+    let now = now_unix_secs();
+    assert!(
+        popup.lines[1]
+            .text
+            .contains(&relative_time_label(1_700_000_000, now)),
+        "relative time present: {}",
+        popup.lines[1].text
+    );
+
+    // A non-numeric column never grows the preview line.
+    app.cell_popup = None;
+    app.set_grid(Grid {
+        columns: vec!["id".into()],
+        rows: vec![vec![Val::Text("1700000000".into())]],
+        note: String::new(),
+        types: vec!["varchar".into()],
+    });
+    key(
+        &mut app,
+        &tx,
+        KeyEvent::new(KeyCode::Char('v'), KeyModifiers::NONE),
+    );
+    assert_eq!(app.cell_popup.as_ref().unwrap().lines.len(), 1);
+}
+
+/// The driver-named line is a fallback locator when the statement text cannot be
+/// matched back (and it stays relative to the statement, not the whole script).
+#[test]
+pub(crate) fn error_line_fallback_locates_by_line() {
+    let text = "SELECT a,\n  b\nFROM t;\nSELECT c\nFROM u;";
+    let stmts = vec![
+        "SELECT a,\n  b\nFROM t".to_string(),
+        "SELECT c\nFROM u".to_string(),
+    ];
+    assert_eq!(statement_start_lines(&stmts), vec![0, 3]);
+    // Statement 1's own line 2 is buffer line 4 (`FROM u`).
+    let (s, e) = locate_statement_at_line(text, &stmts, 1, 2).expect("located by line");
+    let got: String = text.chars().skip(s).take(e - s).collect();
+    assert_eq!(got.trim(), "SELECT c\nFROM u");
+    assert!(locate_statement_at_line(text, &stmts, 5, 1).is_none());
+}

@@ -188,6 +188,22 @@ pub(crate) fn value_to_val(v: &serde_json::Value) -> Val {
     }
 }
 
+/// R77: one statement that failed in the last editor run, located in the editor
+/// buffer by char offset (not by line, so a multi-line statement is one span).
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub(crate) struct EditorErrorSpan {
+    /// Start char offset of the statement in the editor buffer.
+    pub(crate) start: usize,
+    /// End char offset (exclusive).
+    pub(crate) end: usize,
+    /// 1-based ordinal of the statement within the executed script.
+    pub(crate) ordinal: usize,
+    /// Line number parsed from the driver's error message, when the engine
+    /// reported one (MySQL `at line N`, PostgreSQL `LINE N:`), relative to the
+    /// statement as the server received it.
+    pub(crate) err_line: Option<usize>,
+}
+
 /// Collapse control characters so a value never breaks the one-line grid layout.
 pub(crate) fn sanitize_cell(s: &str) -> String {
     if !s.chars().any(|c| c == '\n' || c == '\r' || c == '\t') {
@@ -1917,6 +1933,22 @@ pub(crate) struct App {
     /// Editor buffer snapshot from when the needle was computed; any edit makes
     /// the matches stale, so the highlight is dropped.
     pub(crate) editor_find_snapshot: Vec<String>,
+
+    // ── R77: execution-error statement location (Alt-E / F8) ──
+    /// Char-offset spans in the editor buffer of the statements that failed in
+    /// the most recent editor run, sorted by position. Non-empty paints the
+    /// whole statement(s) and lets `Alt-E` / `F8` cycle them. Client-side only
+    /// (text location, zero queries).
+    pub(crate) editor_error_spans: Vec<EditorErrorSpan>,
+    /// Index into [`App::editor_error_spans`] of the failing statement the
+    /// caret currently sits on (the accent-coloured one).
+    pub(crate) editor_error_idx: usize,
+    /// Editor buffer snapshot when the errors were located; any edit drops the
+    /// highlight (the offsets would no longer address the same text).
+    pub(crate) editor_error_snapshot: Vec<String>,
+    /// The status line that carried the error, kept verbatim so a jump can
+    /// append `第 N 条语句` without losing the message.
+    pub(crate) editor_error_base: String,
 
     // ── query-history panel (Alt-H) ──
     /// The overlay is open (it owns the keyboard until Esc / Enter).

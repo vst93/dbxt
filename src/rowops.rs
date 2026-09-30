@@ -37,10 +37,20 @@ pub(crate) fn open_cell_popup(app: &mut App) {
         "{} · 第 {} 行 · {} 字符",
         &[&col, &(cursor_abs_row(app)), &(text.chars().count())],
     );
+    let mut lines = vec![PopupLine { text, style }];
+    // R77: a whole-number cell that lands in the epoch range gets a gray,
+    // read-only human-readable time line at the bottom of the popup. Preview
+    // only — the value itself, and everything `y`/`Y` copies, is untouched.
+    if let Some(secs) = epoch_secs_from_cell(v, grid.col_type(app.col_cursor)) {
+        lines.push(PopupLine {
+            text: epoch_display(secs, now_unix_secs()),
+            style: Style::default().fg(Color::DarkGray),
+        });
+    }
     app.popup_cache = None;
     app.cell_popup = Some(CellPopup {
         title,
-        lines: vec![PopupLine { text, style }],
+        lines,
         scroll: 0,
         col,
         raw,

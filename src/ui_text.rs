@@ -1360,6 +1360,20 @@ pub static ALL_KEYS: &[&str] = &[
     "收起结果 / 关闭浮层（状态栏 1.5 秒提示「关闭 X / 已清除 Y」）",
     "已取消输入",
     "已关闭导入报告",
+    "第 {} 条语句",
+    "第 {} 条语句（{}/{}）",
+    "没有可定位的执行错误",
+    "{} 分钟前",
+    "{} 分钟后",
+    "{} 小时前",
+    "{} 小时后",
+    "{} 天前",
+    "{} 天后",
+    "{} 个月前",
+    "{} 个月后",
+    "{} 年前",
+    "{} 年后",
+    "刚刚",
 ];
 
 /// The Chinese → English table. Keys must match the source literals exactly.
@@ -3818,6 +3832,29 @@ fn en_of(zh: &'static str) -> Option<&'static str> {
         ),
         "已取消输入" => Some("input cancelled"),
         "已关闭导入报告" => Some("closed import report"),
+        // R77: execution-error statement location + epoch preview.
+        "第 {} 条语句" => Some("statement {}"),
+        "第 {} 条语句（{}/{}）" => Some("statement {} ({}/{})"),
+        "没有可定位的执行错误" => Some("no located execution error"),
+        "{} 分钟前" => Some("{} minutes ago"),
+        "{} 分钟后" => Some("in {} minutes"),
+        "{} 小时前" => Some("{} hours ago"),
+        "{} 小时后" => Some("in {} hours"),
+        "{} 天前" => Some("{} days ago"),
+        "{} 天后" => Some("in {} days"),
+        "{} 个月前" => Some("{} months ago"),
+        "{} 个月后" => Some("in {} months"),
+        "{} 年前" => Some("{} years ago"),
+        "{} 年后" => Some("in {} years"),
+        "刚刚" => Some("just now"),
+        "🕒 {} · {}" => Some("🕒 {} · {}"),
+        "跳到本次执行出错的语句：整段红色高亮 + 光标移到语句首，状态栏保留错误并追加 第 N 条语句；多条语句失败时循环切换（F8 下一个 / Shift+F8 上一个）；纯文本定位，不发任何查询。Alt-E 只在已定位到错误时生效，否则仍是连接导出" => Some(
+            "Jump to the statement that failed in the last run: the whole statement gets a red highlight and the caret moves to its start, while the status line keeps the error and appends `statement N`; with several failures F8 / Shift+F8 cycle them; pure text location, never a query. Alt-E only fires once an error is located, otherwise it still exports connections",
+        ),
+        "时间戳" => Some("timestamp"),
+        "整型值落在 epoch 秒范围（1e9~4e10）时，弹层底部灰显本地时间 + 相对时间（如 2024-06-01 12:34:56 · 3 天前）；仅预览，不改数据、不猜测时区语义" => Some(
+            "When an integer cell lands in the epoch-seconds range (1e9..4e10), the popup appends a gray local time + relative time line (e.g. 2024-06-01 12:34:56 · 3 days ago); preview only — the value is never changed and no timezone semantics are guessed",
+        ),
         _ => None,
     }
 }

@@ -220,6 +220,35 @@ pub(crate) fn offset_to_cursor(text: &str, off: usize) -> (usize, usize) {
     (row, col)
 }
 
+/// Split a whole-buffer char range into per-row `(row, col_start, col_end)` spans
+/// (char columns) so a paint pass can colour every screen cell a multi-line span
+/// covers. Rows outside `start..end` are skipped; pure and allocation-light.
+pub(crate) fn char_range_rows(
+    lines: &[String],
+    start: usize,
+    end: usize,
+) -> Vec<(usize, usize, usize)> {
+    let mut out = Vec::new();
+    let mut off = 0usize;
+    for (row, line) in lines.iter().enumerate() {
+        let len = line.chars().count();
+        let ls = off;
+        let le = off + len;
+        if end > ls && start < le {
+            let c0 = start.saturating_sub(ls).min(len);
+            let c1 = end.saturating_sub(ls).min(len);
+            if c1 > c0 {
+                out.push((row, c0, c1));
+            }
+        }
+        off = le + 1;
+        if off > end {
+            break;
+        }
+    }
+    out
+}
+
 /// Classify every character as *code* (`true`) or as part of a string literal,
 /// quoted identifier (`"…"`, `` `…` ``) or comment (`false`). The lexer is
 /// deliberately small but honours SQL's escaping rules (doubled quotes,
@@ -384,6 +413,48 @@ pub(crate) fn statement_index_at(ranges: &[(usize, usize)], cursor: usize) -> Op
     Some(ranges.iter().rposition(|&(s, _)| s <= cursor).unwrap_or(0))
 }
 
+/// The 0-based line at which each of `statements` starts inside the script they
+/// were split from (a statement's own `\n` count advances the next start).
+/// Used by the R77 line fallback, where the driver reports a line *within its
+/// statement* and the statement's own offset in the buffer is unknown.
+pub(crate) fn statement_start_lines(statements: &[String]) -> Vec<usize> {
+    let mut out = Vec::with_capacity(statements.len());
+    let mut line = 0usize;
+    for st in statements {
+        out.push(line);
+        line += st.matches('\n').count() + 1;
+    }
+    out
+}
+
+/// R77 fallback: the statement `index` of `statements` when the driver reported
+/// `err_line` (1-based, relative to that statement). Returns the editor span
+/// containing that absolute line, or `None` when it is out of range. Pure.
+pub(crate) fn locate_statement_at_line(
+    editor_text: &str,
+    statements: &[String],
+    index: usize,
+    err_line: usize,
+) -> Option<(usize, usize)> {
+    let starts = statement_start_lines(statements);
+    let base = *starts.get(index)?;
+    let line = base + err_line.saturating_sub(1);
+    let chars: Vec<char> = editor_text.chars().collect();
+    let mut off = 0usize;
+    let mut cur = 0usize;
+    while cur < line {
+        if off >= chars.len() {
+            return None;
+        }
+        if chars[off] == '\n' {
+            cur += 1;
+        }
+        off += 1;
+    }
+    let ranges = statement_ranges(editor_text);
+    statement_range_at(&ranges, off).or_else(|| ranges.last().copied())
+}
+
 /// R56: the inclusive `(first_row, last_row)` of the statement the caret at
 /// `(row, col)` sits in, for dimming every other statement in the editor.
 ///
@@ -482,6 +553,254 @@ pub(crate) fn statement_code_start(
         i += 1;
     }
     start
+}
+
+// ── R77: execution-error statement location ──────────────────────────────────
+
+/// Parse the 1-based line number out of a driver error message. Recognises the
+/// two shapes the bundled drivers actually emit — MySQL's `... at line 3` and
+/// PostgreSQL's `LINE 3: ...` — and nothing else, so a `line` in an unrelated
+/// message is never mistaken for a location. Pure text, no query.
+pub(crate) fn extract_error_line(msg: &str) -> Option<usize> {
+    let lower = msg.to_ascii_lowercase();
+    scan_line_marker(&lower).or_else(|| scan_at_line(&lower))
+}
+
+/// PostgreSQL-style `LINE 3:` marker (a `line` token, spaces, digits, colon).
+fn scan_line_marker(lower: &str) -> Option<usize> {
+    let b = lower.as_bytes();
+    let mut i = 0usize;
+    while i + 4 <= b.len() {
+        if &b[i..i + 4] == b"line" && (i == 0 || !b[i - 1].is_ascii_alphanumeric()) {
+            let mut j = i + 4;
+            while j < b.len() && b[j] == b' ' {
+                j += 1;
+            }
+            let s = j;
+            while j < b.len() && b[j].is_ascii_digit() {
+                j += 1;
+            }
+            if j > s {
+                let mut k = j;
+                while k < b.len() && b[k] == b' ' {
+                    k += 1;
+                }
+                if k < b.len() && b[k] == b':' {
+                    if let Ok(n) = lower[s..j].parse::<usize>() {
+                        if n > 0 {
+                            return Some(n);
+                        }
+                    }
+                }
+            }
+        }
+        i += 1;
+    }
+    None
+}
+
+/// MySQL-style `at line 3` marker (digits run to the end of the token).
+fn scan_at_line(lower: &str) -> Option<usize> {
+    let pat = "at line ";
+    let b = lower.as_bytes();
+    let mut from = 0usize;
+    while from <= lower.len() {
+        let Some(p) = lower[from..].find(pat) else {
+            break;
+        };
+        let s = from + p + pat.len();
+        let mut j = s;
+        while j < b.len() && b[j].is_ascii_digit() {
+            j += 1;
+        }
+        if j > s {
+            if let Ok(n) = lower[s..j].parse::<usize>() {
+                if n > 0 {
+                    return Some(n);
+                }
+            }
+        }
+        from += p + 1;
+    }
+    None
+}
+
+/// Map each statement the engine ran (in order) back to its char-offset span in
+/// the editor buffer, or `None` when it cannot be matched. The counts usually
+/// agree, in which case the index is trusted after a text check; when the engine
+/// split the script differently (or stopped early) the span is found by text.
+/// Pure and client-side, so the mapping is unit-testable without a backend.
+pub(crate) fn locate_statement_spans(
+    editor_text: &str,
+    statements: &[String],
+) -> Vec<Option<(usize, usize)>> {
+    let ranges = statement_ranges(editor_text);
+    let chars: Vec<char> = editor_text.chars().collect();
+    let text_of = |(s, e): (usize, usize)| -> String {
+        chars[s..e].iter().collect::<String>().trim().to_string()
+    };
+    let same_count = ranges.len() == statements.len();
+    let mut used = vec![false; ranges.len()];
+    let mut out = Vec::with_capacity(statements.len());
+    for (i, st) in statements.iter().enumerate() {
+        let needle = st.trim();
+        let mut pick = None;
+        if same_count && i < ranges.len() && !used[i] && text_of(ranges[i]) == needle {
+            pick = Some(i);
+        }
+        if pick.is_none() {
+            pick = (0..ranges.len()).find(|&r| !used[r] && text_of(ranges[r]) == needle);
+        }
+        match pick {
+            Some(r) => {
+                used[r] = true;
+                out.push(Some(ranges[r]));
+            }
+            None => out.push(None),
+        }
+    }
+    out
+}
+
+/// Drop every located execution error (new run, edit, backend switch).
+pub(crate) fn clear_editor_errors(app: &mut App) {
+    app.editor_error_spans.clear();
+    app.editor_error_idx = 0;
+    app.editor_error_snapshot.clear();
+    app.editor_error_base.clear();
+}
+
+/// Drop the located errors once the buffer changed under them — the char offsets
+/// would no longer address the same text. Called after every edit path, exactly
+/// like [`sync_editor_find`].
+pub(crate) fn sync_editor_errors(app: &mut App) {
+    if app.editor_error_spans.is_empty() {
+        return;
+    }
+    if app.editor.lines() != app.editor_error_snapshot.as_slice() {
+        clear_editor_errors(app);
+    }
+}
+
+/// Locate the failing statements of the last editor run, highlight them and park
+/// the caret on the first. `statements` is what the engine actually ran (the
+/// core's dialect-aware split); `errors` is `(statement index, message)` per
+/// failure; `base` is the status line that carried the error, kept so a jump can
+/// append the ordinal without losing the message. Returns whether anything was
+/// located. Text-only, zero queries.
+pub(crate) fn record_editor_errors(
+    app: &mut App,
+    statements: &[String],
+    errors: &[(usize, String)],
+    base: &str,
+) -> bool {
+    if errors.is_empty() {
+        clear_editor_errors(app);
+        return false;
+    }
+    let text = app.editor_sql();
+    let Some(exec) = app.last_executed.clone() else {
+        clear_editor_errors(app);
+        return false;
+    };
+    // Only locate when the editor still holds exactly what ran. A selection run
+    // or a buffer edited after the failure has no reliable offset mapping, so it
+    // is left alone rather than highlighting the wrong text.
+    if text.trim() != exec {
+        clear_editor_errors(app);
+        return false;
+    }
+    let located = locate_statement_spans(&text, statements);
+    let mut spans: Vec<EditorErrorSpan> = Vec::new();
+    for (i, msg) in errors {
+        let err_line = extract_error_line(msg);
+        // Primary: match the statement the engine ran back to the buffer. If
+        // that fails (an unusual split), fall back to the line the driver named,
+        // offset by where statement `i` begins in the script.
+        let range =
+            located.get(*i).copied().flatten().or_else(|| {
+                err_line.and_then(|l| locate_statement_at_line(&text, statements, *i, l))
+            });
+        if let Some((s, e)) = range {
+            spans.push(EditorErrorSpan {
+                start: s,
+                end: e,
+                ordinal: i + 1,
+                err_line,
+            });
+        }
+    }
+    if spans.is_empty() {
+        clear_editor_errors(app);
+        return false;
+    }
+    spans.sort_by_key(|s| s.start);
+    app.editor_error_spans = spans;
+    app.editor_error_idx = 0;
+    app.editor_error_snapshot = app.editor.lines().to_vec();
+    app.editor_error_base = base.to_string();
+    jump_editor_error(app);
+    true
+}
+
+/// Park the caret on the first real token of the currently selected failing
+/// statement (a leading comment block is stepped over).
+pub(crate) fn jump_editor_error(app: &mut App) {
+    let Some(span) = app.editor_error_spans.get(app.editor_error_idx).cloned() else {
+        return;
+    };
+    let text = app.editor_sql();
+    let chars: Vec<char> = text.chars().collect();
+    let mask = code_mask(&chars);
+    let at = statement_code_start(&chars, &mask, span.start, span.end);
+    let (r, c) = offset_to_cursor(&text, at);
+    app.editor.move_cursor(CursorMove::Jump(r as u16, c as u16));
+}
+
+/// Step to the next (`dir > 0`) / previous failing statement, wrapping, focus the
+/// editor and refresh the status. `false` when nothing is located.
+pub(crate) fn cycle_editor_error(app: &mut App, dir: i32) -> bool {
+    let n = app.editor_error_spans.len();
+    if n == 0 {
+        return false;
+    }
+    if dir > 0 {
+        app.editor_error_idx = (app.editor_error_idx + 1) % n;
+    } else {
+        app.editor_error_idx = (app.editor_error_idx + n - 1) % n;
+    }
+    app.focus = Focus::Editor;
+    jump_editor_error(app);
+    apply_editor_error_status(app);
+    true
+}
+
+/// The status line for the located errors: the original error message followed
+/// by the failing statement's ordinal (bilingual).
+pub(crate) fn editor_error_status(app: &App) -> Option<String> {
+    let span = app.editor_error_spans.get(app.editor_error_idx)?;
+    let total = app.editor_error_spans.len();
+    let loc = if total > 1 {
+        tf(
+            "第 {} 条语句（{}/{}）",
+            &[&span.ordinal, &(app.editor_error_idx + 1), &(total)],
+        )
+    } else {
+        tf("第 {} 条语句", &[&span.ordinal])
+    };
+    let base = app.editor_error_base.trim_end();
+    Some(if base.is_empty() {
+        loc
+    } else {
+        format!("{base} · {loc}")
+    })
+}
+
+/// Overwrite the status line with [`editor_error_status`].
+pub(crate) fn apply_editor_error_status(app: &mut App) {
+    if let Some(s) = editor_error_status(app) {
+        app.status = s;
+    }
 }
 
 /// Offset of the bracket matching the bracket at `pos`, or `None` when it is
@@ -993,6 +1312,8 @@ pub(crate) fn editor_key(app: &mut App, tx: &Tx, k: KeyEvent) {
     // R61: any edit invalidates the find highlight (matches moved); `Esc` keeps
     // it until exactly this moment.
     sync_editor_find(app);
+    // R77: the located execution-error highlight goes with it.
+    sync_editor_errors(app);
 }
 
 pub(crate) fn editor_key_inner(app: &mut App, tx: &Tx, k: KeyEvent) {
