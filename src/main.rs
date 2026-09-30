@@ -4222,7 +4222,10 @@ struct RowPopup {
     lines: Vec<PopupLine>,
     /// Column name per line, parallel to `lines` (drives the `/` filter).
     cols: Vec<String>,
-    /// Raw display value per line, parallel to `lines` (drives `y` and the
+    /// Display value per line, parallel to `lines` (the text after `name = `,
+    /// used by the narrow stacked layout).
+    shown: Vec<String>,
+    /// Clipboard value per line, parallel to `lines` (drives `y`/`Y` and the
     /// drilled cell popup).
     values: Vec<String>,
     /// Absolute row number (1-based, across pages) for the drilled cell title.
@@ -4247,6 +4250,7 @@ fn row_popup_from_lines(title: String, lines: Vec<PopupLine>) -> RowPopup {
         title,
         lines,
         cols: vec![String::new(); n],
+        shown: vec![String::new(); n],
         values: vec![String::new(); n],
         row_abs: 0,
         scroll: 0,
@@ -21385,6 +21389,17 @@ fn open_redis_batch_rename_prompt(app: &mut App) {
     });
 }
 
+/// Toggle the first-column pin and flash the new state. Shared by the result,
+/// Redis and MongoDB grids so `z` reads the same everywhere.
+fn toggle_freeze_first(app: &mut App) {
+    app.freeze_first = !app.freeze_first;
+    app.status = if app.freeze_first {
+        t("首列已钉住 · z 取消").into()
+    } else {
+        t("首列已取消钉住 · z 钉住").into()
+    };
+}
+
 /// Keys for a Redis value grid: edit the string / hash field, expire, rename,
 /// delete, plus the shared search / copy / popup infrastructure.
 fn redis_value_key(app: &mut App, tx: &Tx, k: KeyEvent) {
@@ -21424,9 +21439,7 @@ fn redis_value_key(app: &mut App, tx: &Tx, k: KeyEvent) {
         KeyCode::Char('y') => copy_redis_row(app),
         KeyCode::Char('Y') => copy_cell_value(app),
         KeyCode::Char(':') => open_goto_row(app),
-        KeyCode::Char('z') => {
-            app.freeze_first = !app.freeze_first;
-        }
+        KeyCode::Char('z') => toggle_freeze_first(app),
         KeyCode::Up | KeyCode::Char('k') => move_cursor(app, tx, -1),
         KeyCode::Down | KeyCode::Char('j') => move_cursor(app, tx, 1),
         KeyCode::Left | KeyCode::Char('h') => move_col_cursor(app, -1),
@@ -21487,6 +21500,9 @@ fn mongo_docs_key(app: &mut App, tx: &Tx, k: KeyEvent) {
         KeyCode::Char('/') => open_result_filter(app),
         KeyCode::Char('\\') => open_cell_find(app),
         KeyCode::Char(':') => open_goto_row(app),
+        // R67: `z` pins the first column here too, matching the result / Redis
+        // grids (with the same status flash).
+        KeyCode::Char('z') => toggle_freeze_first(app),
         KeyCode::Up | KeyCode::Char('k') => move_cursor(app, tx, -1),
         KeyCode::Down | KeyCode::Char('j') => move_cursor(app, tx, 1),
         KeyCode::Left | KeyCode::Char('h') => move_col_cursor(app, -1),
@@ -22172,14 +22188,7 @@ fn preview_key(app: &mut App, tx: &Tx, k: KeyEvent) {
         // Delete the focused row: builds a bound `DELETE … WHERE …` and routes it
         // through the same red confirmation layer as every other write.
         KeyCode::Delete => delete_row(app),
-        KeyCode::Char('z') => {
-            app.freeze_first = !app.freeze_first;
-            app.status = if app.freeze_first {
-                t("首列已钉住 · z 取消").into()
-            } else {
-                t("首列已取消钉住 · z 钉住").into()
-            };
-        }
+        KeyCode::Char('z') => toggle_freeze_first(app),
         KeyCode::Up | KeyCode::Char('k') => {
             let times = take_count(app);
             if ddl {
@@ -27515,6 +27524,7 @@ fn open_row_popup(app: &mut App) {
     };
     let mut lines: Vec<PopupLine> = Vec::new();
     let mut cols: Vec<String> = Vec::new();
+    let mut shown_vals: Vec<String> = Vec::new();
     let mut values: Vec<String> = Vec::new();
     for (ci, col) in grid.columns.iter().enumerate() {
         let (shown, style) = match row.get(ci) {
@@ -27523,6 +27533,8 @@ fn open_row_popup(app: &mut App) {
             Some(Val::Text(s)) => (s.clone(), Style::default()),
         };
         cols.push(fix_double_encoding(col));
+        // The narrow stacked layout draws the value on its own line.
+        shown_vals.push(shown.clone());
         // The popup's `y` copies this same text, so both paths share one mapping.
         values.push(cell_copy_text(row.get(ci).unwrap_or(&Val::Null)));
         lines.push(PopupLine {
@@ -27540,6 +27552,7 @@ fn open_row_popup(app: &mut App) {
         title,
         lines,
         cols,
+        shown: shown_vals,
         values,
         row_abs: abs,
         scroll: 0,
@@ -27601,8 +27614,10 @@ fn row_pk_locator(app: &App, grid: &Grid, row: &[Val]) -> Option<String> {
     }
 }
 
-/// Indices of the row-popup lines whose column name matches the active filter
-/// (case-insensitive substring). An empty filter keeps every line.
+/// Indices of the row-popup lines whose column name *or* displayed value matches
+/// the active filter (case-insensitive substring), so a wide row can be narrowed
+/// by either the field name or the value it holds. An empty filter keeps every
+/// line.
 fn row_popup_visible(popup: &RowPopup) -> Vec<usize> {
     if popup.filter.is_empty() {
         return (0..popup.lines.len()).collect();
@@ -27612,7 +27627,13 @@ fn row_popup_visible(popup: &RowPopup) -> Vec<usize> {
         .cols
         .iter()
         .enumerate()
-        .filter(|(_, c)| c.to_lowercase().contains(&needle))
+        .filter(|(i, c)| {
+            c.to_lowercase().contains(&needle)
+                || popup
+                    .shown
+                    .get(*i)
+                    .is_some_and(|v| v.to_lowercase().contains(&needle))
+        })
         .map(|(i, _)| i)
         .collect()
 }
@@ -27653,8 +27674,9 @@ fn drill_row_popup_cell(app: &mut App) {
     });
 }
 
-/// `y` inside the row popup: copy the selected value, naming the column in the
-/// status so a wide table's many columns stay unambiguous.
+/// `y` / `Y` inside the row popup: copy the selected value, naming the column in
+/// the status so a wide table's many columns stay unambiguous. Shares the grid's
+/// copy path ([`copy_named_value`]) so both read the same.
 fn copy_row_popup_value(app: &mut App) {
     let Some(popup) = app.row_popup.as_ref() else {
         return;
@@ -27665,22 +27687,13 @@ fn copy_row_popup_value(app: &mut App) {
     };
     let col = popup.cols.get(ei).cloned().unwrap_or_default();
     let text = popup.values.get(ei).cloned().unwrap_or_default();
-    let n = text.chars().count();
-    let short = truncate_disp(&one_line(&text), 40);
-    match clipboard_copy(&text) {
-        Some(p) => {
-            app.status = tf(
-                "✓ 已复制 {} = {}（{} 字符）· 兜底 {}",
-                &[&col, &short, &n, &(p.display())],
-            )
-        }
-        None => app.status = tf("✓ 已复制 {} = {}（{} 字符）", &[&col, &short, &n]),
-    }
+    copy_named_value(app, &col, &text);
 }
 
-/// Keys for the row popup. `j`/`k` (with an optional count) move the entry
-/// cursor, `/` filters by column name, `y` copies the selected value, and
-/// `Enter` / `v` drill into the full cell popup. `Esc` / `q` close the row.
+/// Keys for the row popup. `j`/`k` or `n`/`p` (with an optional count) move the
+/// entry cursor, `/` filters by column name or value, `y`/`Y` copy the selected
+/// value, and `Enter` / `v` drill into the full cell popup. `Esc` / `q` close
+/// the row.
 fn row_popup_key(app: &mut App, k: KeyEvent) {
     let Some(popup) = app.row_popup.as_mut() else {
         return;
@@ -27734,7 +27747,7 @@ fn row_popup_key(app: &mut App, k: KeyEvent) {
             popup.count.clear();
             drill_row_popup_cell(app);
         }
-        KeyCode::Char('y') => {
+        KeyCode::Char('y') | KeyCode::Char('Y') => {
             popup.count.clear();
             copy_row_popup_value(app);
         }
@@ -27751,11 +27764,11 @@ fn row_popup_key(app: &mut App, k: KeyEvent) {
             popup.cursor = 0;
             popup.scroll = 0;
         }
-        KeyCode::Down | KeyCode::Char('j') => {
+        KeyCode::Down | KeyCode::Char('j') | KeyCode::Char('n') => {
             popup.cursor = (cur + count).min(last);
             popup.count.clear();
         }
-        KeyCode::Up | KeyCode::Char('k') => {
+        KeyCode::Up | KeyCode::Char('k') | KeyCode::Char('p') => {
             popup.cursor = cur.saturating_sub(count);
             popup.count.clear();
         }
@@ -28346,22 +28359,24 @@ fn copy_cell_value(app: &mut App) {
         return;
     };
     let text = cell_copy_text(val);
+    copy_named_value(app, &fix_double_encoding(&name), &text);
+}
+
+/// Copy one value to the clipboard, naming its column in the status. Shared by
+/// the grid's `Y` and the row popup's `y`/`Y` so every “copy one value” path
+/// reads the same.
+fn copy_named_value(app: &mut App, name: &str, text: &str) {
     let n = text.chars().count();
     // NULL / '' / a short text read best in the status; a long cell would blow it up.
-    let short = truncate_disp(&one_line(&text), 24);
-    match clipboard_copy(&text) {
+    let short = truncate_disp(&one_line(text), 24);
+    match clipboard_copy(text) {
         Some(p) => {
             app.status = tf(
                 "✓ 已复制「{}」= {} · {} 字符 · 兜底 {}",
-                &[&(fix_double_encoding(&name)), &short, &n, &(p.display())],
+                &[&name, &short, &n, &(p.display())],
             )
         }
-        None => {
-            app.status = tf(
-                "✓ 已复制「{}」= {} · {} 字符",
-                &[&(fix_double_encoding(&name)), &short, &n],
-            )
-        }
+        None => app.status = tf("✓ 已复制「{}」= {} · {} 字符", &[&name, &short, &n]),
     }
 }
 
@@ -34431,10 +34446,10 @@ fn footer_hints_ctx(ctx: FooterCtx) -> Vec<Hint> {
         }
         FooterView::Popup => vec![("↑↓", t("滚动")), ("Esc/Enter", t("关闭"))],
         FooterView::RowPopup => vec![
-            ("↑↓", t("移动")),
+            ("↑↓/n p", t("移动")),
             ("Enter/v", t("看值")),
-            ("y", t("复制值")),
-            ("/", t("过滤列")),
+            ("y/Y", t("复制值")),
+            ("/", t("过滤名/值")),
             ("Esc", t("关闭")),
         ],
         FooterView::ErrorBox => vec![
@@ -39966,9 +39981,75 @@ fn render_text_popup(
     )
 }
 
+/// Below this inner width the row popup stacks a field's value on its own line
+/// under the name (`字段:` then the indented value) instead of running
+/// `字段 = 值` together, so a long name can never squeeze the value off a phone.
+const ROW_POPUP_STACK_W: usize = 56;
+
+/// Build the (filtered) body of the row popup plus the physical-line → entry
+/// mapping and the physical line the cursor's entry starts on. Wide popups keep
+/// one `name = value` line per field; a narrow popup (`inner_w <
+/// ROW_POPUP_STACK_W`) stacks the value under the name, one field per column.
+fn row_popup_body(popup: &RowPopup, inner_w: usize) -> (Vec<Line<'static>>, Vec<usize>, usize) {
+    let visible = row_popup_visible(popup);
+    let total = visible.len();
+    let cursor = if total == 0 {
+        0
+    } else {
+        popup.cursor.min(total - 1)
+    };
+    let mut body: Vec<Line<'static>> = Vec::new();
+    let mut hit: Vec<usize> = Vec::new();
+    let mut sel_line = 0usize;
+    if total == 0 {
+        body.push(Line::from(Span::styled(
+            t("（无匹配字段）").to_string(),
+            Style::default().fg(Color::DarkGray),
+        )));
+        return (body, hit, sel_line);
+    }
+    let stacked = inner_w < ROW_POPUP_STACK_W;
+    for (pos, &ei) in visible.iter().enumerate() {
+        let pl = &popup.lines[ei];
+        let selected = pos == cursor;
+        if selected {
+            sel_line = body.len();
+        }
+        let marker = if selected { "▶ " } else { "  " };
+        let style = if selected {
+            pl.style.add_modifier(Modifier::BOLD)
+        } else {
+            pl.style
+        };
+        let push = |line: String, hit: &mut Vec<usize>, body: &mut Vec<Line<'static>>| {
+            for t in wrap_text(&line, inner_w) {
+                body.push(Line::from(Span::styled(t, style)));
+                hit.push(pos);
+            }
+        };
+        if stacked {
+            let name = popup.cols.get(ei).map(String::as_str).unwrap_or("");
+            // `shown` is the display value ("NULL" / "''" / the text); fall back
+            // to the whole line for a fixture that only filled `lines`.
+            let shown = popup
+                .shown
+                .get(ei)
+                .filter(|s| !s.is_empty())
+                .map(String::as_str)
+                .unwrap_or_else(|| pl.text.as_str());
+            push(format!("{marker}{name}:"), &mut hit, &mut body);
+            push(format!("  {shown}"), &mut hit, &mut body);
+        } else {
+            push(format!("{marker}{}", pl.text), &mut hit, &mut body);
+        }
+    }
+    (body, hit, sel_line)
+}
+
 /// R42b: the row-detail popup. A scrollable `column = value` list with a
 /// cursor (highlighted with `▶` and bold, keeping the NULL / '' style), a
-/// column-name filter and a vim count prefix. Drawn under a drilled cell popup.
+/// column-name / value filter and a vim count prefix. Drawn under a drilled
+/// cell popup; a narrow terminal stacks each value under its name.
 fn render_row_popup(f: &mut Frame, area: Rect, app: &mut App) {
     let w = overlay_width(area.width, 88, 24);
     let inner_w = w.saturating_sub(4).max(1) as usize;
@@ -39979,39 +40060,13 @@ fn render_row_popup(f: &mut Frame, area: Rect, app: &mut App) {
         let Some(popup) = app.row_popup.as_ref() else {
             return;
         };
-        let visible = row_popup_visible(popup);
-        let total = visible.len();
+        let total = row_popup_visible(popup).len();
         let cursor = if total == 0 {
             0
         } else {
             popup.cursor.min(total - 1)
         };
-        let mut body: Vec<Line<'static>> = Vec::new();
-        let mut hit: Vec<usize> = Vec::new();
-        let mut sel_line = 0usize;
-        for (pos, &ei) in visible.iter().enumerate() {
-            let pl = &popup.lines[ei];
-            let selected = total > 0 && pos == cursor;
-            if selected {
-                sel_line = body.len();
-            }
-            let marker = if selected { "▶ " } else { "  " };
-            let style = if selected {
-                pl.style.add_modifier(Modifier::BOLD)
-            } else {
-                pl.style
-            };
-            for t in wrap_text(&format!("{marker}{}", pl.text), inner_w) {
-                body.push(Line::from(Span::styled(t, style)));
-                hit.push(pos);
-            }
-        }
-        if body.is_empty() {
-            body.push(Line::from(Span::styled(
-                t("（无匹配列）").to_string(),
-                Style::default().fg(Color::DarkGray),
-            )));
-        }
+        let (body, hit, sel_line) = row_popup_body(popup, inner_w);
         (
             popup.title.clone(),
             body,
@@ -40066,11 +40121,11 @@ fn render_row_popup(f: &mut Frame, area: Rect, app: &mut App) {
     }
     base.push_str(&format!("· {}/{} ", cur, total));
     let full = format!(
-        "{base}· ↑↓ {} · Enter/v {} · y {} · / {} · Esc {} ",
+        "{base}· ↑↓/n p {} · Enter/v {} · y/Y {} · / {} · Esc {} ",
         t("移动"),
         t("看值"),
         t("复制值"),
-        t("过滤列"),
+        t("过滤名/值"),
         t("关闭")
     );
     let short = format!("{}· Esc {} ", base, t("关闭"));
@@ -40921,13 +40976,14 @@ const HELP_ROWS: &[(&str, &str)] = &[
     ("g v", "定位值（排序列 / 主键列，不隐藏行）"),
     ("Esc", "收起结果 / 关闭浮层"),
     ("— 行详情浮层（Enter / o）—", ""),
-    ("↑ ↓ / j k · 5j", "移动选中列（计数前缀：5j 跳 5 列）"),
+    ("↑ ↓ / j k / n p · 5j", "移动选中列（计数前缀：5j 跳 5 列；n/p 与 j/k 同义）"),
     (
         "Enter / v",
         "下钻完整单元格（Esc 返回行弹层，再 Esc 回表格）",
     ),
-    ("y", "复制选中列值（状态栏带列名）"),
-    ("/", "按列名过滤（宽表 40+ 列找列）"),
+    ("y / Y", "复制选中列值（y / Y 均可；状态栏带列名，与结果区 Y 同一路径）"),
+    ("/", "按列名或值过滤（输入即筛；宽表 40+ 列找列）"),
+    ("< 56 cols", "窄屏：每行「字段:」+ 缩进值单列自适应"),
     ("标题", "主键定位：第 12 行 · id=4821"),
     ("— 编辑确认层 —", ""),
     ("Enter", "执行（UPDATE / INSERT，SQL 全文可见）"),
@@ -43490,6 +43546,169 @@ mod tests {
             );
         }
         assert_eq!(app.row_popup.as_ref().unwrap().cursor, 3);
+    }
+
+    /// R67: `n` / `p` move the row-popup cursor just like `j` / `k`, count
+    /// prefix included, so the page-turn keys work one level in as well.
+    #[test]
+    fn row_popup_n_and_p_move_the_cursor() {
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel::<OpResult>();
+        let mut app = test_app();
+        app.grid_kind = GridKind::TableData;
+        app.set_grid(sample_grid());
+        app.focus = Focus::Preview;
+        app.sel = 0;
+        open_row_popup(&mut app);
+        for c in ["3", "n"] {
+            let ch = c.chars().next().unwrap();
+            key(
+                &mut app,
+                &tx,
+                KeyEvent::new(KeyCode::Char(ch), KeyModifiers::NONE),
+            );
+        }
+        assert_eq!(app.row_popup.as_ref().unwrap().cursor, 3);
+        for c in ["2", "p"] {
+            let ch = c.chars().next().unwrap();
+            key(
+                &mut app,
+                &tx,
+                KeyEvent::new(KeyCode::Char(ch), KeyModifiers::NONE),
+            );
+        }
+        assert_eq!(app.row_popup.as_ref().unwrap().cursor, 1);
+    }
+
+    /// R67: the row-popup `/` filter matches the column name *or* the displayed
+    /// value, so a wide row can be narrowed by either.
+    #[test]
+    fn row_popup_filter_matches_name_or_value() {
+        let mut app = test_app();
+        app.grid_kind = GridKind::TableData;
+        app.set_grid(Grid {
+            columns: vec!["id".into(), "name".into(), "city".into()],
+            rows: vec![vec![
+                Val::Text("1".into()),
+                Val::Text("ada".into()),
+                Val::Text("berlin".into()),
+            ]],
+            note: String::new(),
+        });
+        app.focus = Focus::Preview;
+        app.sel = 0;
+        open_row_popup(&mut app);
+        let set = |app: &mut App, f: &str| {
+            app.row_popup.as_mut().unwrap().filter = f.to_string();
+            row_popup_visible(app.row_popup.as_ref().unwrap())
+        };
+        assert_eq!(set(&mut app, ""), vec![0, 1, 2]);
+        // A name match keeps only that field.
+        assert_eq!(set(&mut app, "nam"), vec![1]);
+        // A value match finds the field holding it even when the name does not.
+        assert_eq!(set(&mut app, "berl"), vec![2]);
+        // Nothing matches → the empty state.
+        assert!(set(&mut app, "zzz").is_empty());
+    }
+
+    /// R67: the row-popup body keeps `name = value` on one line when wide and
+    /// stacks the value under the name on a narrow popup; `hit` maps every
+    /// physical line back to its field so a click still selects the right one.
+    #[test]
+    fn row_popup_body_stacks_on_narrow_widths() {
+        let mut app = test_app();
+        app.grid_kind = GridKind::TableData;
+        app.set_grid(Grid {
+            columns: vec!["id".into(), "name".into()],
+            rows: vec![vec![Val::Text("1".into()), Val::Text("ada".into())]],
+            note: String::new(),
+        });
+        app.focus = Focus::Preview;
+        app.sel = 0;
+        open_row_popup(&mut app);
+        let popup = app.row_popup.as_ref().unwrap();
+        // Wide (>= ROW_POPUP_STACK_W): one physical line per field.
+        let (body, hit, sel) = row_popup_body(popup, ROW_POPUP_STACK_W);
+        assert_eq!(body.len(), 2);
+        assert_eq!(hit, vec![0, 1]);
+        assert_eq!(sel, 0);
+        // Narrow: name line + indented value line per field.
+        let (body, hit, sel) = row_popup_body(popup, ROW_POPUP_STACK_W - 1);
+        assert_eq!(body.len(), 4);
+        assert_eq!(hit, vec![0, 0, 1, 1]);
+        assert_eq!(sel, 0);
+    }
+
+    /// R67: `y` and `Y` inside the row popup both copy the selected field's
+    /// value through the grid's copy path, naming the column in the status.
+    #[test]
+    fn row_popup_y_and_shift_y_copy_the_selected_field() {
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel::<OpResult>();
+        let mut app = test_app();
+        app.picker_open = false;
+        app.selected = Some(test_conn("mysql"));
+        app.backend_kind = Backend::Sql;
+        app.grid_kind = GridKind::Query;
+        app.set_grid(Grid {
+            columns: vec!["id".into(), "name".into()],
+            rows: vec![vec![Val::Text("7".into()), Val::Text("seven".into())]],
+            note: String::new(),
+        });
+        app.focus = Focus::Preview;
+        app.sel = 0;
+        open_row_popup(&mut app);
+        // Move to `name`, then `Y` copies it.
+        key(
+            &mut app,
+            &tx,
+            KeyEvent::new(KeyCode::Char('j'), KeyModifiers::NONE),
+        );
+        app.status.clear();
+        key(
+            &mut app,
+            &tx,
+            KeyEvent::new(KeyCode::Char('Y'), KeyModifiers::SHIFT),
+        );
+        assert!(app.status.contains("已复制"), "{}", app.status);
+        assert!(app.status.contains("name"), "{}", app.status);
+        assert!(app.status.contains("seven"), "{}", app.status);
+        // `y` is the same gesture.
+        app.status.clear();
+        key(
+            &mut app,
+            &tx,
+            KeyEvent::new(KeyCode::Char('y'), KeyModifiers::NONE),
+        );
+        assert!(app.status.contains("name"), "{}", app.status);
+    }
+
+    /// R67: `z` pins the first column and flashes the same bilingual state in
+    /// the result, Redis and MongoDB grids — the Redis / Mongo keymaps used to
+    /// toggle silently.
+    #[test]
+    fn z_flashes_the_pin_state_in_every_grid() {
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel::<OpResult>();
+        let z = || KeyEvent::new(KeyCode::Char('z'), KeyModifiers::NONE);
+        let cases: [(Backend, GridKind, &str); 3] = [
+            (Backend::Sql, GridKind::Query, "mysql"),
+            (Backend::Redis, GridKind::RedisValue, "redis"),
+            (Backend::Mongo, GridKind::MongoDocs, "mongodb"),
+        ];
+        for (backend, kind, conn) in cases {
+            let mut app = test_app();
+            app.picker_open = false;
+            app.selected = Some(test_conn(conn));
+            app.backend_kind = backend;
+            app.grid_kind = kind;
+            app.set_grid(sample_grid());
+            app.focus = Focus::Preview;
+            app.freeze_first = false;
+            key(&mut app, &tx, z());
+            assert!(app.freeze_first, "{conn}: z pins the first column");
+            assert_eq!(app.status, t("首列已钉住 · z 取消"), "{conn}");
+            key(&mut app, &tx, z());
+            assert!(!app.freeze_first, "{conn}: z unpins");
+            assert_eq!(app.status, t("首列已取消钉住 · z 钉住"), "{conn}");
+        }
     }
 
     /// One overlay fixture for [`overlays_render_at_extreme_sizes`].

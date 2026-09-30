@@ -1528,7 +1528,9 @@ fn en_of(zh: &'static str) -> Option<&'static str> {
         "移动" => Some("move"),
         "看值" => Some("view value"),
         "过滤列" => Some("filter columns"),
+        "过滤名/值" => Some("filter name/value"),
         "（无匹配列）" => Some("(no matching column)"),
+        "（无匹配字段）" => Some("(no matching field)"),
         "没有可复制的列" => Some("no column to copy"),
         "✓ 已复制 {} = {}（{} 字符）· 兜底 {}" => {
             Some("✓ copied {} = {} ({} chars) · fallback {}")
@@ -1542,17 +1544,20 @@ fn en_of(zh: &'static str) -> Option<&'static str> {
         }
         "整行详情（与 Enter 等价）" => Some("whole-row details (same as Enter)"),
         "— 行详情浮层（Enter / o）—" => Some("— Row-detail popup (Enter / o) —"),
-        "移动选中列（计数前缀：5j 跳 5 列）" => {
-            Some("move the selected column (count prefix: 5j jumps 5)")
+        "移动选中列（计数前缀：5j 跳 5 列；n/p 与 j/k 同义）" => {
+            Some("move the selected column (count prefix: 5j jumps 5; n/p alias j/k)")
         }
         "下钻完整单元格（Esc 返回行弹层，再 Esc 回表格）" => {
             Some("drill into the full cell (Esc returns to the row, Esc again to the grid)")
         }
-        "复制选中列值（状态栏带列名）" => {
-            Some("copy the selected column's value (status names the column)")
+        "复制选中列值（y / Y 均可；状态栏带列名，与结果区 Y 同一路径）" => {
+            Some("copy the selected column's value (y or Y; status names the column, same path as the grid's Y)")
         }
-        "按列名过滤（宽表 40+ 列找列）" => {
-            Some("filter by column name (find a column in a 40+ column table)")
+        "按列名或值过滤（输入即筛；宽表 40+ 列找列）" => {
+            Some("filter by column name or value (as you type; find a column in a 40+ column table)")
+        }
+        "窄屏：每行「字段:」+ 缩进值单列自适应" => {
+            Some("narrow: one field per line, \"field:\" then the indented value")
         }
         "主键定位：第 12 行 · id=4821" => {
             Some("primary-key locator: row 12 · id=4821")
