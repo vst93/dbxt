@@ -9535,3 +9535,163 @@ pub(crate) fn press_g(app: &mut App, tx: &Tx, ch: char) {
         KeyEvent::new(KeyCode::Char(ch), KeyModifiers::NONE),
     );
 }
+
+// ── R92: tip of the day ──
+
+#[test]
+pub(crate) fn tip_pools_are_bilingual_and_equal_length() {
+    assert_eq!(
+        ui_text::TIPS_ZH.len(),
+        ui_text::TIPS_EN.len(),
+        "the two tip pools must stay index-aligned"
+    );
+    assert_eq!(ui_text::tip_count(), 30);
+    let cjk = |s: &str| s.chars().any(|c| ('\u{4e00}'..='\u{9fff}').contains(&c));
+    for (i, (zh, en)) in ui_text::TIPS_ZH.iter().zip(ui_text::TIPS_EN).enumerate() {
+        assert!(!zh.is_empty() && !en.is_empty(), "empty tip at {i}");
+        assert!(cjk(zh), "tip {i} has no Chinese text: {zh:?}");
+        assert_ne!(zh, en, "tip {i} is not translated: {zh:?}");
+    }
+}
+
+#[test]
+pub(crate) fn tip_rotation_wraps_modulo() {
+    let n = ui_text::tip_count();
+    assert_eq!(ui_text::tip_text(0, ui_text::Lang::Zh), ui_text::TIPS_ZH[0]);
+    assert_eq!(ui_text::tip_text(n, ui_text::Lang::Zh), ui_text::TIPS_ZH[0]);
+    assert_eq!(
+        ui_text::tip_text(n + 3, ui_text::Lang::En),
+        ui_text::TIPS_EN[3]
+    );
+    // Every timestamp maps to an in-range index.
+    for day in 1..=800i64 {
+        assert!(ui_text::tip_day_index(day * 86_400) < n);
+    }
+    assert_eq!(
+        ui_text::tip_day_index(86_400),
+        ui_text::day_of_year(86_400) as usize % n
+    );
+}
+
+#[test]
+pub(crate) fn day_of_year_is_correct_for_known_dates() {
+    // 1970-01-01 = day 1; 1970-12-31 = day 365; 2000-03-01 = day 61 (leap).
+    assert_eq!(ui_text::day_of_year(0), 1);
+    assert_eq!(ui_text::day_of_year(364 * 86_400), 365);
+    // 2000-02-29 is day 60, so 2000-03-01 is day 61.
+    assert_eq!(ui_text::day_of_year(951_782_400), 60);
+    assert_eq!(ui_text::day_of_year(951_868_800), 61);
+}
+
+#[test]
+pub(crate) fn t_key_cycles_the_tip() {
+    let mut app = test_app();
+    let tx = test_tx();
+    let n = ui_text::tip_count();
+    let start = app.tip_idx % n;
+    key(
+        &mut app,
+        &tx,
+        KeyEvent::new(KeyCode::Char('T'), KeyModifiers::NONE),
+    );
+    assert_eq!(app.tip_idx, (start + 1) % n);
+    // A full lap lands back on the same tip.
+    for _ in 0..n {
+        key(
+            &mut app,
+            &tx,
+            KeyEvent::new(KeyCode::Char('T'), KeyModifiers::NONE),
+        );
+    }
+    assert_eq!(app.tip_idx, (start + 1) % n);
+}
+
+#[test]
+pub(crate) fn tip_bar_shows_on_the_connection_list_and_rotates() {
+    // The TestBackend pads each wide CJK glyph with a space cell, so compare
+    // against a whitespace-stripped copy of the screen.
+    let squash = |rows: &[String]| -> String {
+        rows.join("\n")
+            .chars()
+            .filter(|c| !c.is_whitespace())
+            .collect()
+    };
+    let nows = |s: &str| -> String { s.chars().filter(|c| !c.is_whitespace()).collect() };
+
+    let mut app = test_app();
+    // No connection selected, picker open = the connection-list page.
+    assert!(app.selected.is_none());
+    app.picker_open = true;
+    app.tip_idx = 0;
+    let rows = draw(&mut app, 110, 30);
+    let text = squash(&rows);
+    assert!(text.contains("今日Tip"), "tip label missing: {text}");
+    assert!(
+        text.contains(&nows(ui_text::TIPS_ZH[0])),
+        "first tip missing: {text}"
+    );
+    assert!(text.contains("T换一条"), "rotation key missing: {text}");
+
+    let tx = test_tx();
+    key(
+        &mut app,
+        &tx,
+        KeyEvent::new(KeyCode::Char('T'), KeyModifiers::NONE),
+    );
+    let rows2 = draw(&mut app, 110, 30);
+    let text2 = squash(&rows2);
+    assert!(
+        text2.contains(&nows(ui_text::TIPS_ZH[1])),
+        "T did not rotate the tip: {text2}"
+    );
+    assert!(
+        !text2.contains(&nows(ui_text::TIPS_ZH[0])),
+        "the old tip should be gone after T"
+    );
+}
+
+#[test]
+pub(crate) fn tip_bar_truncates_to_one_line_on_a_narrow_screen() {
+    let squash = |s: &str| -> String { s.chars().filter(|c| !c.is_whitespace()).collect() };
+    let mut app = test_app();
+    app.picker_open = true;
+    app.tip_idx = 0;
+    // 42x22: the bar must stay on a single row (a wrap would print the label
+    // twice) and the long tip is cut, so the full sentence is not on screen.
+    let rows = draw(&mut app, 42, 22);
+    let label_rows = rows
+        .iter()
+        .filter(|r| squash(r).contains("今日Tip"))
+        .count();
+    assert_eq!(
+        label_rows, 1,
+        "tip bar wrapped onto a second line: {rows:?}"
+    );
+    let label_row = rows
+        .iter()
+        .find(|r| squash(r).contains("今日Tip"))
+        .expect("tip row");
+    assert!(
+        !squash(label_row).contains(&squash(ui_text::TIPS_ZH[0])),
+        "the long tip should be truncated at 42 columns: {label_row:?}"
+    );
+}
+
+/// R92: the tip rotation key ships in the footer (which the mini sheet reuses)
+/// and in the full `?` sheet, all at once.
+#[test]
+pub(crate) fn r92_tip_key_is_in_footer_mini_and_full_help() {
+    let picker = footer_hints_ctx(FooterCtx {
+        view: FooterView::ConnPicker,
+        focus: Focus::Sidebar,
+        has_connection: false,
+    });
+    assert!(
+        picker.iter().any(|h| h.0 == "T" && h.1 == t("换一条")),
+        "picker footer names T: {picker:?}"
+    );
+    assert!(
+        HELP_ROWS.iter().any(|(k, _)| *k == "T"),
+        "full help documents T"
+    );
+}

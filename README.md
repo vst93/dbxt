@@ -4,6 +4,15 @@
 
 A keyboard-first terminal UI for databases, built on the [DBX](https://github.com/t8y2/dbx) kernel. Configure a connection once — in DBX Desktop, the DBX CLI, or dbxt itself — then use it from any terminal. One static binary: no desktop app, no daemon, no HTTP server.
 
+## 30-second quick start
+
+1. Run `dbxt`, then `↑` `↓` + `Enter` to pick a connection (`c` creates one).
+2. `↑` `↓` + `Enter` opens a table; just type in the sidebar to filter.
+3. `Tab` to the SQL editor, type a statement, then `Ctrl-J` (caret statement) or `F5` (whole script).
+4. In the results pane `e` edits a cell, `i` inserts, `Delete` removes — the full SQL is shown before anything runs.
+5. `?` opens a cheat-sheet for the current pane, `F1` the full key list.
+6. The top line of the connection list is the day's tip — press `T` for the next one.
+
 ## What's new in 0.0.4
 
 The biggest jump since the first preview — the sidebar became a real tree, and the safety net around production connections grew up.
@@ -231,7 +240,7 @@ The TUI's `?` overlay and `dbxt --help` carry the complete list; this is the sho
 | Context | Keys |
 | --- | --- |
 | Global | `?` context mini cheat-sheet (a second `?` opens the full help, where `/` filters by key/feature) · `F1` opens this help from anywhere (in the editor / command input `?` is a literal character, so press `F1`) · `Tab`/`Shift-Tab` panes · `Alt-Shift-1/2/3` focus (terminals may report `Alt-!` `Alt-@` `Alt-#`) · `Alt-←`/`Alt-→` back/forward over tables / collections / Redis keys (browser semantics, up to 50) · `F5` run all / `Ctrl-J` run the cursor statement (a selection wins for both) · `Alt-Enter` run only the statement at the cursor · `Alt-O` script-output separators + timing · `Ctrl-L` cycle SQL → Redis → MongoDB · `Ctrl-A` auto-collapse the unfocused panes (in row-select mode: select all rows) · `Ctrl-W` collapse / expand the focused pane · `Ctrl-O` DBX SQL snippets · `Ctrl-P` EXPLAIN (SQL) · `Ctrl-S` / `Ctrl-X` commit / clear the editor batch queue · `q` / `Ctrl-C` quit (two-stage when the editor holds unrun SQL: press again to quit, `Esc` to stay) |
-| Connections | `↑` `↓` move · `Enter` connect · `Alt-1..9` jump to the Nth connection (smart db/table restore) · `Alt-Tab`/`` Alt-` `` toggle with the previous connection · `Alt-Shift-H` recent-connection list (this session, up to 8, `Enter` reconnects) · `c` new · `e` edit · `p` duplicate · `P` health probe (one packet, status-bar RTT) · `L` open a SQLite file (`.db` / `.sqlite` / `.sqlite3`) · `s` sort (name/type/colour) · `x` delete · `d` database/schema switcher, or disconnect the highlighted connection in the picker (red confirm) · `o` picker · each row's right edge shows the connection's latency (R63 session cache, `-` when never probed, client-side read) |
+| Connections | `↑` `↓` move · `Enter` connect · `Alt-1..9` jump to the Nth connection (smart db/table restore) · `Alt-Tab`/`` Alt-` `` toggle with the previous connection · `Alt-Shift-H` recent-connection list (this session, up to 8, `Enter` reconnects) · `c` new · `e` edit · `p` duplicate · `P` health probe (one packet, status-bar RTT) · `L` open a SQLite file (`.db` / `.sqlite` / `.sqlite3`) · `T` next tip of the day (shown atop the connection list) · `s` sort (name/type/colour) · `x` delete · `d` database/schema switcher, or disconnect the highlighted connection in the picker (red confirm) · `o` picker · each row's right edge shows the connection's latency (R63 session cache, `-` when never probed, client-side read) |
 | Import / export | `Alt-E` export every connection as JSON (`p` include passwords w/ red confirm · `y` copy to clipboard) · `Alt-I` import a dbxt / DBeaver / Navicat file (`s` skip · `r` overwrite w/ red confirm · `b` keep both · `Space` toggle · `d` per row) |
 | Connection form | `↑` `↓`/`Tab` fields (order: type → name → host → port → user → password → database → query_timeout) · `Enter` edit/toggle/save · picking `db_type` fills its default port (a hand-typed port is kept) · blank `name` → `host-db_type` on save · `query_timeout` seconds (blank = kernel default 60 s, `0` = no limit; PostgreSQL also gets a connection-level `statement_timeout`) · `Space` toggle `ssh_tunnel`/`ssl`/`read_only`/`ssh_auth`, cycle the `color` palette · `Esc` back |
 | SSH host key | `y`/`Enter` accept & remember · `s` this session only · `n`/`Esc` reject |

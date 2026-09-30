@@ -4471,6 +4471,7 @@ impl App {
             conn_list: ListState::default(),
             picker_open: true,
             conn_sort: ConnSort::Name,
+            tip_idx: ui_text::tip_start_index(),
             conn_gen: 0,
             last_conn_id: None,
             conn_recent: Vec::new(),

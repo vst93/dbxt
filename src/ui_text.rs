@@ -134,10 +134,147 @@ fn render(tmpl: &str, args: &[&dyn fmt::Display]) -> String {
     out
 }
 
+// ── R92: "Tip of the day" pool ─────────────────────────────────────────────
+//
+// A fixed, static bilingual pool that rotates by day-of-year on the
+// connection-list page. Kept as two parallel arrays (Chinese is the source,
+// English the translation) so a test can prove both have the same length; each
+// entry is a single self-contained line naming a feature and its key. Nothing
+// here ever allocates or touches the store — selecting a tip is two array
+// indexes.
+
+/// The Chinese tips (source of truth). One line each, covering the R51–R91
+/// interaction surface: the `g` prefix family, the `F`/`Alt` families, batch
+/// operations, comparison tools and the pin gestures.
+pub static TIPS_ZH: &[&str] = &[
+    "按 ? 打开当前上下文迷你速查，再按 ? 或 F1 进全量帮助",
+    "Ctrl-L 在 SQL / Redis / MongoDB 命令模式间切换",
+    "g 前缀是一组数据手势：g d/t 表结构/数据、g b 切表、g c 列结构",
+    "结果区 g w 按内容适配当前列宽，g W 适配全部可视列；0 复位",
+    "g c 打开列结构弹层：j/k 选列、Enter 跳到该列、/ 按列名过滤",
+    "数据视图 g b 输入即过滤，切换当前库里的表",
+    "侧栏 g t 打开当前库的表切换浮层（零查询）",
+    "g v 在当前列定位值，n / N 循环命中",
+    "g s 把当前行钉为参照行，状态栏显示 Δ 偏移与首个差异列",
+    "g f 冻结当前列到左缘，横向滚动时始终可见（最多 2 列）",
+    "z 钉住 / 取消首列，宽表横向滚动时不丢主键",
+    "# 切换大数字显示：原样 / 千分位 / 缩写（只改显示，复制仍是原值）",
+    "% 开关奇偶行斑马纹，长表更易横向对齐",
+    "< / > 收窄 / 加宽当前列，0 复位，Alt-0 清空整表记忆",
+    "Alt-F 把当前结果钉成置顶带，跨表对照",
+    "Alt-H 打开查询历史，Ctrl-Enter 直接重跑",
+    "Alt-D 对比两张表结构，Shift+Alt-D 对比两个库",
+    "Alt-K 按主键对比两张表数据，n / p 跳差异行",
+    "编辑器 Alt-T 插模板；数据视图 Alt-T 把表搬到另一个连接",
+    "Alt-S 把当前 SQL 存为收藏，Ctrl-O 打开片段列表",
+    "Ctrl-J 只跑光标处语句，F5 跑整段；有选区则只跑选区",
+    "F8 / Shift-F8 在执行失败的语句间前后跳（纯文本定位）",
+    "Alt-↓ / Alt-↑ 在多语句间逐条跳，状态栏显示 语句 i/n",
+    "V 进入行选模式：Shift+↑↓ 扩展、Y 复制 TSV、d/c 生成 DELETE/UPDATE",
+    "/ 隐藏不匹配行，* 按当前列过滤，Esc 清除",
+    ": 按行号跳转（:$ 末行），分页表里是整表绝对行号",
+    "n / p 翻页，5n 翻 5 页；PgUp/PgDn 整屏",
+    "Tab / Shift-Tab 切换栏，Ctrl-A 自动折叠非焦点栏",
+    "Redis：Space 多选、a 全选、T 给焦点 key 设 TTL",
+    "MongoDB：g f 字段跳转、Ctrl-S 按大小排序、c 按路径提取",
+];
+
+/// The English tips, index-aligned with [`TIPS_ZH`].
+pub static TIPS_EN: &[&str] = &[
+    "Press ? for a mini cheat-sheet of this context; ? again or F1 opens the full list",
+    "Ctrl-L switches between SQL / Redis / MongoDB command modes",
+    "The g prefix is a data gesture family: g d/t structure/data, g b switch table, g c columns",
+    "In results, g w fits the current column to content, g W fits every visible column; 0 resets",
+    "g c opens the column popup: j/k pick, Enter jumps to the column, / filters by name",
+    "In a data view, g b filters and switches tables in the current database",
+    "In the sidebar, g t opens the current database's table switcher (zero queries)",
+    "g v locates values in the current column, n / N cycle the hits",
+    "g s pins the current row as a reference; the status bar shows the Δ offset and first differing column",
+    "g f freezes the current column at the left edge so it stays visible while panning (up to 2)",
+    "z pins / unpins the first column so a wide table never loses its key",
+    "# cycles big-number display: raw / grouped / abbreviated (display only, copies keep the raw value)",
+    "% toggles zebra striping so long rows are easier to track",
+    "< / > narrow / widen the current column, 0 resets it, Alt-0 clears the table's memory",
+    "Alt-F pins the current result as a top band to compare across tables",
+    "Alt-H opens query history; Ctrl-Enter re-runs an entry",
+    "Alt-D diffs two table structures, Shift+Alt-D diffs two databases",
+    "Alt-K compares two tables' data by primary key, n / p jump the diff rows",
+    "In the editor Alt-T inserts a template; in a data view Alt-T moves a table to another connection",
+    "Alt-S saves the current SQL as a favourite, Ctrl-O opens the snippet list",
+    "Ctrl-J runs only the statement at the caret, F5 runs the whole script; a selection runs alone",
+    "F8 / Shift-F8 jump between failed statements (pure text, no query)",
+    "Alt-↓ / Alt-↑ step through statements; the status bar shows statement i/n",
+    "V enters row-select mode: Shift+↑↓ extend, Y copies TSV, d/c generate DELETE/UPDATE",
+    "/ hides non-matching rows, * filters by the current column, Esc clears",
+    ": jumps to a row number (:$ last), absolute across pages in a paged table",
+    "n / p page, 5n pages by five; PgUp/PgDn scroll a full screen",
+    "Tab / Shift-Tab switch panes, Ctrl-A collapses the non-focused panes",
+    "Redis: Space multi-selects, a selects all, T sets a TTL on the focused key",
+    "MongoDB: g f jumps fields, Ctrl-S sorts by size, c extracts by path",
+];
+
+/// Number of tips (both pools share it).
+pub fn tip_count() -> usize {
+    TIPS_ZH.len()
+}
+
+/// The tip at `idx` (wrapped into range) for an explicit language.
+pub fn tip_text(idx: usize, l: Lang) -> &'static str {
+    let pool = if l == Lang::En { TIPS_EN } else { TIPS_ZH };
+    pool[idx % pool.len()]
+}
+
+/// The tip at `idx` for the process-wide language.
+pub fn tip(idx: usize) -> &'static str {
+    tip_text(idx, lang())
+}
+
+/// Day of the year (1-based) for a Unix timestamp, in UTC. Pure arithmetic so
+/// the tip rotation needs no date dependency (the machine's timezone would only
+/// shift the rollover by hours, which does not matter for a daily tip).
+pub fn day_of_year(secs: i64) -> u32 {
+    let days = secs.div_euclid(86_400);
+    // Howard Hinnant's civil-from-days algorithm (days since 1970-01-01).
+    let z = days + 719_468;
+    let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
+    let doe = (z - era * 146_097) as u64;
+    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
+    let mut y = yoe as i64 + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = doy - (153 * mp + 2) / 5 + 1;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 };
+    if m <= 2 {
+        y += 1;
+    }
+    const CUM: [u32; 12] = [0, 31, 59, 90, 120, 151, 181, 212, 243, 273, 304, 334];
+    let leap = (y % 4 == 0 && y % 100 != 0) || y % 400 == 0;
+    CUM[(m - 1) as usize] + d as u32 + if leap && m > 2 { 1 } else { 0 }
+}
+
+/// The tip index for a Unix timestamp: `day_of_year % len`.
+pub fn tip_day_index(secs: i64) -> usize {
+    day_of_year(secs) as usize % tip_count()
+}
+
+/// The starting tip index for this process: today's day-of-year rotation.
+pub fn tip_start_index() -> usize {
+    let secs = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0);
+    tip_day_index(secs)
+}
+
 /// Every key the table knows, for coverage tests and tooling. Keep in sync with
 /// [`en_of`] (a test asserts each entry resolves to a distinct English string).
 #[allow(dead_code)]
 pub static ALL_KEYS: &[&str] = &[
+    "今日 Tip",
+    "T 换一条",
+    "换一条",
+    "换下一条今日 Tip（连接列表页顶部显示，按天轮换）",
+    "Tip {}/{} · T 换一条",
     "退出（编辑器有未执行语句时两段确认：再按一次退出，Esc 留下）",
     "只读连接：拒绝 INSERT/UPDATE/DELETE/DDL（SELECT/SHOW/EXPLAIN 照常；树中显 🔒）",
     "切换 ssh_tunnel / ssl / read_only / 登录方式",
@@ -4264,6 +4401,14 @@ fn en_of(zh: &'static str) -> Option<&'static str> {
         "钉住 / 取消参照行：被钉行行尾显 ❮，状态栏显当前行相对它的 Δ 偏移与首个差异列名；换表 / 重新查询自动清除" => {
             Some("Pin / unpin the reference row: the pinned row shows ❮ at its end and the status bar shows the current row's Δ offset plus the first differing column; switching tables / re-running clears it")
         }
+        // ── R92: tip of the day ──
+        "今日 Tip" => Some("Tip of the day"),
+        "T 换一条" => Some("T next"),
+        "换一条" => Some("next"),
+        "换下一条今日 Tip（连接列表页顶部显示，按天轮换）" => {
+            Some("show the next tip of the day (shown atop the connection list, rotates daily)")
+        }
+        "Tip {}/{} · T 换一条" => Some("Tip {}/{} · T next"),
         _ => None,
     }
 }

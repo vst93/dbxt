@@ -25,9 +25,27 @@ pub(crate) fn ui(f: &mut Frame, app: &mut App) {
     if header_h > 0 {
         render_header(f, chunks[0], app);
     }
+    // R92: on the connection-list page (no active connection) reserve the top
+    // row of the content area for the day's tip. Non-modal and one line: the
+    // picker below is shifted down by that row, never covered by it.
+    let mut content = chunks[1];
+    if app.page == Page::Browse && app.picker_open && app.selected.is_none() && content.height > 2 {
+        render_tip_bar(
+            f,
+            Rect {
+                x: content.x,
+                y: content.y,
+                width: content.width,
+                height: 1,
+            },
+            app,
+        );
+        content.y += 1;
+        content.height -= 1;
+    }
     match app.page {
-        Page::Browse => render_browse(f, chunks[1], app),
-        Page::NewConn => render_form(f, chunks[1], app),
+        Page::Browse => render_browse(f, content, app),
+        Page::NewConn => render_form(f, content, app),
     }
     if status_h > 0 {
         render_status(f, chunks[2], app);
@@ -37,7 +55,7 @@ pub(crate) fn ui(f: &mut Frame, app: &mut App) {
     }
 
     if app.page == Page::Browse && app.picker_open && app.selected.is_none() {
-        render_conn_picker(f, f.area(), app);
+        render_conn_picker(f, content, app);
     }
     // R83: the SQLite quick-open picker (`L`) draws over the base UI, under the
     // help layers (matching the key router, which checks help first).
@@ -480,6 +498,44 @@ pub(crate) fn render_header(f: &mut Frame, area: Rect, app: &App) {
         Span::styled(spinner, Style::default().fg(Color::Yellow)),
     ]);
     f.render_widget(Paragraph::new(line), area);
+}
+
+/// R92: the one-line "Tip of the day" bar shown atop the connection-list page
+/// (no active connection). Muted, non-modal, and cut to a single row so a narrow
+/// terminal never wraps it into two lines. The trailing `T 换一条` names the
+/// rotation key when there is room; on a very narrow screen only the tip text is
+/// shown (the footer still carries the key).
+pub(crate) fn render_tip_bar(f: &mut Frame, area: Rect, app: &App) {
+    let w = area.width as usize;
+    if w == 0 || area.height == 0 {
+        return;
+    }
+    let tip = ui_text::tip(app.tip_idx);
+    let label = format!(" {} ", t("今日 Tip"));
+    let tail = format!("  ·  {} ", t("T 换一条"));
+    let label_w = disp_width(&label);
+    let tail_w = disp_width(&tail);
+    let label_style = Style::default()
+        .fg(Color::DarkGray)
+        .add_modifier(Modifier::BOLD);
+    let text_style = Style::default().fg(Color::DarkGray);
+    let mut spans: Vec<Span<'static>> = Vec::new();
+    // Reserve the trailing key hint only when a useful slice of the tip still
+    // fits; otherwise drop it rather than clip the sentence mid-word.
+    if w >= label_w + tail_w + 6 {
+        spans.push(Span::styled(label, label_style));
+        spans.push(Span::styled(
+            truncate_disp(tip, w - label_w - tail_w),
+            text_style,
+        ));
+        spans.push(Span::styled(tail, text_style));
+    } else if w >= label_w + 4 {
+        spans.push(Span::styled(label, label_style));
+        spans.push(Span::styled(truncate_disp(tip, w - label_w), text_style));
+    } else {
+        spans.push(Span::styled(truncate_disp(tip, w), text_style));
+    }
+    f.render_widget(Paragraph::new(Line::from(spans)), area);
 }
 
 pub(crate) fn spinner_frame(i: usize) -> char {
@@ -1225,6 +1281,7 @@ pub(crate) fn footer_hints_ctx(ctx: FooterCtx) -> Vec<Hint> {
             ("Enter", t("连接")),
             ("L", t("打开 SQLite")),
             ("Alt-1..9", t("直切")),
+            ("T", t("换一条")),
             ("c", t("新建")),
             ("e", t("编辑")),
             ("p", t("复制")),

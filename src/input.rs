@@ -1536,6 +1536,17 @@ impl App {
 }
 
 // ── sidebar: connection picker or table browser ──
+/// R92: advance to the next tip of the day (`T` on the connection-list page).
+/// A plain session-only rotation; nothing is persisted and no query runs.
+pub(crate) fn cycle_tip(app: &mut App) {
+    let n = ui_text::tip_count();
+    if n == 0 {
+        return;
+    }
+    app.tip_idx = (app.tip_idx + 1) % n;
+    app.status = tf("Tip {}/{} · T 换一条", &[&(app.tip_idx + 1), &n]);
+}
+
 pub(crate) fn sidebar_key(app: &mut App, tx: &Tx, k: KeyEvent) {
     // A leading digit is a count prefix: with a motion it repeats it, alone it
     // jumps to the Nth connection / table. Text inputs are handled above this
@@ -1607,6 +1618,11 @@ pub(crate) fn sidebar_key(app: &mut App, tx: &Tx, k: KeyEvent) {
             }
             KeyCode::Char('q') => {
                 app.picker_open = !app.picker_open;
+            }
+            // R92: rotate the day's tip line (`T` is otherwise free on the
+            // connection-list page; the Redis browser keeps its TTL `T`).
+            KeyCode::Char('T') => {
+                cycle_tip(app);
             }
             KeyCode::Tab => {
                 app.focus = Focus::Editor;

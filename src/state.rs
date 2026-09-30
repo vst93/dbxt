@@ -1920,6 +1920,10 @@ pub(crate) struct App {
     pub(crate) picker_open: bool,
     /// Order of the connection picker (`s` cycles name / type / colour).
     pub(crate) conn_sort: ConnSort,
+    /// R92: index into the static tip pool shown on the connection-list page.
+    /// Seeded from the day-of-year at startup so it rotates daily; `T` advances
+    /// it. Session-only — nothing is persisted.
+    pub(crate) tip_idx: usize,
     /// Bumped on every connection switch; a `list_databases` reply that carries
     /// an older id is dropped so a slow enumeration cannot clobber the new
     /// connection's database list (R41 makes switching a one-keystroke affair).
