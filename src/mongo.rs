@@ -16,18 +16,21 @@ pub(crate) fn mongo_docs_key(app: &mut App, tx: &Tx, k: KeyEvent) {
     }
     if k.code == KeyCode::Esc && !app.cell_find_needle.is_empty() {
         app.clear_cell_find();
-        app.status = t("已清除单元格查找").into();
+        app.flash(t("已清除单元格查找").into());
         return;
     }
     if k.code == KeyCode::Esc && !app.result_needle.is_empty() {
         app.result_needle.clear();
         app.rebuild_view();
         app.sel = 0;
-        app.status = t("已清除结果搜索").into();
+        app.flash(t("已清除结果搜索").into());
         return;
     }
     match k.code {
-        KeyCode::Esc => app.focus = Focus::Sidebar,
+        KeyCode::Esc => {
+            app.focus = Focus::Sidebar;
+            app.flash(t("已回到侧栏").into());
+        }
         KeyCode::Char('f') => open_mongo_filter_prompt(app),
         // Document CRUD: edit / insert / delete (all confirmed).
         KeyCode::Char('e') => open_mongo_edit(app),
@@ -196,7 +199,7 @@ pub(crate) fn mongo_dialog_key(app: &mut App, k: KeyEvent) {
         return;
     }
     if k.code == KeyCode::Esc {
-        app.status = t("已取消").into();
+        app.flash(t("已取消").into());
         return;
     }
     d.editor.input(k);

@@ -4202,6 +4202,8 @@ impl App {
             col_picker_list: ListState::default(),
             cols_popup_open: false,
             cols_popup_scroll: 0,
+            table_info_open: false,
+            table_info_scroll: 0,
             cols_popup_needle: String::new(),
             cols_popup_filter: None,
             cols_popup_sel: 0,
@@ -4337,6 +4339,8 @@ impl App {
             loading_since: Some(Instant::now()),
             spinner: 0,
             status: t("加载连接…").into(),
+            flash_until: None,
+            flash_text: String::new(),
             backend_kind: Backend::Sql,
             cmd_input: TextArea::default(),
             cmd_output: Vec::new(),
@@ -4517,6 +4521,9 @@ async fn run_app(mut terminal: ratatui::DefaultTerminal, backend: Arc<LocalBacke
                     }
                     app.row_hint_until = None;
                 }
+                // R75: an `Esc` flash ("关闭 X" / "已清除 Y") clears itself once
+                // its short TTL lapses, unless a newer message replaced it.
+                expire_flash(&mut app);
             }
         }
     }

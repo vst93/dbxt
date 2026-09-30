@@ -5866,3 +5866,243 @@ pub(crate) fn script_status_names_total_elapsed() {
     );
     assert!(app.status.contains("750ms"), "{}", app.status);
 }
+
+// ── R75: Esc flash + sidebar table info card (`i`) ──
+
+/// The `Esc` flash auto-clears once its TTL lapses, and a newer status set in
+/// the meantime is never wiped by that expiry.
+#[test]
+pub(crate) fn esc_flash_auto_clears_and_yields_to_a_new_message() {
+    let mut app = test_app();
+    app.flash(t("已关闭帮助").into());
+    assert_eq!(app.status, t("已关闭帮助"));
+    assert!(app.flash_until.is_some());
+    // Not yet due: the message stays.
+    expire_flash(&mut app);
+    assert_eq!(app.status, t("已关闭帮助"));
+    // Deadline forced into the past: it clears and the flash resets.
+    app.flash_until = Some(Instant::now() - Duration::from_millis(1));
+    expire_flash(&mut app);
+    assert!(app.status.is_empty(), "{}", app.status);
+    assert!(app.flash_until.is_none());
+    // A newer status after the flash is preserved by the expiry guard.
+    app.flash(t("已清除定位").into());
+    app.status = "别的消息".into();
+    app.flash_until = Some(Instant::now() - Duration::from_millis(1));
+    expire_flash(&mut app);
+    assert_eq!(app.status, "别的消息");
+    assert!(app.flash_until.is_none());
+}
+
+/// The `Esc` rule matrix: a nested overlay pops exactly one layer, the result
+/// set clears its search, and the editor find keeps its highlight (R61).
+#[test]
+pub(crate) fn esc_closes_one_layer_clears_search_and_keeps_editor_highlight() {
+    let (tx, _rx) = tokio::sync::mpsc::unbounded_channel::<OpResult>();
+    // 1) Nested overlays: cell over row. Esc pops one layer per press.
+    let mut app = test_app();
+    app.picker_open = false;
+    app.selected = Some(test_conn("mysql"));
+    app.backend_kind = Backend::Sql;
+    app.grid_kind = GridKind::TableData;
+    app.set_grid(sample_grid());
+    app.focus = Focus::Preview;
+    open_row_popup(&mut app);
+    open_cell_popup(&mut app);
+    assert!(app.cell_popup.is_some() && app.row_popup.is_some());
+    key(
+        &mut app,
+        &tx,
+        KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE),
+    );
+    assert!(app.cell_popup.is_none(), "Esc closed only the cell");
+    assert!(app.row_popup.is_some(), "the row popup stays underneath");
+    assert_eq!(app.status, t("已关闭单元格"));
+    assert!(app.flash_until.is_some(), "closing an overlay flashes");
+    key(
+        &mut app,
+        &tx,
+        KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE),
+    );
+    assert!(app.row_popup.is_none());
+    assert_eq!(app.status, t("已关闭行详情"));
+
+    // 2) Result set: Esc clears the search needle and rebuilds the view.
+    let mut app = test_app();
+    app.picker_open = false;
+    app.selected = Some(test_conn("mysql"));
+    app.backend_kind = Backend::Sql;
+    app.grid_kind = GridKind::Query;
+    app.set_grid(sample_grid());
+    app.focus = Focus::Preview;
+    app.result_needle = "r0c1".into();
+    app.rebuild_view();
+    key(
+        &mut app,
+        &tx,
+        KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE),
+    );
+    assert!(app.result_needle.is_empty());
+    assert_eq!(app.status, t("已清除结果搜索"));
+    assert!(app.flash_until.is_some());
+
+    // 3) Editor find: Esc leaves the find box but keeps the needle + highlight.
+    let mut app = test_app();
+    app.focus = Focus::Editor;
+    app.set_editor_text("alpha\nbeta\nalpha");
+    open_editor_find(&mut app);
+    app.editor_find_needle = "alpha".into();
+    editor_find_recompute_idx(&mut app);
+    assert!(app.editor_find_idx.is_some());
+    key(
+        &mut app,
+        &tx,
+        KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE),
+    );
+    assert!(app.editor_find.is_none(), "the find box closed");
+    assert_eq!(app.editor_find_needle, "alpha", "the needle stays");
+    assert!(app.editor_find_idx.is_some(), "the highlight stays");
+}
+
+/// `i` on a table node opens an info card built purely from session-cached
+/// metadata: columns / indexes from the open table's `table_meta`, row / size
+/// estimates from the per-database `db_sizes` cache. No query is issued.
+#[test]
+pub(crate) fn table_info_card_reads_cached_metadata_only() {
+    let (tx, _rx) = tokio::sync::mpsc::unbounded_channel::<OpResult>();
+    let mut app = tree_app();
+    app.tables[0].comment = Some("订单主表".into());
+    rebuild_side_rows(&mut app);
+    let pos = app
+        .side_rows
+        .iter()
+        .position(|r| matches!(r, SideRow::Table { table: 0, .. }))
+        .expect("orders node");
+    app.side_sel = pos;
+    app.table_meta = Some(TableMeta {
+        table: "orders".into(),
+        schema: String::new(),
+        columns: vec![ColumnInfo {
+            name: "id".into(),
+            data_type: "int".into(),
+            is_primary_key: true,
+            ..Default::default()
+        }],
+        indexes: Vec::new(),
+    });
+    let mut info = DbSizeInfo::default();
+    info.rows.insert("orders".into(), 42);
+    info.sizes.insert("orders".into(), 4096);
+    app.db_sizes.insert("shop".into(), info);
+    key(
+        &mut app,
+        &tx,
+        KeyEvent::new(KeyCode::Char('i'), KeyModifiers::NONE),
+    );
+    assert!(app.table_info_open, "i opened the card on a table node");
+    let lines = table_info_lines(&app);
+    let value = |label: &str| {
+        lines
+            .iter()
+            .find(|l| l.label == label)
+            .map(|l| l.value.clone())
+    };
+    assert_eq!(value("列数").as_deref(), Some("1"));
+    assert_eq!(value("行数估算").as_deref(), Some("42"));
+    assert_eq!(value("数据大小").as_deref(), Some("4.0 KB"));
+    assert_eq!(value("注释").as_deref(), Some("订单主表"));
+    // Esc closes it and flashes a message.
+    key(
+        &mut app,
+        &tx,
+        KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE),
+    );
+    assert!(!app.table_info_open);
+    assert_eq!(app.status, t("已关闭表信息"));
+    assert!(app.flash_until.is_some());
+}
+
+/// A table never opened this session degrades gracefully: the card shows the
+/// tree-level fields (comment / engine) and a "打开表后可用" hint for the
+/// metadata only an open would have cached — still with no query.
+#[test]
+pub(crate) fn table_info_card_degrades_when_the_table_was_never_opened() {
+    let (tx, _rx) = tokio::sync::mpsc::unbounded_channel::<OpResult>();
+    let mut app = tree_app();
+    app.tables[0].comment = Some("订单主表".into());
+    rebuild_side_rows(&mut app);
+    let pos = app
+        .side_rows
+        .iter()
+        .position(|r| matches!(r, SideRow::Table { table: 0, .. }))
+        .expect("orders node");
+    app.side_sel = pos;
+    // No table_meta / page_state / db_sizes: nothing cached beyond the tree.
+    key(
+        &mut app,
+        &tx,
+        KeyEvent::new(KeyCode::Char('i'), KeyModifiers::NONE),
+    );
+    assert!(app.table_info_open);
+    let lines = table_info_lines(&app);
+    let value = |label: &str| {
+        lines
+            .iter()
+            .find(|l| l.label == label)
+            .map(|l| l.value.clone())
+    };
+    assert_eq!(value("列数").as_deref(), Some(t("打开表后可用")));
+    assert_eq!(value("行数估算").as_deref(), Some(t("打开表后可用")));
+    assert_eq!(value("注释").as_deref(), Some("订单主表"));
+    assert_eq!(value("引擎").as_deref(), Some("mysql"));
+    assert!(
+        lines.iter().any(|l| l.value.contains("尚未打开")),
+        "the card notes the table was never opened"
+    );
+    // `i` on a non-table row does not open an empty card.
+    app.table_info_open = false;
+    let conn = app
+        .side_rows
+        .iter()
+        .position(|r| matches!(r, SideRow::Conn { .. }))
+        .expect("conn node");
+    app.side_sel = conn;
+    key(
+        &mut app,
+        &tx,
+        KeyEvent::new(KeyCode::Char('i'), KeyModifiers::NONE),
+    );
+    assert!(
+        !app.table_info_open,
+        "i on a connection row is a filter char"
+    );
+}
+
+/// The info card actually paints its title and rows at phone (42×22) and
+/// desktop (110×30) sizes, and stays open while it does.
+#[test]
+pub(crate) fn table_info_card_renders_at_phone_and_desktop_sizes() {
+    let mut app = tree_app();
+    app.tables[0].comment = Some("订单主表".into());
+    rebuild_side_rows(&mut app);
+    app.side_sel = app
+        .side_rows
+        .iter()
+        .position(|r| matches!(r, SideRow::Table { .. }))
+        .expect("orders node");
+    app.table_info_open = true;
+    for (w, h) in [(42u16, 22u16), (110, 30)] {
+        let text = draw(&mut app, w, h).join("\n");
+        // Wide CJK glyphs occupy two cells, so the second is blank in the
+        // captured buffer; strip spaces before matching the title.
+        assert!(
+            text.replace(' ', "").contains("表信息"),
+            "card title missing at {w}x{h}"
+        );
+        assert!(text.contains("orders"), "table name missing at {w}x{h}");
+        assert!(
+            app.table_info_open,
+            "the card stays open while the cursor is on a table ({w}x{h})"
+        );
+    }
+}

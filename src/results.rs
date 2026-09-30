@@ -152,7 +152,7 @@ pub(crate) fn preview_key(app: &mut App, tx: &Tx, k: KeyEvent) {
         && app.script.as_ref().is_none_or(|s| s.drilled.is_some())
     {
         clear_locate(app);
-        app.status = t("已清除定位").into();
+        app.flash(t("已清除定位").into());
         return;
     }
     if k.code == KeyCode::Esc
@@ -161,7 +161,7 @@ pub(crate) fn preview_key(app: &mut App, tx: &Tx, k: KeyEvent) {
         && app.script.as_ref().is_none_or(|s| s.drilled.is_some())
     {
         app.clear_cell_find();
-        app.status = t("已清除单元格查找").into();
+        app.flash(t("已清除单元格查找").into());
         return;
     }
     if k.code == KeyCode::Esc
@@ -174,7 +174,7 @@ pub(crate) fn preview_key(app: &mut App, tx: &Tx, k: KeyEvent) {
         app.clear_col_filter();
         app.rebuild_view();
         app.sel = 0;
-        app.status = t("已清除列过滤").into();
+        app.flash(t("已清除列过滤").into());
         return;
     }
     if k.code == KeyCode::Esc
@@ -185,7 +185,7 @@ pub(crate) fn preview_key(app: &mut App, tx: &Tx, k: KeyEvent) {
         app.result_needle.clear();
         app.rebuild_view();
         app.sel = 0;
-        app.status = t("已清除结果搜索").into();
+        app.flash(t("已清除结果搜索").into());
         return;
     }
     match k.code {
@@ -200,15 +200,18 @@ pub(crate) fn preview_key(app: &mut App, tx: &Tx, k: KeyEvent) {
                     app.result_needle.clear();
                     app.result_filter = None;
                     app.clear_col_filter();
+                    app.flash(t("已返回语句列表").into());
                     return;
                 }
             }
             if ddl {
                 app.struct_view = StructView::Fields;
+                app.flash(t("已返回字段视图").into());
                 return;
             }
             app.show_first_grid();
             app.focus = Focus::Sidebar;
+            app.flash(t("已回到侧栏").into());
         }
         KeyCode::Char('e') => edit_cell(app),
         KeyCode::Char('i') => quick_insert(app),
@@ -487,6 +490,7 @@ pub(crate) fn copy_stmt_result(app: &mut App) {
 pub(crate) fn cell_popup_key(app: &mut App, k: KeyEvent) {
     if matches!(k.code, KeyCode::Esc | KeyCode::Char('q') | KeyCode::Enter) {
         app.cell_popup = None;
+        app.flash(t("已关闭单元格").into());
         return;
     }
     // `J`: switch between the pretty and raw JSON views. A non-JSON value says
@@ -562,6 +566,7 @@ pub(crate) fn error_popup_key(app: &mut App, k: KeyEvent) {
     match k.code {
         KeyCode::Esc | KeyCode::Char('q') => {
             app.error_popup = None;
+            app.flash(t("已关闭错误框").into());
             return;
         }
         KeyCode::Enter => {
@@ -610,6 +615,7 @@ pub(crate) fn help_key(app: &mut App, k: KeyEvent) {
             app.help_mini = false;
             app.help_needle.clear();
             app.help_scroll = 0;
+            app.flash(t("已关闭帮助").into());
         }
         KeyCode::Char('/') => {
             app.help_filter = Some(TextArea::from([app.help_needle.clone()]));
@@ -635,6 +641,7 @@ pub(crate) fn help_filter_key(app: &mut App, k: KeyEvent) {
             app.help_filter = None;
             app.help_needle.clear();
             app.help_scroll = 0;
+            app.flash(t("已清除帮助过滤").into());
         }
         _ => {
             if let Some(ta) = app.help_filter.as_mut() {
@@ -661,7 +668,10 @@ pub(crate) fn help_mini_key(app: &mut App, k: KeyEvent) {
             app.help_needle.clear();
             app.help_filter = None;
         }
-        KeyCode::Esc | KeyCode::Char('q') => app.help_mini = false,
+        KeyCode::Esc | KeyCode::Char('q') => {
+            app.help_mini = false;
+            app.flash(t("已关闭帮助").into());
+        }
         _ => {}
     }
 }
@@ -696,7 +706,7 @@ pub(crate) fn filter_prompt_key(app: &mut App, tx: &Tx, k: KeyEvent) {
         }
         KeyCode::Esc => {
             app.filter_prompt = None;
-            app.status = t("已取消过滤").into();
+            app.flash(t("已取消过滤").into());
         }
         _ => {
             if let Some(t) = &mut app.filter_prompt {
@@ -755,7 +765,7 @@ pub(crate) fn result_filter_key(app: &mut App, k: KeyEvent) {
             app.result_needle.clear();
             app.rebuild_view();
             app.sel = 0;
-            app.status = t("已清除结果搜索").into();
+            app.flash(t("已清除结果搜索").into());
         }
         _ => {
             if let Some(t) = &mut app.result_filter {
@@ -887,7 +897,7 @@ pub(crate) fn col_filter_key(app: &mut App, k: KeyEvent) {
             app.clear_col_filter();
             app.rebuild_view();
             app.sel = 0;
-            app.status = t("已清除列过滤").into();
+            app.flash(t("已清除列过滤").into());
         }
         _ => {
             if let Some(ta) = &mut app.col_filter_prompt {
@@ -1048,7 +1058,7 @@ pub(crate) fn locate_key(app: &mut App, k: KeyEvent) {
         }
         KeyCode::Esc => {
             clear_locate(app);
-            app.status = t("已清除定位").into();
+            app.flash(t("已清除定位").into());
         }
         _ => {
             if let Some(t) = &mut app.locate_prompt {
@@ -1238,7 +1248,7 @@ pub(crate) fn cell_find_key(app: &mut App, k: KeyEvent) {
         }
         KeyCode::Esc => {
             app.clear_cell_find();
-            app.status = t("已清除单元格查找").into();
+            app.flash(t("已清除单元格查找").into());
         }
         _ => {
             if let Some(t) = &mut app.cell_find_prompt {
@@ -1368,7 +1378,7 @@ pub(crate) fn col_jump_key(app: &mut App, k: KeyEvent) {
         }
         KeyCode::Esc => {
             app.col_jump = None;
-            app.status = t("已取消跳列").into();
+            app.flash(t("已取消跳列").into());
         }
         _ => {
             if let Some(t) = &mut app.col_jump {
@@ -1444,7 +1454,7 @@ pub(crate) fn goto_row_key(app: &mut App, k: KeyEvent) {
         }
         KeyCode::Esc => {
             app.goto_prompt = None;
-            app.status = t("已取消跳行").into();
+            app.flash(t("已取消跳行").into());
         }
         _ => {
             if let Some(t) = &mut app.goto_prompt {
@@ -1503,6 +1513,7 @@ pub(crate) fn col_picker_key(app: &mut App, k: KeyEvent) {
     match k.code {
         KeyCode::Esc | KeyCode::Enter | KeyCode::Char('q') => {
             app.col_picker_open = false;
+            app.flash(t("已关闭列可见性").into());
         }
         KeyCode::Up | KeyCode::Char('k') => {
             if n > 0 {
@@ -2016,6 +2027,7 @@ pub(crate) fn cols_popup_key(app: &mut App, k: KeyEvent) {
             app.cols_popup_open = false;
             app.cols_popup_needle.clear();
             app.cols_popup_filter = None;
+            app.flash(t("已关闭列结构").into());
         }
         KeyCode::Char('/') => open_cols_popup_filter(app),
         // R65: Enter jumps the cell cursor to the highlighted column.
@@ -2100,7 +2112,7 @@ pub(crate) fn cols_popup_filter_key(app: &mut App, k: KeyEvent) {
         KeyCode::Esc => {
             app.cols_popup_filter = None;
             app.cols_popup_needle.clear();
-            app.status = t("已清除列名过滤").into();
+            app.flash(t("已清除列名过滤").into());
         }
         _ => {
             if let Some(t) = &mut app.cols_popup_filter {
@@ -2170,7 +2182,10 @@ pub(crate) fn open_recent_tables(app: &mut App) {
 pub(crate) fn recent_key(app: &mut App, tx: &Tx, k: KeyEvent) {
     let n = app.recent_tables.len();
     match k.code {
-        KeyCode::Esc | KeyCode::Char('q') => app.recent_open = false,
+        KeyCode::Esc | KeyCode::Char('q') => {
+            app.recent_open = false;
+            app.flash(t("已关闭最近表").into());
+        }
         KeyCode::Up | KeyCode::Char('k') => {
             if n > 0 {
                 let i = app
@@ -2288,6 +2303,7 @@ pub(crate) fn table_jump_key(app: &mut App, tx: &Tx, k: KeyEvent) {
         KeyCode::Esc => {
             app.table_jump_open = false;
             app.table_jump_needle.clear();
+            app.flash(t("已关闭切换表").into());
         }
         KeyCode::Enter => table_jump_accept(app, tx),
         KeyCode::Up | KeyCode::Char('k') => table_jump_step(app, 1, false),

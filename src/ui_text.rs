@@ -1319,6 +1319,39 @@ pub static ALL_KEYS: &[&str] = &[
     "JSON 对象/数组：美化 ↔ 原值切换（键/字符串/数字用主题色区分；非 JSON 时提示）",
     "复制原值（美化视图下仍复制原始 JSON，不复制缩进格式）",
     "关闭（从行弹层下钻时先回行弹层）",
+    // ── R75: Esc flashes + sidebar table info card (`i`) ──
+    "已关闭库列表",
+    "打开表后可用",
+    "库 / 模式",
+    "引擎",
+    "列数",
+    "行数估算",
+    "数据大小",
+    "未缓存（库行按 s 获取）",
+    "创建时间",
+    "未缓存（需查询）",
+    "本表本次会话尚未打开 · 打开后可得列 / 索引 / 行数",
+    "把光标移到表节点上再按 i",
+    "已关闭表信息",
+    "已回到侧栏",
+    "已返回语句列表",
+    "已返回字段视图",
+    "已关闭单元格",
+    "已关闭错误框",
+    "已关闭帮助",
+    "已清除帮助过滤",
+    "已关闭列可见性",
+    "已关闭列结构",
+    "已关闭最近表",
+    "已关闭切换表",
+    "已关闭行详情",
+    " 表信息 · {} · ↑↓ 滚动 · Esc 关 ",
+    " 表信息 · Esc ",
+    "i（表节点）",
+    "表信息卡：类型 / 引擎 / 注释 / 列数 / 索引 / 行数估算 / 数据大小 / 创建时间——全部读已缓存元数据（打开过的表 + 库行按 s 的估计），绝不发查询；从未打开的表提示「打开表后可用」；Esc 关闭",
+    "收起结果 / 关闭浮层（状态栏 1.5 秒提示「关闭 X / 已清除 Y」）",
+    "已取消输入",
+    "已关闭导入报告",
 ];
 
 /// The Chinese → English table. Keys must match the source literals exactly.
@@ -3724,6 +3757,47 @@ fn en_of(zh: &'static str) -> Option<&'static str> {
         "关闭（从行弹层下钻时先回行弹层）" => {
             Some("close (when drilled from the row popup, returns there first)")
         }
+        // ── R75: Esc flashes + sidebar table info card (`i`) ──
+        "已关闭库列表" => Some("closed database list"),
+        "打开表后可用" => Some("available after opening the table"),
+        "库 / 模式" => Some("database / schema"),
+        "引擎" => Some("engine"),
+        "列数" => Some("columns"),
+        "行数估算" => Some("row estimate"),
+        "数据大小" => Some("data size"),
+        "未缓存（库行按 s 获取）" => Some("not cached (press s on the database row)"),
+        "创建时间" => Some("created"),
+        "未缓存（需查询）" => Some("not cached (needs a query)"),
+        "本表本次会话尚未打开 · 打开后可得列 / 索引 / 行数" => Some(
+            "This table has not been opened this session · open it for columns / indexes / row count",
+        ),
+        "把光标移到表节点上再按 i" => Some("Move the cursor onto a table node, then press i"),
+        "已关闭表信息" => Some("closed table info"),
+        "已回到侧栏" => Some("back to the sidebar"),
+        "已返回语句列表" => Some("back to the statement list"),
+        "已返回字段视图" => Some("back to the fields view"),
+        "已关闭单元格" => Some("closed cell"),
+        "已关闭错误框" => Some("closed error box"),
+        "已关闭帮助" => Some("closed help"),
+        "已清除帮助过滤" => Some("cleared help filter"),
+        "已关闭列可见性" => Some("closed column visibility"),
+        "已关闭列结构" => Some("closed column structure"),
+        "已关闭最近表" => Some("closed recent tables"),
+        "已关闭切换表" => Some("closed table switcher"),
+        "已关闭行详情" => Some("closed row detail"),
+        " 表信息 · {} · ↑↓ 滚动 · Esc 关 " => {
+            Some(" Table info · {} · ↑↓ scroll · Esc close ")
+        }
+        " 表信息 · Esc " => Some(" Table info · Esc "),
+        "i（表节点）" => Some("i (table node)"),
+        "表信息卡：类型 / 引擎 / 注释 / 列数 / 索引 / 行数估算 / 数据大小 / 创建时间——全部读已缓存元数据（打开过的表 + 库行按 s 的估计），绝不发查询；从未打开的表提示「打开表后可用」；Esc 关闭" => Some(
+            "Table info card: type / engine / comment / columns / indexes / row estimate / data size / created — all from cached metadata (tables already opened + the `s` estimate on a database row), never a query; a table never opened says \"available after opening the table\"; Esc closes",
+        ),
+        "收起结果 / 关闭浮层（状态栏 1.5 秒提示「关闭 X / 已清除 Y」）" => Some(
+            "collapse results / close overlay (a 1.5 s status flash says \"closed X / cleared Y\")",
+        ),
+        "已取消输入" => Some("input cancelled"),
+        "已关闭导入报告" => Some("closed import report"),
         _ => None,
     }
 }

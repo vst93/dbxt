@@ -344,7 +344,7 @@ pub(crate) fn history_key(app: &mut App, tx: &Tx, k: KeyEvent) {
         KeyCode::Esc | KeyCode::Char('q') => {
             app.history_open = false;
             app.history_filter = None;
-            app.status = t("已关闭查询历史").into();
+            app.flash(t("已关闭查询历史").into());
         }
         KeyCode::Up | KeyCode::Char('k') => {
             let times = take_count(app) as i32;
@@ -482,7 +482,7 @@ pub(crate) fn history_filter_key(app: &mut App, k: KeyEvent) {
             app.history_filter = None;
             app.history_needle.clear();
             recompute_history_view(app);
-            app.status = t("已清除历史过滤").into();
+            app.flash(t("已清除历史过滤").into());
         }
         _ => {
             if let Some(ta) = app.history_filter.as_mut() {
@@ -544,7 +544,7 @@ pub(crate) fn history_confirm_key(app: &mut App, tx: &Tx, k: KeyEvent) {
         }
         KeyCode::Esc | KeyCode::Char('n') | KeyCode::Char('N') => {
             app.history_confirm = None;
-            app.status = t("已取消").into();
+            app.flash(t("已取消").into());
         }
         _ => {}
     }
@@ -593,7 +593,7 @@ pub(crate) fn search_input_key(app: &mut App, tx: &Tx, k: KeyEvent) {
         }
         KeyCode::Esc => {
             app.search_input = None;
-            app.status = t("已取消全库搜索").into();
+            app.flash(t("已取消全库搜索").into());
         }
         _ => {
             if let Some(t) = app.search_input.as_mut() {
@@ -701,7 +701,7 @@ pub(crate) fn search_key(app: &mut App, tx: &Tx, k: KeyEvent) {
                 app.status = t("正在中止全库搜索…").into();
             } else {
                 app.search_open = false;
-                app.status = t("已关闭全库搜索").into();
+                app.flash(t("已关闭全库搜索").into());
             }
         }
         KeyCode::Up | KeyCode::Char('k') => step(app, -1),

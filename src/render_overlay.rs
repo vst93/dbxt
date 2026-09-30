@@ -706,6 +706,78 @@ pub(crate) fn render_cols_popup(f: &mut Frame, area: Rect, app: &mut App) {
     }
 }
 
+/// R75: the sidebar table-node info card (`i`). Every value is read from
+/// session-cached metadata (see [`table_info_lines`]); the card issues no query
+/// and closes itself if the cursor is no longer on a table.
+pub(crate) fn render_table_info(f: &mut Frame, area: Rect, app: &mut App) {
+    let lines = table_info_lines(app);
+    if lines.is_empty() {
+        app.table_info_open = false;
+        return;
+    }
+    let w = area.width.min(if app.layout_mode == LayoutMode::Narrow {
+        area.width
+    } else {
+        64
+    });
+    let (y, h) = overlay_list_box(lines.len(), area);
+    let x = area.x + (area.width.saturating_sub(w)) / 2;
+    let box_area = Rect {
+        x,
+        y,
+        width: w,
+        height: h,
+    };
+    f.render_widget(Clear, box_area);
+    let name = cursor_table(app)
+        .map(|t| fix_double_encoding(&t.name))
+        .unwrap_or_default();
+    let full = tf(" 表信息 · {} · ↑↓ 滚动 · Esc 关 ", &[&name]);
+    let short = t(" 表信息 · Esc ");
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .title(fit_title(&full, short, box_area.width))
+        .border_set(border::ROUNDED)
+        .border_style(Style::default().fg(Color::Cyan));
+    let inner = block.inner(box_area);
+    f.render_widget(block, box_area);
+    let inner_w = inner.width as usize;
+    // Align the values on the widest label, measured in display columns (the
+    // labels are CJK, so char count would be wrong).
+    let label_w = lines
+        .iter()
+        .map(|l| disp_width(&l.label))
+        .max()
+        .unwrap_or(0)
+        .min(12);
+    let items: Vec<Line> = lines
+        .iter()
+        .map(|l| {
+            let value_style = if l.hint {
+                Style::default().fg(Color::DarkGray)
+            } else {
+                Style::default()
+            };
+            if l.label.is_empty() {
+                return Line::from(Span::styled(truncate_disp(&l.value, inner_w), value_style));
+            }
+            let pad = " ".repeat(label_w.saturating_sub(disp_width(&l.label)));
+            let value_w = inner_w.saturating_sub(label_w + 2);
+            Line::from(vec![
+                Span::styled(
+                    format!("{}{}  ", pad, l.label),
+                    Style::default().fg(Color::Cyan),
+                ),
+                Span::styled(truncate_disp(&l.value, value_w), value_style),
+            ])
+        })
+        .collect();
+    let max_scroll = (lines.len().saturating_sub(inner.height as usize)) as u16;
+    let scroll = app.table_info_scroll.min(max_scroll);
+    app.table_info_scroll = scroll;
+    f.render_widget(Paragraph::new(items).scroll((scroll, 0)), inner);
+}
+
 pub(crate) fn render_col_picker(f: &mut Frame, area: Rect, app: &mut App) {
     let Some(grid) = app.grid_full.clone() else {
         return;

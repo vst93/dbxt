@@ -319,7 +319,7 @@ pub(crate) fn confirm_key(app: &mut App, tx: &Tx, k: KeyEvent) {
         KeyCode::Esc | KeyCode::Char('n') | KeyCode::Char('N') => {
             app.confirm = None;
             app.pending_write = false;
-            app.status = t("已取消").into();
+            app.flash(t("已取消").into());
         }
         _ => {}
     }
@@ -645,6 +645,12 @@ pub(crate) fn browse_key(app: &mut App, tx: &Tx, k: KeyEvent) {
     // R48: the `gc` column-structure popup is modal too.
     if app.cols_popup_open {
         cols_popup_key(app, k);
+        return;
+    }
+
+    // R75: the sidebar table-node info card (`i`) is modal too.
+    if app.table_info_open {
+        table_info_key(app, k);
         return;
     }
 
@@ -1084,6 +1090,7 @@ pub(crate) fn db_picker_key(app: &mut App, tx: &Tx, k: KeyEvent) {
     match k.code {
         KeyCode::Esc | KeyCode::Char('q') => {
             app.db_picker_open = false;
+            app.flash(t("已关闭库列表").into());
         }
         KeyCode::Char('d') if k.modifiers.is_empty() => {
             app.db_picker_open = false;
@@ -1215,6 +1222,21 @@ pub(crate) fn maybe_show_row_hint(app: &mut App) {
     }
 }
 
+/// R75: clear an expired `Esc` flash from the status bar. Runs on the UI tick so
+/// a "关闭 X" / "已清除 Y" message fades after [`FLASH_TTL`] without a key press.
+/// The clear is guarded by `flash_text` so a newer status is never wiped.
+pub(crate) fn expire_flash(app: &mut App) {
+    if app
+        .flash_until
+        .is_some_and(|deadline| Instant::now() >= deadline)
+    {
+        if app.status == app.flash_text {
+            app.status.clear();
+        }
+        app.flash_until = None;
+    }
+}
+
 /// Parse a count buffer into a repetition count (`None` for empty / zero).
 pub(crate) fn parse_count(buf: &str) -> Option<u32> {
     if buf.is_empty() {
@@ -1266,7 +1288,7 @@ pub(crate) fn count_pre(app: &mut App, tx: &Tx, k: KeyEvent, is_motion: bool) ->
     if app.count_active() {
         if k.code == KeyCode::Esc {
             app.clear_count();
-            app.status = t("已取消计数").into();
+            app.flash(t("已取消计数").into());
             return true;
         }
         if !is_motion {
@@ -1561,14 +1583,14 @@ pub(crate) fn sidebar_key(app: &mut App, tx: &Tx, k: KeyEvent) {
             KeyCode::Esc => {
                 if !app.redis_filter.is_empty() {
                     clear_redis_filter(app);
-                    app.status = tf(
+                    app.flash(tf(
                         "已清除 key 过滤 · {} 个 key",
                         &[&(app.redis_scan.all.len())],
-                    );
+                    ));
                 } else if !app.redis_selected.is_empty() {
                     app.redis_selected.clear();
                     app.redis_anchor = None;
-                    app.status = t("已清除选择").into();
+                    app.flash(t("已清除选择").into());
                 }
             }
             KeyCode::Up | KeyCode::Char('k') => {
@@ -1790,6 +1812,16 @@ pub(crate) fn sidebar_key(app: &mut App, tx: &Tx, k: KeyEvent) {
         // (the active one on a db / table row) behind the red confirmation
         // layer. Caught before the type-to-filter below so it is never text.
         KeyCode::Char('!') if k.modifiers.is_empty() => open_readonly_toggle_confirm(app),
+        // R75: `i` on a *table* node opens the cached-metadata info card (row
+        // estimate / size / engine / comment / created-time, never a query). On
+        // any other row it falls through to the one-step type-to-filter, so a
+        // filter can still be started with `i` from a connection / database row.
+        KeyCode::Char('i')
+            if k.modifiers.is_empty()
+                && matches!(app.side_rows.get(app.side_sel), Some(SideRow::Table { .. })) =>
+        {
+            open_table_info(app);
+        }
         // One-step type-to-filter (R39): any printable character that is not a
         // bound shortcut starts the filter with that character already typed,
         // so a lookup is a single keystroke instead of `/` then type.

@@ -1,6 +1,10 @@
 use crate::prelude::*;
 use crate::*;
 
+/// R75: how long an `Esc` flash ("关闭 X" / "已清除 Y") stays on the status bar
+/// before it auto-clears. Short enough to feel transient, long enough to read.
+pub(crate) const FLASH_TTL: Duration = Duration::from_millis(1500);
+
 // ─── pages & focus ───────────────────────────────────────────────────────────
 
 #[derive(Clone, Copy, PartialEq)]
@@ -1966,6 +1970,12 @@ pub(crate) struct App {
     /// top visible line.
     pub(crate) cols_popup_open: bool,
     pub(crate) cols_popup_scroll: u16,
+    /// R75: the sidebar table-node info card (`i`). Read-only, sourced entirely
+    /// from metadata already in the session cache (the tree's `TableInfo`, the
+    /// open table's `table_meta`, and the per-database `db_sizes` row / size
+    /// estimates). Opening it never issues a query.
+    pub(crate) table_info_open: bool,
+    pub(crate) table_info_scroll: u16,
     /// R56: `/` inside the popup filters the column list by name.
     /// `cols_popup_needle` is the active needle (empty = show every column) and
     /// `cols_popup_filter` is the modal one-line input while it is being typed.
@@ -2288,6 +2298,11 @@ pub(crate) struct App {
     pub(crate) loading_since: Option<Instant>,
     pub(crate) spinner: usize,
     pub(crate) status: String,
+    /// R75: a transient status message ("关闭 X" / "已清除 Y") that auto-clears
+    /// after [`FLASH_TTL`] unless a newer message replaces it. `flash_text`
+    /// guards the clear so a message set in the meantime is never wiped.
+    pub(crate) flash_until: Option<Instant>,
+    pub(crate) flash_text: String,
 
     pub(crate) backend_kind: Backend,
     pub(crate) cmd_input: TextArea<'static>,
@@ -2394,6 +2409,14 @@ impl App {
     /// [`HBAR_VISIBLE_MS`] after a horizontal scroll.
     pub(crate) fn poke_hbar(&mut self) {
         self.hbar_until = Some(Instant::now() + Duration::from_millis(HBAR_VISIBLE_MS));
+    }
+    /// R75: set a transient status message that auto-clears after [`FLASH_TTL`]
+    /// (unless another message replaces it first). Used by `Esc` so its
+    /// "关闭 X / 已清除 Y" feedback is visible but never lingers.
+    pub(crate) fn flash(&mut self, text: String) {
+        self.flash_text = text.clone();
+        self.flash_until = Some(Instant::now() + FLASH_TTL);
+        self.status = text;
     }
     pub(crate) fn selected_name(&self) -> String {
         self.selected

@@ -753,7 +753,14 @@ pub(crate) type OverlayCase = (&'static str, Box<dyn Fn(&mut App)>);
 pub(crate) fn overlays_render_at_extreme_sizes() {
     // (42, 22) is the R39 acceptance size for the overlay small-screen
     // sweep; the rest are the historical phone / huge / degenerate cases.
-    let sizes = [(40u16, 12u16), (42, 22), (250, 70), (20, 6), (1, 1)];
+    let sizes = [
+        (40u16, 12u16),
+        (42, 22),
+        (110, 30),
+        (250, 70),
+        (20, 6),
+        (1, 1),
+    ];
     let mut app = test_app();
     app.picker_open = false;
     app.selected = Some(test_conn("mysql"));
@@ -784,6 +791,7 @@ pub(crate) fn overlays_render_at_extreme_sizes() {
         app.db_picker_open = false;
         app.col_picker_open = false;
         app.cols_popup_open = false;
+        app.table_info_open = false;
         app.recent_open = false;
         app.table_jump_open = false;
         app.table_jump_needle.clear();
@@ -1017,6 +1025,23 @@ pub(crate) fn overlays_render_at_extreme_sizes() {
             }),
         ),
         ("cols-popup", Box::new(open_cols_popup)),
+        // R75: the sidebar table-node info card, drawn from cached metadata.
+        (
+            "table-info",
+            Box::new(|a| {
+                a.databases = vec!["shop".into()];
+                a.db_index = 0;
+                a.tables = vec![table_info("orders", "TABLE")];
+                a.tables_all = a.tables.clone();
+                rebuild_side_rows(a);
+                a.side_sel = a
+                    .side_rows
+                    .iter()
+                    .position(|r| matches!(r, SideRow::Table { .. }))
+                    .unwrap_or(0);
+                a.table_info_open = true;
+            }),
+        ),
         (
             "search",
             Box::new(|a| {

@@ -2104,7 +2104,7 @@ pub(crate) fn tree_search_cancel(app: &mut App) {
             side_mirror_table(app);
         }
     }
-    app.status = t("已清除搜索").into();
+    app.flash(t("已清除搜索").into());
 }
 
 /// Modal key handler for the quick search while its prompt is open.
@@ -2128,6 +2128,177 @@ pub(crate) fn tree_search_key(app: &mut App, k: KeyEvent) {
             }
             apply_tree_search(app);
         }
+    }
+}
+
+// ── R75: sidebar table-node info card (`i`) ──
+
+/// The table node currently under the sidebar cursor, if any.
+pub(crate) fn cursor_table(app: &App) -> Option<&TableInfo> {
+    match app.side_rows.get(app.side_sel) {
+        Some(SideRow::Table { table, .. }) => app.tables.get(*table),
+        _ => None,
+    }
+}
+
+/// True when the table under the cursor is the one already loaded in the data
+/// browser (its cached `table_meta` / `page_state` match), i.e. this session has
+/// seen its columns / indexes.
+pub(crate) fn cursor_table_opened(app: &App, ti: &TableInfo) -> bool {
+    app.table_meta
+        .as_ref()
+        .is_some_and(|m| m.table == ti.name && m.schema == app.schema)
+        || app
+            .page_state
+            .as_ref()
+            .is_some_and(|p| p.table == ti.name && p.schema == app.schema)
+}
+
+/// One row of the info card: a bilingual label and its (already-localized)
+/// value. `hint` marks a cache-miss placeholder, drawn dimmer by the renderer.
+pub(crate) struct InfoLine {
+    pub(crate) label: String,
+    pub(crate) value: String,
+    pub(crate) hint: bool,
+}
+
+/// Build the `i` info card for the table node under the cursor. Every value is
+/// read from metadata already cached this session — the tree's `TableInfo`, the
+/// open table's `table_meta`, and the per-database `db_sizes` row / size
+/// estimates — so opening the card never issues a query. Fields the session has
+/// not cached fall back to a "打开表后可用" hint instead of being fetched.
+pub(crate) fn table_info_lines(app: &App) -> Vec<InfoLine> {
+    let Some(ti) = cursor_table(app) else {
+        return Vec::new();
+    };
+    let db = app.current_db();
+    let schema = app.schema.clone();
+    let name = fix_double_encoding(&ti.name);
+    let kind = if ti.table_type.eq_ignore_ascii_case("VIEW") {
+        "VIEW"
+    } else {
+        "TABLE"
+    };
+    let engine = app
+        .selected
+        .as_ref()
+        .map(|c| c.db_type.as_str().to_string())
+        .unwrap_or_else(|| "-".to_string());
+    let comment = ti
+        .comment
+        .as_deref()
+        .map(fix_double_encoding)
+        .filter(|s| !s.trim().is_empty());
+    let opened = cursor_table_opened(app, ti);
+    // Column / index metadata is only present once the table has been opened or
+    // its structure loaded (both fill `table_meta`).
+    let meta = app
+        .table_meta
+        .as_ref()
+        .filter(|m| m.table == ti.name && m.schema == schema);
+    // Row / size estimates come from the per-database `db_sizes` cache (filled by
+    // `s` on a database row) or, failing that, the session row-count cache.
+    let db_info = app.db_sizes.get(&db);
+    let key = ti.name.to_lowercase();
+    let est = db_info
+        .and_then(|i| i.rows.get(&key).copied())
+        .or_else(|| app.cached_count(&db, &schema, &ti.name, "").map(|(n, _)| n));
+    let size = db_info.and_then(|i| i.sizes.get(&key).copied());
+    let hint = || t("打开表后可用").to_string();
+    let mut rows = vec![
+        InfoLine {
+            label: t("表").into(),
+            value: name,
+            hint: false,
+        },
+        InfoLine {
+            label: t("库 / 模式").into(),
+            value: qualified_display(&db, &schema),
+            hint: false,
+        },
+        InfoLine {
+            label: t("类型").into(),
+            value: kind.into(),
+            hint: false,
+        },
+        InfoLine {
+            label: t("引擎").into(),
+            value: engine,
+            hint: false,
+        },
+        InfoLine {
+            label: t("注释").into(),
+            value: comment.unwrap_or_else(|| "—".into()),
+            hint: false,
+        },
+        InfoLine {
+            label: t("列数").into(),
+            value: meta
+                .map(|m| m.columns.len().to_string())
+                .unwrap_or_else(hint),
+            hint: meta.is_none(),
+        },
+        InfoLine {
+            label: t("索引").into(),
+            value: meta
+                .map(|m| m.indexes.len().to_string())
+                .unwrap_or_else(hint),
+            hint: meta.is_none(),
+        },
+        InfoLine {
+            label: t("行数估算").into(),
+            value: est.map(human_count).unwrap_or_else(hint),
+            hint: est.is_none(),
+        },
+        InfoLine {
+            label: t("数据大小").into(),
+            value: size
+                .map(human_bytes)
+                .unwrap_or_else(|| t("未缓存（库行按 s 获取）").into()),
+            hint: size.is_none(),
+        },
+        InfoLine {
+            label: t("创建时间").into(),
+            value: t("未缓存（需查询）").into(),
+            hint: true,
+        },
+    ];
+    if !opened {
+        rows.push(InfoLine {
+            label: String::new(),
+            value: t("本表本次会话尚未打开 · 打开后可得列 / 索引 / 行数").into(),
+            hint: true,
+        });
+    }
+    rows
+}
+
+/// Open the info card for the table node under the cursor. A non-table row says
+/// how to reach one instead of opening an empty card.
+pub(crate) fn open_table_info(app: &mut App) {
+    if cursor_table(app).is_none() {
+        app.status = t("把光标移到表节点上再按 i").into();
+        return;
+    }
+    app.table_info_open = true;
+    app.table_info_scroll = 0;
+}
+
+/// Key handling for the info card: Esc / `q` / Enter (or `i` again) close it;
+/// the usual scroll keys page a card taller than the box.
+pub(crate) fn table_info_key(app: &mut App, k: KeyEvent) {
+    match k.code {
+        KeyCode::Esc | KeyCode::Char('q') | KeyCode::Char('i') | KeyCode::Enter => {
+            app.table_info_open = false;
+            app.flash(t("已关闭表信息").into());
+        }
+        KeyCode::Up | KeyCode::Char('k') => {
+            app.table_info_scroll = app.table_info_scroll.saturating_sub(1);
+        }
+        KeyCode::Down | KeyCode::Char('j') => {
+            app.table_info_scroll = app.table_info_scroll.saturating_add(1);
+        }
+        _ => {}
     }
 }
 
@@ -2178,7 +2349,7 @@ pub(crate) fn rename_edit_key(app: &mut App, tx: &Tx, k: KeyEvent) {
         KeyCode::Enter => commit_rename(app, tx),
         KeyCode::Esc => {
             app.rename_edit = None;
-            app.status = t("已取消重命名").into();
+            app.flash(t("已取消重命名").into());
         }
         KeyCode::Backspace => {
             if let Some(e) = app.rename_edit.as_mut() {

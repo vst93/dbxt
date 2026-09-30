@@ -45,6 +45,11 @@ pub(crate) fn ui(f: &mut Frame, app: &mut App) {
     if app.cols_popup_open {
         render_cols_popup(f, f.area(), app);
     }
+    // R75: the sidebar table-node info card (`i`) draws over the grid but under
+    // the taller overlays below, matching its dispatch order.
+    if app.table_info_open {
+        render_table_info(f, f.area(), app);
+    }
     if app.col_picker_open {
         render_col_picker(f, f.area(), app);
     }
@@ -764,6 +769,8 @@ pub(crate) enum FooterView {
     /// R65: the in-data-view table switcher (`g b`).
     TableJump,
     ColPicker,
+    /// R75: the sidebar table-node info card (`i`).
+    TableInfo,
     ConnPicker,
     NewConn,
     RedisKeys,
@@ -913,6 +920,8 @@ pub(crate) fn footer_ctx_inner(app: &App, include_help: bool) -> FooterCtx {
         FooterView::TableJump
     } else if app.col_picker_open {
         FooterView::ColPicker
+    } else if app.table_info_open {
+        FooterView::TableInfo
     } else if app.page == Page::NewConn {
         FooterView::NewConn
     } else if app.picker_open && app.selected.is_none() {
@@ -1081,6 +1090,7 @@ pub(crate) fn footer_hints_ctx(ctx: FooterCtx) -> Vec<Hint> {
             ("x", t("仅首列")),
             ("Esc", t("关闭")),
         ],
+        FooterView::TableInfo => vec![("↑↓", t("滚动")), ("Esc", t("关闭"))],
         FooterView::Completion => vec![
             ("↑↓", t("选择")),
             ("Tab/Enter", t("上屏")),

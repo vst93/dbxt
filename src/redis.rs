@@ -597,18 +597,21 @@ pub(crate) fn redis_value_key(app: &mut App, tx: &Tx, k: KeyEvent) {
     }
     if k.code == KeyCode::Esc && !app.cell_find_needle.is_empty() {
         app.clear_cell_find();
-        app.status = t("已清除单元格查找").into();
+        app.flash(t("已清除单元格查找").into());
         return;
     }
     if k.code == KeyCode::Esc && !app.result_needle.is_empty() {
         app.result_needle.clear();
         app.rebuild_view();
         app.sel = 0;
-        app.status = t("已清除结果搜索").into();
+        app.flash(t("已清除结果搜索").into());
         return;
     }
     match k.code {
-        KeyCode::Esc => app.focus = Focus::Sidebar,
+        KeyCode::Esc => {
+            app.focus = Focus::Sidebar;
+            app.flash(t("已回到侧栏").into());
+        }
         KeyCode::Char('e') => open_redis_edit(app),
         // `n` loads the next page of a large hash / list / set / zset value.
         KeyCode::Char('n') => redis_load_more(app, tx),
@@ -652,7 +655,7 @@ pub(crate) fn redis_prompt_key(app: &mut App, tx: &Tx, k: KeyEvent) {
     };
     if k.code == KeyCode::Esc {
         app.redis_pending_batch = None;
-        app.status = t("已取消").into();
+        app.flash(t("已取消").into());
         return;
     }
     if k.code != KeyCode::Enter {

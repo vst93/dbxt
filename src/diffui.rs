@@ -175,7 +175,7 @@ pub(crate) fn diff_picker_key(app: &mut App, tx: &Tx, k: KeyEvent) {
                 return;
             }
             app.diff_picker = None;
-            app.status = t("已取消对比").into();
+            app.flash(t("已取消对比").into());
         }
         // Toggle target kind: table (Alt-D) ↔ database (Shift+Alt-D). Structure only.
         KeyCode::Char('d') | KeyCode::Char('D')
@@ -434,7 +434,7 @@ pub(crate) fn diff_key(app: &mut App, _tx: &Tx, k: KeyEvent) {
     match k.code {
         KeyCode::Esc | KeyCode::Char('q') => {
             app.diff = None;
-            app.status = t("已关闭结构对比").into();
+            app.flash(t("已关闭结构对比").into());
         }
         KeyCode::Char('y') => copy_diff_summary(app),
         KeyCode::Char('g') => {
@@ -515,7 +515,7 @@ pub(crate) fn db_diff_key(app: &mut App, tx: &Tx, k: KeyEvent) {
     match k.code {
         KeyCode::Esc | KeyCode::Char('q') => {
             app.db_diff = None;
-            app.status = t("已关闭库结构对比").into();
+            app.flash(t("已关闭库结构对比").into());
         }
         KeyCode::Up | KeyCode::Char('k') => step(app, -1),
         KeyCode::Down | KeyCode::Char('j') => step(app, 1),
@@ -695,7 +695,7 @@ pub(crate) fn transfer_conn_key(app: &mut App, k: KeyEvent) {
     match k.code {
         KeyCode::Esc | KeyCode::Char('q') => {
             app.transfer = None;
-            app.status = t("已取消数据搬运").into();
+            app.flash(t("已取消数据搬运").into());
         }
         KeyCode::Up | KeyCode::Char('k') => step(app, -1),
         KeyCode::Down | KeyCode::Char('j') => step(app, 1),
@@ -884,7 +884,7 @@ pub(crate) fn transfer_options_key(app: &mut App, tx: &Tx, k: KeyEvent) {
     match k.code {
         KeyCode::Esc | KeyCode::Char('q') => {
             app.transfer = None;
-            app.status = t("已取消数据搬运").into();
+            app.flash(t("已取消数据搬运").into());
         }
         KeyCode::Up | KeyCode::Char('k') => step(app, -1),
         KeyCode::Down | KeyCode::Char('j') => step(app, 1),
@@ -953,6 +953,7 @@ pub(crate) fn transfer_prompt_key(app: &mut App, _tx: &Tx, k: KeyEvent) {
             if let Some(w) = app.transfer.as_mut() {
                 w.prompt = None;
             }
+            app.flash(t("已取消输入").into());
         }
         _ => {
             if let Some(w) = app.transfer.as_mut() {
@@ -972,7 +973,7 @@ pub(crate) fn transfer_confirm_key(app: &mut App, tx: &Tx, k: KeyEvent) {
                 w.conflict = TransferConflict::Stop;
                 w.step = TransferStep::Options;
             }
-            app.status = t("已取消覆盖，保持报错停下").into();
+            app.flash(t("已取消覆盖，保持报错停下").into());
         }
         _ => {}
     }
@@ -1048,7 +1049,7 @@ pub(crate) fn transfer_report_key(app: &mut App, tx: &Tx, k: KeyEvent) {
     match k.code {
         KeyCode::Esc | KeyCode::Char('q') | KeyCode::Enter => {
             app.transfer_report = None;
-            app.status = t("已关闭搬运汇总").into();
+            app.flash(t("已关闭搬运汇总").into());
         }
         KeyCode::Char('g') | KeyCode::Char('y') => {
             let Some(rep) = app.transfer_report.as_ref() else {
@@ -1192,7 +1193,7 @@ pub(crate) fn data_where_key(app: &mut App, tx: &Tx, k: KeyEvent) {
         }
         KeyCode::Esc => {
             app.data_where = None;
-            app.status = t("已取消 WHERE 输入").into();
+            app.flash(t("已取消 WHERE 输入").into());
         }
         _ => {
             if let Some(t) = app.data_where.as_mut() {
@@ -1390,7 +1391,7 @@ pub(crate) fn data_diff_key(app: &mut App, _tx: &Tx, k: KeyEvent) {
     match k.code {
         KeyCode::Esc | KeyCode::Char('q') => {
             app.data_diff = None;
-            app.status = t("已关闭数据对比").into();
+            app.flash(t("已关闭数据对比").into());
         }
         KeyCode::Char('y') => copy_data_summary(app),
         KeyCode::Char('g') => {
@@ -1576,7 +1577,7 @@ pub(crate) fn file_load_prompt_key(app: &mut App, k: KeyEvent) {
         }
         KeyCode::Esc => {
             app.file_load_prompt = None;
-            app.status = t("已取消加载 SQL 文件").into();
+            app.flash(t("已取消加载 SQL 文件").into());
         }
         _ => {
             if let Some(ta) = app.file_load_prompt.as_mut() {
@@ -1621,7 +1622,7 @@ pub(crate) fn file_load_plan_key(app: &mut App, tx: &Tx, k: KeyEvent) {
         }
         KeyCode::Esc => {
             app.file_load_plan = None;
-            app.status = t("已取消加载 SQL 文件").into();
+            app.flash(t("已取消加载 SQL 文件").into());
         }
         // Load the whole file into the editor for review / tweaking.
         KeyCode::Char('e') | KeyCode::Char('v') if k.modifiers.is_empty() => {

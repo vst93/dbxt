@@ -1618,7 +1618,7 @@ pub(crate) fn export_key(app: &mut App, k: KeyEvent) {
     match k.code {
         KeyCode::Esc | KeyCode::Char('q') => {
             app.export_open = false;
-            app.status = t("已取消导出").into();
+            app.flash(t("已取消导出").into());
         }
         KeyCode::Up | KeyCode::Char('k') => {
             let i = app
@@ -1679,7 +1679,7 @@ pub(crate) fn export_path_key(app: &mut App, tx: &Tx, k: KeyEvent) {
     };
     if k.code == KeyCode::Esc {
         app.export_pending = None;
-        app.status = t("已取消导出").into();
+        app.flash(t("已取消导出").into());
         return;
     }
     if k.code != KeyCode::Enter {
@@ -1790,7 +1790,7 @@ pub(crate) fn import_prompt_key(app: &mut App, tx: &Tx, k: KeyEvent) {
         // Invalidate any plan request still in flight so a slow read cannot pop
         // the preview open after the user cancelled.
         app.import_gen = app.import_gen.wrapping_add(1);
-        app.status = t("已取消导入").into();
+        app.flash(t("已取消导入").into());
         return;
     }
     if k.code != KeyCode::Enter {
@@ -1837,7 +1837,7 @@ pub(crate) fn import_plan_key(app: &mut App, tx: &Tx, k: KeyEvent) {
     match k.code {
         KeyCode::Esc => {
             app.import_scroll = 0;
-            app.status = t("已取消导入").into();
+            app.flash(t("已取消导入").into());
             return;
         }
         KeyCode::Up | KeyCode::Char('k') => {
@@ -1906,6 +1906,7 @@ pub(crate) fn start_import(app: &mut App, tx: &Tx, plan: &ImportPlan) {
 pub(crate) fn import_report_key(app: &mut App, k: KeyEvent) {
     if matches!(k.code, KeyCode::Esc | KeyCode::Enter | KeyCode::Char('q')) {
         app.import_report = None;
+        app.flash(t("已关闭导入报告").into());
     }
 }
 
@@ -2878,7 +2879,7 @@ pub(crate) fn conn_export_key(app: &mut App, k: KeyEvent) {
             }
             KeyCode::Esc | KeyCode::Char('n') | KeyCode::Char('N') => {
                 ex.confirm_pw = false;
-                app.status = t("已取消含密码导出").into();
+                app.flash(t("已取消含密码导出").into());
             }
             _ => {}
         }
@@ -2907,7 +2908,7 @@ pub(crate) fn conn_export_key(app: &mut App, k: KeyEvent) {
     };
     match k.code {
         KeyCode::Esc => {
-            app.status = t("已取消导出").into();
+            app.flash(t("已取消导出").into());
             return;
         }
         KeyCode::Up | KeyCode::Char('k') => ex.field = (ex.field + n - 1) % n,
@@ -2940,7 +2941,7 @@ pub(crate) fn conn_import_path_key(app: &mut App, k: KeyEvent) {
     match k.code {
         KeyCode::Esc => {
             app.conn_import_path = None;
-            app.status = t("已取消导入连接").into();
+            app.flash(t("已取消导入连接").into());
         }
         KeyCode::Enter => {
             let raw = app
@@ -3015,7 +3016,7 @@ pub(crate) fn conn_import_plan_key(app: &mut App, tx: &Tx, k: KeyEvent) {
             }
             KeyCode::Esc | KeyCode::Char('n') | KeyCode::Char('N') => {
                 plan.confirm = None;
-                app.status = t("已取消覆盖").into();
+                app.flash(t("已取消覆盖").into());
             }
             _ => {}
         }
@@ -3025,7 +3026,7 @@ pub(crate) fn conn_import_plan_key(app: &mut App, tx: &Tx, k: KeyEvent) {
     let rows = plan.rows.len();
     match k.code {
         KeyCode::Esc => {
-            app.status = t("已取消导入连接").into();
+            app.flash(t("已取消导入连接").into());
             return;
         }
         KeyCode::Up | KeyCode::Char('k') => plan.cursor = plan.cursor.saturating_sub(1),
@@ -3203,7 +3204,7 @@ pub(crate) fn snippet_key(app: &mut App, tx: &Tx, k: KeyEvent) {
             app.snippet_open = false;
             app.snippet_insert = false;
             app.snippet_needle.clear();
-            app.status = t("已关闭 SQL 收藏").into();
+            app.flash(t("已关闭 SQL 收藏").into());
         }
         KeyCode::Up | KeyCode::Char('k') => {
             let i = app
@@ -3291,7 +3292,7 @@ pub(crate) fn snippet_filter_key(app: &mut App, k: KeyEvent) {
             app.snippet_filter = None;
             app.snippet_needle.clear();
             recompute_snippet_view(app);
-            app.status = t("已清除收藏过滤").into();
+            app.flash(t("已清除收藏过滤").into());
         }
         _ => {
             if let Some(ta) = app.snippet_filter.as_mut() {
@@ -3322,7 +3323,7 @@ pub(crate) fn snippet_confirm_key(app: &mut App, tx: &Tx, k: KeyEvent) {
         }
         KeyCode::Esc | KeyCode::Char('n') | KeyCode::Char('N') => {
             app.snippet_confirm = None;
-            app.status = t("已取消删除").into();
+            app.flash(t("已取消删除").into());
         }
         _ => {}
     }
@@ -3367,7 +3368,7 @@ pub(crate) fn snippet_name_key(app: &mut App, tx: &Tx, k: KeyEvent) {
         }
         KeyCode::Esc => {
             app.snippet_name = None;
-            app.status = t("已取消收藏").into();
+            app.flash(t("已取消收藏").into());
         }
         _ => {
             if let Some(t) = app.snippet_name.as_mut() {
@@ -3481,7 +3482,7 @@ pub(crate) fn template_key(app: &mut App, k: KeyEvent) {
         KeyCode::Esc | KeyCode::Char('q') => {
             app.template_open = false;
             app.template_needle.clear();
-            app.status = t("已关闭 SQL 模板").into();
+            app.flash(t("已关闭 SQL 模板").into());
         }
         KeyCode::Up | KeyCode::Char('k') => {
             let i = app
@@ -3553,7 +3554,7 @@ pub(crate) fn template_filter_key(app: &mut App, k: KeyEvent) {
             app.template_filter = None;
             app.template_needle.clear();
             recompute_template_view(app);
-            app.status = t("已清除模板过滤").into();
+            app.flash(t("已清除模板过滤").into());
         }
         _ => {
             if let Some(ta) = app.template_filter.as_mut() {

@@ -290,6 +290,7 @@ pub(crate) fn row_popup_key(app: &mut App, k: KeyEvent) {
     match k.code {
         KeyCode::Esc | KeyCode::Char('q') => {
             app.row_popup = None;
+            app.flash(t("已关闭行详情").into());
         }
         KeyCode::Enter | KeyCode::Char('v') => {
             popup.count.clear();
@@ -1200,7 +1201,7 @@ pub(crate) fn row_select_key(app: &mut App, tx: &Tx, k: KeyEvent) -> bool {
     match k.code {
         KeyCode::Esc => {
             app.row_sel_anchor = None;
-            app.status = t("已退出行选").into();
+            app.flash(t("已退出行选").into());
             true
         }
         // Plain ↑/↓ move the anchor and the cursor together (collapsing the
@@ -1676,7 +1677,7 @@ pub(crate) fn edit_dialog_key(app: &mut App, tx: &Tx, k: KeyEvent) {
     let to_batch =
         ctrl && k.code == KeyCode::Char('t') || (insert && plain && k.code == KeyCode::Char('b'));
     if k.code == KeyCode::Esc {
-        app.status = t("已取消编辑").into();
+        app.flash(t("已取消编辑").into());
     } else if k.code == KeyCode::Enter {
         submit_edit_sql(app, tx, d.sql());
     } else if to_editor {

@@ -151,10 +151,10 @@ pub(crate) fn redis_filter_key(app: &mut App, tx: &Tx, k: KeyEvent) {
         }
         KeyCode::Esc => {
             clear_redis_filter(app);
-            app.status = tf(
+            app.flash(tf(
                 "已清除 key 过滤 · {} 个 key",
                 &[&(app.redis_scan.all.len())],
-            );
+            ));
         }
         _ => {
             if let Some(t) = app.redis_filter_prompt.as_mut() {
@@ -366,7 +366,7 @@ pub(crate) fn table_filter_key(app: &mut App, tx: &Tx, k: KeyEvent) {
         }
         KeyCode::Esc => {
             clear_table_filter(app);
-            app.status = tf("已清除表过滤 · {} 个表/视图", &[&(app.tables.len())]);
+            app.flash(tf("已清除表过滤 · {} 个表/视图", &[&(app.tables.len())]));
         }
         _ => {
             if let Some(t) = app.table_prompt.as_mut() {
