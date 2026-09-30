@@ -679,7 +679,14 @@ pub(crate) fn browse_key(app: &mut App, tx: &Tx, k: KeyEvent) {
     }
 
     // Help works from anywhere except the text inputs (where `?` is a character).
-    if k.code == KeyCode::Char('?') && !matches!(app.focus, Focus::Editor | Focus::CmdInput) {
+    // `F1` opens the very same cheat-sheet in *every* context, so the editor and
+    // the command input — where `?` must stay a literal character — get a way in
+    // too. (`Alt-H` was the spec's first pick, but it is already the query-history
+    // panel, so the keybinding iron law keeps it there and this free key is the
+    // fallback.)
+    if (k.code == KeyCode::Char('?') && !matches!(app.focus, Focus::Editor | Focus::CmdInput))
+        || k.code == KeyCode::F(1)
+    {
         open_help(app);
         return;
     }

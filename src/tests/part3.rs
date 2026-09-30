@@ -367,6 +367,62 @@ pub(crate) fn mini_help_is_progressive_and_context_aware() {
     assert!(!app.help_mini && !app.help_open);
 }
 
+/// R70: `?` stays a literal character inside the text inputs, so `F1` opens the
+/// same cheat-sheet there — and `F1` again widens it to the full reference.
+#[test]
+pub(crate) fn f1_opens_help_where_question_mark_is_a_character() {
+    let (tx, _rx) = tokio::sync::mpsc::unbounded_channel::<OpResult>();
+    let mut app = test_app();
+    app.picker_open = false;
+    app.selected = Some(test_conn("mysql"));
+    app.backend_kind = Backend::Sql;
+    app.focus = Focus::Editor;
+
+    // `?` must reach the buffer, never be hijacked for help.
+    key(
+        &mut app,
+        &tx,
+        KeyEvent::new(KeyCode::Char('?'), KeyModifiers::NONE),
+    );
+    assert!(
+        !app.help_mini && !app.help_open,
+        "? must stay a character in the editor"
+    );
+    assert_eq!(app.editor.lines().join(""), "?");
+
+    // F1 opens the mini sheet from the editor...
+    key(
+        &mut app,
+        &tx,
+        KeyEvent::new(KeyCode::F(1), KeyModifiers::NONE),
+    );
+    assert!(app.help_mini && !app.help_open, "F1 opens the mini sheet");
+    assert_eq!(footer_ctx(&app).view, FooterView::HelpMini);
+    // ...and a second F1 widens it to the full list (the editor cannot type `?`
+    // into the mini sheet's promote path any other way).
+    key(
+        &mut app,
+        &tx,
+        KeyEvent::new(KeyCode::F(1), KeyModifiers::NONE),
+    );
+    assert!(app.help_open && !app.help_mini, "second F1 opens full help");
+    key(
+        &mut app,
+        &tx,
+        KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE),
+    );
+    assert!(!app.help_open && !app.help_mini);
+
+    // The command input behaves the same way.
+    app.focus = Focus::CmdInput;
+    key(
+        &mut app,
+        &tx,
+        KeyEvent::new(KeyCode::F(1), KeyModifiers::NONE),
+    );
+    assert!(app.help_mini, "F1 opens help from the command input too");
+}
+
 /// An overlay title drops whole key hints (never half a hint) as the box
 /// narrows.
 #[test]

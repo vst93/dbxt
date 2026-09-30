@@ -604,7 +604,7 @@ pub(crate) fn help_filter_key(app: &mut App, k: KeyEvent) {
 /// Esc (or `q`) closes.
 pub(crate) fn help_mini_key(app: &mut App, k: KeyEvent) {
     match k.code {
-        KeyCode::Char('?') | KeyCode::Enter => {
+        KeyCode::Char('?') | KeyCode::Enter | KeyCode::F(1) => {
             app.help_mini = false;
             app.help_open = true;
             app.help_scroll = 0;

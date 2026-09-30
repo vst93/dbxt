@@ -496,6 +496,7 @@ pub static ALL_KEYS: &[&str] = &[
     "未知选项: {}",
     "未连接",
     "本帮助（面板内 / 过滤键位或功能名；上下文键位排前）",
+    "打开本帮助（编辑器 / 命令输入里 ? 是字面字符，改用 F1）",
     "横向滚动列（触屏左右滑动 / 拖动）；PC 终端若 Shift+滚轮 无效，用 Ctrl+滚轮 或 Ctrl-G",
     "横滚 关 · 滚轮纵向",
     "横滚 开",
@@ -2342,6 +2343,9 @@ fn en_of(zh: &'static str) -> Option<&'static str> {
         "未知选项: {}" => Some("Unknown option: {}"),
         "未连接" => Some("Not connected"),
         "本帮助（面板内 / 过滤键位或功能名；上下文键位排前）" => Some("this help (press / inside to filter by key or feature; context keys float first)"),
+        "打开本帮助（编辑器 / 命令输入里 ? 是字面字符，改用 F1）" => {
+            Some("open this help (in the editor / command input `?` is a literal character, so press F1)")
+        }
         "横向滚动列（触屏左右滑动 / 拖动）；PC 终端若 Shift+滚轮 无效，用 Ctrl+滚轮 或 Ctrl-G" => Some("Scroll columns horizontally (touch swipe / drag); on PC terminals where Shift+wheel does nothing, use Ctrl+wheel or Ctrl-G"),
         "横滚 关 · 滚轮纵向" => Some("pan off · wheel scrolls rows"),
         "横滚 开" => Some("pan on"),

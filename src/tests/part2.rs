@@ -2932,6 +2932,7 @@ pub(crate) fn help_documents_core_bindings() {
         "Alt-/",
         "Alt-G",
         "Alt-H",
+        "F1",
         "Alt-F",
         "Alt-L",
         "Alt-D",
