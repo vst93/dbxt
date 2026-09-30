@@ -1088,12 +1088,23 @@ pub static ALL_KEYS: &[&str] = &[
     "无可钉住的结果（先打开一张表或执行查询）",
     "无可钉住的结果",
     "📌 已钉住结果区 · 切换表/库仍显示 · Alt-F 解除",
-    "g… d=表结构 t=表数据 v=定位值 c=列结构",
+    "g… d=表结构 t=表数据 v=定位值 c=列结构 b=切换表",
     "无可显示的列（先打开一张表或执行查询）",
-    " 列结构 · {} · {} 列 · / 过滤 · j/k 滚动 · Esc 关 ",
-    " 列结构 · {} · {}/{} 列 · 过滤「{}」· Esc 关 ",
+    " 列结构 · {} · {} 列 · / 过滤 · j/k 选 · Enter 跳列 · Esc 关 ",
+    " 列结构 · {} · {}/{} 列 · 过滤「{}」· Enter 跳列 · Esc 关 ",
     "（没有匹配的列）",
     " 列结构 · j/k · Esc ",
+    // R65: in-data-view table switcher (`g b`) + `gc` Enter jump + status label
+    "还没有可切换的表",
+    "切换表 · {} 张",
+    "切换表 · {} 张 · 输入即过滤",
+    "切换表「{}」· {}/{} 张",
+    " 切换表 · {} · {} 张 · 输入即过滤 · Esc 关 ",
+    " 切换表 · {}/{} 张 · 过滤「{}」· Esc 关 ",
+    "切换表",
+    "列 {} 不在当前视图（可能已隐藏）",
+    "切换同库其他表：输入即过滤的浮层（复用最近表样式，↑↓/j/k 选），Enter 打开该表数据",
+    "列结构弹层：列名 / 类型 / 键(PRI/UNI/MUL) / 默认值 / 可空 / 注释（缓存元数据，不额外查库；/ 过滤列名；Enter 跳到该列）",
     // R51: connection-form defaults / history counts / grid Home-End column reset
     "切换字段：db_type → name → host → port → user → password → database → query_timeout（开启 ssh_tunnel 后自动展开 SSH 段）",
     "查询超时秒数：留空=默认 60s，0=不限；PostgreSQL 同时以 statement_timeout 连接选项生效（连接级，不逐条查询）",
@@ -1343,20 +1354,38 @@ fn en_of(zh: &'static str) -> Option<&'static str> {
         "📌 已钉住结果区 · 切换表/库仍显示 · Alt-F 解除" => Some(
             "📌 Results pinned · stays visible after switching tables/DBs · Alt-F to unpin",
         ),
-        "g… d=表结构 t=表数据 v=定位值 c=列结构" => {
-            Some("g… d=structure t=data v=locate c=columns")
+        "g… d=表结构 t=表数据 v=定位值 c=列结构 b=切换表" => {
+            Some("g… d=structure t=data v=locate c=columns b=switch table")
         }
         "无可显示的列（先打开一张表或执行查询）" => {
             Some("No columns to show (open a table or run a query first)")
         }
-        " 列结构 · {} · {} 列 · / 过滤 · j/k 滚动 · Esc 关 " => {
-            Some(" Columns · {} · {} · / filter · j/k scroll · Esc close ")
+        " 列结构 · {} · {} 列 · / 过滤 · j/k 选 · Enter 跳列 · Esc 关 " => {
+            Some(" Columns · {} · {} · / filter · j/k select · Enter jump · Esc close ")
         }
-        " 列结构 · {} · {}/{} 列 · 过滤「{}」· Esc 关 " => {
-            Some(" Columns · {} · {}/{} · filter \"{}\" · Esc close ")
+        " 列结构 · {} · {}/{} 列 · 过滤「{}」· Enter 跳列 · Esc 关 " => {
+            Some(" Columns · {} · {}/{} · filter \"{}\" · Enter jump · Esc close ")
         }
         "（没有匹配的列）" => Some("(no matching columns)"),
         " 列结构 · j/k · Esc " => Some(" Columns · j/k · Esc "),
+        // ── R65: in-data-view table switcher + `gc` Enter jump + status label ──
+        "还没有可切换的表" => Some("No table to switch to yet"),
+        "切换表 · {} 张" => Some("Switch table · {}"),
+        "切换表 · {} 张 · 输入即过滤" => Some("Switch table · {} · type to filter"),
+        "切换表「{}」· {}/{} 张" => Some("Switch table \"{}\" · {}/{}"),
+        " 切换表 · {} · {} 张 · 输入即过滤 · Esc 关 " => {
+            Some(" Switch table · {} · {} · type to filter · Esc close ")
+        }
+        " 切换表 · {}/{} 张 · 过滤「{}」· Esc 关 " => {
+            Some(" Switch table · {}/{} · filter \"{}\" · Esc close ")
+        }
+        "切换表" => Some("switch table"),
+        "列 {} 不在当前视图（可能已隐藏）" => {
+            Some("Column {} is not in the current view (maybe hidden)")
+        }
+        "切换同库其他表：输入即过滤的浮层（复用最近表样式，↑↓/j/k 选），Enter 打开该表数据" => Some(
+            "Switch to another table in the same database: a type-to-filter overlay (same style as the recent-tables panel; ↑↓/j/k choose), Enter opens that table's data",
+        ),
         "分组节点" => Some("group node"),
         "DBX 桌面的连接分组（▾ 组名 [n]）；h l / ← → 折叠展开，会话内记忆；无分组则平铺" => Some(
             "DBX Desktop connection groups (▾ name [n]); h l / ← → fold and unfold, remembered for the session; a layout with no groups stays flat",
@@ -1365,8 +1394,8 @@ fn en_of(zh: &'static str) -> Option<&'static str> {
         "分组行无连接池：x 无动作（不会误进表过滤）" => Some(
             "A group row has no connection pool: x does nothing (it no longer leaks into the table filter)",
         ),
-        "列结构弹层：列名 / 类型 / 键(PRI/UNI/MUL) / 默认值 / 可空 / 注释（缓存元数据，不额外查库；/ 过滤列名）" => Some(
-            "Column-structure popup: name / type / key (PRI/UNI/MUL) / default / nullable / comment (cached metadata, no extra query; / filters by name)",
+        "列结构弹层：列名 / 类型 / 键(PRI/UNI/MUL) / 默认值 / 可空 / 注释（缓存元数据，不额外查库；/ 过滤列名；Enter 跳到该列）" => Some(
+            "Column-structure popup: name / type / key (PRI/UNI/MUL) / default / nullable / comment (cached metadata, no extra query; / filters by name; Enter jumps to that column)",
         ),
         "钉住 / 解除当前结果区（钉住后切换表/库仍显示，上下对照）" => Some(
             "Pin / unpin the current results pane (a pinned grid stays visible after switching tables/DBs, for up-and-down comparison)",

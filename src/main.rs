@@ -8549,6 +8549,36 @@ fn data_table_label(db: &str, schema: &str, table: &str) -> String {
     format!("{}{}", prefix, fix_double_encoding(&rel))
 }
 
+/// R65: the status bar's session identity — where the open data view actually
+/// lives. The connection name already leads the left block, so this adds only
+/// the location: `database.table`, with the schema folded in when it differs
+/// from the database (PostgreSQL) and skipped when it duplicates it (MySQL,
+/// where the schema *is* the database). Below 56 columns (the same gate as the
+/// server version) it collapses to the bare table name, so a phone status bar
+/// keeps its row / column readout. `None` when no table data view is open.
+fn session_label(db: &str, schema: &str, table: &str, term_w: u16) -> Option<String> {
+    let table = fix_double_encoding(table);
+    if table.trim().is_empty() {
+        return None;
+    }
+    if term_w != 0 && term_w < 56 {
+        return Some(table);
+    }
+    let db = fix_double_encoding(db);
+    let schema = fix_double_encoding(schema);
+    let mut out = String::new();
+    if !db.trim().is_empty() {
+        out.push_str(&db);
+        out.push('.');
+    }
+    if !schema.trim().is_empty() && !schema.eq_ignore_ascii_case(&db) {
+        out.push_str(&schema);
+        out.push('.');
+    }
+    out.push_str(&table);
+    Some(out)
+}
+
 /// The data-compare worker: resolve both sides' primary keys, forecast counts,
 /// then merge-join chunk by chunk. Progress is streamed between chunks and the
 /// shared `cancel` flag aborts, keeping the rows found so far.
@@ -11151,6 +11181,9 @@ struct App {
     /// `cols_popup_filter` is the modal one-line input while it is being typed.
     cols_popup_needle: String,
     cols_popup_filter: Option<TextArea<'static>>,
+    /// R65: the highlighted row of the `gc` popup, as an index into the
+    /// *filtered* column rows. Enter jumps the cell cursor to that column.
+    cols_popup_sel: usize,
     /// The unfiltered grid backing the filtered `grid` (needed to re-show a
     /// hidden column without re-querying).
     grid_full: Option<Grid>,
@@ -11158,6 +11191,12 @@ struct App {
     recent_tables: Vec<(String, String, String)>,
     recent_open: bool,
     recent_list: ListState,
+    /// R65: the in-data-view table switcher (`g b`). The needle is edited inline
+    /// (type to filter) over the current database's *cached* table list — never
+    /// a query. Enter opens the highlighted table's data view.
+    table_jump_open: bool,
+    table_jump_needle: String,
+    table_jump_list: ListState,
     /// Browser-style back/forward history of browsed tables / collections /
     /// Redis keys (`Alt-←` / `Alt-→`). `nav_pos` is the cursor into it; opening
     /// a node truncates the forward branch and appends, exactly like a browser.
@@ -11930,10 +11969,14 @@ impl App {
             cols_popup_scroll: 0,
             cols_popup_needle: String::new(),
             cols_popup_filter: None,
+            cols_popup_sel: 0,
             grid_full: None,
             recent_tables: Vec::new(),
             recent_open: false,
             recent_list: ListState::default(),
+            table_jump_open: false,
+            table_jump_needle: String::new(),
+            table_jump_list: ListState::default(),
             nav_history: Vec::new(),
             nav_pos: 0,
             pending_open_redis_key: None,
@@ -14209,6 +14252,10 @@ fn reset_overlays_for_backend_switch(app: &mut App) {
     app.cols_popup_open = false;
     app.cols_popup_needle.clear();
     app.cols_popup_filter = None;
+    app.cols_popup_sel = 0;
+    // R65: drop the in-data-view table switcher with the rest of the overlays.
+    app.table_jump_open = false;
+    app.table_jump_needle.clear();
     app.snippet_open = false;
     app.snippet_name = None;
     app.snippet_needle.clear();
@@ -14741,6 +14788,12 @@ fn browse_key(app: &mut App, tx: &Tx, k: KeyEvent) {
         return;
     }
 
+    // R65: the in-data-view table switcher (`g b`) is modal too.
+    if app.table_jump_open {
+        table_jump_key(app, tx, k);
+        return;
+    }
+
     // Column-visibility overlay (Ctrl-Shift-H) is modal.
     if app.col_picker_open {
         col_picker_key(app, k);
@@ -14784,6 +14837,7 @@ fn browse_key(app: &mut App, tx: &Tx, k: KeyEvent) {
             | KeyCode::Char('t')
             | KeyCode::Char('v')
             | KeyCode::Char('c')
+            | KeyCode::Char('b')
             | KeyCode::Char('g')
                 if k.modifiers.is_empty() =>
             {
@@ -17939,6 +17993,7 @@ fn mouse(app: &mut App, tx: &Tx, m: MouseEvent) {
         || app.snippet_open
         || app.col_picker_open
         || app.recent_open
+        || app.table_jump_open
         || app.table_prompt.is_some()
         || app.tree_search_prompt.is_some()
         || app.help_open
@@ -18053,6 +18108,7 @@ fn mouse(app: &mut App, tx: &Tx, m: MouseEvent) {
             if app.snippet_open
                 || app.col_picker_open
                 || app.recent_open
+                || app.table_jump_open
                 || app.table_prompt.is_some()
                 || app.tree_search_prompt.is_some()
                 || app.filter_prompt.is_some()
@@ -21943,10 +21999,19 @@ fn preview_key(app: &mut App, tx: &Tx, k: KeyEvent) {
             }
             // `gc` — R48: a quick column-structure popup (name / type /
             // nullable / comment) from the cached metadata, without leaving the
-            // grid for the full `gd` structure view.
+            // grid for the full `gd` structure view. R65: Enter inside it jumps
+            // the cell cursor to that column.
             KeyCode::Char('c') if k.modifiers.is_empty() => {
                 app.pending_g = false;
                 open_cols_popup(app);
+                return;
+            }
+            // `gb` — R65: switch to another table in the *same* database. A
+            // type-to-filter list of the cached table names; Enter opens the
+            // highlighted one in the data view. Never a query.
+            KeyCode::Char('b') if k.modifiers.is_empty() => {
+                app.pending_g = false;
+                open_table_jump(app);
                 return;
             }
             // `gg` — vim's "go to top" (R42): a real console motion for the
@@ -22047,10 +22112,11 @@ fn preview_key(app: &mut App, tx: &Tx, k: KeyEvent) {
                 app.ddl_scroll = 0;
             }
         }
-        // `g` starts the `gd` (goto structure) / `gt` (goto data) chord.
+        // `g` starts the `gd` (goto structure) / `gt` (goto data) / `gb`
+        // (switch table) chord.
         KeyCode::Char('g') => {
             app.pending_g = true;
-            app.status = t("g… d=表结构 t=表数据 v=定位值 c=列结构").into();
+            app.status = t("g… d=表结构 t=表数据 v=定位值 c=列结构 b=切换表").into();
         }
         KeyCode::Char('s') => sort_column(app, tx, false),
         KeyCode::Char('f') => open_filter_prompt(app),
@@ -23347,6 +23413,7 @@ fn open_cols_popup(app: &mut App) {
     }
     app.cols_popup_open = true;
     app.cols_popup_scroll = 0;
+    app.cols_popup_sel = 0;
     app.cols_popup_needle.clear();
     app.cols_popup_filter = None;
 }
@@ -23543,6 +23610,10 @@ fn cols_popup_key(app: &mut App, k: KeyEvent) {
         cols_popup_filter_key(app, k);
         return;
     }
+    // `j` / `k` / PgUp / PgDn move the highlighted row (the render keeps it on
+    // screen), clamped to the filtered row count.
+    let hits = cols_popup_hits(app).0;
+    let last = hits.saturating_sub(1);
     match k.code {
         KeyCode::Esc | KeyCode::Char('q') | KeyCode::Char('c') => {
             app.cols_popup_open = false;
@@ -23550,15 +23621,66 @@ fn cols_popup_key(app: &mut App, k: KeyEvent) {
             app.cols_popup_filter = None;
         }
         KeyCode::Char('/') => open_cols_popup_filter(app),
+        // R65: Enter jumps the cell cursor to the highlighted column.
+        KeyCode::Enter => cols_popup_jump(app),
         KeyCode::Up | KeyCode::Char('k') => {
-            app.cols_popup_scroll = app.cols_popup_scroll.saturating_sub(1)
+            app.cols_popup_sel = app.cols_popup_sel.saturating_sub(1)
         }
+        // `hits == 0` leaves `last == 0`, so the clamp parks on the empty state.
         KeyCode::Down | KeyCode::Char('j') => {
-            app.cols_popup_scroll = app.cols_popup_scroll.saturating_add(1)
+            app.cols_popup_sel = (app.cols_popup_sel + 1).min(last)
         }
-        KeyCode::PageUp => app.cols_popup_scroll = app.cols_popup_scroll.saturating_sub(8),
-        KeyCode::PageDown => app.cols_popup_scroll = app.cols_popup_scroll.saturating_add(8),
+        KeyCode::PageUp => app.cols_popup_sel = app.cols_popup_sel.saturating_sub(8),
+        KeyCode::PageDown => app.cols_popup_sel = (app.cols_popup_sel + 8).min(last),
         _ => {}
+    }
+}
+
+/// R65: map a `gc` popup column name onto the visible grid's column index. The
+/// popup names are double-encoding-fixed, so the grid names are fixed before the
+/// exact (then case-insensitive) comparison. Pure, so the popup→grid mapping is
+/// unit-testable without a terminal.
+fn col_index_by_name(columns: &[String], name: &str) -> Option<usize> {
+    let want = name.to_lowercase();
+    columns
+        .iter()
+        .position(|c| fix_double_encoding(c) == name)
+        .or_else(|| {
+            columns
+                .iter()
+                .position(|c| fix_double_encoding(c).to_lowercase() == want)
+        })
+}
+
+/// R65: Enter in the `gc` popup. The highlighted column is matched onto the
+/// *visible* grid by name and the cell cursor jumps there; the popup closes so
+/// the landing is visible. A column hidden by the column picker (or absent from
+/// a bare query result) reports instead of jumping somewhere wrong.
+fn cols_popup_jump(app: &mut App) {
+    let rows: Vec<ColPopupRow> = cols_popup_rows(app)
+        .into_iter()
+        .filter(|r| cols_popup_matches(r, &app.cols_popup_needle))
+        .collect();
+    let Some(row) = rows.get(app.cols_popup_sel).cloned() else {
+        app.status = t("没有可跳转的列").into();
+        return;
+    };
+    let Some(grid) = active_grid(app) else {
+        app.status = t("没有可跳转的列").into();
+        return;
+    };
+    match col_index_by_name(&grid.columns, &row.name) {
+        Some(i) => {
+            app.col_cursor = i;
+            app.poke_hbar();
+            app.cols_popup_open = false;
+            app.cols_popup_needle.clear();
+            app.cols_popup_filter = None;
+            app.status = tf("跳到第 {} 列 {}", &[&(i + 1), &row.name]);
+        }
+        None => {
+            app.status = tf("列 {} 不在当前视图（可能已隐藏）", &[&row.name]);
+        }
     }
 }
 
@@ -23593,6 +23715,7 @@ fn cols_popup_filter_key(app: &mut App, k: KeyEvent) {
                 .map(|t| t.lines().join(" ").trim().to_string())
                 .unwrap_or_default();
             app.cols_popup_scroll = 0;
+            app.cols_popup_sel = 0;
             let (hits, total) = cols_popup_hits(app);
             app.status = if app.cols_popup_needle.trim().is_empty() {
                 t("输入以过滤列名…").into()
@@ -23691,6 +23814,131 @@ fn recent_key(app: &mut App, tx: &Tx, k: KeyEvent) {
         }
         _ => {}
     }
+}
+
+// ── R65: in-data-view table switcher (`g b`) ──
+
+/// R65: open the in-data-view table switcher (`g b`). It lists the current
+/// database's tables from the cached sidebar metadata (never a query) with
+/// type-to-filter; Enter opens the highlighted one's data view.
+fn open_table_jump(app: &mut App) {
+    if app.tables_all.is_empty() {
+        app.status = t("还没有可切换的表").into();
+        return;
+    }
+    app.table_jump_open = true;
+    app.table_jump_needle.clear();
+    app.table_jump_list.select(Some(0));
+    table_jump_report(app);
+}
+
+/// The `g b` switcher's rows: the current database's tables (the cached
+/// `tables_all`, so a sidebar `/` filter never hides a table here), ordered like
+/// the sidebar and narrowed by the inline needle. Matching runs on the qualified
+/// `schema.table` the sidebar draws, so `inv.` keeps a whole schema. Pure — it
+/// reads the cache only and can never issue a query.
+fn table_jump_rows(app: &App) -> Vec<(String, String)> {
+    let needle = app.table_jump_needle.trim().to_lowercase();
+    let schema = app.schema.clone();
+    let mut list = app.tables_all.clone();
+    sort_table_list(&mut list, app.table_sort);
+    list.into_iter()
+        .filter(|t| {
+            needle.is_empty()
+                || qualified_display(&schema, &t.name)
+                    .to_lowercase()
+                    .contains(&needle)
+        })
+        .map(|t| (t.name, t.table_type))
+        .collect()
+}
+
+/// Move the switcher's highlight by `step` rows (forward or back), clamped to
+/// the filtered list. Shared by the arrow / page keys.
+fn table_jump_step(app: &mut App, step: usize, forward: bool) {
+    let n = table_jump_rows(app).len();
+    if n == 0 {
+        app.table_jump_list.select(None);
+        return;
+    }
+    let cur = app.table_jump_list.selected().unwrap_or(0).min(n - 1);
+    let next = if forward {
+        (cur + step).min(n - 1)
+    } else {
+        cur.saturating_sub(step)
+    };
+    app.table_jump_list.select(Some(next));
+}
+
+/// The `g b` keymap. `↑`/`↓` (and `j`/`k`, the ironclad vim-up rule every list
+/// panel follows) move the highlight; every *other* printable character edits
+/// the needle (filter as you type), exactly like the sidebar's own
+/// type-to-filter list.
+fn table_jump_key(app: &mut App, tx: &Tx, k: KeyEvent) {
+    if k.modifiers.contains(KeyModifiers::CONTROL) {
+        // Ctrl-U clears the needle (grep / less muscle memory).
+        if k.code == KeyCode::Char('u') {
+            app.table_jump_needle.clear();
+            app.table_jump_list.select(Some(0));
+            app.status = tf("切换表 · {} 张", &[&(table_jump_rows(app).len())]);
+        }
+        return;
+    }
+    if k.modifiers.contains(KeyModifiers::ALT) {
+        return;
+    }
+    match k.code {
+        KeyCode::Esc => {
+            app.table_jump_open = false;
+            app.table_jump_needle.clear();
+        }
+        KeyCode::Enter => table_jump_accept(app, tx),
+        KeyCode::Up | KeyCode::Char('k') => table_jump_step(app, 1, false),
+        KeyCode::Down | KeyCode::Char('j') => table_jump_step(app, 1, true),
+        KeyCode::PageUp => table_jump_step(app, 8, false),
+        KeyCode::PageDown => table_jump_step(app, 8, true),
+        KeyCode::Backspace => {
+            app.table_jump_needle.pop();
+            app.table_jump_list.select(Some(0));
+            table_jump_report(app);
+        }
+        KeyCode::Char(c) if !c.is_control() => {
+            app.table_jump_needle.push(c);
+            app.table_jump_list.select(Some(0));
+            table_jump_report(app);
+        }
+        _ => {}
+    }
+}
+
+/// Live hit count for the switcher's status line while the needle is typed.
+fn table_jump_report(app: &mut App) {
+    let hits = table_jump_rows(app).len();
+    let total = app.tables_all.len();
+    let needle = app.table_jump_needle.trim();
+    app.status = if needle.is_empty() {
+        tf("切换表 · {} 张 · 输入即过滤", &[&total])
+    } else {
+        tf("切换表「{}」· {}/{} 张", &[&needle, &hits, &total])
+    };
+}
+
+/// Enter in the `g b` switcher: open the highlighted table in the data view.
+/// Reuses the nav path, so the same database + schema case is a pure cached
+/// jump (no reload, no query beyond the page fetch the data view always does).
+fn table_jump_accept(app: &mut App, tx: &Tx) {
+    let rows = table_jump_rows(app);
+    let Some(i) = app.table_jump_list.selected() else {
+        return;
+    };
+    let Some((table, _)) = rows.get(i).cloned() else {
+        return;
+    };
+    app.table_jump_open = false;
+    app.table_jump_needle.clear();
+    let db = app.current_db();
+    let schema = app.schema.clone();
+    open_nav_table(app, tx, &db, &schema, &table, "");
 }
 
 /// R63: the recency panel's visible order as indices into `recent_tables`. The
@@ -32972,6 +33220,9 @@ fn ui(f: &mut Frame, app: &mut App) {
     if app.recent_open {
         render_recent_tables(f, f.area(), app);
     }
+    if app.table_jump_open {
+        render_table_jump(f, f.area(), app);
+    }
     if app.history_open {
         // Confine the panel to the content area so the header, status line and
         // footer stay visible — `y`/`f`/`Del` feedback lands on the status line.
@@ -33386,6 +33637,15 @@ fn context_info(app: &App) -> String {
     if let Some(hint) = &app.nav_landing {
         parts.push(hint.clone());
     }
+    // R65: where the open data view lives (`db.table`, table alone when narrow).
+    // The connection name leads the left block, so only the location is added
+    // here. Sits ahead of the other persistent fields so the identity survives
+    // the status bar's tail truncation on a narrow terminal.
+    if let Some(ps) = &app.page_state {
+        if let Some(label) = session_label(&app.current_db(), &ps.schema, &ps.table, app.term_w) {
+            parts.push(label);
+        }
+    }
     // R63: the connect-time latency is the next-most-useful connection fact and
     // only a few cells wide, so it sits here — before the wide fields — and
     // survives the tail truncation on a 42-column status bar. Absent when the
@@ -33664,6 +33924,8 @@ enum FooterView {
     TransferPrompt,
     TransferReport,
     Recent,
+    /// R65: the in-data-view table switcher (`g b`).
+    TableJump,
     ColPicker,
     ConnPicker,
     NewConn,
@@ -33806,6 +34068,8 @@ fn footer_ctx_inner(app: &App, include_help: bool) -> FooterCtx {
         FooterView::DbDiff
     } else if app.recent_open {
         FooterView::Recent
+    } else if app.table_jump_open {
+        FooterView::TableJump
     } else if app.col_picker_open {
         FooterView::ColPicker
     } else if app.page == Page::NewConn {
@@ -33964,6 +34228,12 @@ fn footer_hints_ctx(ctx: FooterCtx) -> Vec<Hint> {
             ("Esc", t("关闭")),
         ],
         FooterView::Recent => vec![("↑↓", t("选择")), ("Enter", t("直达")), ("Esc", t("关闭"))],
+        FooterView::TableJump => vec![
+            ("a-z", t("过滤")),
+            ("↑↓", t("选择")),
+            ("Enter", t("切换表")),
+            ("Esc", t("关闭")),
+        ],
         FooterView::ColPicker => vec![
             ("Space", t("勾选")),
             ("a", t("全选")),
@@ -34144,6 +34414,7 @@ fn footer_hints_ctx(ctx: FooterCtx) -> Vec<Hint> {
                 ("gv", t("定位值")),
                 ("|", t("跳列")),
                 ("gd/gt", t("结构/数据")),
+                ("gb", t("切换表")),
                 ("Alt-O", t("语句耗时")),
             ],
         },
@@ -37063,10 +37334,17 @@ fn render_cols_popup(f: &mut Frame, area: Rect, app: &mut App) {
     f.render_widget(Clear, box_area);
     let inner_w = box_area.width.saturating_sub(2) as usize;
     let inner_h = h.saturating_sub(2) as usize;
-    let max_scroll = rows.len().saturating_sub(inner_h) as u16;
-    if app.cols_popup_scroll > max_scroll {
-        app.cols_popup_scroll = max_scroll;
+    // R65: the highlighted row is a cursor now, so the scroll window follows it
+    // (and both stay clamped to the filtered list).
+    let sel = app.cols_popup_sel.min(rows.len().saturating_sub(1));
+    let max_scroll = rows.len().saturating_sub(inner_h.max(1)) as u16;
+    let mut scroll = app.cols_popup_scroll.min(max_scroll);
+    if sel < scroll as usize {
+        scroll = sel as u16;
+    } else if inner_h > 0 && sel >= scroll as usize + inner_h {
+        scroll = (sel + 1 - inner_h) as u16;
     }
+    app.cols_popup_scroll = scroll.min(max_scroll);
     let table = app
         .table_meta
         .as_ref()
@@ -37075,12 +37353,12 @@ fn render_cols_popup(f: &mut Frame, area: Rect, app: &mut App) {
     let needle = app.cols_popup_needle.trim();
     let full = if needle.is_empty() {
         tf(
-            " 列结构 · {} · {} 列 · / 过滤 · j/k 滚动 · Esc 关 ",
+            " 列结构 · {} · {} 列 · / 过滤 · j/k 选 · Enter 跳列 · Esc 关 ",
             &[&table, &rows.len()],
         )
     } else {
         tf(
-            " 列结构 · {} · {}/{} 列 · 过滤「{}」· Esc 关 ",
+            " 列结构 · {} · {}/{} 列 · 过滤「{}」· Enter 跳列 · Esc 关 ",
             &[&table, &rows.len(), &all_rows.len(), &needle],
         )
     };
@@ -37092,11 +37370,18 @@ fn render_cols_popup(f: &mut Frame, area: Rect, app: &mut App) {
     } else {
         let layout = cols_popup_layout(&rows, inner_w);
         rows.iter()
-            .map(|r| {
-                Line::from(Span::styled(
-                    cols_popup_line(r, &layout, inner_w),
-                    Style::default(),
-                ))
+            .enumerate()
+            .map(|(i, r)| {
+                // R65: the cursor row is highlighted like the other list
+                // overlays, so Enter's target is never ambiguous.
+                let style = if i == sel {
+                    Style::default()
+                        .bg(Color::DarkGray)
+                        .add_modifier(Modifier::BOLD)
+                } else {
+                    Style::default()
+                };
+                Line::from(Span::styled(cols_popup_line(r, &layout, inner_w), style))
             })
             .collect()
     };
@@ -37244,6 +37529,70 @@ fn render_recent_tables(f: &mut Frame, area: Rect, app: &mut App) {
                 .add_modifier(Modifier::BOLD),
         );
     f.render_stateful_widget(list, box_area, &mut app.recent_list);
+}
+
+/// R65: the in-data-view table switcher (`g b`). A type-to-filter list of the
+/// current database's tables, drawn like the recent-table overlay: the needle
+/// rides the title and the highlighted row is the one Enter opens.
+fn render_table_jump(f: &mut Frame, area: Rect, app: &mut App) {
+    let rows = table_jump_rows(app);
+    let w = area.width.min(if app.layout_mode == LayoutMode::Narrow {
+        area.width
+    } else {
+        54
+    });
+    let (y, h) = overlay_list_box(rows.len().max(1), area);
+    let x = area.x + (area.width.saturating_sub(w)) / 2;
+    let box_area = Rect {
+        x,
+        y,
+        width: w,
+        height: h,
+    };
+    f.render_widget(Clear, box_area);
+    let items: Vec<ListItem> = rows
+        .iter()
+        .map(|(name, kind)| {
+            let view = kind.eq_ignore_ascii_case("VIEW");
+            let mut spans = vec![Span::styled(
+                fix_double_encoding(name),
+                Style::default().add_modifier(Modifier::BOLD),
+            )];
+            if view {
+                spans.push(Span::styled(
+                    "~".to_string(),
+                    Style::default().fg(Color::Blue),
+                ));
+            }
+            ListItem::new(Line::from(spans))
+        })
+        .collect();
+    let needle = app.table_jump_needle.trim();
+    let title = if needle.is_empty() {
+        tf(
+            " 切换表 · {} · {} 张 · 输入即过滤 · Esc 关 ",
+            &[&fix_double_encoding(&app.current_db()), &rows.len()],
+        )
+    } else {
+        tf(
+            " 切换表 · {}/{} 张 · 过滤「{}」· Esc 关 ",
+            &[&rows.len(), &app.tables_all.len(), &needle],
+        )
+    };
+    let list = List::new(items)
+        .block(
+            Block::default()
+                .borders(Borders::ALL)
+                .title(title)
+                .border_set(border::ROUNDED)
+                .border_style(Style::default().fg(Color::Cyan)),
+        )
+        .highlight_style(
+            Style::default()
+                .bg(Color::DarkGray)
+                .add_modifier(Modifier::BOLD),
+        );
+    f.render_stateful_widget(list, box_area, &mut app.table_jump_list);
 }
 
 /// One non-selectable section header inside the history panel (R45).
@@ -40301,7 +40650,11 @@ const HELP_ROWS: &[(&str, &str)] = &[
     ("g d / g t", "跳表结构视图 / 回表数据"),
     (
         "g c",
-        "列结构弹层：列名 / 类型 / 键(PRI/UNI/MUL) / 默认值 / 可空 / 注释（缓存元数据，不额外查库；/ 过滤列名）",
+        "列结构弹层：列名 / 类型 / 键(PRI/UNI/MUL) / 默认值 / 可空 / 注释（缓存元数据，不额外查库；/ 过滤列名；Enter 跳到该列）",
+    ),
+    (
+        "g b",
+        "切换同库其他表：输入即过滤的浮层（复用最近表样式，↑↓/j/k 选），Enter 打开该表数据",
     ),
     (
         "Alt-F",
@@ -42923,6 +43276,8 @@ mod tests {
             app.col_picker_open = false;
             app.cols_popup_open = false;
             app.recent_open = false;
+            app.table_jump_open = false;
+            app.table_jump_needle.clear();
             app.history_open = false;
             app.history_filter = None;
             app.history_confirm = None;
@@ -43136,6 +43491,19 @@ mod tests {
             ("db-picker", Box::new(|a| a.db_picker_open = true)),
             ("col-picker", Box::new(|a| a.col_picker_open = true)),
             ("recent", Box::new(|a| a.recent_open = true)),
+            // R65: the in-data-view table switcher and its filter-as-you-type
+            // needle render at every size too.
+            (
+                "table-jump",
+                Box::new(|a| {
+                    a.tables_all =
+                        vec![table_info("orders", "TABLE"), table_info("items", "TABLE")];
+                    a.table_jump_open = true;
+                    a.table_jump_needle = "ord".into();
+                    a.table_jump_list.select(Some(0));
+                }),
+            ),
+            ("cols-popup", Box::new(open_cols_popup)),
             (
                 "search",
                 Box::new(|a| {
@@ -48582,6 +48950,217 @@ mod tests {
         assert!(app.cols_popup_needle.is_empty());
     }
 
+    /// R65: Enter in the `gc` popup jumps the cell cursor to the highlighted
+    /// column (matched by name on the visible grid) and closes the popup. `j`
+    /// moves the cursor; a column the view does not show reports instead.
+    #[test]
+    fn gc_enter_jumps_to_the_highlighted_column() {
+        // Pure name mapping: exact first, then case-insensitive, else `None`.
+        let cols = vec!["a".to_string(), "Column_5".to_string()];
+        assert_eq!(col_index_by_name(&cols, "a"), Some(0));
+        assert_eq!(col_index_by_name(&cols, "column_5"), Some(1));
+        assert_eq!(col_index_by_name(&cols, "Column_5"), Some(1));
+        assert_eq!(col_index_by_name(&cols, "zzz"), None);
+
+        let mut app = test_app();
+        app.picker_open = false;
+        app.selected = Some(test_conn("mysql"));
+        app.backend_kind = Backend::Sql;
+        app.grid_kind = GridKind::TableData;
+        app.set_grid(sample_grid());
+        app.table_meta = Some(TableMeta {
+            table: "orders".into(),
+            schema: String::new(),
+            columns: vec![col_info("column_3", "text"), col_info("column_5", "text")],
+            indexes: Vec::new(),
+        });
+        open_cols_popup(&mut app);
+        assert_eq!(app.cols_popup_sel, 0);
+        // `j` moves the cursor (the scroll window follows it), not the offset.
+        cols_popup_key(
+            &mut app,
+            KeyEvent::new(KeyCode::Char('j'), KeyModifiers::NONE),
+        );
+        assert_eq!(app.cols_popup_sel, 1);
+        cols_popup_key(&mut app, KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        assert!(!app.cols_popup_open, "Enter closes the popup");
+        assert_eq!(app.col_cursor, 5, "cursor lands on column_5");
+        assert!(app.status.contains("column_5"), "{}", app.status);
+
+        // A column hidden from the view reports and keeps the popup open.
+        app.col_hidden.insert("column_3".into());
+        app.reapply_col_filter();
+        open_cols_popup(&mut app);
+        cols_popup_key(&mut app, KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        assert!(app.cols_popup_open, "a missing column keeps the popup open");
+        assert!(app.status.contains("不在当前视图"), "{}", app.status);
+    }
+
+    /// R65: `g b` opens a type-to-filter table switcher over the current
+    /// database's *cached* tables. The needle narrows the rows, Enter opens the
+    /// highlighted table's data view, and Esc closes it without a query.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn table_jump_panel_filters_and_opens() {
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel::<OpResult>();
+        let mut app = test_app();
+        app.picker_open = false;
+        app.selected = Some(test_conn("mysql"));
+        app.backend_kind = Backend::Sql;
+        app.databases = vec!["shop".into()];
+        app.schema = "shop".into();
+        app.tables_all = vec![
+            table_info("orders", "TABLE"),
+            table_info("order_items", "TABLE"),
+            table_info("users", "TABLE"),
+            table_info("v_orders", "VIEW"),
+        ];
+        app.tables = app.tables_all.clone();
+        app.focus = Focus::Preview;
+        app.grid_kind = GridKind::TableData;
+        app.set_grid(sample_grid());
+
+        // `g` arms the chord, `b` opens the switcher; the list is name-ordered.
+        key(
+            &mut app,
+            &tx,
+            KeyEvent::new(KeyCode::Char('g'), KeyModifiers::NONE),
+        );
+        assert!(app.pending_g);
+        key(
+            &mut app,
+            &tx,
+            KeyEvent::new(KeyCode::Char('b'), KeyModifiers::NONE),
+        );
+        assert!(app.table_jump_open, "g b opens the switcher");
+        assert!(!app.pending_g);
+        assert_eq!(table_jump_rows(&app).len(), 4);
+
+        // Type to filter: `order` keeps orders / order_items / v_orders.
+        for ch in "order".chars() {
+            key(
+                &mut app,
+                &tx,
+                KeyEvent::new(KeyCode::Char(ch), KeyModifiers::NONE),
+            );
+        }
+        let names: Vec<String> = table_jump_rows(&app).into_iter().map(|r| r.0).collect();
+        assert_eq!(names, vec!["order_items", "orders", "v_orders"]);
+        assert!(app.status.contains("3/4"), "{}", app.status);
+
+        // `j` / `k` stay vim-down/up (they move, they never filter); Enter
+        // opens the selected table.
+        key(
+            &mut app,
+            &tx,
+            KeyEvent::new(KeyCode::Char('j'), KeyModifiers::NONE),
+        );
+        assert_eq!(app.table_jump_needle, "order", "j must not filter");
+        assert_eq!(app.table_jump_list.selected(), Some(1));
+        key(
+            &mut app,
+            &tx,
+            KeyEvent::new(KeyCode::Char('k'), KeyModifiers::NONE),
+        );
+        assert_eq!(app.table_jump_list.selected(), Some(0));
+        key(
+            &mut app,
+            &tx,
+            KeyEvent::new(KeyCode::Char('j'), KeyModifiers::NONE),
+        );
+        assert_eq!(app.table_jump_list.selected(), Some(1));
+        key(
+            &mut app,
+            &tx,
+            KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+        );
+        assert!(!app.table_jump_open, "Enter closes the switcher");
+        let ps = app.page_state.as_ref().expect("the table data page opened");
+        assert_eq!(ps.table, "orders");
+        assert_eq!(app.table_list.selected(), Some(0));
+
+        // Esc closes it too, and the overlay renders with its needle at 42x22.
+        open_table_jump(&mut app);
+        app.table_jump_needle = "ord".into();
+        let screen: String = draw(&mut app, 42, 22)
+            .join("\n")
+            .chars()
+            .filter(|c| !c.is_whitespace())
+            .collect();
+        assert!(screen.contains("切换表"), "{screen}");
+        assert!(screen.contains("orders"), "{screen}");
+        // A needle with no hit renders an empty list without panicking.
+        app.table_jump_needle = "zzz".into();
+        app.table_jump_list.select(Some(0));
+        let empty: String = draw(&mut app, 42, 22).join("\n");
+        assert!(empty.contains("0/4"), "{empty}");
+        key(
+            &mut app,
+            &tx,
+            KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE),
+        );
+        assert!(!app.table_jump_open);
+    }
+
+    /// R65: the status bar names where the open data view lives. The pure label
+    /// folds the schema in only when it differs from the database (PostgreSQL)
+    /// and skips it when it duplicates it (MySQL); a narrow terminal keeps just
+    /// the table name.
+    #[test]
+    fn status_bar_shows_the_open_table_location() {
+        assert_eq!(
+            session_label("shop", "shop", "orders", 120).as_deref(),
+            Some("shop.orders")
+        );
+        assert_eq!(
+            session_label("shop", "public", "orders", 120).as_deref(),
+            Some("shop.public.orders")
+        );
+        assert_eq!(
+            session_label("shop", "shop", "orders", 42).as_deref(),
+            Some("orders")
+        );
+        assert_eq!(
+            session_label("", "", "orders", 120).as_deref(),
+            Some("orders")
+        );
+        assert_eq!(session_label("shop", "shop", "", 120), None);
+        // `term_w == 0` (tests / unknown width) counts as wide, like the server
+        // version field.
+        assert_eq!(
+            session_label("shop", "public", "orders", 0).as_deref(),
+            Some("shop.public.orders")
+        );
+
+        let mut app = test_app();
+        app.picker_open = false;
+        app.selected = Some(test_conn("postgres"));
+        app.backend_kind = Backend::Sql;
+        app.databases = vec!["shop".into()];
+        app.schema = "public".into();
+        app.grid_kind = GridKind::TableData;
+        app.set_grid(sample_grid());
+        app.page_state = Some(PageState {
+            table: "orders".into(),
+            schema: "public".into(),
+            table_type: Some("TABLE".into()),
+            page: 0,
+            page_size: PAGE_SIZE,
+            total: None,
+            total_lower_bound: false,
+            has_next: false,
+            filter: String::new(),
+            order_by: None,
+            keyset: None,
+        });
+        app.term_w = 120;
+        let wide = context_info(&app);
+        assert!(wide.contains("shop.public.orders"), "{wide}");
+        app.term_w = 42;
+        let narrow = context_info(&app);
+        assert!(narrow.contains("orders"), "{narrow}");
+        assert!(!narrow.contains("shop.public"), "{narrow}");
+    }
+
     /// R43: the tree cursor walks tables, `h` collapses the active database
     /// (hiding its tables) and remembers it, and `l` expands it again.
     #[test]
@@ -52401,6 +52980,7 @@ mod tests {
         app.help_open = true;
         app.file_load_prompt = Some(TextArea::default());
         app.recent_open = true;
+        app.table_jump_open = true;
         app.result_filter = Some(TextArea::default());
         let search_gen = app.search_gen;
         let diff_gen = app.data_diff_gen;
@@ -52418,6 +52998,7 @@ mod tests {
         assert!(app.data_diff.is_none() && app.data_where.is_none());
         assert!(app.transfer.is_none() && app.transfer_report.is_none());
         assert!(!app.help_open && !app.recent_open);
+        assert!(!app.table_jump_open);
         assert!(app.file_load_prompt.is_none() && app.result_filter.is_none());
     }
 
@@ -53042,6 +53623,11 @@ mod tests {
                 Box::new(|a| !a.recent_open),
             ),
             (
+                "table-jump",
+                Box::new(|a| a.table_jump_open = true),
+                Box::new(|a| !a.table_jump_open),
+            ),
+            (
                 "col-picker",
                 Box::new(|a| a.col_picker_open = true),
                 Box::new(|a| !a.col_picker_open),
@@ -53238,6 +53824,7 @@ mod tests {
             FooterView::FilterPrompt,
             FooterView::DbPicker,
             FooterView::Recent,
+            FooterView::TableJump,
             FooterView::Completion,
             FooterView::SnippetName,
             FooterView::ConnPicker,
@@ -53273,6 +53860,12 @@ mod tests {
         // The mini sheet looks *through* itself to the surface below.
         assert_eq!(footer_ctx_inner(&app, false).view, FooterView::ConnPicker);
         app.help_mini = false;
+
+        // R65: the in-data-view table switcher owns the footer like the recent
+        // overlay does.
+        app.table_jump_open = true;
+        assert_eq!(footer_ctx(&app).view, FooterView::TableJump);
+        app.table_jump_open = false;
 
         app.export_open = true;
         assert_eq!(footer_ctx(&app).view, FooterView::ExportPicker);
