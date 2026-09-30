@@ -686,6 +686,251 @@ pub(crate) fn pair_action(text: &str, cursor: usize, ch: char) -> PairAction {
     }
 }
 
+// ── R93: comment toggle (`Ctrl-/` / `Alt-C`) ──────────────────────────────────
+
+/// What a comment toggle did, so the caller can name it in the status bar.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum CommentAction {
+    Commented,
+    Uncommented,
+}
+
+/// True when `line`'s first non-whitespace characters are a *real* `--` line
+/// comment. `line_start` is the line's char offset inside the whole-buffer
+/// lexer and `mask` its [`code_mask`] flags, so a `--` that continues a
+/// multi-line string literal (or any other non-code context) is never mistaken
+/// for a comment.
+///
+/// `code_mask` records the first `-` of a real line comment as *code* (it only
+/// flips to the comment state after recording), so the mask bit is exactly the
+/// discriminator: `true` = a real opener, `false` = inside a literal / comment.
+pub(crate) fn line_is_commented(line: &str, line_start: usize, mask: &[bool]) -> bool {
+    let chars: Vec<char> = line.chars().collect();
+    let Some(i) = chars.iter().position(|c| !c.is_whitespace()) else {
+        return false;
+    };
+    chars.get(i) == Some(&'-')
+        && chars.get(i + 1) == Some(&'-')
+        && mask.get(line_start + i).copied().unwrap_or(false)
+}
+
+/// R93: add / remove a `-- ` line comment across rows `r0..=r1` (inclusive).
+///
+/// The decision is uniform for the whole range: when every non-blank line is
+/// already a real `--` comment the toggle removes one `--` (plus one following
+/// space) from each; otherwise it inserts `-- ` after each line's indentation.
+/// Blank lines are left untouched and never affect the decision. [`code_mask`]
+/// (the shared SQL lexer) draws the boundary, so a `--` continuing a multi-line
+/// string literal is invisible to the uncomment branch. `/* … */` wrapping is
+/// deliberately *not* used: nested / partial block comments are easy to get
+/// wrong, while the line-prefix form is exactly revertible.
+///
+/// Returns the rewritten lines plus the action taken, or `None` when the range
+/// holds nothing but blank lines. Pure, so the whole matrix is unit-testable.
+pub(crate) fn toggle_comment_lines(
+    lines: &[String],
+    r0: usize,
+    r1: usize,
+) -> Option<(Vec<String>, CommentAction)> {
+    if lines.is_empty() || r0 > r1 || r1 >= lines.len() {
+        return None;
+    }
+    let text = lines.join("\n");
+    let chars: Vec<char> = text.chars().collect();
+    let mask = code_mask(&chars);
+    let mut starts = Vec::with_capacity(lines.len());
+    let mut off = 0usize;
+    for l in lines {
+        starts.push(off);
+        off += l.chars().count() + 1;
+    }
+    let blank = |row: usize| lines[row].trim().is_empty();
+    if (r0..=r1).all(blank) {
+        return None;
+    }
+    let all_commented =
+        (r0..=r1).all(|r| blank(r) || line_is_commented(&lines[r], starts[r], &mask));
+    let mut out: Vec<String> = Vec::with_capacity(lines.len());
+    for (row, line) in lines.iter().enumerate() {
+        if row < r0 || row > r1 || blank(row) {
+            out.push(line.clone());
+            continue;
+        }
+        let indent = line.len() - line.trim_start_matches([' ', '\t']).len();
+        let (head, body) = line.split_at(indent);
+        if all_commented {
+            let body_chars: Vec<char> = body.chars().collect();
+            let drop = if body_chars.get(2) == Some(&' ') {
+                3
+            } else {
+                2
+            };
+            out.push(format!(
+                "{head}{}",
+                body_chars[drop..].iter().collect::<String>()
+            ));
+        } else {
+            out.push(format!("{head}-- {body}"));
+        }
+    }
+    Some((
+        out,
+        if all_commented {
+            CommentAction::Uncommented
+        } else {
+            CommentAction::Commented
+        },
+    ))
+}
+
+/// R93 `Ctrl-/` (and the in-editor `Alt-C` fallback): toggle `-- ` line comments
+/// over the selection, or just the caret's line when nothing is selected. A
+/// multi-line selection is commented one line at a time (never `/* */`), keeping
+/// each line's indentation; a block that stays selected keeps the gesture
+/// repeatable, so a second press uncomments it. Render-state only — the buffer
+/// is rewritten in one gesture and the SQL semantics are never touched beyond
+/// the comment markers.
+pub(crate) fn toggle_comment(app: &mut App) {
+    let lines = app.editor.lines().to_vec();
+    let had_selection = app.editor.is_selecting();
+    let cursor = app.editor.cursor();
+    let (r0, r1) = match app.editor.selection_range() {
+        Some(((sr, _), (er, ec))) => {
+            // A selection that ends at column 0 does not include that line.
+            let end = if ec == 0 && er > sr { er - 1 } else { er };
+            (sr, end)
+        }
+        None => (cursor.0, cursor.0),
+    };
+    let Some((next, action)) = toggle_comment_lines(&lines, r0, r1) else {
+        app.status = t("没有可注释的行").into();
+        return;
+    };
+    let n = (r0..=r1).filter(|&r| !lines[r].trim().is_empty()).count();
+    let text = next.join("\n");
+    app.editor.select_all();
+    app.editor.insert_str(&text);
+    app.editor_clip_idx = None;
+    if had_selection {
+        // Keep the same block selected so a repeat flips the comment back.
+        let end_col = next.get(r1).map(|l| l.chars().count()).unwrap_or(0);
+        app.editor.cancel_selection();
+        app.editor.move_cursor(CursorMove::Jump(r0 as u16, 0));
+        app.editor.start_selection();
+        app.editor
+            .move_cursor(CursorMove::Jump(r1 as u16, end_col as u16));
+    } else {
+        // A single-line toggle keeps the caret on the same text (shifted by the
+        // marker) instead of leaving the whole line selected — otherwise the
+        // next typed character would replace it.
+        let indent = lines[r0].len() - lines[r0].trim_start_matches([' ', '\t']).len();
+        let delta: isize = match action {
+            CommentAction::Commented => 3,
+            CommentAction::Uncommented => {
+                if lines[r0][indent..].chars().nth(2) == Some(' ') {
+                    -3
+                } else {
+                    -2
+                }
+            }
+        };
+        let new_len = next.get(r0).map(|l| l.chars().count()).unwrap_or(0);
+        let col = if cursor.1 <= indent {
+            cursor.1
+        } else {
+            (cursor.1 as isize + delta).clamp(indent as isize, new_len as isize) as usize
+        };
+        app.editor.cancel_selection();
+        app.editor
+            .move_cursor(CursorMove::Jump(r0 as u16, col as u16));
+    }
+    app.status = match action {
+        CommentAction::Commented => tf("已注释 {} 行", &[&n]),
+        CommentAction::Uncommented => tf("已取消注释 {} 行", &[&n]),
+    };
+}
+
+// ── R93: editor clipboard ring (`Ctrl-Shift-V`) ──────────────────────────────
+
+/// Push one editor yank payload (a copy / cut / `Ctrl-K` kill) onto the ring:
+/// newest first, a repeat of an existing entry floats to the top instead of
+/// duplicating, and the ring never grows past [`EDITOR_CLIP_MAX`]. Pure, so the
+/// ordering / dedupe / cap are unit-testable.
+pub(crate) fn clip_ring_push(ring: &mut Vec<String>, text: &str) {
+    if text.is_empty() {
+        return;
+    }
+    if ring.first().map(String::as_str) == Some(text) {
+        return;
+    }
+    ring.retain(|s| s != text);
+    ring.insert(0, text.to_string());
+    ring.truncate(EDITOR_CLIP_MAX);
+}
+
+/// R93: capture a fresh editor yank into the ring. Runs after every key, so any
+/// path that fills tui-textarea's yank buffer (copy, cut, `Ctrl-K`) is
+/// remembered; an unchanged buffer is a cheap no-op. Purely in memory — nothing
+/// is persisted and the system clipboard is never read or written.
+pub(crate) fn record_editor_yank(app: &mut App) {
+    let yanked = app.editor.yank_text();
+    if yanked.is_empty() {
+        // A fresh TextArea (history recall, file load, reformat) has no yank;
+        // forget the last payload so re-copying it later is still detected.
+        app.editor_clip_last.clear();
+        return;
+    }
+    if yanked == app.editor_clip_last {
+        return;
+    }
+    app.editor_clip_last = yanked.clone();
+    clip_ring_push(&mut app.editor_clip_ring, &yanked);
+}
+
+/// R93 `Ctrl-Shift-V`: paste the next ring entry, replacing the current
+/// selection (or inserting at the caret) and leaving the pasted text *selected*
+/// so a repeat replaces it and advances — a true ring rather than a growing
+/// paste. The newest entry is used first; any other key resets the cycle.
+pub(crate) fn editor_clip_paste_step(app: &mut App) {
+    let n = app.editor_clip_ring.len();
+    if n == 0 {
+        app.status = t("剪贴板环为空（先复制或剪切）").into();
+        return;
+    }
+    let next = match app.editor_clip_idx {
+        Some(i) => (i + 1) % n,
+        None => 0,
+    };
+    let text = app.editor_clip_ring[next].clone();
+    // Where the paste starts: the selection head when there is one, else the
+    // caret.
+    let start = app
+        .editor
+        .selection_range()
+        .map(|(s, _)| s)
+        .unwrap_or_else(|| app.editor.cursor());
+    app.editor.insert_str(&text);
+    let end = app.editor.cursor();
+    app.editor.cancel_selection();
+    app.editor
+        .move_cursor(CursorMove::Jump(start.0 as u16, start.1 as u16));
+    app.editor.start_selection();
+    app.editor
+        .move_cursor(CursorMove::Jump(end.0 as u16, end.1 as u16));
+    app.editor_clip_idx = Some(next);
+    app.status = tf("剪贴板环 {}/{} · 再按替换", &[&(next + 1), &n]);
+}
+
+/// True when `k` is the clipboard-ring paste key: `Ctrl-Shift-V`, which the
+/// terminal reports either as an uppercase `V` or as `v` with the SHIFT flag set
+/// (kitty / extended keyboard protocol). Used to keep the cycle position across
+/// repeats while any other key resets it.
+pub(crate) fn is_clip_ring_key(k: &KeyEvent) -> bool {
+    k.modifiers.contains(KeyModifiers::CONTROL)
+        && (matches!(k.code, KeyCode::Char('V'))
+            || (matches!(k.code, KeyCode::Char('v')) && k.modifiers.contains(KeyModifiers::SHIFT)))
+}
+
 // ── R77: execution-error statement location ──────────────────────────────────
 
 /// Parse the 1-based line number out of a driver error message. Recognises the
@@ -1551,7 +1796,14 @@ pub(crate) fn editor_find_key(app: &mut App, k: KeyEvent) {
 }
 
 pub(crate) fn editor_key(app: &mut App, tx: &Tx, k: KeyEvent) {
+    // R93: any key other than the ring paste resets the cycle, so the next
+    // Ctrl-Shift-V starts from the newest entry.
+    if !is_clip_ring_key(&k) {
+        app.editor_clip_idx = None;
+    }
     editor_key_inner(app, tx, k);
+    // R93: a copy / cut / kill fills the yank buffer — remember it in the ring.
+    record_editor_yank(app);
     // R61: any edit invalidates the find highlight (matches moved); `Esc` keeps
     // it until exactly this moment.
     sync_editor_find(app);
@@ -1586,6 +1838,24 @@ pub(crate) fn editor_key_inner(app: &mut App, tx: &Tx, k: KeyEvent) {
         return;
     }
     match (k.modifiers, k.code) {
+        // R93: Ctrl-/ toggles `-- ` line comments over the selection (or the
+        // caret's line). Terminals disagree on what Ctrl-/ sends: the extended
+        // keyboard protocol reports `Char('/')`, while a legacy terminal sends
+        // 0x1F, which crossterm spells `Ctrl-_` or `Ctrl-7` — all three are
+        // accepted so the muscle memory works everywhere. `Alt-C` is the
+        // documented fallback (handled in the global layer, where it is
+        // context-sensitive with the compact-columns toggle).
+        (m, KeyCode::Char('/')) if m.contains(KeyModifiers::CONTROL) => toggle_comment(app),
+        (m, KeyCode::Char('_')) if m.contains(KeyModifiers::CONTROL) => toggle_comment(app),
+        (m, KeyCode::Char('7')) if m.contains(KeyModifiers::CONTROL) => toggle_comment(app),
+        // R93: Ctrl-Shift-V pastes from the editor clipboard ring (the last few
+        // copy / cut / kill payloads), cycling on repeat.
+        (m, KeyCode::Char('V')) if m.contains(KeyModifiers::CONTROL) => editor_clip_paste_step(app),
+        (m, KeyCode::Char('v'))
+            if m.contains(KeyModifiers::CONTROL) && m.contains(KeyModifiers::SHIFT) =>
+        {
+            editor_clip_paste_step(app)
+        }
         // R88: Ctrl-J runs the selection when there is one, otherwise the
         // statement under the cursor; F5 still runs the whole editor.
         (m, KeyCode::Char('j')) if m.contains(KeyModifiers::CONTROL) => {

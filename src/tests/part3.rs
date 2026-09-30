@@ -9695,3 +9695,324 @@ pub(crate) fn r92_tip_key_is_in_footer_mini_and_full_help() {
         "full help documents T"
     );
 }
+
+// ── R93: comment toggle + editor clipboard ring ──────────────────────────────
+
+fn r93_lines(v: &[&str]) -> Vec<String> {
+    v.iter().map(|s| s.to_string()).collect()
+}
+
+/// The pure comment-toggle matrix: indentation, an already-commented line (with
+/// and without the space), blank lines (skipped and ignored), a mixed block and
+/// an out-of-range selection.
+#[test]
+pub(crate) fn r93_comment_toggle_line_matrix() {
+    // Comment preserves the indent; a second pass reverts exactly once.
+    let l = r93_lines(&["  SELECT 1"]);
+    let (out, act) = toggle_comment_lines(&l, 0, 0).expect("comment");
+    assert_eq!(act, CommentAction::Commented);
+    assert_eq!(out, r93_lines(&["  -- SELECT 1"]));
+    let (back, act) = toggle_comment_lines(&out, 0, 0).expect("uncomment");
+    assert_eq!(act, CommentAction::Uncommented);
+    assert_eq!(back, l);
+
+    // `-- ` and a bare `--` are both removed with exactly one marker pass.
+    let l = r93_lines(&["-- a", "--b"]);
+    let (out, act) = toggle_comment_lines(&l, 0, 1).expect("uncomment");
+    assert_eq!(act, CommentAction::Uncommented);
+    assert_eq!(out, r93_lines(&["a", "b"]));
+
+    // Blank lines stay byte-for-byte and never sway the decision.
+    let l = r93_lines(&["", "-- a", "   ", "-- b", ""]);
+    let (out, act) = toggle_comment_lines(&l, 0, 4).expect("uncomment");
+    assert_eq!(act, CommentAction::Uncommented);
+    assert_eq!(out, r93_lines(&["", "a", "   ", "b", ""]));
+
+    // A range that is nothing but blank lines has nothing to toggle.
+    assert!(toggle_comment_lines(&r93_lines(&["", "  "]), 0, 1).is_none());
+
+    // Mixed block: the toggle comments every (non-blank) line uniformly.
+    let l = r93_lines(&["-- a", "b"]);
+    let (out, act) = toggle_comment_lines(&l, 0, 1).expect("comment");
+    assert_eq!(act, CommentAction::Commented);
+    assert_eq!(out, r93_lines(&["-- -- a", "-- b"]));
+
+    // Only the rows inside the range are touched.
+    let l = r93_lines(&["a", "b", "c"]);
+    let (out, _) = toggle_comment_lines(&l, 1, 1).expect("comment");
+    assert_eq!(out, r93_lines(&["a", "-- b", "c"]));
+
+    // An out-of-range selection is a no-op, not a panic.
+    assert!(toggle_comment_lines(&r93_lines(&["a"]), 0, 5).is_none());
+    assert!(toggle_comment_lines(&[], 0, 0).is_none());
+}
+
+/// The shared SQL lexer draws the comment boundary: a `--` that continues a
+/// multi-line string literal (or a block comment) is never read as a comment.
+#[test]
+pub(crate) fn r93_comment_toggle_lexer_ignores_string_literals() {
+    // Line 1 starts with `--` but is inside the string opened on line 0, so the
+    // uncomment branch must not fire; the toggle comments it like any other line.
+    let l = r93_lines(&["SELECT 'a", "-- b", "c'"]);
+    let (out, act) = toggle_comment_lines(&l, 1, 1).expect("comment");
+    assert_eq!(
+        act,
+        CommentAction::Commented,
+        "a string-continuation `--` must not read as commented"
+    );
+    assert_eq!(out, r93_lines(&["SELECT 'a", "-- -- b", "c'"]));
+
+    // A real comment line still reads as commented (the mask marks the opener).
+    let l = r93_lines(&["-- note"]);
+    assert_eq!(
+        toggle_comment_lines(&l, 0, 0).expect("x").1,
+        CommentAction::Uncommented
+    );
+
+    // Same for a block comment's continuation line.
+    let l = r93_lines(&["/* a", "-- b", "*/"]);
+    assert_eq!(
+        toggle_comment_lines(&l, 1, 1).expect("x").1,
+        CommentAction::Commented
+    );
+}
+
+/// `Ctrl-/` (and its Ctrl-_ / Ctrl-7 spellings) and the in-editor `Alt-C`
+/// fallback all toggle comments; elsewhere `Alt-C` keeps toggling compact
+/// columns. A no-selection toggle leaves the caret on the line, unselected.
+#[test]
+pub(crate) fn r93_comment_toggle_keys_and_alt_c_split() {
+    let (tx, _rx) = tokio::sync::mpsc::unbounded_channel::<OpResult>();
+    let mut app = test_app();
+    app.focus = Focus::Editor;
+    app.set_editor_text("SELECT 1\nFROM t");
+    app.editor.move_cursor(CursorMove::Jump(0, 3));
+
+    key(
+        &mut app,
+        &tx,
+        KeyEvent::new(KeyCode::Char('/'), KeyModifiers::CONTROL),
+    );
+    assert_eq!(app.editor_sql(), "-- SELECT 1\nFROM t");
+    assert!(
+        !app.editor.is_selecting(),
+        "a bare line toggle keeps no selection"
+    );
+
+    // Alt-C in the editor is the fallback and toggles back.
+    key(
+        &mut app,
+        &tx,
+        KeyEvent::new(KeyCode::Char('c'), KeyModifiers::ALT),
+    );
+    assert_eq!(app.editor_sql(), "SELECT 1\nFROM t");
+
+    // The legacy spellings crossterm emits for 0x1F are equivalent.
+    key(
+        &mut app,
+        &tx,
+        KeyEvent::new(KeyCode::Char('_'), KeyModifiers::CONTROL),
+    );
+    assert_eq!(app.editor_sql(), "-- SELECT 1\nFROM t");
+    key(
+        &mut app,
+        &tx,
+        KeyEvent::new(KeyCode::Char('7'), KeyModifiers::CONTROL),
+    );
+    assert_eq!(app.editor_sql(), "SELECT 1\nFROM t");
+
+    // Outside the editor Alt-C still means compact columns.
+    app.focus = Focus::Sidebar;
+    let before = app.compact;
+    key(
+        &mut app,
+        &tx,
+        KeyEvent::new(KeyCode::Char('c'), KeyModifiers::ALT),
+    );
+    assert_ne!(app.compact, before, "sidebar Alt-C should toggle compact");
+    assert_eq!(app.editor_sql(), "SELECT 1\nFROM t");
+}
+
+/// A multi-line selection comments every line and stays selected, so a second
+/// press uncomments the whole block.
+#[test]
+pub(crate) fn r93_comment_toggle_multi_line_selection_round_trips() {
+    let (tx, _rx) = tokio::sync::mpsc::unbounded_channel::<OpResult>();
+    let mut app = test_app();
+    app.focus = Focus::Editor;
+    app.set_editor_text("SELECT 1\nFROM t\nWHERE x = 1");
+    app.editor.move_cursor(CursorMove::Jump(0, 0));
+    app.editor.start_selection();
+    app.editor.move_cursor(CursorMove::Jump(2, 11));
+    key(
+        &mut app,
+        &tx,
+        KeyEvent::new(KeyCode::Char('/'), KeyModifiers::CONTROL),
+    );
+    assert_eq!(app.editor_sql(), "-- SELECT 1\n-- FROM t\n-- WHERE x = 1");
+    assert_eq!(app.editor.selection_range(), Some(((0, 0), (2, 14))));
+    // The still-live selection makes a repeat revert the block.
+    key(
+        &mut app,
+        &tx,
+        KeyEvent::new(KeyCode::Char('/'), KeyModifiers::CONTROL),
+    );
+    assert_eq!(app.editor_sql(), "SELECT 1\nFROM t\nWHERE x = 1");
+}
+
+/// The ring keeps the newest five, deduping a repeat by floating it forward.
+#[test]
+pub(crate) fn r93_clip_ring_push_dedupes_and_caps() {
+    let mut ring = Vec::new();
+    for s in ["a", "b", "c", "d", "e", "f"] {
+        clip_ring_push(&mut ring, s);
+    }
+    assert_eq!(ring, vec!["f", "e", "d", "c", "b"]);
+    assert_eq!(ring.len(), EDITOR_CLIP_MAX);
+    clip_ring_push(&mut ring, "d");
+    assert_eq!(ring, vec!["d", "f", "e", "c", "b"]);
+    clip_ring_push(&mut ring, "d");
+    assert_eq!(ring, vec!["d", "f", "e", "c", "b"]);
+    clip_ring_push(&mut ring, "");
+    assert_eq!(ring.len(), EDITOR_CLIP_MAX);
+}
+
+/// `Ctrl-Shift-V` inserts at the caret, keeps the paste selected and cycles on
+/// repeat; any other key resets the cycle to the newest entry.
+#[test]
+pub(crate) fn r93_clip_ring_paste_cycles_and_replaces_selection() {
+    let (tx, _rx) = tokio::sync::mpsc::unbounded_channel::<OpResult>();
+    let mut app = test_app();
+    app.focus = Focus::Editor;
+    let ring_key = || {
+        KeyEvent::new(
+            KeyCode::Char('V'),
+            KeyModifiers::CONTROL | KeyModifiers::SHIFT,
+        )
+    };
+
+    // Empty ring: a status hint and no edit.
+    app.set_editor_text("x = ");
+    key(&mut app, &tx, ring_key());
+    assert_eq!(app.editor_sql(), "x = ");
+    assert!(app.status.contains("剪贴板环为空"));
+
+    app.editor_clip_ring = vec!["ONE".into(), "TWO".into(), "THREE".into()];
+    app.set_editor_text("keep me");
+    app.editor.move_cursor(CursorMove::Jump(0, 4));
+    key(&mut app, &tx, ring_key());
+    assert_eq!(app.editor_sql(), "keepONE me");
+    assert_eq!(app.editor.selection_range(), Some(((0, 4), (0, 7))));
+    assert_eq!(app.editor_clip_idx, Some(0));
+
+    key(&mut app, &tx, ring_key());
+    assert_eq!(app.editor_sql(), "keepTWO me");
+    key(&mut app, &tx, ring_key());
+    assert_eq!(app.editor_sql(), "keepTHREE me");
+    key(&mut app, &tx, ring_key());
+    assert_eq!(app.editor_sql(), "keepONE me", "the ring wraps");
+
+    // Any other key ends the cycle.
+    key(
+        &mut app,
+        &tx,
+        KeyEvent::new(KeyCode::Right, KeyModifiers::NONE),
+    );
+    assert_eq!(app.editor_clip_idx, None);
+
+    // A live selection is replaced outright.
+    app.set_editor_text("hello world");
+    app.editor.move_cursor(CursorMove::Jump(0, 6));
+    app.editor.start_selection();
+    app.editor.move_cursor(CursorMove::Jump(0, 11));
+    key(&mut app, &tx, ring_key());
+    assert_eq!(app.editor_sql(), "hello ONE");
+}
+
+/// Editor copy / cut reach the ring through plain `Ctrl-C` / `Ctrl-X` when a
+/// selection is live — and the quit guard is untouched without one.
+#[test]
+pub(crate) fn r93_editor_copy_and_cut_feed_the_ring() {
+    let (tx, _rx) = tokio::sync::mpsc::unbounded_channel::<OpResult>();
+    let mut app = test_app();
+    app.focus = Focus::Editor;
+    app.set_editor_text("SELECT 42");
+    app.editor.move_cursor(CursorMove::Jump(0, 7));
+    app.editor.start_selection();
+    app.editor.move_cursor(CursorMove::Jump(0, 9));
+
+    // Ctrl-C with a selection copies instead of quitting.
+    key(
+        &mut app,
+        &tx,
+        KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL),
+    );
+    assert!(!app.quit && !app.quit_armed);
+    assert_eq!(app.editor_sql(), "SELECT 42");
+    assert_eq!(
+        app.editor_clip_ring.first().map(String::as_str),
+        Some("42"),
+        "copy fills the ring"
+    );
+
+    // Ctrl-X with a fresh selection cuts it (copy consumed the first one, the
+    // way tui-textarea's `copy` collapses the selection).
+    app.editor.move_cursor(CursorMove::Jump(0, 7));
+    app.editor.start_selection();
+    app.editor.move_cursor(CursorMove::Jump(0, 9));
+    key(
+        &mut app,
+        &tx,
+        KeyEvent::new(KeyCode::Char('x'), KeyModifiers::CONTROL),
+    );
+    assert_eq!(app.editor_sql(), "SELECT ");
+    assert_eq!(app.editor_clip_ring.first().map(String::as_str), Some("42"));
+
+    // Without a selection Ctrl-C is the quit guard again.
+    key(
+        &mut app,
+        &tx,
+        KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL),
+    );
+    assert!(
+        app.quit_armed,
+        "no selection: Ctrl-C must still ask to quit"
+    );
+}
+
+/// The new keys ship in the footer (which the mini sheet reuses) and in the
+/// full `?` sheet at once.
+#[test]
+pub(crate) fn r93_comment_and_ring_keys_are_in_footer_mini_and_full_help() {
+    let hints = footer_hints_ctx(FooterCtx {
+        view: FooterView::Browse,
+        focus: Focus::Editor,
+        has_connection: true,
+    });
+    let keys: Vec<&str> = hints.iter().map(|h| h.0).collect();
+    assert!(
+        keys.contains(&"Ctrl-/"),
+        "editor footer missing Ctrl-/: {keys:?}"
+    );
+    assert!(
+        keys.contains(&"Ctrl-⇧V"),
+        "editor footer missing Ctrl-⇧V: {keys:?}"
+    );
+    // The mini sheet reuses the same group (it only drops the pinned help key).
+    let mini: Vec<&str> = hints
+        .iter()
+        .filter(|h| h.0 != "?" && h.0 != "F1")
+        .map(|h| h.0)
+        .collect();
+    assert!(
+        mini.contains(&"Ctrl-/"),
+        "mini help missing Ctrl-/: {mini:?}"
+    );
+    // The full cheat-sheet documents all three rows.
+    for needle in ["Ctrl-/ · Alt-C", "Ctrl-C / Ctrl-X", "Ctrl-⇧V"] {
+        assert!(
+            HELP_ROWS.iter().any(|(k, _)| *k == needle),
+            "full help missing {needle:?}"
+        );
+    }
+}

@@ -1386,6 +1386,9 @@ pub(crate) fn footer_hints_ctx(ctx: FooterCtx) -> Vec<Hint> {
                 // so they lead and survive the 42-column tier trimming.
                 ("Ctrl-J", t("运行")),
                 ("Alt-/", t("补全")),
+                // R93: comment toggle is a high-frequency edit gesture, so it
+                // ranks just behind the two keys a small terminal must keep.
+                ("Ctrl-/", t("注释")),
                 ("Alt-Enter", t("当前句")),
                 // R71: the built-in SQL template panel. R79's auto-indent and
                 // bracket auto-pair are `tui.json` switches, not keys, so they
@@ -1398,6 +1401,8 @@ pub(crate) fn footer_hints_ctx(ctx: FooterCtx) -> Vec<Hint> {
                 ("%", t("配对括号")),
                 // R88: F2 toggles the optional statement-ordinal gutter.
                 ("F2", t("语句序号")),
+                // R93: the editor clipboard ring paste.
+                ("Ctrl-⇧V", t("粘贴环")),
                 ("Esc", t("侧栏")),
             ],
             Focus::CmdInput => vec![

@@ -1339,6 +1339,11 @@ pub(crate) struct SessionRun {
 /// R84: how many session runs the in-memory log keeps (LRU window).
 pub(crate) const SESSION_RUN_MAX: usize = 20;
 
+/// R93: how many recent entries the editor's clipboard ring keeps. `Ctrl-Shift-V`
+/// cycles through them; five is enough to recover a value you copied a few edits
+/// ago without turning the ring into a history you have to search.
+pub(crate) const EDITOR_CLIP_MAX: usize = 5;
+
 impl SessionRun {
     /// Render one session run as the history row the panel draws: a synthetic
     /// `session:` id makes it recognisable without touching the store.
@@ -2076,6 +2081,20 @@ pub(crate) struct App {
     /// a single `Ctrl-U` can undo it (tui-textarea's own undo needs two steps
     /// for a whole-buffer replace).
     pub(crate) editor_undo: Option<String>,
+
+    // ── R93: editor clipboard ring (`Ctrl-Shift-V`) ──
+    /// The editor's clipboard ring: the last few yank-buffer contents (a copy,
+    /// cut or `Ctrl-K` kill inside the editor), newest first, deduped and capped
+    /// at [`EDITOR_CLIP_MAX`]. Session-only — never persisted, and the system
+    /// clipboard (`Y` / OSC 52) is untouched.
+    pub(crate) editor_clip_ring: Vec<String>,
+    /// Position inside [`App::editor_clip_ring`] of the entry the last
+    /// `Ctrl-Shift-V` pasted, so repeated presses replace in place and advance.
+    /// Any other key resets it so the next paste starts from the newest entry.
+    pub(crate) editor_clip_idx: Option<usize>,
+    /// The yank-buffer text observed after the last key, so a fresh copy / cut
+    /// can be detected (and pushed onto the ring) without re-reading history.
+    pub(crate) editor_clip_last: String,
 
     // ── editor buffer find (R61 `Ctrl-F`) ──
     /// The modal one-line input while the find needle is being typed (bottom

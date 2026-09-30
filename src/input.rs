@@ -7,7 +7,15 @@ pub(crate) fn handle_event(app: &mut App, tx: &Tx, ev: Event) {
     trace_event(app, &ev);
     match ev {
         Event::Key(k) if matches!(k.kind, KeyEventKind::Press | KeyEventKind::Repeat) => {
+            // R93: any key other than the clipboard-ring paste ends the paste
+            // cycle, so the next Ctrl-Shift-V starts from the newest entry.
+            if !is_clip_ring_key(&k) {
+                app.editor_clip_idx = None;
+            }
             key(app, tx, k);
+            // R93: a copy / cut (from any path — the editor's own Ctrl-C, or
+            // tui-textarea's cut / kill) fills the yank buffer; remember it.
+            record_editor_yank(app);
             // R61: an edit through any path (paste, snippet insert, history
             // recall, completion accept, …) invalidates the editor find
             // highlight, not only the keys routed through `editor_key`.
@@ -22,6 +30,7 @@ pub(crate) fn handle_event(app: &mut App, tx: &Tx, ev: Event) {
         Event::Paste(s) => match app.focus {
             Focus::Editor => {
                 app.editor.insert_str(s);
+                app.editor_clip_idx = None;
                 sync_editor_find(app);
                 sync_editor_errors(app);
                 sync_editor_template(app);
@@ -110,6 +119,8 @@ pub(crate) fn reset_overlays_for_backend_switch(app: &mut App) {
     app.goto_prompt = None;
     // R61: drop the editor find highlight with the rest of the overlays.
     clear_editor_find(app);
+    // R93: end any in-progress clipboard-ring paste cycle.
+    app.editor_clip_idx = None;
     // R77: the located execution-error highlight is tied to the connection too.
     clear_editor_errors(app);
     app.mongo_dialog = None;
@@ -185,7 +196,17 @@ pub(crate) fn key(app: &mut App, tx: &Tx, k: KeyEvent) {
     }
     // global: quit. Ctrl-Shift-C is a *view* toggle (compact columns), so the
     // quit must not swallow it on terminals that report Shift as a modifier.
+    // R93: in the editor a live selection makes plain Ctrl-C a *copy* (feeding
+    // the clipboard ring) — copying selected SQL is a far more common intent
+    // than quitting with text highlighted, and the quit guard is unchanged
+    // whenever nothing is selected.
     if ctrl_c {
+        if app.focus == Focus::Editor && app.editor.is_selecting() {
+            app.editor.copy();
+            record_editor_yank(app);
+            app.status = t("已复制选区到剪贴板环").into();
+            return;
+        }
         request_quit(app);
         return;
     }
@@ -925,6 +946,16 @@ pub(crate) fn browse_key(app: &mut App, tx: &Tx, k: KeyEvent) {
         return;
     }
     if k.modifiers.contains(KeyModifiers::CONTROL) && k.code == KeyCode::Char('x') {
+        // R93: a live selection in the editor turns Ctrl-X into *cut* (feeding
+        // the clipboard ring) instead of clearing the batch queue — cutting the
+        // text you just highlighted is the obvious intent there. With no
+        // selection the batch-queue gesture is unchanged.
+        if app.focus == Focus::Editor && app.editor.is_selecting() {
+            app.editor.cut();
+            record_editor_yank(app);
+            app.status = t("已剪切选区到剪贴板环").into();
+            return;
+        }
         if app.batch.is_empty() {
             app.status = t("批量队列为空（编辑时按 Ctrl-T 加入）").into();
         } else {
@@ -987,7 +1018,15 @@ pub(crate) fn browse_key(app: &mut App, tx: &Tx, k: KeyEvent) {
                 return;
             }
             KeyCode::Char('c') | KeyCode::Char('C') => {
-                toggle_compact(app);
+                // R93: in the editor Alt-C is the comment-toggle fallback (for
+                // terminals where Ctrl-/ is hard to send); everywhere else it
+                // keeps toggling compact columns, the same context split the
+                // Alt-T template / transfer pair uses.
+                if app.focus == Focus::Editor {
+                    toggle_comment(app);
+                } else {
+                    toggle_compact(app);
+                }
                 return;
             }
             // Alt-H is the query-history panel; column visibility keeps its

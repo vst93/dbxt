@@ -4409,6 +4409,28 @@ fn en_of(zh: &'static str) -> Option<&'static str> {
             Some("show the next tip of the day (shown atop the connection list, rotates daily)")
         }
         "Tip {}/{} · T 换一条" => Some("Tip {}/{} · T next"),
+        // ── R93: comment toggle + editor clipboard ring ──
+        "没有可注释的行" => Some("Nothing to comment"),
+        "已注释 {} 行" => Some("Commented {} line(s)"),
+        "已取消注释 {} 行" => Some("Uncommented {} line(s)"),
+        "剪贴板环为空（先复制或剪切）" => {
+            Some("Clipboard ring is empty (copy or cut first)")
+        }
+        "剪贴板环 {}/{} · 再按替换" => {
+            Some("Clipboard ring {}/{} · press again to replace")
+        }
+        "已复制选区到剪贴板环" => Some("Copied selection to the clipboard ring"),
+        "已剪切选区到剪贴板环" => Some("Cut selection to the clipboard ring"),
+        "粘贴环" => Some("paste ring"),
+        "注释切换：选区或光标所在行加上 / 去掉 -- 前缀（保留缩进；多行选区逐行处理，不使用 /* */ 块注释）；字符串字面量里的 -- 不参与判断（复用 SQL 词法边界）；无选区只切当前行，整段保持选中便于再按一次还原。部分终端把 Ctrl-/ 报为 Ctrl-_ 或 Ctrl-7，三者等效；编辑器内 Alt-C 是同一功能的备用键（其他区域仍是紧凑列宽）" => {
+            Some("Toggle comments: add / remove the `-- ` prefix on the selection or the caret's line (indentation preserved; a multi-line selection is handled line by line, never a /* */ block); a `--` inside a string literal never counts (the shared SQL lexer draws the boundary); with no selection only the current line is toggled, and the block stays selected so a second press reverts it. Some terminals report Ctrl-/ as Ctrl-_ or Ctrl-7 — all three are equivalent; in the editor Alt-C is the fallback for the same action (elsewhere it stays the compact-columns toggle)")
+        }
+        "编辑器内有选区时：Ctrl-C 复制、Ctrl-X 剪切到剪贴板环；无选区时 Ctrl-C 仍是退出、Ctrl-X 仍是清空批量队列" => {
+            Some("With a selection in the editor: Ctrl-C copies and Ctrl-X cuts into the clipboard ring; with no selection Ctrl-C still quits and Ctrl-X still clears the batch queue")
+        }
+        "粘贴环：在最近 5 次编辑器内复制 / 剪切内容间循环，替换当前选区或在光标处插入并保持选中，连按可继续翻到下一条；仅会话内存、不落盘，也不读写系统剪贴板（Y / OSC52 通道不受影响）。需要终端能区分 Shift（kitty / wezterm / foot 等扩展键盘协议）" => {
+            Some("Paste ring: cycle through the last 5 editor copy / cut payloads, replacing the current selection (or inserting at the caret) and keeping it selected so a repeat advances; session-only, never written to disk, and it never reads or writes the system clipboard (the Y / OSC52 channel is untouched). Needs a terminal that reports Shift distinctly (kitty / wezterm / foot and other extended-keyboard-protocol terminals)")
+        }
         _ => None,
     }
 }
