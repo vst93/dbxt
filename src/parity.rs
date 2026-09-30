@@ -1496,6 +1496,47 @@ pub(crate) fn switch_result_tab(app: &mut App, delta: i32) {
     );
 }
 
+/// True when the active result tab carries an edit that has not been committed:
+/// the diff-style cell edit dialog or the red write confirmation is open. Such a
+/// tab is not closed by `Alt-W` (the hint asks the user to confirm or cancel
+/// first); every other tab closes immediately, purely client-side, with no
+/// confirmation overlay.
+pub(crate) fn result_tab_pending_edit(app: &App) -> bool {
+    app.edit_dialog.is_some() || app.confirm.is_some()
+}
+
+/// `Alt-W`: close the active query-result tab. The last tab is never closed
+/// (the grid would have nowhere to go), and a tab with a pending edit is left
+/// alone so the confirmation is not lost. Everything here is client-side: no
+/// query, no socket, and the dropped grid is only in-memory state.
+pub(crate) fn close_result_tab(app: &mut App) {
+    if app.result_tabs.is_empty() {
+        app.status = t("当前没有结果标签").into();
+        return;
+    }
+    if app.grid_kind != GridKind::Query {
+        // Closing a query tab while a table page is on screen would yank the
+        // user into another result, so the action stays scoped to query views.
+        app.status = t("当前不是查询结果 · 标签不可关").into();
+        return;
+    }
+    if result_tab_pending_edit(app) {
+        app.status = t("有未确认的编辑 · 先确认或 Esc 取消").into();
+        return;
+    }
+    if app.result_tabs.len() <= 1 {
+        app.status = t("最后一个结果标签不可关闭").into();
+        return;
+    }
+    let idx = app.result_tab.min(app.result_tabs.len() - 1);
+    app.result_tabs.remove(idx);
+    if app.result_tab >= app.result_tabs.len() {
+        app.result_tab = app.result_tabs.len() - 1;
+    }
+    app.restore_result_tab();
+    app.status = tf("已关闭结果标签 · 剩 {}", &[&(app.result_tabs.len())]);
+}
+
 /// `Alt-F` in the results pane (R48): pin / unpin the current grid. A pinned
 /// grid keeps showing in a strip above the live one, so switching to another
 /// table / database lets the two be compared up-and-down. Only data grids make

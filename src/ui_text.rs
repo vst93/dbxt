@@ -308,6 +308,11 @@ pub static ALL_KEYS: &[&str] = &[
     "主键 ",
     "事件 {}",
     "仅 1 个结果标签",
+    "当前没有结果标签",
+    "当前不是查询结果 · 标签不可关",
+    "最后一个结果标签不可关闭",
+    "有未确认的编辑 · 先确认或 Esc 取消",
+    "已关闭结果标签 · 剩 {}",
     "仅保留第一列（已记住）",
     "仅表格浏览支持删除行",
     "仅表格浏览支持快速插入",
@@ -328,7 +333,9 @@ pub static ALL_KEYS: &[&str] = &[
     "全部 {} 列已适配",
     "共 {} 行",
     "关",
+    "关标签",
     "关闭",
+    "关闭当前结果标签（最后一个不可关；有未确认编辑时先处理；纯客户端，不查询）",
     "切库",
     "切换",
     "切换到 {} …",
@@ -338,6 +345,7 @@ pub static ALL_KEYS: &[&str] = &[
     "切换数据库 → {}",
     "切换数据库（快捷）",
     "切换本次会话的结果标签",
+    "切标签",
     "列",
     "列   ",
     "列 {}{}-{}/{}",
@@ -2162,6 +2170,15 @@ fn en_of(zh: &'static str) -> Option<&'static str> {
         "主键 " => Some("primary key "),
         "事件 {}" => Some("event {}"),
         "仅 1 个结果标签" => Some("only 1 result tab"),
+        "当前没有结果标签" => Some("no result tab open"),
+        "当前不是查询结果 · 标签不可关" => {
+            Some("this is not a query result · its tab cannot be closed")
+        }
+        "最后一个结果标签不可关闭" => Some("the last result tab cannot be closed"),
+        "有未确认的编辑 · 先确认或 Esc 取消" => {
+            Some("there is an unconfirmed edit · confirm it or press Esc first")
+        }
+        "已关闭结果标签 · 剩 {}" => Some("result tab closed · {} left"),
         "仅保留第一列（已记住）" => Some("kept only the first column (remembered)"),
         "仅表格浏览支持删除行" => Some("delete rows is only supported in table browsing"),
         "仅表格浏览支持快速插入" => Some("quick insert is only supported in table browsing"),
@@ -2182,7 +2199,11 @@ fn en_of(zh: &'static str) -> Option<&'static str> {
         "全部 {} 列已适配" => Some("all {} columns fit"),
         "共 {} 行" => Some("{} rows"),
         "关" => Some("off"),
+        "关标签" => Some("close tab"),
         "关闭" => Some("close"),
+        "关闭当前结果标签（最后一个不可关；有未确认编辑时先处理；纯客户端，不查询）" => {
+            Some("Close the active result tab (the last one stays; a tab with an unconfirmed edit is kept; client-side only, never queries)")
+        }
         "切库" => Some("switch db"),
         "切换" => Some("switch"),
         "切换到 {} …" => Some("Switching to {} …"),
@@ -2192,6 +2213,7 @@ fn en_of(zh: &'static str) -> Option<&'static str> {
         "切换数据库 → {}" => Some("Switch database → {}"),
         "切换数据库（快捷）" => Some("Switch database (shortcut)"),
         "切换本次会话的结果标签" => Some("Switch result tab for this session"),
+        "切标签" => Some("switch tab"),
         "列" => Some("column"),
         "列   " => Some("col   "),
         "列 {}{}-{}/{}" => Some("cols {}{}-{}/{}"),

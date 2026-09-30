@@ -56,6 +56,15 @@ pub(crate) fn preview_key(app: &mut App, tx: &Tx, k: KeyEvent) {
         toggle_pin_results(app);
         return;
     }
+    // R73: Alt-W closes the active result tab (the last one is kept). Ctrl-W is
+    // already the pane-collapse toggle, so the tab close takes the free Alt
+    // mnemonic; the close is purely client-side and never runs a query.
+    if k.modifiers.contains(KeyModifiers::ALT)
+        && matches!(k.code, KeyCode::Char('w') | KeyCode::Char('W'))
+    {
+        close_result_tab(app);
+        return;
+    }
     // R72: Alt-0 forgets every remembered column width for the current browsed
     // table (session + tui.json). `Ctrl-0` was rejected: most terminals — tmux
     // included — collapse it to a plain `0`, which is the single-column reset.

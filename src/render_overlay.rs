@@ -97,23 +97,45 @@ pub(crate) fn render_conn_picker(f: &mut Frame, area: Rect, app: &mut App) {
     app.rects.picker_visible = true;
 
     f.render_widget(Clear, box_area);
+    let inner_w = (box_area.width as usize).saturating_sub(2);
     let items: Vec<ListItem> = app
         .connections
         .iter()
         .map(|c| {
-            let w = (box_area.width as usize).saturating_sub(16);
             let color = connection_color(c);
-            ListItem::new(Line::from(vec![
+            // R73: the connect-time latency (R63 cache) sits right-aligned on
+            // every row; a connection never probed in this session shows `-`.
+            // Read from the session cache only, so the list never opens a
+            // socket or issues a probe.
+            let lat = app
+                .server_rtts
+                .get(&c.id)
+                .map(|d| format_rtt(*d))
+                .unwrap_or_else(|| "-".to_string());
+            let lat_field = format!("{:>6}", lat);
+            let name_w = inner_w.saturating_sub(11 + 1 + 1 + disp_width(&lat_field));
+            let name = truncate_disp(&c.name, name_w.max(4));
+            let used = 11 + 1 + disp_width(&name);
+            let pad = inner_w.saturating_sub(used + disp_width(&lat_field));
+            let mut spans = vec![
                 Span::styled(
                     format!("{:11}", truncate_disp(c.db_type.as_str(), 11)),
                     Style::default().fg(color),
                 ),
                 Span::raw(" "),
                 Span::styled(
-                    truncate_disp(&c.name, w),
+                    name,
                     Style::default().fg(color).add_modifier(Modifier::BOLD),
                 ),
-            ]))
+            ];
+            if pad > 0 {
+                spans.push(Span::raw(" ".repeat(pad)));
+            }
+            spans.push(Span::styled(
+                lat_field,
+                Style::default().fg(Color::DarkGray),
+            ));
+            ListItem::new(Line::from(spans))
         })
         .collect();
     let list = List::new(items)

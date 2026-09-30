@@ -5450,3 +5450,251 @@ pub(crate) fn query_timeout_row_shows_raw_buffer_while_editing() {
         "editing row must not show the derived suffix: {editing}"
     );
 }
+
+/// R73: `Alt-W` closes the active query-result tab, keeps the tab that slides
+/// into its slot on screen, and never closes the last one (the grid would have
+/// nowhere to go).
+#[test]
+pub(crate) fn result_tab_close_keeps_current_and_protects_last() {
+    let mut app = test_app();
+    app.picker_open = false;
+    app.focus = Focus::Preview;
+    for title in ["select a", "select b", "select c"] {
+        push_result_tab(
+            &mut app,
+            title.into(),
+            Some(sample_grid()),
+            None,
+            GridKind::Query,
+        );
+    }
+    assert_eq!(app.result_tabs.len(), 3);
+    assert_eq!(app.result_tab, 2);
+
+    // Make the middle tab current, then close it.
+    app.result_tab = 1;
+    app.restore_result_tab();
+    close_result_tab(&mut app);
+    let titles: Vec<String> = app.result_tabs.iter().map(|t| t.title.clone()).collect();
+    assert_eq!(titles, vec!["select a".to_string(), "select c".to_string()]);
+    assert_eq!(app.result_tab, 1, "the tab that slid in should be shown");
+    assert!(app.grid_kind == GridKind::Query);
+
+    // Down to one: the last tab is protected.
+    close_result_tab(&mut app);
+    assert_eq!(app.result_tabs.len(), 1);
+    close_result_tab(&mut app);
+    assert_eq!(app.result_tabs.len(), 1);
+    assert!(app.status.contains("最后一个"), "{}", app.status);
+}
+
+/// R73: a tab with an unconfirmed edit is not closed — the hint asks the user
+/// to confirm or cancel first. Closing is otherwise pure client-side.
+#[test]
+pub(crate) fn result_tab_close_refuses_while_edit_pending() {
+    let mut app = test_app();
+    app.picker_open = false;
+    app.focus = Focus::Preview;
+    push_result_tab(
+        &mut app,
+        "select a".into(),
+        Some(sample_grid()),
+        None,
+        GridKind::Query,
+    );
+    push_result_tab(
+        &mut app,
+        "select b".into(),
+        Some(sample_grid()),
+        None,
+        GridKind::Query,
+    );
+    app.confirm = Some(Confirm {
+        sql: "update t set a = 1".into(),
+        reasons: vec!["write".into()],
+        refresh: true,
+        clear_batch: false,
+        redis: None,
+        mongo: None,
+        conn: None,
+    });
+    assert!(result_tab_pending_edit(&app));
+    close_result_tab(&mut app);
+    assert_eq!(
+        app.result_tabs.len(),
+        2,
+        "pending edit must block the close"
+    );
+    assert!(app.status.contains("未确认"), "{}", app.status);
+}
+
+/// R73: the tab-strip layout shows every tab when they fit, folds the middle
+/// into `…` when they do not, and always keeps the current tab inside the
+/// window.
+#[test]
+pub(crate) fn tab_strip_folds_but_keeps_current_visible() {
+    let widths = vec![6usize; 8];
+    // Wide: every tab, no folds.
+    assert_eq!(tab_strip_window(8, 3, &widths, 500), (0, 7, false, false));
+    // Narrow around a middle tab: folds on both sides, current inside.
+    let (lo, hi, lf, rf) = tab_strip_window(8, 3, &widths, 30);
+    assert!(lo <= 3 && 3 <= hi, "current hidden: {lo}..{hi}");
+    assert!(
+        lf && rf,
+        "expected folds on both sides: {lo}..{hi} {lf} {rf}"
+    );
+    // Current at the far end: the right fold disappears.
+    let (lo, hi, lf, rf) = tab_strip_window(8, 7, &widths, 30);
+    assert!(lo <= 7 && 7 <= hi, "current hidden: {lo}..{hi}");
+    assert!(!rf && lf, "far-end window should only fold the left");
+    // Too narrow even for one folded tab: no folds, the caller clips the label.
+    assert_eq!(tab_strip_window(8, 3, &widths, 5), (3, 3, false, false));
+}
+
+/// R73: the tab label is the 1-based number plus the statement's first 12
+/// display columns.
+#[test]
+pub(crate) fn result_tab_label_uses_number_and_twelve_chars() {
+    assert_eq!(
+        result_tab_label(0, "select * from orders"),
+        "1:select * fr…"
+    );
+    assert_eq!(result_tab_label(2, "short"), "3:short");
+}
+
+/// R73: the strip actually reaches the screen for a multi-tab query result and
+/// folds when the terminal is narrow (42×22, bilingual-neutral glyphs).
+#[test]
+pub(crate) fn result_tab_strip_renders_and_folds() {
+    let mut app = test_app();
+    app.picker_open = false;
+    app.selected = Some(test_conn("mysql"));
+    app.backend_kind = Backend::Sql;
+    app.focus = Focus::Preview;
+    for i in 0..5 {
+        push_result_tab(
+            &mut app,
+            format!("select col_{i} from t"),
+            Some(sample_grid()),
+            None,
+            GridKind::Query,
+        );
+    }
+    let screen = draw(&mut app, 42, 22).join("\n");
+    let cur = result_tab_label(4, "select col_4 from t");
+    assert!(screen.contains(&cur), "missing current tab {cur}: {screen}");
+    assert!(screen.contains('…'), "expected a folded tab: {screen}");
+}
+
+/// R73: the connection picker shows each connection's connect-time latency from
+/// the R63 session cache, and `-` for one never probed. Pure client-side read.
+#[test]
+pub(crate) fn conn_picker_shows_latency_column() {
+    let mut app = test_app();
+    let mk = |id: &str, name: &str| {
+        new_connection_config(
+            id.into(),
+            name.into(),
+            parse_database_type("mysql").unwrap(),
+            "127.0.0.1".into(),
+            1,
+            "u".into(),
+            "p".into(),
+            None,
+            false,
+            None,
+        )
+        .unwrap()
+    };
+    let alpha = mk("id-alpha", "alpha");
+    let beta = mk("id-beta", "beta");
+    app.connections = vec![alpha.clone(), beta];
+    app.selected = None;
+    app.picker_open = true;
+    app.backend_kind = Backend::Sql;
+    app.server_rtts
+        .insert(alpha.id.clone(), Duration::from_millis(12));
+    let screen = draw(&mut app, 70, 20).join("\n");
+    assert!(
+        screen.contains("12ms"),
+        "connected latency missing: {screen}"
+    );
+    assert!(
+        screen.contains("     -"),
+        "unconnected connection should show `-`: {screen}"
+    );
+}
+
+/// R73: the new result-tab strings resolve in English (the tab strip itself is
+/// language-neutral: `…` and the SQL-derived labels read the same in both).
+#[test]
+pub(crate) fn result_tab_close_strings_are_bilingual() {
+    use ui_text::{t_lang, tf_lang, Lang};
+    assert_eq!(
+        t_lang("最后一个结果标签不可关闭", Lang::En),
+        "the last result tab cannot be closed"
+    );
+    assert_eq!(t_lang("当前没有结果标签", Lang::En), "no result tab open");
+    assert_eq!(t_lang("切标签", Lang::En), "switch tab");
+    assert_eq!(t_lang("关标签", Lang::En), "close tab");
+    assert_eq!(
+        tf_lang("已关闭结果标签 · 剩 {}", &[&2], Lang::En),
+        "result tab closed · 2 left"
+    );
+    assert!(t_lang(
+        "关闭当前结果标签（最后一个不可关；有未确认编辑时先处理；纯客户端，不查询）",
+        Lang::En
+    )
+    .starts_with("Close the active result tab"));
+}
+
+/// R73: while a table page (not a query result) is on screen, `Alt-W` refuses
+/// so closing a stale query tab cannot yank the user into another result.
+#[test]
+pub(crate) fn result_tab_close_refuses_on_table_page() {
+    let mut app = test_app();
+    app.picker_open = false;
+    app.focus = Focus::Preview;
+    push_result_tab(
+        &mut app,
+        "select a".into(),
+        Some(sample_grid()),
+        None,
+        GridKind::Query,
+    );
+    push_result_tab(
+        &mut app,
+        "select b".into(),
+        Some(sample_grid()),
+        None,
+        GridKind::Query,
+    );
+    app.grid_kind = GridKind::TableData;
+    close_result_tab(&mut app);
+    assert_eq!(app.result_tabs.len(), 2);
+    assert!(app.status.contains("不是查询结果"), "{}", app.status);
+}
+
+/// R73: a connection root's right-aligned cell shows its connect-time latency
+/// from the R63 cache, and `-` for one never probed in this session.
+#[test]
+pub(crate) fn sidebar_connection_row_shows_latency() {
+    let mut app = tree_app();
+    app.term_w = 100;
+    let id = app.selected.as_ref().unwrap().id.clone();
+    app.server_rtts.insert(id, Duration::from_millis(26));
+    assert_eq!(
+        side_row_size(&app, &SideRow::Conn { idx: 0, depth: 0 }).as_deref(),
+        Some("26ms")
+    );
+    assert_eq!(
+        side_row_size(&app, &SideRow::Conn { idx: 1, depth: 0 }).as_deref(),
+        Some("-")
+    );
+    // A narrow sidebar hides the column entirely, exactly like the size cell.
+    app.term_w = 42;
+    assert_eq!(
+        side_row_size(&app, &SideRow::Conn { idx: 0, depth: 0 }),
+        None
+    );
+}

@@ -1264,6 +1264,8 @@ pub(crate) fn footer_hints_ctx(ctx: FooterCtx) -> Vec<Hint> {
                 ("|", t("跳列")),
                 ("gd/gt", t("结构/数据")),
                 ("gb", t("切换表")),
+                ("[ ]", t("切标签")),
+                ("Alt-W", t("关标签")),
                 ("Alt-O", t("语句耗时")),
             ],
         },
@@ -1807,6 +1809,140 @@ pub(crate) fn render_results_strip(f: &mut Frame, area: Rect, app: &mut App) {
     );
 }
 
+/// R73: the short label for one result tab — its 1-based number plus the first
+/// 12 display columns of the statement that produced it. Pure, so the strip and
+/// its tests agree on the exact text.
+pub(crate) fn result_tab_label(idx: usize, title: &str) -> String {
+    format!("{}:{}", idx + 1, truncate_disp(title, 12))
+}
+
+/// R73: pure tab-strip layout. Given `n` tab label widths and `avail` columns,
+/// return the inclusive index window to draw around `current`, plus whether a
+/// `…` fold stands in for hidden tabs on the left / right. The current tab is
+/// always inside the window; a hidden middle is folded to `…` on each side.
+pub(crate) fn tab_strip_window(
+    n: usize,
+    current: usize,
+    widths: &[usize],
+    avail: usize,
+) -> (usize, usize, bool, bool) {
+    if n == 0 {
+        return (0, 0, false, false);
+    }
+    let current = current.min(n - 1);
+    // A tab token is ` label ` (2 padding columns); a fold token is `…`; tokens
+    // are joined by `│`. Cost includes the separators.
+    let cost = |lo: usize, hi: usize| -> usize {
+        let mut sum = 0usize;
+        let mut count = 0usize;
+        if lo > 0 {
+            sum += 1;
+            count += 1;
+        }
+        for i in lo..=hi {
+            sum += widths.get(i).copied().unwrap_or(0) + 2;
+            count += 1;
+        }
+        if hi < n - 1 {
+            sum += 1;
+            count += 1;
+        }
+        sum + count.saturating_sub(1)
+    };
+    let (mut lo, mut hi) = (current, current);
+    loop {
+        if hi + 1 < n && cost(lo, hi + 1) <= avail {
+            hi += 1;
+            continue;
+        }
+        if lo > 0 && cost(lo - 1, hi) <= avail {
+            lo -= 1;
+            continue;
+        }
+        break;
+    }
+    // When even the folded single tab does not fit, drop the folds so the
+    // caller knows to clip the label instead of drawing an overflowing row.
+    if cost(lo, hi) > avail {
+        return (current, current, false, false);
+    }
+    (lo, hi, lo > 0, hi < n - 1)
+}
+
+/// R73: draw the one-line result-tab strip. The active tab is bold, the rest
+/// dim, and a too-wide bar folds its middle to `…` while the current tab stays
+/// on screen. Purely presentational — the strip is drawn from the cached tabs,
+/// so it never runs a query.
+pub(crate) fn render_result_tabs(f: &mut Frame, area: Rect, app: &App) {
+    if app.result_tabs.is_empty() || area.width == 0 || area.height == 0 {
+        return;
+    }
+    let labels: Vec<String> = app
+        .result_tabs
+        .iter()
+        .enumerate()
+        .map(|(i, t)| result_tab_label(i, &t.title))
+        .collect();
+    let widths: Vec<usize> = labels.iter().map(|l| disp_width(l)).collect();
+    let avail = area.width as usize;
+    let (lo, hi, lfold, rfold) = tab_strip_window(labels.len(), app.result_tab, &widths, avail);
+    let dim = Style::default().fg(Color::DarkGray);
+    let current_style = Style::default()
+        .fg(Color::Black)
+        .bg(Color::Gray)
+        .add_modifier(Modifier::BOLD);
+    // When even a single folded tab does not fit, fall back to a clipped label
+    // so the active tab is still named rather than the row going blank.
+    let single_overflow = lo == hi && !lfold && !rfold && (widths[lo] + 2) > avail;
+    let mut spans: Vec<Span> = Vec::new();
+    if single_overflow {
+        spans.push(Span::styled(
+            truncate_disp(&labels[lo], avail),
+            current_style,
+        ));
+    } else {
+        let push_token = |spans: &mut Vec<Span>, text: String, style: Style| {
+            if !spans.is_empty() {
+                spans.push(Span::styled("│", dim));
+            }
+            spans.push(Span::styled(text, style));
+        };
+        if lfold {
+            push_token(&mut spans, "…".to_string(), dim);
+        }
+        for (i, label) in labels.iter().enumerate().take(hi + 1).skip(lo) {
+            let cur = i == app.result_tab;
+            push_token(
+                &mut spans,
+                format!(" {} ", label),
+                if cur { current_style } else { dim },
+            );
+        }
+        if rfold {
+            push_token(&mut spans, "…".to_string(), dim);
+        }
+    }
+    f.render_widget(Paragraph::new(Line::from(spans)), area);
+}
+
+/// R73: carve the one-line result-tab strip off the top of the results pane
+/// when several query tabs are open, and hand back the area left for the grid.
+/// Below the minimum height the strip is skipped so a tiny terminal keeps its
+/// rows for data.
+pub(crate) fn result_tab_strip_area(f: &mut Frame, area: Rect, app: &App) -> Rect {
+    if app.result_tabs.len() > 1 && app.grid_kind == GridKind::Query && area.height >= 5 {
+        let strip = Rect { height: 1, ..area };
+        render_result_tabs(f, strip, app);
+        Rect {
+            y: area.y + 1,
+            height: area.height - 1,
+            ..area
+        }
+    } else {
+        area
+    }
+}
+
 pub(crate) fn border_style(focused: bool) -> Style {
     if focused {
         Style::default().fg(Color::Green)
@@ -1816,6 +1952,10 @@ pub(crate) fn border_style(focused: bool) -> Style {
 }
 
 pub(crate) fn render_results_pane(f: &mut Frame, area: Rect, app: &mut App) {
+    // R73: a query result with several tabs gets a one-line strip on top; the
+    // grid (and the mouse mapping) then uses the area left below it.
+    let area = result_tab_strip_area(f, area, app);
+    app.rects.results = area;
     if let Some(s) = app.script.clone() {
         if let Some(i) = s.drilled {
             let o = &s.outcomes[i];
@@ -3470,14 +3610,25 @@ pub(crate) fn side_row_line(
     Line::from(spans)
 }
 
-/// The right-aligned size cell for a database (`2.1 GB`) or table (`1.2k` row
+/// The right-aligned cell for a database (`2.1 GB`) or table (`1.2k` row
 /// estimate) row, or `None` when there is nothing (or no room) to show (R45).
+/// R73: a connection root instead shows its connect-time latency (R63 cache),
+/// or `-` when this session never probed it.
 pub(crate) fn side_row_size(app: &App, row: &SideRow) -> Option<String> {
     // Width first: a narrow screen gives every cell to the name.
     if app.term_w < 56 {
         return None;
     }
     match row {
+        SideRow::Conn { idx, .. } => {
+            let id = side_root_cfg(app, *idx).map(|c| c.id.clone())?;
+            Some(
+                app.server_rtts
+                    .get(&id)
+                    .map(|d| format_rtt(*d))
+                    .unwrap_or_else(|| "-".to_string()),
+            )
+        }
         SideRow::Db { db, .. } => match app.db_size_state.get(db) {
             Some(TreeDbState::Loading) => Some("…".to_string()),
             Some(TreeDbState::Error(_)) => Some("✗".to_string()),

@@ -1131,6 +1131,10 @@ pub(crate) const HELP_ROWS: &[(&str, &str)] = &[
     ),
     ("[ ]", "切换本次会话的结果标签"),
     (
+        "Alt-W",
+        "关闭当前结果标签（最后一个不可关；有未确认编辑时先处理；纯客户端，不查询）",
+    ),
+    (
         "Ctrl-Y",
         "导出当前结果（CSV / JSON / NDJSON / Markdown / INSERT）",
     ),
