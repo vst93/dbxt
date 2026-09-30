@@ -299,6 +299,13 @@ pub(crate) fn confirm_key(app: &mut App, tx: &Tx, k: KeyEvent) {
                         open_redis_typed_confirm(app, rc);
                         return;
                     }
+                    // R81: a confirmed single-key TTL write updates the loaded
+                    // list in place (no rescan, cursor kept) and re-applies the
+                    // active filter / order so a TTL sort stays truthful.
+                    if !rc.set_ttl_in_place.is_empty() {
+                        redis_apply_ttl_in_place(app, &rc.set_ttl_in_place);
+                        apply_redis_filter(app);
+                    }
                     if !rc.batch.is_empty() {
                         // R57: a single-key delete prunes the loaded list in
                         // place before the command runs, keeping the cursor.
@@ -1548,6 +1555,12 @@ pub(crate) fn sidebar_key(app: &mut App, tx: &Tx, k: KeyEvent) {
             redis_batch_delete(app);
             return;
         }
+        // R81: Ctrl-T cycles the loaded-key ordering scan → TTL↑ → TTL↓. Pure
+        // client-side re-sorting of the loaded window; never a query.
+        if k.modifiers.contains(KeyModifiers::CONTROL) && k.code == KeyCode::Char('t') {
+            cycle_redis_sort(app);
+            return;
+        }
         // R42 first-letter jump: Alt+<letter> cycles to the next loaded key
         // starting with that letter (the KV twin of the sidebar table jump).
         if k.modifiers.contains(KeyModifiers::ALT) {
@@ -1605,6 +1618,11 @@ pub(crate) fn sidebar_key(app: &mut App, tx: &Tx, k: KeyEvent) {
             KeyCode::Char('a') => redis_select_all(app),
             // `y` copies the selected key names (or the focused one).
             KeyCode::Char('y') => redis_copy_selection(app),
+            // R81: `T` sets the focused key's TTL (red confirm, read-only
+            // blocked); `t` cycles the client-side type filter over the loaded
+            // keys. Both are pure-local until confirmed: no browsing query.
+            KeyCode::Char('T') => open_redis_key_ttl_prompt(app),
+            KeyCode::Char('t') => cycle_redis_type_filter(app),
             // Batch operations act on the selection (focused key when empty).
             KeyCode::Delete => redis_batch_delete(app),
             KeyCode::Char('x') => open_redis_batch_ttl_prompt(app),

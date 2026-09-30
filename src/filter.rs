@@ -49,20 +49,26 @@ pub(crate) fn apply_redis_filter(app: &mut App) {
         .and_then(|i| app.redis_scan.keys.get(i))
         .map(|k| k.key_raw.clone());
     let needle = app.redis_filter.trim().to_lowercase();
-    app.redis_scan.keys = if needle.is_empty() {
-        app.redis_scan.all.clone()
-    } else {
-        app.redis_scan
-            .all
-            .iter()
-            .filter(|k| {
-                fix_double_encoding(&k.key_display)
+    let type_filter = app.redis_type_filter.clone();
+    let mut list: Vec<RedisKeyInfo> = app
+        .redis_scan
+        .all
+        .iter()
+        .filter(|k| {
+            type_filter
+                .as_deref()
+                .is_none_or(|ty| k.key_type.eq_ignore_ascii_case(ty))
+        })
+        .filter(|k| {
+            needle.is_empty()
+                || fix_double_encoding(&k.key_display)
                     .to_lowercase()
                     .contains(&needle)
-            })
-            .cloned()
-            .collect()
-    };
+        })
+        .cloned()
+        .collect();
+    redis_sort_keys(&mut list, app.redis_sort);
+    app.redis_scan.keys = list;
     let n = app.redis_scan.keys.len();
     if n == 0 {
         app.redis_list.select(None);
@@ -73,6 +79,58 @@ pub(crate) fn apply_redis_filter(app: &mut App) {
         .unwrap_or(0)
         .min(n - 1);
     app.redis_list.select(Some(sel));
+}
+
+/// R81: re-sort the loaded key window in place. `Scan` is a no-op (arrival
+/// order); the TTL modes order by remaining seconds, with persistent (`-1`) and
+/// missing (`-2`) keys ranked last (ascending) / first (descending). The sort is
+/// stable, so equal TTLs keep their SCAN order.
+pub(crate) fn redis_sort_keys(keys: &mut [RedisKeyInfo], sort: RedisSort) {
+    fn ttl_rank(ttl: i64) -> i64 {
+        if ttl < 0 {
+            i64::MAX
+        } else {
+            ttl
+        }
+    }
+    match sort {
+        RedisSort::Scan => {}
+        RedisSort::TtlAsc => keys.sort_by_key(|k| ttl_rank(k.ttl)),
+        RedisSort::TtlDesc => keys.sort_by_key(|k| std::cmp::Reverse(ttl_rank(k.ttl))),
+    }
+}
+
+/// R81: `Ctrl-T` in the key browser cycles the loaded-key ordering
+/// `扫描顺序 → TTL 升序 → TTL 降序 → 扫描顺序`. Pure client-side re-sorting; the
+/// SCAN cursor and the loaded window are untouched.
+pub(crate) fn cycle_redis_sort(app: &mut App) {
+    app.redis_sort = app.redis_sort.next();
+    apply_redis_filter(app);
+    app.status = tf(
+        "key 排序：{} · {} 个 key · Ctrl-T 循环",
+        &[&(app.redis_sort.label()), &(app.redis_scan.keys.len())],
+    );
+}
+
+/// R81: `t` in the key browser cycles the client-side type filter
+/// (`全部 → string → hash → list → set → zset → stream → 全部`) over the loaded
+/// keys. Zero queries — the type came from the SCAN page itself.
+pub(crate) fn cycle_redis_type_filter(app: &mut App) {
+    let cur = app.redis_type_filter.as_deref().unwrap_or("");
+    let i = REDIS_TYPE_FILTERS
+        .iter()
+        .position(|f| *f == cur)
+        .unwrap_or(0);
+    let next = REDIS_TYPE_FILTERS[(i + 1) % REDIS_TYPE_FILTERS.len()];
+    app.redis_type_filter = (!next.is_empty()).then(|| next.to_string());
+    apply_redis_filter(app);
+    app.status = match &app.redis_type_filter {
+        Some(ty) => tf(
+            "类型过滤 {} · {} 个 key · t 循环",
+            &[&(ty.as_str()), &(app.redis_scan.keys.len())],
+        ),
+        None => tf("类型过滤 全部 · {} 个 key", &[&(app.redis_scan.keys.len())]),
+    };
 }
 
 /// Open the Redis key filter, optionally seeded with the character that started

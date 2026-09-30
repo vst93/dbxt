@@ -3877,6 +3877,45 @@ fn en_of(zh: &'static str) -> Option<&'static str> {
         "整型值落在 epoch 秒范围（1e9~4e10）时，弹层底部灰显本地时间 + 相对时间（如 2024-06-01 12:34:56 · 3 天前）；仅预览，不改数据、不猜测时区语义" => Some(
             "When an integer cell lands in the epoch-seconds range (1e9..4e10), the popup appends a gray local time + relative time line (e.g. 2024-06-01 12:34:56 · 3 days ago); preview only — the value is never changed and no timezone semantics are guessed",
         ),
+        // ── R81: Redis key browsing (TTL display / sort / edit, type filter) ──
+        "TTL 不能为空：秒数，可加 s/ms/m/h/d 后缀" => {
+            Some("TTL cannot be empty: seconds, optionally with an s/ms/m/h/d suffix")
+        }
+        "TTL 需为整数（可加 s/ms/m/h/d 后缀，-1 持久化）" => {
+            Some("TTL must be an integer (s/ms/m/h/d suffix allowed; -1 persists)")
+        }
+        "TTL 超出范围" => Some("TTL out of range"),
+        "永久（-1）" => Some("persistent (-1)"),
+        "扫描顺序" => Some("scan order"),
+        "TTL 升序" => Some("TTL ascending"),
+        "TTL 降序" => Some("TTL descending"),
+        "TTL：300 / 30m / 2h / 500ms（-1 = 持久化，0 = 立即删除）" => {
+            Some("TTL: 300 / 30m / 2h / 500ms (-1 = persist, 0 = delete now)")
+        }
+        "类型过滤 {} · {} 个 key · t 循环" => Some("type filter {} · {} keys · t cycles"),
+        "key 排序：{} · {} 个 key · Ctrl-T 循环" => {
+            Some("key order: {} · {} keys · Ctrl-T cycles")
+        }
+        "类型过滤 全部 · {} 个 key" => Some("type filter all · {} keys"),
+        "将 key {} 的 TTL 设为 {}（覆盖当前 TTL，不可撤销）" => {
+            Some("set key {} TTL to {} (overwrites the current TTL, irreversible)")
+        }
+        "设 TTL" => Some("set TTL"),
+        "类型过滤" => Some("type filter"),
+        "TTL 排序" => Some("TTL sort"),
+        "设置焦点 key 的 TTL（红确认层；秒，可加 s/ms/m/h/d 后缀；只读连接拦截）" => {
+            Some("set the focused key's TTL (red confirm; seconds with an optional s/ms/m/h/d suffix; blocked on a read-only connection)")
+        }
+        "按类型循环过滤 string/hash/list/set/zset/stream（客户端，零查询）" => {
+            Some("cycle a client-side type filter string/hash/list/set/zset/stream (zero queries)")
+        }
+        "按 TTL 排序已加载 key：扫描顺序 → 升序 → 降序 循环（客户端）" => {
+            Some("order the loaded keys by TTL: scan order → ascending → descending (client-side)")
+        }
+        "行尾 TTL" => Some("TTL at row end"),
+        "紧凑显示 `45s` / `5m` / `2h` / `3d`，`-1` 永久、`-2` 不存在；每秒本地倒计时" => {
+            Some("compact `45s` / `5m` / `2h` / `3d`, `-1` permanent, `-2` missing; counts down locally every second")
+        }
         _ => None,
     }
 }

@@ -4165,6 +4165,8 @@ impl App {
             side_table_seen: None,
             redis_filter: String::new(),
             redis_filter_prompt: None,
+            redis_type_filter: None,
+            redis_sort: RedisSort::Scan,
             redis_jump_letter: None,
             show_stmt_timing: false,
             columns: Vec::new(),

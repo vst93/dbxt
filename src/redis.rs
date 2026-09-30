@@ -3,6 +3,12 @@ use crate::*;
 
 // ─── Redis key browser ───────────────────────────────────────────────────────
 
+/// R81: the key-browser type filter cycle (`t`). The empty string is the "all
+/// types" step; every other entry matches a key's `TYPE` verbatim. Pure
+/// client-side filtering of the already-loaded SCAN window.
+pub(crate) const REDIS_TYPE_FILTERS: [&str; 7] =
+    ["", "string", "hash", "list", "set", "zset", "stream"];
+
 /// Server-side SCAN state for the Redis key browser. Keys are appended page by
 /// page (never a full `KEYS *`), and `cursor == 0` marks the end of the keyspace.
 #[derive(Clone)]
@@ -69,6 +75,9 @@ pub(crate) enum RedisPromptKind {
     Pattern,
     /// New TTL in seconds for the focused key.
     Ttl,
+    /// R81: new TTL for the focused key straight from the key list (`T`), with
+    /// an optional `s` / `ms` / `m` / `h` / `d` unit suffix.
+    TtlKey,
     /// New key name for a RENAME.
     Rename,
     /// New string body for the focused string key.
@@ -206,6 +215,7 @@ pub(crate) fn redis_confirm_delete(app: &mut App) {
             typed_confirm: None,
             summary: String::new(),
             remove_in_place: Vec::new(),
+            set_ttl_in_place: Vec::new(),
         }),
         mongo: None,
     });
@@ -432,6 +442,7 @@ pub(crate) fn redis_open_batch_confirm(
             typed_confirm,
             summary,
             remove_in_place: Vec::new(),
+            set_ttl_in_place: Vec::new(),
         }),
         mongo: None,
     });
@@ -467,6 +478,25 @@ pub(crate) fn redis_remove_keys_in_place(app: &mut App, raws: &[String]) {
             app.redis_value = None;
             app.clear_grid();
             app.focus = Focus::Sidebar;
+        }
+    }
+}
+
+/// R81: reflect a just-confirmed single-key TTL write in the loaded key window
+/// in place, so the list keeps its SCAN cursor / position instead of rescanning
+/// from page one. Pure local state, no extra query.
+pub(crate) fn redis_apply_ttl_in_place(app: &mut App, updates: &[(String, i64)]) {
+    for (raw, ttl) in updates {
+        for k in app.redis_scan.all.iter_mut().filter(|k| &k.key_raw == raw) {
+            k.ttl = *ttl;
+        }
+        for k in app.redis_scan.keys.iter_mut().filter(|k| &k.key_raw == raw) {
+            k.ttl = *ttl;
+        }
+        if let Some(v) = app.redis_value.as_mut() {
+            if &v.key_raw == raw {
+                v.ttl = *ttl;
+            }
         }
     }
 }
@@ -770,6 +800,47 @@ pub(crate) fn redis_prompt_key(app: &mut App, tx: &Tx, k: KeyEvent) {
             }
             return;
         }
+        // R81: `T` on the key list parses seconds / `ms` / `m` / `h` / `d` and
+        // opens the red layer. The new TTL is also reflected in the loaded list
+        // in place, so the browser never rescans from page one.
+        RedisPromptKind::TtlKey => {
+            let plan = match redis_ttl_command(&p.key_display, &input) {
+                Ok(plan) => plan,
+                Err(e) => {
+                    app.status = format!("✗ {e}");
+                    app.redis_prompt = Some(p);
+                    return;
+                }
+            };
+            app.confirm = Some(Confirm {
+                sql: plan.command.clone(),
+                reasons: vec![
+                    tf(
+                        "将 key {} 的 TTL 设为 {}（覆盖当前 TTL，不可撤销）",
+                        &[&(p.key_display), &(plan.label)],
+                    ),
+                    t("Enter 执行 · Esc 取消").into(),
+                ],
+                refresh: false,
+                clear_batch: false,
+                conn: None,
+                redis: Some(RedisConfirm {
+                    db: app.redis_db,
+                    cmd: plan.command,
+                    batch: Vec::new(),
+                    batch_keys: Vec::new(),
+                    reload_value: None,
+                    reload_list: false,
+                    typed_confirm: None,
+                    summary: String::new(),
+                    remove_in_place: Vec::new(),
+                    set_ttl_in_place: vec![(p.key_raw.clone(), plan.ttl_secs)],
+                }),
+                mongo: None,
+            });
+            app.status = t("确认写入 · Enter 执行 · Esc 取消").into();
+            return;
+        }
         _ => {}
     }
     let cmd = redis_prompt_command(p.kind, &p.key_display, &p.field, &input);
@@ -784,6 +855,7 @@ pub(crate) fn redis_prompt_key(app: &mut App, tx: &Tx, k: KeyEvent) {
         }
         RedisPromptKind::Ttl => (Some(p.key_raw.clone()), true),
         RedisPromptKind::Pattern
+        | RedisPromptKind::TtlKey
         | RedisPromptKind::BatchTtl
         | RedisPromptKind::BatchRenamePrefix
         | RedisPromptKind::BatchConfirm => (None, false),
@@ -807,6 +879,7 @@ pub(crate) fn redis_prompt_key(app: &mut App, tx: &Tx, k: KeyEvent) {
             typed_confirm: None,
             summary: String::new(),
             remove_in_place: Vec::new(),
+            set_ttl_in_place: Vec::new(),
         }),
         mongo: None,
     });

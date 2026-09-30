@@ -341,6 +341,87 @@ pub(crate) fn redis_ttl_advance(ttl: i64, secs: i64) -> i64 {
     }
 }
 
+/// R81: compact TTL for the key-browser row — `45s` / `5m` / `2h` / `3d`, with
+/// `-1` permanent and `-2` missing shown verbatim. Purely a rendering of the
+/// `TTL` value already loaded by SCAN, so the list stays query-free.
+pub(crate) fn redis_ttl_short(ttl: i64) -> String {
+    if ttl < 0 {
+        return ttl.to_string();
+    }
+    match ttl {
+        0..=59 => format!("{ttl}s"),
+        60..=3599 => format!("{}m", ttl / 60),
+        3600..=86399 => format!("{}h", ttl / 3600),
+        n => format!("{}d", n / 86400),
+    }
+}
+
+/// R81: the parsed result of a key-list TTL input (`T`): the exact Redis
+/// command, a human label and the TTL in seconds for a local, query-free list
+/// refresh.
+#[derive(Clone, PartialEq, Debug)]
+pub struct RedisTtlPlan {
+    pub command: String,
+    pub label: String,
+    pub ttl_secs: i64,
+}
+
+/// R81: parse a TTL argument for the key browser's `T` prompt. A bare integer
+/// is seconds; an explicit `s` / `ms` / `m` / `h` / `d` suffix picks the unit
+/// (`ms` needs `PEXPIRE`, everything else `EXPIRE`). `-1` persists the key and
+/// `0` deletes it immediately, exactly like `EXPIRE`.
+pub(crate) fn redis_ttl_command(key: &str, input: &str) -> Result<RedisTtlPlan, String> {
+    let raw = input.trim();
+    if raw.is_empty() {
+        return Err(t("TTL 不能为空：秒数，可加 s/ms/m/h/d 后缀").to_string());
+    }
+    let lower = raw.to_ascii_lowercase();
+    let (num, unit_ms) = if let Some(p) = lower.strip_suffix("ms") {
+        (p, 1i64)
+    } else if let Some(p) = lower.strip_suffix('s') {
+        (p, 1_000)
+    } else if let Some(p) = lower.strip_suffix('m') {
+        (p, 60_000)
+    } else if let Some(p) = lower.strip_suffix('h') {
+        (p, 3_600_000)
+    } else if let Some(p) = lower.strip_suffix('d') {
+        (p, 86_400_000)
+    } else {
+        (lower.as_str(), 1_000)
+    };
+    let n: i64 = num
+        .trim()
+        .parse()
+        .map_err(|_| t("TTL 需为整数（可加 s/ms/m/h/d 后缀，-1 持久化）").to_string())?;
+    let ms = n
+        .checked_mul(unit_ms)
+        .ok_or_else(|| t("TTL 超出范围").to_string())?;
+    // Prefer EXPIRE (whole seconds) so the common case is a plain second count;
+    // a sub-second / millisecond input needs PEXPIRE.
+    let command = if ms % 1_000 == 0 {
+        format!("EXPIRE {} {}", redis_quote(key), ms / 1_000)
+    } else {
+        format!("PEXPIRE {} {}", redis_quote(key), ms)
+    };
+    let ttl_secs = if ms % 1_000 == 0 {
+        ms / 1_000
+    } else {
+        ms.div_euclid(1_000) + 1
+    };
+    let label = if unit_ms == 1 {
+        format!("{n}ms")
+    } else if n == -1 {
+        t("永久（-1）").to_string()
+    } else {
+        redis_ttl_short(ttl_secs)
+    };
+    Ok(RedisTtlPlan {
+        command,
+        label,
+        ttl_secs,
+    })
+}
+
 /// How many keys one batch command may carry. A multi-key `DEL` with thousands
 /// of arguments risks a huge line and a slow single round trip, so the batch is
 /// split into chunks of this size (also the per-batch safety ceiling).

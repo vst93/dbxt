@@ -1184,6 +1184,9 @@ pub(crate) fn footer_hints_ctx(ctx: FooterCtx) -> Vec<Hint> {
             ("Del", t("批量删")),
             ("x", t("批量TTL")),
             ("m", t("批量改名")),
+            ("T", t("设 TTL")),
+            ("t", t("类型过滤")),
+            ("Ctrl-T", t("TTL 排序")),
             ("/", t("匹配模式")),
             ("n", t("更多")),
             ("r", t("重扫")),
@@ -3802,10 +3805,10 @@ pub(crate) fn redis_type_badge(t: &str) -> (&'static str, Color) {
 
 /// The type badge shown for one key. On a narrow screen the TTL fuses into the
 /// badge (`S·12s`) so the key name keeps its width and the row never wraps
-/// (R42).
+/// (R42). R81 renders the compact TTL (`5m` / `2h` / `-1`).
 pub(crate) fn redis_badge_token(narrow: bool, badge: &str, ttl: Option<i64>) -> String {
     match (narrow, ttl) {
-        (true, Some(t)) => format!("{badge}·{t}s"),
+        (true, Some(t)) => format!("{badge}·{}", redis_ttl_short(t)),
         _ => badge.to_string(),
     }
 }
@@ -3817,7 +3820,7 @@ pub(crate) fn render_redis_sidebar(f: &mut Frame, area: Rect, app: &App, lines: 
     let w = (area.width as usize).saturating_sub(4).max(6);
     let needle = app.redis_filter.trim().to_lowercase();
     // pattern row (server-side SCAN MATCH) + client-side filter row (R42).
-    let (mark, text, style) = if app.redis_scan.pattern == "*" {
+    let (mark, mut text, style) = if app.redis_scan.pattern == "*" {
         (
             "/ ",
             t("/ 匹配模式（SCAN MATCH）").to_string(),
@@ -3834,6 +3837,14 @@ pub(crate) fn render_redis_sidebar(f: &mut Frame, area: Rect, app: &App, lines: 
             Style::default().fg(Color::Yellow),
         )
     };
+    // R81: surface the active type filter / TTL ordering on the same header row
+    // so the layout maths below stay untouched.
+    if let Some(ty) = &app.redis_type_filter {
+        text.push_str(&format!(" · t:{ty}"));
+    }
+    if app.redis_sort != RedisSort::Scan {
+        text.push_str(&format!(" · {}", app.redis_sort.label()));
+    }
     lines.push(Line::from(vec![
         Span::styled(mark, Style::default().fg(Color::Yellow)),
         Span::styled(truncate_disp(&text, w), style),
@@ -3870,12 +3881,15 @@ pub(crate) fn render_redis_sidebar(f: &mut Frame, area: Rect, app: &App, lines: 
     let narrow = area.width < 30;
     for (i, key) in app.redis_scan.keys.iter().enumerate().skip(start).take(cap) {
         let (badge, color) = redis_type_badge(&key.key_type);
-        let ttl_num = (key.ttl >= 0).then_some(key.ttl);
+        // R81: the TTL is always shown (compact), including `-1` permanent.
+        let ttl_num = Some(key.ttl);
         let badge_token = redis_badge_token(narrow, badge, ttl_num);
         let ttl = if narrow {
             String::new()
         } else {
-            ttl_num.map(|t| format!(" {t}s")).unwrap_or_default()
+            ttl_num
+                .map(|t| format!(" {}", redis_ttl_short(t)))
+                .unwrap_or_default()
         };
         let picked = app.redis_selected.contains(&key.key_raw);
         let marker = if sel == Some(i) { "▸" } else { " " };

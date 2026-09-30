@@ -1766,6 +1766,33 @@ pub(crate) enum RecentSort {
     Name,
 }
 
+/// R81: ordering of the loaded Redis keys (`Ctrl-T`). `Scan` keeps the order
+/// SCAN delivered; the two TTL modes re-sort the already-loaded window in place
+/// (never a query), so a keyspace can be scanned by expiry.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum RedisSort {
+    Scan,
+    TtlAsc,
+    TtlDesc,
+}
+
+impl RedisSort {
+    pub(crate) fn next(self) -> Self {
+        match self {
+            RedisSort::Scan => RedisSort::TtlAsc,
+            RedisSort::TtlAsc => RedisSort::TtlDesc,
+            RedisSort::TtlDesc => RedisSort::Scan,
+        }
+    }
+    pub(crate) fn label(self) -> &'static str {
+        match self {
+            RedisSort::Scan => t("扫描顺序"),
+            RedisSort::TtlAsc => t("TTL 升序"),
+            RedisSort::TtlDesc => t("TTL 降序"),
+        }
+    }
+}
+
 pub(crate) struct App {
     pub(crate) backend: Arc<LocalBackend>,
     pub(crate) page: Page,
@@ -1897,6 +1924,10 @@ pub(crate) struct App {
     /// the filtered view; `redis_scan.all` keeps the full loaded window.
     pub(crate) redis_filter: String,
     pub(crate) redis_filter_prompt: Option<TextArea<'static>>,
+    /// R81: client-side type filter (`t`) over the loaded keys; `None` = all.
+    pub(crate) redis_type_filter: Option<String>,
+    /// R81: scan-order / TTL ordering of the loaded keys (`Ctrl-T`).
+    pub(crate) redis_sort: RedisSort,
     /// Last Redis first-letter jump, so `;` / `,` repeat it forward / backward.
     pub(crate) redis_jump_letter: Option<char>,
 

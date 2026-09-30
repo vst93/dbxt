@@ -121,6 +121,18 @@ pub(crate) fn mk_redis_key(name: &str) -> RedisKeyInfo {
     }
 }
 
+/// R81: a key with an explicit type / TTL, for the filter / sort tests.
+pub(crate) fn mk_redis_typed(name: &str, ty: &str, ttl: i64) -> RedisKeyInfo {
+    RedisKeyInfo {
+        key_display: name.to_string(),
+        key_raw: base64_encode(name.as_bytes()),
+        key_type: ty.into(),
+        ttl,
+        size: 1,
+        value_preview: String::new(),
+    }
+}
+
 /// R42: the KV list filter narrows `keys` without touching the loaded window
 /// (`all`), keeps a still-matching selection, and restores on clear.
 #[test]
@@ -192,6 +204,208 @@ pub(crate) fn redis_badge_fuses_type_and_ttl_when_narrow() {
     assert_eq!(redis_badge_token(true, "S", Some(12)), "S·12s");
     assert_eq!(redis_badge_token(true, "H", None), "H");
     assert_eq!(redis_badge_token(false, "S", Some(12)), "S");
+}
+
+/// R81: the key-row TTL renders in compact units and keeps `-1` / `-2`
+/// verbatim so a permanent key is obvious at a glance.
+#[test]
+pub(crate) fn redis_ttl_short_formats_compact_units() {
+    assert_eq!(redis_ttl_short(-1), "-1");
+    assert_eq!(redis_ttl_short(-2), "-2");
+    assert_eq!(redis_ttl_short(0), "0s");
+    assert_eq!(redis_ttl_short(45), "45s");
+    assert_eq!(redis_ttl_short(60), "1m");
+    assert_eq!(redis_ttl_short(300), "5m");
+    assert_eq!(redis_ttl_short(3599), "59m");
+    assert_eq!(redis_ttl_short(7200), "2h");
+    assert_eq!(redis_ttl_short(86400), "1d");
+    // The narrow badge fuses the same compact form.
+    assert_eq!(redis_badge_token(true, "S", Some(300)), "S·5m");
+    assert_eq!(redis_badge_token(true, "H", Some(-1)), "H·-1");
+}
+
+/// R81: the `T` TTL input accepts a bare second count or an explicit
+/// `s` / `ms` / `m` / `h` / `d` suffix and rejects anything else.
+#[test]
+pub(crate) fn redis_ttl_command_parses_units_and_validates() {
+    let p = redis_ttl_command("k", "300").unwrap();
+    assert_eq!(p.command, "EXPIRE \"k\" 300");
+    assert_eq!(p.ttl_secs, 300);
+    assert_eq!(
+        redis_ttl_command("k", "300s").unwrap().command,
+        "EXPIRE \"k\" 300"
+    );
+    assert_eq!(
+        redis_ttl_command("k", "30m").unwrap().command,
+        "EXPIRE \"k\" 1800"
+    );
+    assert_eq!(
+        redis_ttl_command("k", "2h").unwrap().command,
+        "EXPIRE \"k\" 7200"
+    );
+    assert_eq!(
+        redis_ttl_command("k", "1d").unwrap().command,
+        "EXPIRE \"k\" 86400"
+    );
+    // A sub-second input needs PEXPIRE and rounds the local TTL up.
+    let ms = redis_ttl_command("k", "500ms").unwrap();
+    assert_eq!(ms.command, "PEXPIRE \"k\" 500");
+    assert_eq!(ms.ttl_secs, 1);
+    assert_eq!(ms.label, "500ms");
+    // `-1` persists the key.
+    let perm = redis_ttl_command("k", "-1").unwrap();
+    assert_eq!(perm.command, "EXPIRE \"k\" -1");
+    assert_eq!(perm.ttl_secs, -1);
+    // Key quoting escapes a quote / backslash.
+    assert_eq!(
+        redis_ttl_command("a\"b", "10").unwrap().command,
+        "EXPIRE \"a\\\"b\" 10"
+    );
+    // Errors: empty, junk, an unknown suffix, and an overflowing product.
+    assert!(redis_ttl_command("k", "").is_err());
+    assert!(redis_ttl_command("k", "abc").is_err());
+    assert!(redis_ttl_command("k", "5x").is_err());
+    assert!(redis_ttl_command("k", "9223372036854775807d").is_err());
+}
+
+/// R81: `Ctrl-T` re-sorts the loaded keys by TTL and cycles back to scan order,
+/// ranking persistent keys last ascending / first descending.
+#[test]
+pub(crate) fn redis_ttl_sort_cycles_and_restores_scan_order() {
+    let mut app = test_app();
+    app.redis_scan.all = vec![
+        mk_redis_typed("a", "string", -1),
+        mk_redis_typed("b", "hash", 300),
+        mk_redis_typed("c", "list", 60),
+        mk_redis_typed("d", "set", 7200),
+    ];
+    apply_redis_filter(&mut app);
+    let names = |app: &App| {
+        app.redis_scan
+            .keys
+            .iter()
+            .map(|k| k.key_display.clone())
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(names(&app), vec!["a", "b", "c", "d"]);
+    cycle_redis_sort(&mut app);
+    assert_eq!(app.redis_sort, RedisSort::TtlAsc);
+    assert_eq!(names(&app), vec!["c", "b", "d", "a"]);
+    cycle_redis_sort(&mut app);
+    assert_eq!(app.redis_sort, RedisSort::TtlDesc);
+    assert_eq!(names(&app), vec!["a", "d", "b", "c"]);
+    cycle_redis_sort(&mut app);
+    assert_eq!(app.redis_sort, RedisSort::Scan);
+    assert_eq!(names(&app), vec!["a", "b", "c", "d"]);
+}
+
+/// R81: `t` cycles the client-side type filter over the loaded window and
+/// wraps back to "all", never touching the loaded `all` list.
+#[test]
+pub(crate) fn redis_type_filter_cycles_over_loaded_keys() {
+    let mut app = test_app();
+    app.redis_scan.all = vec![
+        mk_redis_typed("k1", "string", -1),
+        mk_redis_typed("k2", "hash", -1),
+        mk_redis_typed("k3", "string", -1),
+        mk_redis_typed("k4", "zset", -1),
+    ];
+    apply_redis_filter(&mut app);
+    assert_eq!(app.redis_scan.keys.len(), 4);
+    cycle_redis_type_filter(&mut app);
+    assert_eq!(app.redis_type_filter.as_deref(), Some("string"));
+    assert_eq!(app.redis_scan.keys.len(), 2);
+    cycle_redis_type_filter(&mut app);
+    assert_eq!(app.redis_type_filter.as_deref(), Some("hash"));
+    assert_eq!(app.redis_scan.keys.len(), 1);
+    assert_eq!(app.redis_scan.keys[0].key_display, "k2");
+    // list / set / zset / stream — zset keeps the fourth key, stream is empty.
+    for _ in 0..3 {
+        cycle_redis_type_filter(&mut app);
+    }
+    assert_eq!(app.redis_type_filter.as_deref(), Some("zset"));
+    assert_eq!(app.redis_scan.keys.len(), 1);
+    cycle_redis_type_filter(&mut app);
+    assert_eq!(app.redis_type_filter.as_deref(), Some("stream"));
+    assert!(app.redis_scan.keys.is_empty());
+    cycle_redis_type_filter(&mut app);
+    assert_eq!(app.redis_type_filter, None);
+    assert_eq!(app.redis_scan.keys.len(), 4);
+    assert_eq!(app.redis_scan.all.len(), 4);
+}
+
+/// R81: `T` on the key list opens the TTL prompt, Enter builds an `EXPIRE` and
+/// routes it through the red layer, and the confirmed write updates the loaded
+/// list in place (no rescan). A read-only connection refuses up front.
+#[test]
+pub(crate) fn redis_key_ttl_prompt_confirms_and_updates_in_place() {
+    let (tx, _rx) = tokio::sync::mpsc::unbounded_channel::<OpResult>();
+    let mut app = test_app();
+    app.picker_open = false;
+    app.selected = Some(test_conn("redis"));
+    app.backend_kind = Backend::Redis;
+    app.focus = Focus::Sidebar;
+    app.redis_scan.all = vec![mk_redis_typed("app:x", "string", -1)];
+    apply_redis_filter(&mut app);
+    app.redis_list.select(Some(0));
+
+    key(
+        &mut app,
+        &tx,
+        KeyEvent::new(KeyCode::Char('T'), KeyModifiers::NONE),
+    );
+    let p = app.redis_prompt.as_ref().expect("T opens the TTL prompt");
+    assert_eq!(p.kind, RedisPromptKind::TtlKey);
+    assert_eq!(p.key_display, "app:x");
+    for c in "300".chars() {
+        key(
+            &mut app,
+            &tx,
+            KeyEvent::new(KeyCode::Char(c), KeyModifiers::NONE),
+        );
+    }
+    key(
+        &mut app,
+        &tx,
+        KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+    );
+    assert!(app.redis_prompt.is_none());
+    {
+        let rc = app
+            .confirm
+            .as_ref()
+            .and_then(|c| c.redis.as_ref())
+            .expect("T routes through the red confirm layer");
+        assert_eq!(rc.cmd, "EXPIRE \"app:x\" 300");
+        assert_eq!(rc.set_ttl_in_place, vec![(base64_encode(b"app:x"), 300)]);
+        assert!(!rc.reload_list, "the loaded list is updated in place");
+    }
+    // Applying the in-place update reflects the new TTL without a rescan.
+    redis_apply_ttl_in_place(&mut app, &[(base64_encode(b"app:x"), 300)]);
+    assert_eq!(app.redis_scan.keys[0].ttl, 300);
+    assert_eq!(app.redis_scan.all[0].ttl, 300);
+
+    // A read-only connection blocks the gesture before any prompt opens.
+    let mut app = test_app();
+    app.picker_open = false;
+    let mut conn = test_conn("redis");
+    conn.read_only = true;
+    app.selected = Some(conn);
+    app.backend_kind = Backend::Redis;
+    app.focus = Focus::Sidebar;
+    app.redis_scan.all = vec![mk_redis_typed("app:x", "string", -1)];
+    apply_redis_filter(&mut app);
+    app.redis_list.select(Some(0));
+    key(
+        &mut app,
+        &tx,
+        KeyEvent::new(KeyCode::Char('T'), KeyModifiers::NONE),
+    );
+    assert!(
+        app.redis_prompt.is_none(),
+        "read-only must not open the prompt"
+    );
+    assert!(app.status.contains("只读"), "status: {}", app.status);
 }
 
 pub(crate) fn sample_script(n: usize) -> ScriptView {

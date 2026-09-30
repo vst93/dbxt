@@ -168,6 +168,8 @@ pub(crate) fn activate_connection(
     app.redis_list = ListState::default();
     app.redis_filter.clear();
     app.redis_filter_prompt = None;
+    app.redis_type_filter = None;
+    app.redis_sort = RedisSort::Scan;
     app.redis_jump_letter = None;
     app.mongo_filter.clear();
     app.mongo_page = 0;
@@ -649,6 +651,8 @@ pub(crate) fn back_to_picker(app: &mut App) {
     app.redis_pending_batch = None;
     app.redis_filter.clear();
     app.redis_filter_prompt = None;
+    app.redis_type_filter = None;
+    app.redis_sort = RedisSort::Scan;
     app.redis_jump_letter = None;
     app.picker_open = true;
 }
@@ -667,6 +671,8 @@ pub(crate) fn cycle_redis_db(app: &mut App, tx: &Tx, forward: bool) {
     app.redis_anchor = None;
     app.redis_filter.clear();
     app.redis_filter_prompt = None;
+    app.redis_type_filter = None;
+    app.redis_sort = RedisSort::Scan;
     app.redis_jump_letter = None;
     app.status = tf("redis db → {}", &[&(app.redis_db)]);
     start_redis_scan(app, tx, true);
@@ -706,6 +712,42 @@ pub(crate) fn open_redis_ttl_prompt(app: &mut App) {
         title: tf("设置 TTL · {}", &[&(view.key_display)]),
         key_display: view.key_display.clone(),
         key_raw: view.key_raw.clone(),
+        field: String::new(),
+        batch: Vec::new(),
+        input: ta,
+    });
+}
+
+/// R81: `T` on the key list — set the focused key's TTL without opening its
+/// value first. Seconds by default, with `s` / `ms` / `m` / `h` / `d` suffixes.
+/// A write, so it is refused up front on a read-only connection and still goes
+/// through the red confirmation layer.
+pub(crate) fn open_redis_key_ttl_prompt(app: &mut App) {
+    if readonly_conn_block(app) {
+        return;
+    }
+    let Some(i) = app.redis_list.selected() else {
+        app.status = t("先选中一个 key").into();
+        return;
+    };
+    let Some(key) = app.redis_scan.keys.get(i).cloned() else {
+        return;
+    };
+    let initial = if key.ttl >= 0 {
+        key.ttl.to_string()
+    } else {
+        String::new()
+    };
+    let mut ta = TextArea::from(vec![initial]);
+    ta.set_placeholder_text(t(
+        "TTL：300 / 30m / 2h / 500ms（-1 = 持久化，0 = 立即删除）",
+    ));
+    ta.move_cursor(CursorMove::End);
+    app.redis_prompt = Some(RedisPrompt {
+        kind: RedisPromptKind::TtlKey,
+        title: tf("设置 TTL · {}", &[&(key.key_display)]),
+        key_display: key.key_display.clone(),
+        key_raw: key.key_raw.clone(),
         field: String::new(),
         batch: Vec::new(),
         input: ta,
@@ -803,6 +845,7 @@ pub(crate) fn redis_prompt_command(
         RedisPromptKind::StringValue => format!("SET {} {}", q(key), q(input)),
         RedisPromptKind::HashField => format!("HSET {} {} {}", q(key), q(field), q(input)),
         RedisPromptKind::Pattern
+        | RedisPromptKind::TtlKey
         | RedisPromptKind::BatchTtl
         | RedisPromptKind::BatchRenamePrefix
         | RedisPromptKind::BatchConfirm => String::new(),

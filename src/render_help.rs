@@ -821,6 +821,9 @@ pub(crate) fn render_redis_prompt(f: &mut Frame, area: Rect, app: &mut App) {
         let hint = match app.redis_prompt.as_ref().map(|p| p.kind) {
             Some(RedisPromptKind::Pattern) => t("SCAN MATCH 模式，例 app:* · 支持 * ? []"),
             Some(RedisPromptKind::Ttl) => t("秒数；-1 = 持久化，0 = 立即删除"),
+            Some(RedisPromptKind::TtlKey) => {
+                t("TTL：300 / 30m / 2h / 500ms（-1 = 持久化，0 = 立即删除）")
+            }
             Some(RedisPromptKind::Rename) => t("新 key 名（已存在的 key 会被覆盖）"),
             Some(RedisPromptKind::StringValue) => t("新的 string 内容（支持多行）"),
             Some(RedisPromptKind::HashField) => t("新的 hash 字段值"),
@@ -1550,6 +1553,13 @@ pub(crate) const HELP_ROWS: &[(&str, &str)] = &[
     (
         "Del / x / m",
         "删除 / 设 TTL / 前缀重命名选中 key（均确认）；删单个 key 就地移除，SCAN 游标不动",
+    ),
+    ("T", "设置焦点 key 的 TTL（红确认层；秒，可加 s/ms/m/h/d 后缀；只读连接拦截）"),
+    ("t", "按类型循环过滤 string/hash/list/set/zset/stream（客户端，零查询）"),
+    ("Ctrl-T", "按 TTL 排序已加载 key：扫描顺序 → 升序 → 降序 循环（客户端）"),
+    (
+        "行尾 TTL",
+        "紧凑显示 `45s` / `5m` / `2h` / `3d`，`-1` 永久、`-2` 不存在；每秒本地倒计时",
     ),
     ("y", "复制选中的 key 名（每行一个）"),
     (

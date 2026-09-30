@@ -289,6 +289,10 @@ pub(crate) struct RedisConfirm {
     /// successful single-key delete, so the SCAN cursor and loaded pages stay
     /// put (a full rescan would jump the list back to the first page).
     pub(crate) remove_in_place: Vec<String>,
+    /// R81: `(raw key, new TTL seconds)` applied to the loaded key browser in
+    /// place after a confirmed single-key `T` TTL write, so the list keeps its
+    /// SCAN cursor instead of rescanning from page one.
+    pub(crate) set_ttl_in_place: Vec<(String, i64)>,
 }
 
 /// A pending MongoDB document write shown in the red confirmation layer.

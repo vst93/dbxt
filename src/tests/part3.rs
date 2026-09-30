@@ -371,6 +371,37 @@ pub(crate) fn preview_footer_lists_new_result_keys() {
     }
 }
 
+/// R81: the Redis key-browser footer / mini-help group lists the new TTL and
+/// type-filter keys, and the full help documents them.
+#[test]
+pub(crate) fn redis_footer_lists_ttl_and_type_keys() {
+    let hints = footer_hints_ctx(FooterCtx {
+        view: FooterView::RedisKeys,
+        focus: Focus::Sidebar,
+        has_connection: true,
+    });
+    let keys: Vec<&str> = hints.iter().map(|h| h.0).collect();
+    for k in ["T", "t", "Ctrl-T"] {
+        assert!(keys.contains(&k), "redis footer dropped {k:?}: {keys:?}");
+    }
+    // Mini-help reuses the same group (it only drops the pinned `?`).
+    let mini: Vec<&str> = hints
+        .iter()
+        .filter(|h| h.0 != "?" && h.0 != "F1")
+        .map(|h| h.0)
+        .collect();
+    for k in ["T", "t", "Ctrl-T"] {
+        assert!(mini.contains(&k), "mini help dropped {k:?}");
+    }
+    // The full cheat-sheet documents each of them too.
+    for k in ["T", "t", "Ctrl-T"] {
+        assert!(
+            HELP_ROWS.iter().any(|(key, _)| *key == k),
+            "full help missing {k:?}"
+        );
+    }
+}
+
 /// R80: the mini cheat-sheet sizes itself to the screen instead of a fixed ten
 /// rows, so the newer keys are visible on a normal terminal.
 #[test]
