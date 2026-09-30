@@ -358,6 +358,8 @@ pub(crate) fn confirm_key(app: &mut App, tx: &Tx, k: KeyEvent) {
         KeyCode::Esc | KeyCode::Char('n') | KeyCode::Char('N') => {
             app.confirm = None;
             app.pending_write = false;
+            // R88: a cancelled scoped run must not label a later result.
+            app.pending_scope = None;
             app.flash(t("已取消").into());
         }
         _ => {}
@@ -805,10 +807,14 @@ pub(crate) fn browse_key(app: &mut App, tx: &Tx, k: KeyEvent) {
         return;
     }
 
-    // run from anywhere (browse page)
-    if (k.modifiers.contains(KeyModifiers::CONTROL) && k.code == KeyCode::Char('j'))
-        || k.code == KeyCode::F(5)
-    {
+    // run from anywhere (browse page). R88: `Ctrl-J` runs the editor selection
+    // when there is one, otherwise the statement under the cursor; `F5` keeps
+    // running the whole editor.
+    if k.modifiers.contains(KeyModifiers::CONTROL) && k.code == KeyCode::Char('j') {
+        run_current_scoped(app, tx, RunScope::CurrentStatement);
+        return;
+    }
+    if k.code == KeyCode::F(5) {
         run_current(app, tx);
         return;
     }

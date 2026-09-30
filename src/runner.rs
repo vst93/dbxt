@@ -211,9 +211,9 @@ pub(crate) fn drill_script(app: &mut App, idx: usize) {
 /// What the run keys should execute when there is no selection.
 #[derive(Clone, Copy, PartialEq)]
 pub(crate) enum RunScope {
-    /// `F5` / `Ctrl-J`: the whole editor (the historical behaviour).
+    /// `F5`: the whole editor.
     All,
-    /// `Alt-Enter`: only the statement under the cursor.
+    /// `Ctrl-J` / `Alt-Enter`: only the statement under the cursor.
     CurrentStatement,
 }
 
@@ -228,17 +228,33 @@ pub(crate) fn run_current_scoped(app: &mut App, tx: &Tx, scope: RunScope) {
     }
 }
 
-/// The editor's current selection, trimmed, or `None` when nothing (usable) is
+/// R88: the editor's current selection as a trimmed char-offset span
+/// `(lo, hi)` into the flattened buffer, or `None` when nothing usable is
 /// selected. Shift+arrows build the selection inside tui-textarea.
-pub(crate) fn editor_selection_text(app: &App) -> Option<String> {
+pub(crate) fn editor_selection_span(app: &App) -> Option<(usize, usize)> {
     let ((r1, c1), (r2, c2)) = app.editor.selection_range()?;
     let text = app.editor_sql();
     let a = text_offset(&text, r1, c1)?;
     let b = text_offset(&text, r2, c2)?;
     let (lo, hi) = if a <= b { (a, b) } else { (b, a) };
-    let sel: String = text.chars().skip(lo).take(hi - lo).collect();
-    let sel = sel.trim().to_string();
-    (!sel.is_empty()).then_some(sel)
+    let chars: Vec<char> = text.chars().collect();
+    let (mut s, mut e) = (lo, hi);
+    while s < e && chars.get(s).is_some_and(|c| c.is_whitespace()) {
+        s += 1;
+    }
+    while e > s && chars.get(e - 1).is_some_and(|c| c.is_whitespace()) {
+        e -= 1;
+    }
+    (s < e).then_some((s, e))
+}
+
+/// The editor's current selection, trimmed, or `None` when nothing (usable) is
+/// selected. Shift+arrows build the selection inside tui-textarea.
+pub(crate) fn editor_selection_text(app: &App) -> Option<String> {
+    let (s, e) = editor_selection_span(app)?;
+    let text = app.editor_sql();
+    let sel: String = text.chars().skip(s).take(e - s).collect();
+    (!sel.trim().is_empty()).then_some(sel)
 }
 
 /// `Alt-↓` / `Alt-↑` in the editor: move the cursor to the start of the next /
@@ -280,26 +296,123 @@ pub(crate) fn jump_statement(app: &mut App, dir: i32) -> bool {
     true
 }
 
-/// The statement under the editor cursor (semicolon-delimited, literals and
-/// comments ignored), trimmed, or `None` when the cursor is not on a statement.
-pub(crate) fn current_statement_text(app: &App) -> Option<String> {
+/// The statement under the editor cursor as `(span, 0-based index)`, using the
+/// same gap rule as [`statement_range_at`] (a caret parked on a separator or in
+/// the whitespace between statements belongs to the following one).
+pub(crate) fn current_statement_span(app: &App) -> Option<((usize, usize), usize)> {
     let text = app.editor_sql();
     let (row, col) = app.editor.cursor();
     let off = text_offset(&text, row, col)?;
     let ranges = statement_ranges(&text);
     let (s, e) = statement_range_at(&ranges, off)?;
-    let chars: Vec<char> = text.chars().collect();
-    let stmt: String = chars[s..e].iter().collect();
-    let stmt = stmt.trim().to_string();
-    (!stmt.is_empty()).then_some(stmt)
+    let idx = ranges.iter().position(|&r| r == (s, e))?;
+    Some(((s, e), idx))
+}
+
+/// The statement under the editor cursor (semicolon-delimited, literals and
+/// comments ignored), trimmed, or `None` when the cursor is not on a statement.
+pub(crate) fn current_statement_text(app: &App) -> Option<String> {
+    let ((s, e), _) = current_statement_span(app)?;
+    let text = app.editor_sql();
+    let stmt: String = text.chars().skip(s).take(e - s).collect();
+    (!stmt.trim().is_empty()).then_some(stmt)
+}
+
+/// R88: the metadata for a scoped run — the buffer spans/ordinals of the
+/// statements it sent, plus the `执行第 N 条` status label. `None` for a
+/// whole-buffer run (`F5` with no selection). Pure; built before the query is
+/// spawned so the result can name exactly what ran.
+pub(crate) fn build_scoped_run(
+    app: &App,
+    sql: &str,
+    sel_span: Option<(usize, usize)>,
+    scope: RunScope,
+    db_type: DatabaseType,
+) -> Option<ScopedRun> {
+    if sel_span.is_none() && scope == RunScope::All {
+        return None;
+    }
+    let text = app.editor_sql();
+    let statements = dbx_core::sql::split_sql_statements_for_database(sql, db_type);
+    if statements.is_empty() {
+        return None;
+    }
+    if let Some(sel) = sel_span {
+        // A selection may start / end mid-statement; a statement counts only
+        // when its buffer span actually overlaps what was highlighted.
+        let located = locate_statement_indices(&text, &statements);
+        let mut spans: Vec<Option<(usize, usize)>> = Vec::with_capacity(located.len());
+        let mut ordinals: Vec<usize> = Vec::with_capacity(located.len());
+        for ent in &located {
+            match ent {
+                Some((idx, sp)) if sp.0 < sel.1 && sp.1 > sel.0 => {
+                    spans.push(Some(*sp));
+                    ordinals.push(idx + 1);
+                }
+                _ => {
+                    spans.push(None);
+                    ordinals.push(0);
+                }
+            }
+        }
+        let mut ords: Vec<usize> = ordinals.iter().copied().filter(|n| *n > 0).collect();
+        if ords.is_empty() {
+            return Some(ScopedRun {
+                sql: sql.trim().to_string(),
+                spans,
+                ordinals,
+                label: t("执行选区").to_string(),
+            });
+        }
+        ords.sort_unstable();
+        let label = if ords.len() == 1 {
+            tf("执行第 {} 条", &[&ords[0]])
+        } else {
+            tf("执行第 {}-{} 条", &[&ords[0], &ords[ords.len() - 1]])
+        };
+        Some(ScopedRun {
+            sql: sql.trim().to_string(),
+            spans,
+            ordinals,
+            label,
+        })
+    } else {
+        let ((s, e), idx) = current_statement_span(app)?;
+        Some(ScopedRun {
+            sql: sql.trim().to_string(),
+            spans: vec![Some((s, e))],
+            ordinals: vec![idx + 1],
+            label: tf("执行第 {} 条", &[&(idx + 1)]),
+        })
+    }
+}
+
+/// R88: consume the scoped-run label for the result status, but only when it
+/// belongs to `sql` (so a `Ctrl-N` load-more or an `EXPLAIN` re-run never
+/// inherits the previous run's label).
+pub(crate) fn take_scope_label(app: &mut App, sql: &str) -> Option<String> {
+    let matches = app
+        .pending_scope
+        .as_ref()
+        .is_some_and(|s| s.sql == sql.trim());
+    if matches {
+        app.pending_scope.take().map(|s| s.label)
+    } else {
+        None
+    }
 }
 
 pub(crate) fn run_sql(app: &mut App, tx: &Tx, scope: RunScope) {
-    // R41: a selection always wins (run only what is highlighted); otherwise
-    // `Alt-Enter` narrows to the statement under the cursor while `F5`/`Ctrl-J`
-    // keep running the whole editor.
-    let sql = if let Some(sel) = editor_selection_text(app) {
-        sel
+    let Some(cfg) = app.selected.clone() else {
+        app.status = t("✗ 未选择连接").into();
+        return;
+    };
+    // R41/R88: a selection always wins (run only what is highlighted); with no
+    // selection, `Ctrl-J` / `Alt-Enter` narrow to the statement under the cursor
+    // while `F5` keeps running the whole editor.
+    let sel_span = editor_selection_span(app);
+    let sql = if sel_span.is_some() {
+        editor_selection_text(app).unwrap_or_default()
     } else {
         match scope {
             RunScope::All => app.editor_sql().trim().to_string(),
@@ -315,10 +428,10 @@ pub(crate) fn run_sql(app: &mut App, tx: &Tx, scope: RunScope) {
     if sql.is_empty() {
         return;
     }
-    let Some(cfg) = app.selected.clone() else {
-        app.status = t("✗ 未选择连接").into();
-        return;
-    };
+    // R88: capture the buffer spans / ordinals of what this run sends, so the
+    // result can label `执行第 N 条` and a failure can localize back to exactly
+    // these statements. Computed before any early return below.
+    let scope_info = build_scoped_run(app, &sql, sel_span, scope, cfg.db_type);
     // Read-only connections refuse every write before the danger layer, so a
     // blocked statement never even reaches the red confirmation.
     if readonly_block(app, &sql) {
@@ -336,6 +449,7 @@ pub(crate) fn run_sql(app: &mut App, tx: &Tx, scope: RunScope) {
     }
     if !reasons.is_empty() {
         app.pending_run_origin = "editor";
+        app.pending_scope = scope_info;
         app.confirm = Some(Confirm {
             sql,
             reasons,
@@ -348,6 +462,7 @@ pub(crate) fn run_sql(app: &mut App, tx: &Tx, scope: RunScope) {
         return;
     }
     app.push_history(&sql);
+    app.pending_scope = scope_info;
     execute_sql(app, tx, sql, "editor");
 }
 
@@ -394,6 +509,9 @@ pub(crate) fn load_more_rows(app: &mut App, tx: &Tx) {
     };
     let next = (cap + QUERY_MORE_STEP).min(QUERY_MAX_ROWS_CAP);
     app.loading = true;
+    // R88: a load-more re-runs the same SQL; it must never inherit the scoped
+    // run's `执行第 N 条` label.
+    app.pending_scope = None;
     app.status = tf("加载更多… (上限 {} 行)", &[&(next)]);
     let db = app.current_db();
     app.spawn(tx, Op::Query(Box::new(cfg), db, sql, next, "editor"));

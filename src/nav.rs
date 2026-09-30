@@ -446,6 +446,8 @@ pub(crate) fn history_run_selected(app: &mut App, tx: &Tx) {
     };
     app.history_open = false;
     app.history_filter = None;
+    // R88: a direct history run is not an editor scope — no `执行第 N 条` label.
+    app.pending_scope = None;
     // The same per-statement danger check the editor uses, so a re-run of a
     // DELETE / DROP still stops at the red confirmation layer.
     let statements = dbx_core::sql::split_sql_statements_for_database(&sql, cfg.db_type);

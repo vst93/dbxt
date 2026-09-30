@@ -1322,6 +1322,8 @@ pub(crate) fn footer_hints_ctx(ctx: FooterCtx) -> Vec<Hint> {
                 ("↑↓", t("历史")),
                 ("Tab", t("下一区")),
                 ("%", t("配对括号")),
+                // R88: F2 toggles the optional statement-ordinal gutter.
+                ("F2", t("语句序号")),
                 ("Esc", t("侧栏")),
             ],
             Focus::CmdInput => vec![
@@ -1681,6 +1683,7 @@ pub(crate) fn render_main_area(
     };
 
     if editor_collapsed {
+        app.editor_gutter = 0;
         render_editor_strip(f, main_chunks[0], app);
     } else {
         let focused = app.focus == Focus::Editor;
@@ -1688,17 +1691,29 @@ pub(crate) fn render_main_area(
         // write policy is visible next to the SQL being typed (not just on the
         // tree root).
         let ro = app.selected.as_ref().is_some_and(|c| c.read_only);
-        let block = Block::default()
+        // R88: reserve a left gutter for the optional statement ordinals. The
+        // padding shifts tui-textarea's text right; every paint layer and the
+        // click mapping read `app.editor_gutter` so they stay aligned, and the
+        // buffer text itself is never touched (render-only).
+        let gutter = statement_gutter_cols(app);
+        app.editor_gutter = gutter;
+        let mut block = Block::default()
             .borders(Borders::ALL)
             .title(if ro { " SQL 🔒 " } else { " SQL " })
             .border_set(border::ROUNDED)
             .border_style(border_style(focused));
+        if gutter > 0 {
+            block = block.padding(Padding::left(gutter));
+        }
         app.editor.set_block(block);
         // Keep the click-to-place-caret mirror in step with the widget: the
         // bordered inner area is the viewport, and the widget re-derives its own
         // scroll origin from the previous one plus the cursor on every render.
         app.editor_vp.resize(
-            main_chunks[0].width.saturating_sub(2),
+            main_chunks[0]
+                .width
+                .saturating_sub(2)
+                .saturating_sub(gutter),
             main_chunks[0].height.saturating_sub(2),
         );
         app.editor_vp.follow(app.editor.cursor());
@@ -1715,6 +1730,9 @@ pub(crate) fn render_main_area(
         // R77: the located execution-error statements sit on top of everything,
         // so a failure is never hidden by a find highlight or placeholder mark.
         paint_editor_errors(f, main_chunks[0], app);
+        // R88: the statement ordinals go on last, in the reserved gutter, so the
+        // dim / error backgrounds never cover them.
+        paint_stmt_gutter(f, main_chunks[0], app);
     }
 
     if has_cmd {
@@ -1803,6 +1821,9 @@ pub(crate) fn paint_bracket_pair(f: &mut Frame, area: Rect, app: &App) {
     // The widget's own scroll origin for this frame, mirrored in `editor_vp`.
     let top_row = app.editor_vp.row as usize;
     let top_col = app.editor_vp.col as usize;
+    // R88: text starts after the reserved statement gutter (0 when off).
+    let gutter = app.editor_gutter as usize;
+    let text_w = (inner.width as usize).saturating_sub(gutter);
     let lines = app.editor.lines();
     for (row, col) in [a, b] {
         let Some(line) = lines.get(row) else {
@@ -1812,10 +1833,10 @@ pub(crate) fn paint_bracket_pair(f: &mut Frame, area: Rect, app: &App) {
         if row < top_row || row - top_row >= inner.height as usize {
             continue;
         }
-        if dcol < top_col || dcol - top_col >= inner.width as usize {
+        if dcol < top_col || dcol - top_col >= text_w {
             continue;
         }
-        let x = inner.x + (dcol - top_col) as u16;
+        let x = inner.x + gutter as u16 + (dcol - top_col) as u16;
         let y = inner.y + (row - top_row) as u16;
         let cell = &mut f.buffer_mut()[(x, y)];
         cell.fg = Color::LightCyan;
@@ -1851,6 +1872,9 @@ pub(crate) fn paint_editor_find(f: &mut Frame, area: Rect, app: &App) {
     }
     let top_row = app.editor_vp.row as usize;
     let top_col = app.editor_vp.col as usize;
+    // R88: text starts after the reserved statement gutter (0 when off).
+    let gutter = app.editor_gutter as usize;
+    let text_w = (inner.width as usize).saturating_sub(gutter);
     let lines = app.editor.lines();
     for (hi, hit) in hits.iter().enumerate() {
         let Some(line) = lines.get(hit.row) else {
@@ -1863,14 +1887,14 @@ pub(crate) fn paint_editor_find(f: &mut Frame, area: Rect, app: &App) {
         let y = inner.y + (hit.row - top_row) as u16;
         for k in 0..hit.len {
             let dcol = editor_display_col(line, hit.col + k);
-            if dcol < top_col || dcol - top_col >= inner.width as usize {
+            if dcol < top_col || dcol - top_col >= text_w {
                 continue;
             }
             // The next char's display column minus this one is the exact cell
             // span (a tab is 1..4 cells, a wide CJK glyph 2, a combining mark 0).
             let dnext = editor_display_col(line, hit.col + k + 1);
             let span = dnext.saturating_sub(dcol).max(1);
-            let x0 = inner.x + (dcol - top_col) as u16;
+            let x0 = inner.x + gutter as u16 + (dcol - top_col) as u16;
             for dx in 0..span as u16 {
                 if x0 + dx >= inner.x + inner.width {
                     break;
@@ -1913,6 +1937,9 @@ pub(crate) fn paint_editor_errors(f: &mut Frame, area: Rect, app: &App) {
     }
     let top_row = app.editor_vp.row as usize;
     let top_col = app.editor_vp.col as usize;
+    // R88: text starts after the reserved statement gutter (0 when off).
+    let gutter = app.editor_gutter as usize;
+    let text_w = (inner.width as usize).saturating_sub(gutter);
     let lines = app.editor.lines();
     for (i, span) in app.editor_error_spans.iter().enumerate() {
         let current = i == app.editor_error_idx;
@@ -1926,12 +1953,12 @@ pub(crate) fn paint_editor_errors(f: &mut Frame, area: Rect, app: &App) {
             let y = inner.y + (row - top_row) as u16;
             for col in c0..c1 {
                 let dcol = editor_display_col(line, col);
-                if dcol < top_col || dcol - top_col >= inner.width as usize {
+                if dcol < top_col || dcol - top_col >= text_w {
                     continue;
                 }
                 let dnext = editor_display_col(line, col + 1);
                 let span_w = dnext.saturating_sub(dcol).max(1);
-                let x0 = inner.x + (dcol - top_col) as u16;
+                let x0 = inner.x + gutter as u16 + (dcol - top_col) as u16;
                 for dx in 0..span_w as u16 {
                     if x0 + dx >= inner.x + inner.width {
                         break;
@@ -1942,6 +1969,52 @@ pub(crate) fn paint_editor_errors(f: &mut Frame, area: Rect, app: &App) {
                     cell.modifier.insert(Modifier::BOLD);
                 }
             }
+        }
+    }
+}
+
+/// R88: paint the optional statement ordinals in the editor's left gutter.
+/// Pure render layer, on top of every other editor mark, and only active while
+/// `stmt_gutter` is on; the buffer text itself is never touched (the gutter
+/// columns are reserved with a left padding, not by inserting characters).
+/// Ordinals are right-aligned so the marker column stays tidy as the count
+/// grows.
+pub(crate) fn paint_stmt_gutter(f: &mut Frame, area: Rect, app: &App) {
+    let gutter = app.editor_gutter as usize;
+    if gutter == 0 {
+        return;
+    }
+    let text = app.editor_sql();
+    let rows = statement_start_rows(&text, STMT_DIM_MAX_BYTES);
+    if rows.is_empty() {
+        return;
+    }
+    // tui-textarea draws the text inside the `Borders::ALL` block dbxt sets on
+    // it, so the gutter lives in the block's inner rect.
+    let inner = Rect {
+        x: area.x.saturating_add(1),
+        y: area.y.saturating_add(1),
+        width: area.width.saturating_sub(2),
+        height: area.height.saturating_sub(2),
+    };
+    if inner.width == 0 || inner.height == 0 {
+        return;
+    }
+    let top_row = app.editor_vp.row as usize;
+    let marker_w = gutter.saturating_sub(1).max(1);
+    for (row, ord) in rows {
+        if row < top_row || row - top_row >= inner.height as usize {
+            continue;
+        }
+        let y = inner.y + (row - top_row) as u16;
+        let padded = format!("{:>marker_w$} ", format!("{ord}."));
+        for (i, ch) in padded.chars().enumerate() {
+            if i >= gutter {
+                break;
+            }
+            let cell = &mut f.buffer_mut()[(inner.x + i as u16, y)];
+            cell.set_char(ch);
+            cell.fg = Color::DarkGray;
         }
     }
 }
@@ -1973,6 +2046,9 @@ pub(crate) fn paint_editor_placeholders(f: &mut Frame, area: Rect, app: &App) {
     }
     let top_row = app.editor_vp.row as usize;
     let top_col = app.editor_vp.col as usize;
+    // R88: text starts after the reserved statement gutter (0 when off).
+    let gutter = app.editor_gutter as usize;
+    let text_w = (inner.width as usize).saturating_sub(gutter);
     let lines = app.editor.lines();
     for p in &phs {
         let Some(line) = lines.get(p.row) else {
@@ -1984,14 +2060,14 @@ pub(crate) fn paint_editor_placeholders(f: &mut Frame, area: Rect, app: &App) {
         let y = inner.y + (p.row - top_row) as u16;
         for k in 0..p.len {
             let dcol = editor_display_col(line, p.col + k);
-            if dcol < top_col || dcol - top_col >= inner.width as usize {
+            if dcol < top_col || dcol - top_col >= text_w {
                 continue;
             }
             // The next char's display column minus this one is the exact cell
             // span (a tab is 1..4 cells, a wide CJK glyph 2, a combining mark 0).
             let dnext = editor_display_col(line, p.col + k + 1);
             let span = dnext.saturating_sub(dcol).max(1);
-            let x0 = inner.x + (dcol - top_col) as u16;
+            let x0 = inner.x + gutter as u16 + (dcol - top_col) as u16;
             for dx in 0..span as u16 {
                 if x0 + dx >= inner.x + inner.width {
                     break;

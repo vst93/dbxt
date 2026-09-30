@@ -1469,7 +1469,10 @@ pub(crate) fn editor_click(app: &mut App, x: u16, y: u16) {
     if !rect_contains(inner, x, y) {
         return;
     }
-    let (row, col) = app.editor_vp.text_pos(x - inner.x, y - inner.y);
+    // R88: the optional statement gutter sits left of the text; a click there
+    // maps to column 0 rather than a bogus negative offset.
+    let rel_x = (x.saturating_sub(inner.x)).saturating_sub(app.editor_gutter);
+    let (row, col) = app.editor_vp.text_pos(rel_x, y - inner.y);
     if row as usize >= app.editor.lines().len() {
         // Clicking the empty space below the text jumps to the end of the buffer
         // (`Jump` with an out-of-range position clamps to the last character).

@@ -1810,6 +1810,9 @@ pub(crate) fn submit_edit_sql(app: &mut App, tx: &Tx, sql: String) {
     if readonly_block(app, &sql) {
         return;
     }
+    // R88: a generated row edit is its own run — never inherit an editor
+    // selection / statement scope label.
+    app.pending_scope = None;
     let mut reason = detect_danger(&sql);
     if reason.is_none() && one_line(&sql).to_ascii_lowercase().contains("where 1 = 1") {
         reason = Some(t("WHERE 恒真（1 = 1），会作用于整张表").into());

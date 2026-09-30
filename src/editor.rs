@@ -765,6 +765,19 @@ pub(crate) fn locate_statement_spans(
     editor_text: &str,
     statements: &[String],
 ) -> Vec<Option<(usize, usize)>> {
+    locate_statement_indices(editor_text, statements)
+        .into_iter()
+        .map(|o| o.map(|(_, span)| span))
+        .collect()
+}
+
+/// R88: like [`locate_statement_spans`] but also returns each statement's
+/// 0-based index into the buffer's statement list, so a scoped run can name the
+/// editor ordinal (`第 N 条`) of the statements it executed. Pure.
+pub(crate) fn locate_statement_indices(
+    editor_text: &str,
+    statements: &[String],
+) -> Vec<Option<(usize, (usize, usize))>> {
     let ranges = statement_ranges(editor_text);
     let chars: Vec<char> = editor_text.chars().collect();
     let text_of = |(s, e): (usize, usize)| -> String {
@@ -785,12 +798,76 @@ pub(crate) fn locate_statement_spans(
         match pick {
             Some(r) => {
                 used[r] = true;
-                out.push(Some(ranges[r]));
+                out.push(Some((r, ranges[r])));
             }
             None => out.push(None),
         }
     }
     out
+}
+
+/// R88: the 0-based row each statement's first code token sits on, paired with
+/// its 1-based ordinal. A line that carries two statements keeps the first (the
+/// ordinal of the line's leading statement). Purely textual — used by the
+/// optional editor statement gutter — and `None` (empty) above `max_bytes`, so a
+/// huge script costs nothing per frame. Client-side, zero queries.
+pub(crate) fn statement_start_rows(text: &str, max_bytes: usize) -> Vec<(usize, usize)> {
+    if text.len() > max_bytes {
+        return Vec::new();
+    }
+    let chars: Vec<char> = text.chars().collect();
+    let mask = code_mask(&chars);
+    let ranges = statement_ranges(text);
+    // Line start offsets (char indices) so an offset maps to a row in O(log n).
+    let mut line_starts = vec![0usize];
+    for (i, c) in chars.iter().enumerate() {
+        if *c == '\n' {
+            line_starts.push(i + 1);
+        }
+    }
+    let row_of =
+        |off: usize| -> usize { line_starts.partition_point(|&s| s <= off).saturating_sub(1) };
+    let mut out: Vec<(usize, usize)> = Vec::new();
+    for (i, (s, e)) in ranges.iter().enumerate() {
+        let at = statement_code_start(&chars, &mask, *s, *e);
+        let row = row_of(at);
+        if out.last().is_some_and(|&(r, _)| r == row) {
+            continue;
+        }
+        out.push((row, i + 1));
+    }
+    out
+}
+
+/// R88: the width of the editor's statement-ordinal gutter for the last frame.
+/// Zero when the toggle is off, when the buffer has fewer than two statements,
+/// or when it is above the size cap (a huge script must not pay a lex per
+/// frame). The width is `digits + "." + one space`; purely presentational, so
+/// the SQL text itself never changes.
+pub(crate) fn statement_gutter_cols(app: &App) -> u16 {
+    if !app.stmt_gutter {
+        return 0;
+    }
+    let text = app.editor_sql();
+    let rows = statement_start_rows(&text, STMT_DIM_MAX_BYTES);
+    if rows.len() < 2 {
+        return 0;
+    }
+    (rows.len().to_string().len() + 2) as u16
+}
+
+/// R88: `F2` — toggle the editor's statement-ordinal gutter. A pure render
+/// layer (the buffer is never touched); the choice persists in `tui.json` and
+/// is applied on the next launch. Default off (a visual preference).
+pub(crate) fn toggle_stmt_gutter(app: &mut App) {
+    app.stmt_gutter = !app.stmt_gutter;
+    app.config.set_stmt_gutter(app.stmt_gutter);
+    app.persist();
+    app.flash(if app.stmt_gutter {
+        t("语句序号 开（F2 关闭）").to_string()
+    } else {
+        t("语句序号 关（F2 开启）").to_string()
+    });
 }
 
 /// Drop every located execution error (new run, edit, backend switch).
@@ -799,6 +876,8 @@ pub(crate) fn clear_editor_errors(app: &mut App) {
     app.editor_error_idx = 0;
     app.editor_error_snapshot.clear();
     app.editor_error_base.clear();
+    // R88: a located-error reset also drops any half-consumed run scope.
+    app.pending_scope = None;
 }
 
 /// Drop the located errors once the buffer changed under them — the char offsets
@@ -834,29 +913,62 @@ pub(crate) fn record_editor_errors(
         clear_editor_errors(app);
         return false;
     };
-    // Only locate when the editor still holds exactly what ran. A selection run
-    // or a buffer edited after the failure has no reliable offset mapping, so it
-    // is left alone rather than highlighting the wrong text.
-    if text.trim() != exec {
-        clear_editor_errors(app);
-        return false;
+    // R88: a scoped run (selection / current statement) already knows the
+    // buffer spans it sent; a whole-buffer run re-derives them from the text.
+    // Either way the editor must still hold what ran (a buffer edited while the
+    // query was in flight would make every stored offset stale).
+    let scope = app.pending_scope.take();
+    let mut located: Vec<Option<(usize, usize)>>;
+    let ordinals: Vec<usize>;
+    match &scope {
+        Some(sr) => {
+            located = sr.spans.clone();
+            ordinals = sr.ordinals.clone();
+            let chars: Vec<char> = text.chars().collect();
+            for (i, slot) in located.iter_mut().enumerate() {
+                if let Some((s, e)) = *slot {
+                    if e > chars.len() {
+                        *slot = None;
+                        continue;
+                    }
+                    let cur: String = chars[s..e].iter().collect::<String>().trim().to_string();
+                    if statements.get(i).map(|t| t.trim()) != Some(cur.as_str()) {
+                        *slot = None;
+                    }
+                }
+            }
+        }
+        None => {
+            // Only locate when the editor still holds exactly what ran.
+            if text.trim() != exec {
+                clear_editor_errors(app);
+                return false;
+            }
+            located = locate_statement_spans(&text, statements);
+            ordinals = (1..=statements.len()).collect();
+        }
     }
-    let located = locate_statement_spans(&text, statements);
     let mut spans: Vec<EditorErrorSpan> = Vec::new();
     for (i, msg) in errors {
         let err_line = extract_error_line(msg);
-        // Primary: match the statement the engine ran back to the buffer. If
-        // that fails (an unusual split), fall back to the line the driver named,
-        // offset by where statement `i` begins in the script.
-        let range =
-            located.get(*i).copied().flatten().or_else(|| {
+        let primary = located.get(*i).copied().flatten();
+        // Primary: match the statement the engine ran back to the buffer. For a
+        // whole-buffer run, fall back to the line the driver named, offset by
+        // where statement `i` begins in the script. A scoped run skips that
+        // fallback: its statements are not the whole buffer, so a buffer-relative
+        // line number would point at the wrong text.
+        let range = if scope.is_some() {
+            primary
+        } else {
+            primary.or_else(|| {
                 err_line.and_then(|l| locate_statement_at_line(&text, statements, *i, l))
-            });
+            })
+        };
         if let Some((s, e)) = range {
             spans.push(EditorErrorSpan {
                 start: s,
                 end: e,
-                ordinal: i + 1,
+                ordinal: ordinals.get(*i).copied().unwrap_or(i + 1),
                 err_line,
             });
         }
@@ -1474,7 +1586,11 @@ pub(crate) fn editor_key_inner(app: &mut App, tx: &Tx, k: KeyEvent) {
         return;
     }
     match (k.modifiers, k.code) {
-        (m, KeyCode::Char('j')) if m.contains(KeyModifiers::CONTROL) => run_current(app, tx),
+        // R88: Ctrl-J runs the selection when there is one, otherwise the
+        // statement under the cursor; F5 still runs the whole editor.
+        (m, KeyCode::Char('j')) if m.contains(KeyModifiers::CONTROL) => {
+            run_current_scoped(app, tx, RunScope::CurrentStatement)
+        }
         // R61 Ctrl-F: find inside the editor buffer (client-side, no query).
         // Free in the editor — the results pane owns Ctrl-F for page turn.
         (m, KeyCode::Char('f')) if m.contains(KeyModifiers::CONTROL) => open_editor_find(app),
@@ -1644,6 +1760,8 @@ pub(crate) fn editor_key_inner(app: &mut App, tx: &Tx, k: KeyEvent) {
         // the previous word. `browse_key` deliberately does not claim those
         // combos while the editor is focused, so the muscle memory survives.
         (KeyModifiers::NONE, KeyCode::F(5)) => run_current(app, tx),
+        // R88: F2 toggles the optional statement-ordinal gutter (render-only).
+        (KeyModifiers::NONE, KeyCode::F(2)) => toggle_stmt_gutter(app),
         (KeyModifiers::NONE, KeyCode::Tab) => {
             app.focus = if app.backend_kind == Backend::Sql {
                 Focus::Preview

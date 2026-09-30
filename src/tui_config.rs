@@ -67,6 +67,9 @@ pub(crate) struct TuiConfig {
     pub(crate) editor_indent: Option<bool>,
     /// R79: editor bracket auto-pairing (`None` = default on).
     pub(crate) editor_pairs: Option<bool>,
+    /// R88: editor statement-ordinal gutter (`None` / `false` = default off; a
+    /// visual preference, so it only ever turns on when the user asks).
+    pub(crate) stmt_gutter: Option<bool>,
     /// R83: the last few SQLite files opened through the `L` quick-open picker,
     /// most-recent first. These are plain file paths, never connections — a
     /// quick-open stays out of the connection store entirely.
@@ -104,6 +107,10 @@ pub(crate) struct TuiConfig {
     /// so a session that never collapsed a group cannot clobber another
     /// session's fold state.
     pub(crate) dirty_group_closed: bool,
+    /// R88: whether this session changed the statement-gutter toggle. Kept
+    /// separate from the other display flags so toggling it never rewrites a
+    /// value another session owns.
+    pub(crate) dirty_stmt_gutter: bool,
 }
 
 impl TuiConfig {
@@ -124,6 +131,7 @@ impl TuiConfig {
             stripe: v.get("stripe").and_then(|b| b.as_bool()),
             editor_indent: v.get("editor_indent").and_then(|b| b.as_bool()),
             editor_pairs: v.get("editor_pairs").and_then(|b| b.as_bool()),
+            stmt_gutter: v.get("stmt_gutter").and_then(|b| b.as_bool()),
             ..Self::default()
         };
         if let Some(arr) = v.get("sqlite_recent").and_then(|a| a.as_array()) {
@@ -316,6 +324,9 @@ impl TuiConfig {
         if self.dirty_group_closed {
             merged.group_closed = self.group_closed.clone();
         }
+        if self.dirty_stmt_gutter {
+            merged.stmt_gutter = self.stmt_gutter;
+        }
         for key in &self.dirty {
             let all_default = self
                 .tables
@@ -408,6 +419,9 @@ impl TuiConfig {
         if let Some(e) = self.editor_pairs {
             root.insert("editor_pairs".into(), serde_json::Value::Bool(e));
         }
+        if let Some(g) = self.stmt_gutter {
+            root.insert("stmt_gutter".into(), serde_json::Value::Bool(g));
+        }
         if !self.sqlite_recent.is_empty() {
             let arr: Vec<serde_json::Value> = self
                 .sqlite_recent
@@ -487,6 +501,12 @@ impl TuiConfig {
     pub(crate) fn set_stripe(&mut self, value: bool) {
         self.stripe = Some(value);
         self.dirty_display = true;
+    }
+
+    /// R88: set the editor statement-gutter toggle.
+    pub(crate) fn set_stmt_gutter(&mut self, value: bool) {
+        self.stmt_gutter = Some(value);
+        self.dirty_stmt_gutter = true;
     }
 
     /// R83: remember a SQLite file as the most recent quick-open, dropping any

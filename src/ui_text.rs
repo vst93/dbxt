@@ -1425,6 +1425,15 @@ pub static ALL_KEYS: &[&str] = &[
     "已关闭导入报告",
     "第 {} 条语句",
     "第 {} 条语句（{}/{}）",
+    "执行第 {} 条",
+    "执行第 {}-{} 条",
+    "执行选区",
+    "语句序号 开（F2 关闭）",
+    "语句序号 关（F2 开启）",
+    "语句序号",
+    "SQL … (Ctrl-J 当前句/选区 · F5 全部 · ↑ 历史)",
+    "有选区时 F5 / Ctrl-J 都只跑选区；无选区时 F5 执行整段 SQL、Ctrl-J 只执行光标所在语句（分号边界，字面量/注释里的分号不算）；执行后选区保留、状态栏显示 执行第 N 条",
+    "语句序号：编辑器左栏为每条语句首行显示 1. 2. …（纯渲染，绝不改动 SQL 文本；默认关，F2 切换并存入 tui.json 的 stmt_gutter，跨会话记住）",
     "没有可定位的执行错误",
     "{} 分钟前",
     "{} 分钟后",
@@ -3994,6 +4003,22 @@ fn en_of(zh: &'static str) -> Option<&'static str> {
         // R77: execution-error statement location + epoch preview.
         "第 {} 条语句" => Some("statement {}"),
         "第 {} 条语句（{}/{}）" => Some("statement {} ({}/{})"),
+        // R88: scoped editor run (selection / current statement) + gutter.
+        "执行第 {} 条" => Some("ran statement {}"),
+        "执行第 {}-{} 条" => Some("ran statements {}-{}"),
+        "执行选区" => Some("ran the selection"),
+        "语句序号 开（F2 关闭）" => Some("Statement numbers on (F2 to turn off)"),
+        "语句序号 关（F2 开启）" => Some("Statement numbers off (F2 to turn on)"),
+        "语句序号" => Some("stmt numbers"),
+        "SQL … (Ctrl-J 当前句/选区 · F5 全部 · ↑ 历史)" => {
+            Some("SQL … (Ctrl-J statement/selection · F5 all · ↑ history)")
+        }
+        "有选区时 F5 / Ctrl-J 都只跑选区；无选区时 F5 执行整段 SQL、Ctrl-J 只执行光标所在语句（分号边界，字面量/注释里的分号不算）；执行后选区保留、状态栏显示 执行第 N 条" => Some(
+            "With a selection, both F5 and Ctrl-J run only the selection; with none, F5 runs the whole editor and Ctrl-J runs only the statement at the cursor (semicolon boundaries; `;` in literals/comments never splits). The selection stays and the status bar names the statement it ran",
+        ),
+        "语句序号：编辑器左栏为每条语句首行显示 1. 2. …（纯渲染，绝不改动 SQL 文本；默认关，F2 切换并存入 tui.json 的 stmt_gutter，跨会话记住）" => Some(
+            "Statement numbers: show 1. 2. … in the editor's left gutter on each statement's first line (render-only, the SQL text is never touched; off by default, F2 toggles and persists it as `stmt_gutter` in tui.json)",
+        ),
         "没有可定位的执行错误" => Some("no located execution error"),
         "{} 分钟前" => Some("{} minutes ago"),
         "{} 分钟后" => Some("in {} minutes"),

@@ -1583,6 +1583,8 @@ pub(crate) fn explain_current(app: &mut App, tx: &Tx) {
     match explain_sql_for(cfg.db_type.as_str(), &sql) {
         Some(explain) => {
             app.loading = true;
+            // R88: EXPLAIN is its own run — never inherit an editor scope label.
+            app.pending_scope = None;
             app.status = format!("{} EXPLAIN…", cfg.db_type.as_str());
             let db = app.current_db();
             app.spawn(

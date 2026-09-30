@@ -4265,6 +4265,8 @@ impl App {
         // R79: editor input assist ships on. A `tui.json` value still wins.
         let config_editor_indent = config.editor_indent.unwrap_or(true);
         let config_editor_pairs = config.editor_pairs.unwrap_or(true);
+        // R88: the statement gutter is a visual aid, so it defaults off.
+        let config_stmt_gutter = config.stmt_gutter.unwrap_or(false);
         let mut app = Self {
             backend,
             page: Page::Browse,
@@ -4355,6 +4357,7 @@ impl App {
             history_view: Vec::new(),
             history_confirm: None,
             pending_run_origin: "editor",
+            pending_scope: None,
             direct_run: false,
             grid: None,
             grid_kind: GridKind::Query,
@@ -4375,6 +4378,8 @@ impl App {
             stripe: config_stripe,
             editor_indent: config_editor_indent,
             editor_pairs: config_editor_pairs,
+            stmt_gutter: config_stmt_gutter,
+            editor_gutter: 0,
             col_hidden: HashSet::new(),
             col_picker_open: false,
             col_picker_list: ListState::default(),
@@ -4572,7 +4577,7 @@ impl App {
             rects: Rects::default(),
         };
         app.editor
-            .set_placeholder_text(t("SQL … (Ctrl-J / F5 执行 · ↑ 历史)"));
+            .set_placeholder_text(t("SQL … (Ctrl-J 当前句/选区 · F5 全部 · ↑ 历史)"));
         app.set_placeholder();
         app
     }
@@ -5499,6 +5504,10 @@ fn apply_op_result(app: &mut App, res: OpResult, tx: &Tx) {
                 Some(n) => format!("{} {}", tf("⚠ 大结果集 · LIMIT {} · 可能较慢", &[&n]), base),
                 None => base,
             };
+            // R88: a scoped run names the statement it executed.
+            if let Some(l) = take_scope_label(app, &sql) {
+                app.status = format!("{} · {}", app.status, l);
+            }
             // Keep every query result as a tab so consecutive SELECTs can be flipped
             // with `[` / `]` instead of overwriting each other. A `Ctrl-N` "load more"
             // (a cap above the default) replaces the active tab instead of spawning
@@ -5592,12 +5601,21 @@ fn apply_op_result(app: &mut App, res: OpResult, tx: &Tx) {
                     ],
                 );
             }
+            // R88: a scoped selection run names the statement range it ran.
+            // The scope is left intact for `record_editor_errors` below, which
+            // consumes it to localize a failure to exactly these statements.
+            if let Some(l) = app.pending_scope.as_ref().map(|s| s.label.clone()) {
+                app.status = format!("{} · {}", app.status, l);
+            }
             // R77: locate the failing statements back in the editor (when it
             // still holds exactly what ran) and append `第 N 条语句` to the
             // status line. `F8` / `Shift-F8` and `Alt-E` then cycle them.
             let base = app.status.clone();
             if record_editor_errors(app, &stmt_sqls, &error_list, &base) {
                 apply_editor_error_status(app);
+            } else {
+                // No located error: drop any half-consumed scope.
+                app.pending_scope = None;
             }
         }
         OpResult::Redis(s) => {

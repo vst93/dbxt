@@ -48,7 +48,7 @@ pub(crate) use ratatui::style::{Color, Modifier, Style};
 pub(crate) use ratatui::symbols::border;
 pub(crate) use ratatui::text::{Line, Span};
 pub(crate) use ratatui::widgets::{
-    Block, Borders, Cell, Clear, List, ListItem, ListState, Paragraph, Row, Table, Wrap,
+    Block, Borders, Cell, Clear, List, ListItem, ListState, Padding, Paragraph, Row, Table, Wrap,
 };
 pub(crate) use ratatui::Frame;
 pub(crate) use tui_textarea::{CursorMove, Scrolling, TextArea};

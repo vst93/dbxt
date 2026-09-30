@@ -8512,3 +8512,227 @@ pub(crate) fn r87_keys_are_in_footer_mini_and_full_help() {
         "sidebar footer names Alt-Shift-H: {hints:?}"
     );
 }
+
+// ── R88: scoped editor run (Ctrl-J selection / current statement) + gutter ──
+
+/// R88: the cursor → statement-index matrix. `current_statement_span` is the
+/// single resolver `Ctrl-J` runs through, so every edge case is pinned here:
+/// statement start, mid-statement, right after a `;`, the gap between
+/// statements (→ the following one), a `;` inside a string literal (never
+/// splits), an empty buffer, and a lone statement with no `;`.
+#[test]
+pub(crate) fn r88_cursor_to_statement_index_matrix() {
+    let mut app = test_app();
+    app.set_editor_text("SELECT 1;\nSELECT ';' AS s;\nSELECT 3;\nSELECT 4;\nSELECT 5");
+    let idx_at = |app: &mut App, row: u16, col: u16| {
+        app.editor.move_cursor(CursorMove::Jump(row, col));
+        current_statement_span(app).map(|(_, i)| i)
+    };
+    // 句首.
+    assert_eq!(idx_at(&mut app, 0, 0), Some(0));
+    // 句中 (row 2 = `SELECT 3`, col 3 inside it).
+    assert_eq!(idx_at(&mut app, 2, 3), Some(2));
+    // 分号后: (0, 8) is the `;` separator itself → the next statement.
+    assert_eq!(idx_at(&mut app, 0, 8), Some(1));
+    // 空隙: (0, 9) is the newline between statement 0 and 1 → the next one.
+    assert_eq!(idx_at(&mut app, 0, 9), Some(1));
+    // 字符串内分号: row 1 col 8 is the `;` inside `';'` → stays statement 1.
+    assert_eq!(
+        idx_at(&mut app, 1, 8),
+        Some(1),
+        "a `;` inside a literal must not split"
+    );
+    // Last statement / trailing edge.
+    assert_eq!(idx_at(&mut app, 4, 8), Some(4));
+    // 无分号单句.
+    app.set_editor_text("SELECT 42");
+    assert_eq!(idx_at(&mut app, 0, 5), Some(0));
+    // Empty buffer: nothing to run.
+    app.set_editor_text("");
+    assert_eq!(idx_at(&mut app, 0, 0), None);
+}
+
+/// R88: a selection spanning two full statements scopes the run to exactly
+/// those ordinals; a run scoped to the cursor names its single statement; a
+/// whole-buffer run carries no scope at all.
+#[test]
+pub(crate) fn r88_scoped_run_maps_ordinals_and_labels() {
+    let mut app = test_app();
+    let text = "SELECT 1;\nSELECT 2;\nSELECT 3;\nSELECT 4;";
+    app.set_editor_text(text);
+    let dt = parse_database_type("mysql").unwrap();
+    let ranges = statement_ranges(text);
+    assert_eq!(ranges.len(), 4);
+
+    // 选区跨界: highlight statements 2 and 3 (indices 1..=2).
+    let (s2, e3) = (ranges[1].0, ranges[2].1);
+    let sql: String = text.chars().skip(s2).take(e3 - s2).collect();
+    let sr = build_scoped_run(
+        &app,
+        sql.trim(),
+        Some((s2, e3)),
+        RunScope::CurrentStatement,
+        dt,
+    )
+    .expect("selection scope");
+    assert_eq!(sr.ordinals, vec![2, 3]);
+    assert_eq!(sr.spans, vec![Some(ranges[1]), Some(ranges[2])]);
+    assert_eq!(sr.label, tf("执行第 {}-{} 条", &[&2, &3]));
+
+    // 光标所在语句 (row 2 = statement 3).
+    app.editor.move_cursor(CursorMove::Jump(2, 0));
+    let stmt = current_statement_text(&app).unwrap();
+    assert_eq!(stmt, "SELECT 3");
+    let sr = build_scoped_run(&app, &stmt, None, RunScope::CurrentStatement, dt).unwrap();
+    assert_eq!(sr.ordinals, vec![3]);
+    assert_eq!(sr.spans, vec![Some(ranges[2])]);
+    assert_eq!(sr.label, tf("执行第 {} 条", &[&3]));
+
+    // 整段 (F5): no scope label.
+    assert!(build_scoped_run(&app, text.trim(), None, RunScope::All, dt).is_none());
+
+    // The label is consumed only for the SQL it belongs to.
+    app.pending_scope = Some(sr.clone());
+    assert!(take_scope_label(&mut app, "SELECT other").is_none());
+    app.pending_scope = Some(sr.clone());
+    assert_eq!(
+        take_scope_label(&mut app, &sr.sql).as_deref(),
+        Some(sr.label.as_str())
+    );
+    assert!(app.pending_scope.is_none(), "label consumed exactly once");
+}
+
+/// R88: a failure inside a scoped run localizes the red block to the exact
+/// editor statement (ordinal from the buffer, not the run), and the R77 cycle
+/// walks only this run's span.
+#[test]
+pub(crate) fn r88_scoped_error_localizes_to_editor_ordinal() {
+    let mut app = test_app();
+    let text = "SELECT 1;\nSELECT bad;\nSELECT 3;";
+    app.set_editor_text(text);
+    let ranges = statement_ranges(text);
+    app.editor.move_cursor(CursorMove::Jump(1, 0));
+    let sql = current_statement_text(&app).unwrap();
+    let dt = parse_database_type("mysql").unwrap();
+    app.pending_scope = build_scoped_run(&app, &sql, None, RunScope::CurrentStatement, dt);
+    app.last_executed = Some(sql.clone());
+
+    let statements = vec![sql.clone()];
+    let located = record_editor_errors(
+        &mut app,
+        &statements,
+        &[(0, "query: syntax error".into())],
+        "✗ query: syntax error",
+    );
+    assert!(located, "scoped failure should localize");
+    assert_eq!(app.editor_error_spans.len(), 1);
+    assert_eq!(
+        app.editor_error_spans[0].ordinal, 2,
+        "editor ordinal, not #1"
+    );
+    assert_eq!(app.editor_error_spans[0].start, ranges[1].0);
+    assert_eq!(app.editor_error_spans[0].end, ranges[1].1);
+    assert!(
+        app.pending_scope.is_none(),
+        "scope consumed by the error path"
+    );
+}
+
+/// R88: the statement gutter renders `1.` `2.` on each statement's first line
+/// when enabled, defaults off, and never edits the buffer text.
+#[test]
+pub(crate) fn r88_statement_gutter_renders_and_never_edits_text() {
+    let mut app = test_app();
+    app.picker_open = false;
+    app.selected = Some(test_conn("mysql"));
+    app.backend_kind = Backend::Sql;
+    app.focus = Focus::Editor;
+    app.set_editor_text("SELECT 1;\nSELECT 2;\nSELECT 3;");
+    let buffer_before = app.editor_sql();
+
+    // Visual feature: off by default.
+    assert!(!app.stmt_gutter, "the gutter must default off");
+    let off = draw(&mut app, 90, 30).join("\n");
+    assert!(!off.contains("1. SELECT 1"), "gutter off by default: {off}");
+    assert_eq!(app.editor_gutter, 0);
+
+    app.stmt_gutter = true;
+    let on = draw(&mut app, 90, 30).join("\n");
+    assert!(on.contains("1. SELECT 1"), "{on}");
+    assert!(on.contains("2. SELECT 2"), "{on}");
+    assert!(on.contains("3. SELECT 3"), "{on}");
+    assert_eq!(app.editor_sql(), buffer_before, "gutter must not edit SQL");
+
+    // A single statement has nothing to number: no gutter is reserved.
+    app.set_editor_text("SELECT 42");
+    let _ = draw(&mut app, 90, 30);
+    assert_eq!(app.editor_gutter, 0, "one statement → no gutter");
+
+    app.stmt_gutter = false;
+    let _ = draw(&mut app, 90, 30);
+    assert_eq!(app.editor_gutter, 0);
+}
+
+/// R88: `F2` flips the gutter and persists `stmt_gutter` through `tui.json`.
+#[test]
+pub(crate) fn r88_f2_toggles_and_persists_the_gutter() {
+    let dir = std::env::temp_dir().join(format!("dbxt-r88-{}", std::process::id()));
+    let _ = std::fs::create_dir_all(&dir);
+    let path = dir.join("tui.json");
+    let _ = std::fs::remove_file(&path);
+
+    let mut app = test_app();
+    app.config_path = Some(path.clone());
+    assert!(!app.stmt_gutter);
+    app.focus = Focus::Editor;
+    let tx = test_tx();
+    editor_key(
+        &mut app,
+        &tx,
+        KeyEvent::new(KeyCode::F(2), KeyModifiers::NONE),
+    );
+    assert!(app.stmt_gutter, "F2 turns the gutter on");
+    editor_key(
+        &mut app,
+        &tx,
+        KeyEvent::new(KeyCode::F(2), KeyModifiers::NONE),
+    );
+    assert!(!app.stmt_gutter, "F2 turns it back off");
+
+    app.config.set_stmt_gutter(true);
+    app.persist();
+    assert_eq!(TuiConfig::load(&path).stmt_gutter, Some(true));
+    let _ = std::fs::remove_file(&path);
+}
+
+/// R88:D — the new `F2` key ships in the footer (which the mini sheet reuses)
+/// and in the full `?` sheet, all three at once.
+#[test]
+pub(crate) fn r88_key_is_in_footer_mini_and_full_help() {
+    // Full cheat-sheet.
+    assert!(
+        HELP_ROWS.iter().any(|(k, _)| *k == "F2"),
+        "full help is missing F2"
+    );
+    assert!(
+        HELP_ROWS.iter().any(|(k, _)| k.starts_with("F5 / Ctrl-J")),
+        "the F5 / Ctrl-J row should document the scoped run"
+    );
+
+    // Editor footer / mini sheet share `footer_hints_ctx`.
+    let hints = footer_hints_ctx(FooterCtx {
+        view: FooterView::Browse,
+        focus: Focus::Editor,
+        has_connection: true,
+    });
+    assert!(
+        hints.iter().any(|h| h.0 == "F2" && h.1 == t("语句序号")),
+        "editor footer names F2: {hints:?}"
+    );
+    let mini: Vec<&str> = hints
+        .iter()
+        .filter(|h| h.0 != "?" && h.0 != "F1")
+        .map(|h| h.0)
+        .collect();
+    assert!(mini.contains(&"F2"), "mini help dropped F2: {mini:?}");
+}

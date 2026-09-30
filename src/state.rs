@@ -204,6 +204,24 @@ pub(crate) struct EditorErrorSpan {
     pub(crate) err_line: Option<usize>,
 }
 
+/// R88: metadata for a scoped editor run (a selection or the statement under
+/// the cursor). Captured when the run is submitted so the result can label
+/// `执行第 N 条` and a failure can localize back to exactly the statements that
+/// ran — all client-side, zero extra queries.
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub(crate) struct ScopedRun {
+    /// The SQL this run sent, trimmed; `take_scope_label` matches on it so an
+    /// unrelated result (a load-more, an EXPLAIN) never inherits the label.
+    pub(crate) sql: String,
+    /// Buffer char spans of the executed statements, one per statement (`None`
+    /// when it could not be mapped back to the buffer).
+    pub(crate) spans: Vec<Option<(usize, usize)>>,
+    /// 1-based editor ordinals aligned with `spans` (0 = unmapped placeholder).
+    pub(crate) ordinals: Vec<usize>,
+    /// The bilingual status suffix, e.g. `执行第 3 条`.
+    pub(crate) label: String,
+}
+
 /// Collapse control characters so a value never breaks the one-line grid layout.
 pub(crate) fn sanitize_cell(s: &str) -> String {
     if !s.chars().any(|c| c == '\n' || c == '\r' || c == '\t') {
@@ -2099,6 +2117,9 @@ pub(crate) struct App {
     /// Where the next [`execute_sql`] came from, so a run that goes through the
     /// danger-confirm layer still records its origin (R45).
     pub(crate) pending_run_origin: &'static str,
+    /// R88: the scope of the last editor run when it was narrowed to a selection
+    /// or the statement under the cursor. `None` for a whole-buffer run.
+    pub(crate) pending_scope: Option<ScopedRun>,
     /// The in-flight query was started by `Ctrl-Enter` in the history panel;
     /// the result status names it a direct run plus its elapsed time (R45).
     pub(crate) direct_run: bool,
@@ -2142,6 +2163,12 @@ pub(crate) struct App {
     /// R79: auto-close `(` / `[` and skip over an existing closer (input
     /// behaviour, default on; `tui.json` can turn it off).
     pub(crate) editor_pairs: bool,
+    /// R88: show statement ordinals in the editor's left gutter (render-only,
+    /// default off; `tui.json` `stmt_gutter`, toggled with `F2`).
+    pub(crate) stmt_gutter: bool,
+    /// R88: the gutter width used on the last frame (0 = no gutter). Read by
+    /// the click mapping and the editor paint layers so text stays aligned.
+    pub(crate) editor_gutter: u16,
     /// Column names hidden for this browsing session (Ctrl-Shift-H).
     pub(crate) col_hidden: HashSet<String>,
     pub(crate) col_picker_open: bool,
@@ -2647,7 +2674,7 @@ impl App {
     }
     pub(crate) fn set_editor_text(&mut self, text: &str) {
         let mut ta = TextArea::from(text.split('\n'));
-        ta.set_placeholder_text(t("SQL … (Ctrl-J / F5 执行 · ↑ 历史)"));
+        ta.set_placeholder_text(t("SQL … (Ctrl-J 当前句/选区 · F5 全部 · ↑ 历史)"));
         ta.move_cursor(CursorMove::Bottom);
         ta.move_cursor(CursorMove::End);
         self.editor = ta;
