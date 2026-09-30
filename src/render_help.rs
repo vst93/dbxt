@@ -360,11 +360,20 @@ pub(crate) fn row_popup_body(
         } else {
             pl.style
         };
-        let push = |line: String, hit: &mut Vec<usize>, body: &mut Vec<Line<'static>>| {
-            for t in wrap_text(&line, inner_w) {
-                body.push(Line::from(Span::styled(t, style)));
+        let push = |spans: Vec<PopupSpan>, hit: &mut Vec<usize>, body: &mut Vec<Line<'static>>| {
+            for line in wrap_spans(&spans, inner_w) {
+                body.push(line);
                 hit.push(pos);
             }
+        };
+        // A JSON object/array field can be expanded in place with `J`; the
+        // compact line carries a quiet `(J 美化)` marker so the gesture is
+        // discoverable without crowding the value.
+        let expandable = popup.pretty.get(ei).is_some_and(|p| p.is_some());
+        let expanded = expandable && popup.expanded.get(ei).copied().unwrap_or(false);
+        let marker_span = || PopupSpan {
+            text: format!(" ({})", t("J 美化")),
+            style: Style::default().fg(Color::DarkGray),
         };
         if stacked {
             let name = popup.cols.get(ei).map(String::as_str).unwrap_or("");
@@ -376,10 +385,46 @@ pub(crate) fn row_popup_body(
                 .filter(|s| !s.is_empty())
                 .map(String::as_str)
                 .unwrap_or_else(|| pl.text.as_str());
-            push(format!("{marker}{name}:"), &mut hit, &mut body);
-            push(format!("  {shown}"), &mut hit, &mut body);
+            push(
+                vec![PopupSpan {
+                    text: format!("{marker}{name}:"),
+                    style,
+                }],
+                &mut hit,
+                &mut body,
+            );
+            let mut spans = vec![PopupSpan {
+                text: format!("  {shown}"),
+                style,
+            }];
+            if expandable && !expanded {
+                spans.push(marker_span());
+            }
+            push(spans, &mut hit, &mut body);
         } else {
-            push(format!("{marker}{}", pl.text), &mut hit, &mut body);
+            let mut spans = vec![PopupSpan {
+                text: format!("{marker}{}", pl.text),
+                style,
+            }];
+            if expandable && !expanded {
+                spans.push(marker_span());
+            }
+            push(spans, &mut hit, &mut body);
+        }
+        // R86: the pretty JSON block, indented under its field so the field /
+        // value grouping stays readable; its lines belong to the same entry, so
+        // the cursor highlight and click map cover them.
+        if expanded {
+            if let Some(pretty) = popup.pretty.get(ei).and_then(|p| p.as_ref()) {
+                for line_spans in pretty {
+                    let mut spans = vec![PopupSpan {
+                        text: "    ".to_string(),
+                        style: Style::default(),
+                    }];
+                    spans.extend(line_spans.iter().cloned());
+                    push(spans, &mut hit, &mut body);
+                }
+            }
         }
     }
     (body, hit, sel_line)
@@ -1030,6 +1075,18 @@ pub(crate) const HELP_ROWS: &[(&str, &str)] = &[
     ("Shift+← →", "列窗口横滚一列（任意区域，按住连滚）"),
     ("Ctrl-O", "SQL 片段收藏（DBX saved_sql_files）"),
     ("Ctrl-P", "EXPLAIN 当前 SQL（SQL 后端）"),
+    (
+        "Ctrl-T",
+        "加入批量队列（编辑确认层；Redis 中为「按 TTL 排序」）",
+    ),
+    (
+        "Ctrl-S / Ctrl-X",
+        "提交 / 清空批量队列（编辑器批量事务；Mongo 文档列表用 Ctrl-S 大小排序）",
+    ),
+    (
+        "Ctrl-D",
+        "删除当前行 / Redis 批量删 key（半屏下移让位给此键）",
+    ),
     ("?", "本帮助（面板内 / 过滤键位或功能名；上下文键位排前）"),
     (
         "F1",
@@ -1266,7 +1323,7 @@ pub(crate) const HELP_ROWS: &[(&str, &str)] = &[
     ("Y", "复制当前单元格值（状态栏显示列名与字符数）"),
     (
         "V",
-        "行选模式：↑↓ 移动 · Shift+↑↓ / v 扩展 · Y 复制 TSV（含列头）· d 生成 DELETE · c 生成 UPDATE 模板 · Esc 退出；d/c 只把语句送进编辑器，绝不执行",
+        "行选模式：↑↓ 移动 · Shift+↑↓ / v 扩展 · Ctrl-A 全选本页 · Y 复制 TSV（含列头）· d 生成 DELETE · c 生成 UPDATE 模板 · Esc 退出；d/c 只把语句送进编辑器，绝不执行",
     ),
     (
         "/",
@@ -1364,6 +1421,10 @@ pub(crate) const HELP_ROWS: &[(&str, &str)] = &[
         "下钻完整单元格（Esc 返回行弹层，再 Esc 回表格）",
     ),
     ("y / Y", "复制选中列值（y / Y 均可；状态栏带列名，与结果区 Y 同一路径）"),
+    (
+        "J",
+        "JSON 字段就地展开 / 收起（对象 / 数组；缩进多行块，超出弹层可滚动；y / Y 始终复制原始值）",
+    ),
     ("/", "按列名或值过滤（输入即筛；宽表 40+ 列找列）"),
     ("< 56 cols", "窄屏：每行「字段:」+ 缩进值单列自适应"),
     ("标题", "主键定位：第 12 行 · id=4821"),
@@ -2103,17 +2164,36 @@ pub(crate) fn mini_help_rows(area_h: u16) -> usize {
     (area_h.saturating_sub(4) as usize).max(MINI_HELP_MIN_ROWS)
 }
 
+/// R86: the fixed global anchor printed on the mini cheat-sheet's last row. The
+/// variant is chosen by the card's inner width so the line never wraps or clips
+/// (`[ ]` switches result tabs, `Ctrl-L` is the mode switch, `F1`/`?` widens to
+/// the full list). Returns an already-translated string.
+pub(crate) fn mini_help_anchor(inner_w: usize) -> &'static str {
+    if inner_w >= 32 {
+        t("Ctrl-L 模式 · [ ] 标签 · F1 全部")
+    } else if inner_w >= 22 {
+        t("Ctrl-L 模式 · [ ] 标签")
+    } else if inner_w >= 11 {
+        t("Ctrl-L 模式")
+    } else {
+        t("F1 全部")
+    }
+}
+
 /// The context mini cheat-sheet: as many keys for the surface that owns the
 /// keyboard right now as the screen can hold (at least [`MINI_HELP_MIN_ROWS`]),
 /// sized to fit one screen so it never scrolls. `?` again widens it to
 /// [`render_help`].
 pub(crate) fn render_help_mini(f: &mut Frame, area: Rect, app: &mut App) {
+    let w = overlay_width(area.width, 64, 30);
+    let inner_w = w.saturating_sub(2) as usize;
     // Reuse the footer's context-aware group for the surface *under* the mini
-    // sheet; drop the pinned `?` hint and size the list to the screen height.
+    // sheet; drop the pinned `?` hint, reserve the last row for the fixed global
+    // anchor, and size the list to the screen height.
     let hints: Vec<Hint> = footer_hints_ctx(footer_ctx_inner(app, false))
         .into_iter()
         .filter(|h| h.0 != "?" && h.0 != "F1")
-        .take(mini_help_rows(area.height))
+        .take(mini_help_rows(area.height).saturating_sub(1))
         .collect();
     let key_w = hints
         .iter()
@@ -2121,7 +2201,7 @@ pub(crate) fn render_help_mini(f: &mut Frame, area: Rect, app: &mut App) {
         .max()
         .unwrap_or(4)
         .min(12);
-    let mut lines: Vec<Line<'static>> = Vec::with_capacity(hints.len());
+    let mut lines: Vec<Line<'static>> = Vec::with_capacity(hints.len() + 1);
     for (key, desc) in &hints {
         lines.push(Line::from(vec![
             Span::styled(
@@ -2134,9 +2214,14 @@ pub(crate) fn render_help_mini(f: &mut Frame, area: Rect, app: &mut App) {
     if lines.is_empty() {
         lines.push(Line::from(t("当前上下文没有快捷操作")));
     }
+    // R86: a fixed global anchor so the mini card names the always-available
+    // gestures (mode switch / tabs / full help) on every context.
+    lines.push(Line::from(Span::styled(
+        mini_help_anchor(inner_w),
+        Style::default().fg(Color::DarkGray),
+    )));
     let max_h = area.height.saturating_sub(2).max(3);
     let h = (lines.len() as u16 + 2).min(max_h);
-    let w = overlay_width(area.width, 64, 30);
     let box_area = centered_overlay(area, w, h);
     f.render_widget(Clear, box_area);
     let title = if box_area.width < 60 {

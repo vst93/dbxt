@@ -1097,12 +1097,15 @@ pub(crate) fn browse_key(app: &mut App, tx: &Tx, k: KeyEvent) {
     // are kept out of the text inputs so typing is never hijacked.
     //   Ctrl-A = auto-collapse master switch
     //   Ctrl-W = collapse / expand just the focused pane
+    // R86: while the results pane is in row-select mode, Ctrl-A is the
+    // select-all gesture, so the auto-collapse master switch yields there and
+    // the key reaches `row_select_key`.
     if k.modifiers.contains(KeyModifiers::CONTROL)
         && !k.modifiers.contains(KeyModifiers::ALT)
         && !matches!(app.focus, Focus::Editor | Focus::CmdInput)
     {
         match k.code {
-            KeyCode::Char('a') => {
+            KeyCode::Char('a') if app.row_sel_anchor.is_none() => {
                 toggle_auto_collapse(app);
                 return;
             }

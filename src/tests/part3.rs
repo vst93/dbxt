@@ -5008,6 +5008,207 @@ pub(crate) fn row_select_state_machine_moves_extends_and_clears() {
     assert_eq!(app.row_sel_anchor, None);
 }
 
+/// R86: `Ctrl-A` inside row-select mode selects every row on the page (the
+/// Redis / Mongo key-browser `a` equivalent), while outside the mode it keeps
+/// its auto-collapse meaning.
+#[test]
+pub(crate) fn ctrl_a_selects_all_rows_in_row_select_mode() {
+    let tx = test_tx();
+    let mut app = orders_app(&[("id", "int"), ("name", "text")], 6);
+    app.sel = 1;
+    key(
+        &mut app,
+        &tx,
+        KeyEvent::new(KeyCode::Char('V'), KeyModifiers::NONE),
+    );
+    assert_eq!(app.row_sel_anchor, Some(1));
+    key(
+        &mut app,
+        &tx,
+        KeyEvent::new(KeyCode::Char('a'), KeyModifiers::CONTROL),
+    );
+    assert_eq!((app.row_sel_anchor, app.sel), (Some(0), 5));
+    assert_eq!(selected_full_rows(&app).len(), 6);
+    // Outside the mode Ctrl-A is still the auto-collapse master switch.
+    key(
+        &mut app,
+        &tx,
+        KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE),
+    );
+    assert_eq!(app.row_sel_anchor, None);
+    let before = app.auto_collapse;
+    key(
+        &mut app,
+        &tx,
+        KeyEvent::new(KeyCode::Char('a'), KeyModifiers::CONTROL),
+    );
+    assert_ne!(app.auto_collapse, before);
+}
+
+/// R86: the global segment is reserved and shown only in the Full footer tier,
+/// so a narrow line never loses a context key to it.
+#[test]
+pub(crate) fn footer_global_segment_shows_only_in_full_tier() {
+    let ctx = FooterCtx {
+        view: FooterView::Browse,
+        focus: Focus::Preview,
+        has_connection: true,
+    };
+    let hints = footer_hints_ctx(ctx);
+    let globals = footer_global_hints(ctx);
+    assert!(!globals.is_empty());
+    for width in [42usize, 80] {
+        let (chosen, gchosen, more) = footer_select_split(
+            &hints,
+            &globals,
+            footer_tier(width) == FooterTier::Full,
+            width,
+        );
+        assert!(gchosen.is_empty(), "width {width} should not show globals");
+        assert!(footer_line_width_split(&chosen, &gchosen, more, "?") <= width);
+    }
+    // A wide terminal keeps the global segment and still fits one line.
+    let (chosen, gchosen, more) = footer_select_split(&hints, &globals, true, 120);
+    assert!(!gchosen.is_empty());
+    assert!(footer_line_width_split(&chosen, &gchosen, more, "?") <= 120);
+    // The editor's segment names the snippet / EXPLAIN keys it cannot see.
+    let ectx = FooterCtx {
+        view: FooterView::Browse,
+        focus: Focus::Editor,
+        has_connection: true,
+    };
+    let eg: Vec<&str> = footer_global_hints(ectx).iter().map(|h| h.0).collect();
+    assert!(eg.contains(&"Ctrl-O") && eg.contains(&"Ctrl-P"));
+    // A modal overlay owns the keyboard, so it gets no global segment.
+    let modal = FooterCtx {
+        view: FooterView::RowPopup,
+        focus: Focus::Preview,
+        has_connection: true,
+    };
+    assert!(footer_global_hints(modal).is_empty());
+}
+
+/// R86: the `— 全局 —` help section is a complete ledger of the keys the
+/// top-level router owns, so a global gesture is never discoverable only from
+/// the footer (or nowhere at all).
+#[test]
+pub(crate) fn global_key_ledger_is_documented_in_help() {
+    let ledger: &[&str] = &[
+        "q",
+        "Ctrl-C",
+        "Ctrl-L",
+        "Ctrl-J",
+        "F5",
+        "Alt-Enter",
+        "Tab",
+        "Shift-Tab",
+        "Alt-1..9",
+        "Alt-Tab",
+        "Alt-Shift-1/2/3",
+        "Ctrl-A",
+        "Ctrl-W",
+        "Ctrl-G",
+        "Ctrl-O",
+        "Ctrl-P",
+        "Ctrl-T",
+        "Ctrl-S",
+        "Ctrl-X",
+        "Ctrl-D",
+        "F1",
+        "?",
+    ];
+    let mut in_global = false;
+    let mut keys: Vec<&str> = Vec::new();
+    for (k, d) in HELP_ROWS {
+        if *k == "— 全局 —" {
+            in_global = true;
+            continue;
+        }
+        if in_global {
+            if k.starts_with('—') {
+                break;
+            }
+            if !d.is_empty() {
+                keys.push(k);
+            }
+        }
+    }
+    assert!(!keys.is_empty(), "no global section found");
+    for needle in ledger {
+        assert!(
+            keys.iter().any(|k| k.contains(needle)),
+            "global help section is missing {needle:?}: {keys:?}"
+        );
+    }
+}
+
+/// R86: `J` expands a JSON object/array field in place inside the row popup,
+/// the compact line carries a marker, and `y` still copies the raw value.
+#[test]
+pub(crate) fn row_popup_json_expands_in_place() {
+    let tx = test_tx();
+    let mut app = orders_app(&[("id", "int"), ("payload", "json")], 1);
+    let mut grid = app.grid.clone().unwrap();
+    grid.rows[0][1] = Val::Text("{\"a\":1,\"b\":[2,3]}".into());
+    app.set_grid(grid);
+    app.sel = 0;
+    key(
+        &mut app,
+        &tx,
+        KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+    );
+    assert!(app.row_popup.is_some());
+    let popup = app.row_popup.as_ref().unwrap();
+    assert!(popup.pretty[1].is_some(), "payload is JSON");
+    let plain = |body: &[Line<'static>]| {
+        body.iter()
+            .map(|l| {
+                l.spans
+                    .iter()
+                    .map(|s| s.content.as_ref())
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    };
+    let (body, _, _) = row_popup_body(popup, 76);
+    let compact = plain(&body);
+    assert!(
+        compact.contains(&format!("({})", t("J 美化"))),
+        "marker missing: {compact}"
+    );
+    let lines_before = body.len();
+    app.row_popup.as_mut().unwrap().cursor = 1;
+    row_popup_key(
+        &mut app,
+        KeyEvent::new(KeyCode::Char('J'), KeyModifiers::NONE),
+    );
+    assert!(app.row_popup.as_ref().unwrap().expanded[1]);
+    let (body2, _, _) = row_popup_body(app.row_popup.as_ref().unwrap(), 76);
+    assert!(body2.len() > lines_before, "expanded body should be longer");
+    let expanded = plain(&body2);
+    assert!(expanded.contains("\"a\": 1"), "{expanded}");
+    assert!(expanded.contains("\"b\": ["), "{expanded}");
+    // `y` copies the original compact value, never the pretty form.
+    copy_row_popup_value(&mut app);
+    let raw = app.row_popup.as_ref().unwrap().values[1].clone();
+    assert_eq!(raw, "{\"a\":1,\"b\":[2,3]}");
+}
+
+/// R86: the mini card's fixed global anchor never exceeds the card's inner
+/// width, whatever variant the width selects.
+#[test]
+pub(crate) fn mini_help_anchor_fits_every_card_width() {
+    for inner in [7usize, 10, 11, 18, 22, 28, 31, 62] {
+        let a = mini_help_anchor(inner);
+        assert!(
+            disp_width(a) <= inner.max(7),
+            "anchor {a:?} ({}) too wide for inner {inner}",
+            disp_width(a)
+        );
+    }
+}
+
 /// R57: a three-row block is drawn as a reverse-video band.
 #[test]
 pub(crate) fn row_select_draws_a_reverse_video_block() {

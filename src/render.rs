@@ -1426,6 +1426,7 @@ pub(crate) fn footer_help_hint(more: bool, key: &'static str) -> Hint {
     }
 }
 
+#[cfg(test)]
 /// Choose which leading hints to show in `width`. The width tier caps the count
 /// (4 / 6 / all); within the cap hints are appended while they fit, so a single
 /// hint is never split. Returns the chosen hints and whether any were hidden
@@ -1454,6 +1455,91 @@ pub(crate) fn footer_select<'a>(hints: &'a [Hint], width: usize) -> (Vec<&'a Hin
     (chosen, hidden)
 }
 
+/// R86: the global keys most relevant to the surface that owns the keyboard.
+/// They are appended to the footer's hint list in the Full tier only, so a
+/// narrow line keeps its context keys. Ordered most-relevant first.
+pub(crate) fn footer_global_hints(ctx: FooterCtx) -> Vec<Hint> {
+    // The global keys are routed after the modal overlays, so they are only
+    // live on the pane-browsing surfaces (`key` checks `confirm` / the edit
+    // dialog before `Ctrl-L`, and `browse_key` checks the popups / pickers
+    // before `Ctrl-O` / the pane toggles). A modal surface therefore gets no
+    // global segment — the footer must never name a key it will not receive.
+    if !matches!(
+        ctx.view,
+        FooterView::Browse | FooterView::RedisKeys | FooterView::RedisValue | FooterView::MongoDocs
+    ) {
+        return Vec::new();
+    }
+    match ctx.focus {
+        // The editor already leads with `Ctrl-J` (run); the globals it cannot
+        // see at a glance are the snippet / EXPLAIN / batch keys.
+        Focus::Editor => vec![
+            ("Ctrl-O", t("片段")),
+            ("Ctrl-P", t("EXPLAIN")),
+            ("Ctrl-S", t("提交批量")),
+        ],
+        Focus::CmdInput => vec![("Ctrl-J", t("执行")), ("Ctrl-L", t("换模式"))],
+        // The results / sidebar panes share the layout globals; `Ctrl-A` is
+        // both the auto-collapse switch and (in row-select mode) select-all.
+        Focus::Preview => vec![
+            ("Ctrl-L", t("切模式")),
+            ("Ctrl-A", t("折叠栏")),
+            ("Tab", t("切区")),
+        ],
+        Focus::Sidebar => vec![
+            ("Ctrl-L", t("切模式")),
+            ("Ctrl-A", t("折叠栏")),
+            ("Tab", t("切区")),
+        ],
+    }
+}
+
+/// R86: choose the footer hints for a width, splitting off the global segment.
+/// The global hints are reserved first (so they survive when `show_globals` is
+/// set), then the context hints fill the remaining budget in priority order; the
+/// pinned help hint always closes the line. Display order is context → globals →
+/// help, matching [`render_footer`].
+pub(crate) fn footer_select_split<'a>(
+    hints: &'a [Hint],
+    globals: &'a [Hint],
+    show_globals: bool,
+    width: usize,
+) -> (Vec<&'a Hint>, Vec<&'a Hint>, bool) {
+    let (help, lead) = hints.split_last().expect("footer always has a hint");
+    let cap = footer_tier_cap(footer_tier(width));
+    let mut budget = width.saturating_sub(hint_width(help) + 5);
+    let mut hidden = false;
+    let mut gchosen: Vec<&'a Hint> = Vec::new();
+    if show_globals {
+        for g in globals {
+            let w = hint_width(g);
+            if w + 3 <= budget {
+                budget -= w + 3;
+                gchosen.push(g);
+            } else {
+                hidden = true;
+                break;
+            }
+        }
+    }
+    let mut chosen: Vec<&'a Hint> = Vec::new();
+    for (i, h) in lead.iter().enumerate() {
+        if cap.is_some_and(|c| i >= c) {
+            hidden = true;
+            break;
+        }
+        let w = hint_width(h);
+        if w + 3 <= budget {
+            budget -= w + 3;
+            chosen.push(h);
+        } else {
+            hidden = true;
+            break;
+        }
+    }
+    (chosen, gchosen, hidden)
+}
+
 #[cfg(test)]
 /// Display width of the rendered footer line for a chosen set, used by tests.
 /// Mirrors exactly what [`render_footer`] draws: the chosen hints, the pinned
@@ -1464,9 +1550,31 @@ pub(crate) fn footer_line_width(chosen: &[&Hint], more: bool, key: &'static str)
     w + chosen.len() * 3
 }
 
+#[cfg(test)]
+/// Display width of the split footer line (context hints then the global
+/// segment then the pinned help hint), used by the R86 tests.
+pub(crate) fn footer_line_width_split(
+    chosen: &[&Hint],
+    globals: &[&Hint],
+    more: bool,
+    key: &'static str,
+) -> usize {
+    let help = footer_help_hint(more, key);
+    let w: usize = chosen.iter().map(|h| hint_width(h)).sum::<usize>()
+        + globals.iter().map(|h| hint_width(h)).sum::<usize>()
+        + hint_width(&help);
+    w + (chosen.len() + globals.len()) * 3
+}
+
 pub(crate) fn render_footer(f: &mut Frame, area: Rect, app: &App) {
     let hints = footer_hints(app);
-    let (chosen, more) = footer_select(&hints, area.width as usize);
+    let globals = footer_global_hints(footer_ctx(app));
+    let (chosen, gchosen, more) = footer_select_split(
+        &hints,
+        &globals,
+        footer_tier(area.width as usize) == FooterTier::Full,
+        area.width as usize,
+    );
     let help = footer_help_hint(more, footer_help_key(app.focus));
     let mut spans: Vec<Span> = Vec::new();
     let sep = Span::styled(" · ", Style::default().fg(Color::DarkGray));
@@ -1474,7 +1582,7 @@ pub(crate) fn render_footer(f: &mut Frame, area: Rect, app: &App) {
         .fg(Color::Cyan)
         .add_modifier(Modifier::BOLD);
     let desc_style = Style::default().fg(Color::DarkGray);
-    for h in &chosen {
+    for h in chosen.iter().chain(gchosen.iter()) {
         if !spans.is_empty() {
             spans.push(sep.clone());
         }

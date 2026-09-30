@@ -1291,7 +1291,7 @@ pub static ALL_KEYS: &[&str] = &[
     "跳行：输入行号直达该行，:$ 跳末行（结果 / 表 / Redis / Mongo 均可）",
     // R57: results row selection + batch statements + Redis cursor-preserving delete.
     "当前视图没有可选行",
-    "行选 {}-{}（{} 行）· ↑↓ 移动 · Shift+↑↓ / v 扩展 · Y 复制 · d 删除语句 · c 更新模板 · Esc 退出",
+    "行选 {}-{}（{} 行）· Ctrl-A 全选 · ↑↓ 移动 · Shift+↑↓ / v 扩展 · Y 复制 · d 删除语句 · c 更新模板 · Esc 退出",
     "已退出行选",
     "✓ 已复制 {} 行（TSV，含列头）· 兜底 {}",
     "✓ 已复制 {} 行（TSV，含列头）",
@@ -1471,11 +1471,6 @@ fn en_of(zh: &'static str) -> Option<&'static str> {
         "✓ 已复制「{}」= {} · {} 字符" => Some("✓ Copied [{}] = {} · {} chars"),
         "复制当前单元格值（状态栏显示列名与字符数）" => {
             Some("copy the focused cell's value (status shows the column and char count)")
-        }
-        "行选模式：↑↓ 移动 · Shift+↑↓ / v 扩展 · Y 复制 TSV（含列头）· d 生成 DELETE · c 生成 UPDATE 模板 · Esc 退出；d/c 只把语句送进编辑器，绝不执行" => {
-            Some(
-                "row-select mode: ↑↓ move · Shift+↑↓ / v extend · Y copy TSV (with header) · d generate DELETE · c generate UPDATE template · Esc exit; d/c only send SQL to the editor, never execute it",
-            )
         }
         // ── R52: editor statement jump + results column filter + server version ──
         "语句 {}/{}" => Some("statement {}/{}"),
@@ -3742,9 +3737,9 @@ fn en_of(zh: &'static str) -> Option<&'static str> {
         ),
         // R57: results row selection + batch statements + Redis cursor-preserving delete.
         "当前视图没有可选行" => Some("No selectable rows in this view"),
-        "行选 {}-{}（{} 行）· ↑↓ 移动 · Shift+↑↓ / v 扩展 · Y 复制 · d 删除语句 · c 更新模板 · Esc 退出" => {
+        "行选 {}-{}（{} 行）· Ctrl-A 全选 · ↑↓ 移动 · Shift+↑↓ / v 扩展 · Y 复制 · d 删除语句 · c 更新模板 · Esc 退出" => {
             Some(
-                "Row select {}-{} ({} rows) · ↑↓ move · Shift+↑↓ / v extend · Y copy · d delete SQL · c update template · Esc exit",
+                "Row select {}-{} ({} rows) · Ctrl-A select all · ↑↓ move · Shift+↑↓ / v extend · Y copy · d delete SQL · c update template · Esc exit",
             )
         }
         "已退出行选" => Some("Row select off"),
@@ -4091,6 +4086,44 @@ fn en_of(zh: &'static str) -> Option<&'static str> {
         "正在加载，稍后再试" => Some("loading, try again in a moment"),
         "跳行：输入行号直达该行（超出范围钳到末行）；分页表视图按整数行号跳到目标页，:$ 跳末行（结果 / 表 / Redis / Mongo 均可）" => {
             Some("Row jump: type a row number to go straight there (out-of-range clamps to the last row); in a paginated table view the number is an absolute row and the target page loads on demand; :$ goes to the last row (results / tables / Redis / Mongo)")
+        }
+        // ── R86: global-key footer segment, row-select select-all, row-popup
+        // JSON expand (`J`), and the mini-cheat-sheet global anchor ──
+        "提交批量" => Some("commit batch"),
+        "切模式" => Some("switch mode"),
+        "折叠栏" => Some("collapse panes"),
+        "切区" => Some("switch pane"),
+        "J 美化" => Some("J pretty"),
+        "已就地展开 JSON 字段（再按 J 收起）" => {
+            Some("JSON field expanded in place (press J again to collapse)")
+        }
+        "已收起 JSON 字段" => Some("JSON field collapsed"),
+        "该字段不是 JSON 对象/数组，无法美化" => {
+            Some("This field is not a JSON object/array, cannot pretty-print")
+        }
+        "没有可美化的字段" => Some("No field to pretty-print"),
+        "Ctrl-L 模式 · [ ] 标签 · F1 全部" => {
+            Some("Ctrl-L mode · [ ] tabs · F1 all")
+        }
+        "Ctrl-L 模式 · [ ] 标签" => Some("Ctrl-L mode · [ ] tabs"),
+        "Ctrl-L 模式" => Some("Ctrl-L mode"),
+        "F1 全部" => Some("F1 all"),
+        "加入批量队列（编辑确认层；Redis 中为「按 TTL 排序」）" => {
+            Some("Add to the batch queue (edit dialog; in Redis it sorts by TTL)")
+        }
+        "提交 / 清空批量队列（编辑器批量事务；Mongo 文档列表用 Ctrl-S 大小排序）" => {
+            Some("Commit / clear the batch queue (editor batch transaction; the MongoDB document list uses Ctrl-S for size sort)")
+        }
+        "删除当前行 / Redis 批量删 key（半屏下移让位给此键）" => {
+            Some("Delete the current row / batch-delete Redis keys (half-page-down yields to this key)")
+        }
+        "行选模式：↑↓ 移动 · Shift+↑↓ / v 扩展 · Ctrl-A 全选本页 · Y 复制 TSV（含列头）· d 生成 DELETE · c 生成 UPDATE 模板 · Esc 退出；d/c 只把语句送进编辑器，绝不执行" => {
+            Some(
+                "row-select mode: ↑↓ move · Shift+↑↓ / v extend · Ctrl-A select all on this page · Y copy TSV (with header) · d generate DELETE · c generate UPDATE template · Esc exit; d/c only send SQL to the editor, never execute it",
+            )
+        }
+        "JSON 字段就地展开 / 收起（对象 / 数组；缩进多行块，超出弹层可滚动；y / Y 始终复制原始值）" => {
+            Some("Expand / collapse a JSON field in place (object / array; an indented multi-line block that scrolls inside the popup; y / Y always copy the raw value)")
         }
         _ => None,
     }

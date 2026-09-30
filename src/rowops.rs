@@ -96,6 +96,13 @@ pub(crate) fn open_row_popup(app: &mut App) {
         Some(pk) => tf("第 {} 行 · {}", &[&abs, &pk]),
         None => tf("第 {} 行 · {} 列", &[&abs, &(grid.columns.len())]),
     };
+    // R86: precompute the pretty JSON body for every field that holds an object
+    // or array, so the in-place `J` expansion never re-parses while scrolling.
+    let pretty: Vec<Option<Vec<Vec<PopupSpan>>>> = values
+        .iter()
+        .map(|v| pretty_json(v).map(|p| pretty_json_spans(&p)))
+        .collect();
+    let expanded = vec![false; values.len()];
     app.popup_cache = None;
     app.row_popup = Some(RowPopup {
         title,
@@ -103,6 +110,8 @@ pub(crate) fn open_row_popup(app: &mut App) {
         cols,
         shown: shown_vals,
         values,
+        pretty,
+        expanded,
         row_abs: abs,
         scroll: 0,
         cursor: 0,
@@ -248,11 +257,66 @@ pub(crate) fn copy_row_popup_value(app: &mut App) {
     copy_named_value(app, &col, &text);
 }
 
+/// R86: `J` in the row popup expands / collapses the selected field's JSON
+/// object/array in place (a `(J 美化)` marker flags the fields that qualify).
+/// Pure client-side: it only changes how the already-loaded value is drawn, so
+/// `y`/`Y` still copy the raw text.
+pub(crate) fn toggle_row_popup_json(app: &mut App) {
+    let ei = {
+        let Some(popup) = app.row_popup.as_ref() else {
+            return;
+        };
+        let visible = row_popup_visible(popup);
+        let cursor = if visible.is_empty() {
+            0
+        } else {
+            popup.cursor.min(visible.len() - 1)
+        };
+        let Some(&ei) = visible.get(cursor) else {
+            app.status = t("没有可美化的字段").into();
+            return;
+        };
+        if !popup.pretty.get(ei).is_some_and(|p| p.is_some()) {
+            app.status = t("该字段不是 JSON 对象/数组，无法美化").into();
+            return;
+        }
+        ei
+    };
+    let now = if let Some(popup) = app.row_popup.as_mut() {
+        let now = !popup.expanded.get(ei).copied().unwrap_or(false);
+        if let Some(e) = popup.expanded.get_mut(ei) {
+            *e = now;
+        }
+        popup.count.clear();
+        now
+    } else {
+        return;
+    };
+    app.status = if now {
+        t("已就地展开 JSON 字段（再按 J 收起）").into()
+    } else {
+        t("已收起 JSON 字段").into()
+    };
+}
+
 /// Keys for the row popup. `j`/`k` or `n`/`p` (with an optional count) move the
 /// entry cursor, `/` filters by column name or value, `y`/`Y` copy the selected
-/// value, and `Enter` / `v` drill into the full cell popup. `Esc` / `q` close
-/// the row.
+/// value, `J` expands a JSON field in place, and `Enter` / `v` drill into the
+/// full cell popup. `Esc` / `q` close the row.
 pub(crate) fn row_popup_key(app: &mut App, k: KeyEvent) {
+    // R86: `J` expands / collapses the selected field's JSON object/array in
+    // place. Handled before the mutable borrow below (while a `/` filter is
+    // being typed, `J` stays a literal character).
+    let filtering = app.row_popup.as_ref().is_some_and(|p| p.filtering);
+    if !filtering
+        && !k
+            .modifiers
+            .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT)
+        && k.code == KeyCode::Char('J')
+    {
+        toggle_row_popup_json(app);
+        return;
+    }
     let Some(popup) = app.row_popup.as_mut() else {
         return;
     };
@@ -1199,15 +1263,39 @@ pub(crate) fn row_select_status(app: &App) -> String {
     };
     let (lo, hi) = (anchor.min(app.sel), anchor.max(app.sel));
     tf(
-        "行选 {}-{}（{} 行）· ↑↓ 移动 · Shift+↑↓ / v 扩展 · Y 复制 · d 删除语句 · c 更新模板 · Esc 退出",
+        "行选 {}-{}（{} 行）· Ctrl-A 全选 · ↑↓ 移动 · Shift+↑↓ / v 扩展 · Y 复制 · d 删除语句 · c 更新模板 · Esc 退出",
         &[&(lo + 1), &(hi + 1), &(hi - lo + 1)],
     )
+}
+
+/// R86: `Ctrl-A` inside row-select mode selects every row on the current page
+/// (anchor at the first row, cursor at the last), mirroring the Redis / MongoDB
+/// key browser's `a` select-all gesture. Pure client-side, no query.
+pub(crate) fn row_select_all(app: &mut App) {
+    let n = result_row_count(app);
+    if n == 0 {
+        app.status = t("当前视图没有可选行").into();
+        return;
+    }
+    app.row_sel_anchor = Some(0);
+    app.sel = n - 1;
+    app.status = row_select_status(app);
 }
 
 /// R57: row-select mode keys. Returns `true` when consumed; a key the mode does
 /// not use exits the mode (so the rest of the grid keymap stays one keystroke
 /// away) and returns `false` for the caller to handle normally.
 pub(crate) fn row_select_key(app: &mut App, tx: &Tx, k: KeyEvent) -> bool {
+    // R86: `Ctrl-A` selects every row on the page (the Redis / Mongo `a`
+    // equivalent). Handled before the generic modifier bailout, which would
+    // otherwise exit the mode.
+    if k.modifiers.contains(KeyModifiers::CONTROL)
+        && !k.modifiers.contains(KeyModifiers::ALT)
+        && k.code == KeyCode::Char('a')
+    {
+        row_select_all(app);
+        return true;
+    }
     if k.modifiers.contains(KeyModifiers::CONTROL) || k.modifiers.contains(KeyModifiers::ALT) {
         app.row_sel_anchor = None;
         return false;

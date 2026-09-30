@@ -410,6 +410,12 @@ pub(crate) struct RowPopup {
     /// Clipboard value per line, parallel to `lines` (drives `y`/`Y` and the
     /// drilled cell popup).
     pub(crate) values: Vec<String>,
+    /// R86: pretty-printed JSON token runs per field, parallel to `lines`;
+    /// `None` when the field is not a JSON object/array. Drives the in-place
+    /// `J` expansion.
+    pub(crate) pretty: Vec<Option<Vec<Vec<PopupSpan>>>>,
+    /// R86: whether the field is currently expanded to its pretty JSON block.
+    pub(crate) expanded: Vec<bool>,
     /// Absolute row number (1-based, across pages) for the drilled cell title.
     pub(crate) row_abs: usize,
     pub(crate) scroll: u16,
@@ -434,6 +440,8 @@ pub(crate) fn row_popup_from_lines(title: String, lines: Vec<PopupLine>) -> RowP
         cols: vec![String::new(); n],
         shown: vec![String::new(); n],
         values: vec![String::new(); n],
+        pretty: vec![None; n],
+        expanded: vec![false; n],
         row_abs: 0,
         scroll: 0,
         cursor: 0,
