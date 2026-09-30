@@ -4108,6 +4108,9 @@ impl App {
         let config_compact = config.compact;
         let config_num_fmt = config.num_fmt.unwrap_or_default();
         let config_stripe = config.stripe.unwrap_or(false);
+        // R79: editor input assist ships on. A `tui.json` value still wins.
+        let config_editor_indent = config.editor_indent.unwrap_or(true);
+        let config_editor_pairs = config.editor_pairs.unwrap_or(true);
         let mut app = Self {
             backend,
             page: Page::Browse,
@@ -4208,6 +4211,8 @@ impl App {
             compact: config_compact,
             num_fmt: config_num_fmt,
             stripe: config_stripe,
+            editor_indent: config_editor_indent,
+            editor_pairs: config_editor_pairs,
             col_hidden: HashSet::new(),
             col_picker_open: false,
             col_picker_list: ListState::default(),

@@ -1429,6 +1429,14 @@ pub(crate) const HELP_ROWS: &[(&str, &str)] = &[
         "常用 SQL 模板面板（内置只读；Enter 插入光标处并选中第一个 {{}} 占位符，Tab 跳下一个；片段 Ctrl-O 为用户自存）",
     ),
     ("%", "跳到配对括号（光标在 ()[]{} 上或旁；否则照常输入 %；停在括号上时配对项自动高亮）"),
+    (
+        "Enter",
+        "回车自动缩进：上一行以 SELECT/FROM/WHERE/AND/OR/JOIN/ON/SET/VALUES 或 ( [ { , 结尾，或含未闭合括号时，新行继承缩进 + 2 空格；纯空白行不继承（默认开；tui.json 的 editor_indent 可关）",
+    ),
+    (
+        "( [",
+        "括号自动补对：输入 ( / [ 自动补上 ) / ] 并把光标停在中间；光标处已是相同的右括号时按 ) / ] 直接跳过；字符串 / 注释内照常输入（默认开；tui.json 的 editor_pairs 可关）",
+    ),
     ("Ctrl-A / Ctrl-E", "行首 / 行尾（Home / End 同）"),
     ("Ctrl-K / Ctrl-⇧K", "删至行尾（kill line）"),
     ("Ctrl-W", "删前一个词"),

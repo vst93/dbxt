@@ -6801,3 +6801,227 @@ pub(crate) fn error_line_fallback_locates_by_line() {
     assert_eq!(got.trim(), "SELECT c\nFROM u");
     assert!(locate_statement_at_line(text, &stmts, 5, 1).is_none());
 }
+
+// ── R79: editor input assist (Enter auto-indent / bracket auto-pair) ─────────
+
+/// The whole Enter-indent inheritance matrix: blank lines inherit nothing, a
+/// block-opening line grows by two spaces, and every other line passes its own
+/// indent down. Brackets/keywords inside strings and comments never count.
+#[test]
+pub(crate) fn editor_auto_indent_matrix() {
+    let s = |v: &[&str]| v.iter().map(|s| s.to_string()).collect::<Vec<String>>();
+
+    // 1 · a whitespace-only previous line inherits nothing.
+    assert_eq!(auto_indent(&s(&["SELECT 1", ""]), 1), "");
+    assert_eq!(auto_indent(&s(&["SELECT 1", "   "]), 1), "");
+    // 2 · a trailing block keyword indents one level (case-insensitive).
+    assert_eq!(auto_indent(&s(&["SELECT"]), 0), "  ");
+    assert_eq!(auto_indent(&s(&["from"]), 0), "  ");
+    assert_eq!(auto_indent(&s(&["WHERE"]), 0), "  ");
+    assert_eq!(auto_indent(&s(&["VALUES"]), 0), "  ");
+    // 3 · `+2` is relative to the previous line's own indent.
+    assert_eq!(auto_indent(&s(&["\tAND"]), 0), "\t  ");
+    assert_eq!(auto_indent(&s(&["    OR"]), 0), "      ");
+    // 4 · a trailing `(` / `[` / `{` / `,` opens a block.
+    assert_eq!(auto_indent(&s(&["INSERT INTO t ("]), 0), "  ");
+    assert_eq!(auto_indent(&s(&["SELECT * FROM ["]), 0), "  ");
+    assert_eq!(auto_indent(&s(&["  a,"]), 0), "    ");
+    // 5 · an unbalanced bracket anywhere on the line opens a block.
+    assert_eq!(auto_indent(&s(&["WHERE id IN (SELECT id"]), 0), "  ");
+    // 6 · a keyword mid-line is not a block opener: the indent just carries.
+    assert_eq!(auto_indent(&s(&["SELECT a FROM t"]), 0), "");
+    assert_eq!(auto_indent(&s(&["  FROM t"]), 0), "  ");
+    // 7 · balanced brackets do not open a block.
+    assert_eq!(auto_indent(&s(&["WHERE f(a) = 1"]), 0), "");
+    // 8 · a bracket / keyword inside a string literal or comment never counts.
+    assert_eq!(auto_indent(&s(&["SELECT '('"]), 0), "");
+    assert_eq!(auto_indent(&s(&["SELECT 1 -- ("]), 0), "");
+    assert_eq!(auto_indent(&s(&["SELECT 1 /* WHERE"]), 0), "");
+    // 9 · an out-of-range row is a safe no-op.
+    assert_eq!(auto_indent(&s(&["SELECT"]), 3), "");
+}
+
+/// `Enter` in the editor really inserts the inherited indent, and the switch
+/// turns the behaviour off.
+#[test]
+pub(crate) fn editor_enter_indents_and_switch_disables_it() {
+    let (tx, _rx) = tokio::sync::mpsc::unbounded_channel::<OpResult>();
+    let mut app = test_app();
+    app.focus = Focus::Editor;
+    app.set_editor_text("SELECT");
+    editor_key(
+        &mut app,
+        &tx,
+        KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+    );
+    assert_eq!(app.editor_sql(), "SELECT\n  ");
+    assert_eq!(app.editor.cursor(), (1, 2), "caret sits after the indent");
+
+    // With the switch off, Enter inserts a bare newline.
+    app.editor_indent = false;
+    app.set_editor_text("WHERE");
+    editor_key(
+        &mut app,
+        &tx,
+        KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+    );
+    assert_eq!(app.editor_sql(), "WHERE\n");
+}
+
+/// The pure pair decision: `(` / `[` close, an existing closer is stepped over,
+/// and nothing happens inside a string or comment (or for `{`).
+#[test]
+pub(crate) fn bracket_pair_action_respects_literals() {
+    assert_eq!(pair_action("SELECT ", 7, '('), PairAction::Pair(')'));
+    assert_eq!(pair_action("SELECT ", 7, '['), PairAction::Pair(']'));
+    assert_eq!(pair_action("SELECT ()", 8, ')'), PairAction::Skip);
+    assert_eq!(pair_action("SELECT []", 8, ']'), PairAction::Skip);
+    assert_eq!(pair_action("SELECT ", 7, ')'), PairAction::Pass);
+    // Literals / comments: brackets stay literal.
+    assert_eq!(pair_action("SELECT '", 8, '('), PairAction::Pass);
+    assert_eq!(pair_action("SELECT ')'", 8, ')'), PairAction::Pass);
+    assert_eq!(pair_action("SELECT -- x", 11, '('), PairAction::Pass);
+    // `{` never pairs, so it cannot fight the template `{{…}}` placeholders.
+    assert_eq!(pair_action("SELECT ", 7, '{'), PairAction::Pass);
+}
+
+/// Typing `(` / `[` through the editor really inserts the pair and parks the
+/// caret between; typing the closer ahead steps over it. Strings stay literal.
+#[test]
+pub(crate) fn editor_bracket_auto_pair_skips_and_ignores_strings() {
+    let (tx, _rx) = tokio::sync::mpsc::unbounded_channel::<OpResult>();
+    let mut app = test_app();
+    app.focus = Focus::Editor;
+    app.set_editor_text("SELECT ");
+    editor_key(
+        &mut app,
+        &tx,
+        KeyEvent::new(KeyCode::Char('('), KeyModifiers::NONE),
+    );
+    assert_eq!(app.editor_sql(), "SELECT ()");
+    assert_eq!(app.editor.cursor(), (0, 8), "caret between the pair");
+
+    // The closer already sitting after the caret is stepped over, not doubled.
+    editor_key(
+        &mut app,
+        &tx,
+        KeyEvent::new(KeyCode::Char(')'), KeyModifiers::NONE),
+    );
+    assert_eq!(app.editor_sql(), "SELECT ()");
+    assert_eq!(app.editor.cursor(), (0, 9));
+
+    // `[` pairs too.
+    app.set_editor_text("SELECT ");
+    editor_key(
+        &mut app,
+        &tx,
+        KeyEvent::new(KeyCode::Char('['), KeyModifiers::NONE),
+    );
+    assert_eq!(app.editor_sql(), "SELECT []");
+    assert_eq!(app.editor.cursor(), (0, 8));
+
+    // Inside an unterminated string literal the bracket is typed literally.
+    app.set_editor_text("SELECT '");
+    editor_key(
+        &mut app,
+        &tx,
+        KeyEvent::new(KeyCode::Char('('), KeyModifiers::NONE),
+    );
+    assert_eq!(app.editor_sql(), "SELECT '(");
+
+    // The switch disables auto-pairing entirely.
+    app.editor_pairs = false;
+    app.set_editor_text("SELECT ");
+    editor_key(
+        &mut app,
+        &tx,
+        KeyEvent::new(KeyCode::Char('('), KeyModifiers::NONE),
+    );
+    assert_eq!(app.editor_sql(), "SELECT (");
+}
+
+/// R79: the editor footer keeps `Ctrl-J` (run) and `Alt-/` (complete) visible
+/// all the way down to a 42-column terminal, where the tier trims the rest.
+#[test]
+pub(crate) fn editor_footer_keeps_run_and_complete_when_narrow() {
+    let hints = footer_hints_ctx(FooterCtx {
+        view: FooterView::Browse,
+        focus: Focus::Editor,
+        has_connection: true,
+    });
+    for w in [42usize, 50, 60, 71, 72, 90] {
+        let (chosen, _) = footer_select(&hints, w);
+        let keys: Vec<&str> = chosen.iter().map(|h| h.0).collect();
+        assert!(keys.contains(&"Ctrl-J"), "width {w}: {keys:?}");
+        assert!(keys.contains(&"Alt-/"), "width {w}: {keys:?}");
+    }
+    // At 42 columns exactly the two critical keys survive, then `? 更多`.
+    let (chosen, more) = footer_select(&hints, 42);
+    assert_eq!(
+        chosen.iter().map(|h| h.0).collect::<Vec<_>>(),
+        vec!["Ctrl-J", "Alt-/"]
+    );
+    assert!(more);
+}
+
+/// R79: both editor input switches default on and an explicit `tui.json` value
+/// still wins, independently.
+#[test]
+pub(crate) fn editor_input_assist_defaults_on_and_honours_config() {
+    let app = App::new(
+        test_backend(),
+        TuiConfig::default(),
+        None,
+        false,
+        None,
+        DragPan::Off,
+    );
+    assert!(app.editor_indent, "auto-indent default on");
+    assert!(app.editor_pairs, "auto-pair default on");
+
+    let off = TuiConfig {
+        editor_indent: Some(false),
+        editor_pairs: Some(false),
+        ..TuiConfig::default()
+    };
+    let app_off = App::new(test_backend(), off, None, false, None, DragPan::Off);
+    assert!(!app_off.editor_indent);
+    assert!(!app_off.editor_pairs);
+
+    let mixed = TuiConfig {
+        editor_indent: Some(false),
+        editor_pairs: Some(true),
+        ..TuiConfig::default()
+    };
+    let app_mixed = App::new(test_backend(), mixed, None, false, None, DragPan::Off);
+    assert!(!app_mixed.editor_indent, "indent off stays off");
+    assert!(app_mixed.editor_pairs, "pairs on stays on");
+}
+
+/// R79: the two input switches round-trip through `tui.json`, and an unrelated
+/// save (which touches only other prefs) never drops them.
+#[test]
+pub(crate) fn editor_input_prefs_round_trip_through_config() {
+    let dir = std::env::temp_dir().join(format!("dbxt-cfg-r79-{}", std::process::id()));
+    let _ = std::fs::create_dir_all(&dir);
+    let path = dir.join("tui.json");
+    let _ = std::fs::remove_file(&path);
+
+    let cfg = TuiConfig {
+        editor_indent: Some(false),
+        editor_pairs: Some(true),
+        ..TuiConfig::default()
+    };
+    cfg.write(&path);
+    let back = TuiConfig::load(&path);
+    assert_eq!(back.editor_indent, Some(false));
+    assert_eq!(back.editor_pairs, Some(true));
+
+    // A save from a session that changed nothing relevant preserves them.
+    TuiConfig::default().save(&path);
+    let after = TuiConfig::load(&path);
+    assert_eq!(after.editor_indent, Some(false));
+    assert_eq!(after.editor_pairs, Some(true));
+
+    let _ = std::fs::remove_file(&path);
+}

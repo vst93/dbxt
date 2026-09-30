@@ -555,6 +555,139 @@ pub(crate) fn statement_code_start(
     start
 }
 
+// ── R79: editor input assist (auto-indent on Enter / bracket auto-pair) ──────
+
+/// Line endings that open a block: the next line stays one level deeper.
+const INDENT_OPENERS: &[&str] = &[
+    "SELECT", "FROM", "WHERE", "AND", "OR", "JOIN", "ON", "SET", "VALUES",
+];
+
+/// R79: the leading whitespace (spaces / tabs, verbatim) of `line`.
+pub(crate) fn leading_ws(line: &str) -> String {
+    line.chars()
+        .take_while(|c| *c == ' ' || *c == '\t')
+        .collect()
+}
+
+/// R79: true when the line's own brackets are unbalanced — more `(` / `[` / `{`
+/// than closers, counting *code* only (a `(` inside a string or comment never
+/// counts; the shared [`code_mask`] lexer draws the boundary).
+pub(crate) fn line_has_unclosed_bracket(line: &str) -> bool {
+    let chars: Vec<char> = line.chars().collect();
+    let mask = code_mask(&chars);
+    let mut depth = 0i32;
+    for (i, c) in chars.iter().enumerate() {
+        if !mask[i] {
+            continue;
+        }
+        match c {
+            '(' | '[' | '{' => depth += 1,
+            ')' | ']' | '}' => depth -= 1,
+            _ => {}
+        }
+    }
+    depth > 0
+}
+
+/// R79: true when a new line under `line` should be indented one level deeper —
+/// the line ends with a block keyword, `(` / `[` / `{` / `,`, or has an unclosed
+/// bracket of its own. Only *code* counts, so a trailing keyword or bracket
+/// inside a string / comment never opens a block. Pure, so the whole
+/// inheritance matrix is unit-testable.
+pub(crate) fn indent_one_deeper(line: &str) -> bool {
+    let chars: Vec<char> = line.chars().collect();
+    let mask = code_mask(&chars);
+    // The last non-whitespace character that is real code.
+    let last_code = (0..chars.len())
+        .rev()
+        .find(|&i| mask[i] && !chars[i].is_whitespace());
+    if let Some(i) = last_code {
+        if matches!(chars[i], '(' | '[' | '{' | ',') {
+            return true;
+        }
+        // The trailing identifier: a line that ends with `WHERE` opens a block,
+        // while `WHERE x = 1` does not.
+        if chars[i].is_alphanumeric() || chars[i] == '_' {
+            let start = (0..=i)
+                .rev()
+                .take_while(|&j| mask[j] && (chars[j].is_alphanumeric() || chars[j] == '_'))
+                .last()
+                .unwrap_or(i);
+            let token: String = chars[start..=i].iter().collect();
+            if INDENT_OPENERS.contains(&token.to_ascii_uppercase().as_str()) {
+                return true;
+            }
+        }
+    }
+    line_has_unclosed_bracket(line)
+}
+
+/// R79: the whitespace a new line should start with when `Enter` is pressed on
+/// `lines[row]`. A blank (whitespace-only) previous line inherits nothing; a
+/// block-opening one inherits its own indent plus two spaces; every other line
+/// just passes its indent down.
+pub(crate) fn auto_indent(lines: &[String], row: usize) -> String {
+    let Some(line) = lines.get(row) else {
+        return String::new();
+    };
+    if line.trim().is_empty() {
+        return String::new();
+    }
+    let base = leading_ws(line);
+    if indent_one_deeper(line) {
+        format!("{base}  ")
+    } else {
+        base
+    }
+}
+
+/// R79: is the char offset `cursor` in *code* (not inside a string literal,
+/// quoted identifier or comment)? A cursor at the very end of the buffer is
+/// treated as the state the text leaves behind, so typing into an unterminated
+/// literal still counts as being inside it. Shared with [`pair_action`].
+pub(crate) fn char_in_code(text: &str, cursor: usize) -> bool {
+    let chars: Vec<char> = text.chars().chain(std::iter::once(' ')).collect();
+    let mask = code_mask(&chars);
+    mask.get(cursor).copied().unwrap_or(true)
+}
+
+/// R79: what the auto-pair layer should do with a typed bracket.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum PairAction {
+    /// Type `ch` and its closer, leaving the caret between them.
+    Pair(char),
+    /// The caret already sits on the matching closer — step over it.
+    Skip,
+    /// Not a bracket, or inside a literal / comment: type it normally.
+    Pass,
+}
+
+/// R79: decide how a typed `ch` at char offset `cursor` is handled. Only `(`
+/// and `[` auto-close (a `{` is left alone so it never fights the template
+/// `{{…}}` placeholders), and both the opener and the closer-skip respect the
+/// lexer, so a `(` typed inside `'…'` or a `-- comment` stays literal.
+pub(crate) fn pair_action(text: &str, cursor: usize, ch: char) -> PairAction {
+    let chars: Vec<char> = text.chars().collect();
+    let next = chars.get(cursor).copied();
+    match ch {
+        '(' | '[' => {
+            if char_in_code(text, cursor) {
+                PairAction::Pair(if ch == '(' { ')' } else { ']' })
+            } else {
+                PairAction::Pass
+            }
+        }
+        ')' | ']' => {
+            if next == Some(ch) && char_in_code(text, cursor) {
+                PairAction::Skip
+            } else {
+                PairAction::Pass
+            }
+        }
+        _ => PairAction::Pass,
+    }
+}
+
 // ── R77: execution-error statement location ──────────────────────────────────
 
 /// Parse the 1-based line number out of a driver error message. Recognises the
@@ -1454,6 +1587,58 @@ pub(crate) fn editor_key_inner(app: &mut App, tx: &Tx, k: KeyEvent) {
         // the built-in binding below).
         (m, KeyCode::Char('K')) if m.contains(KeyModifiers::CONTROL) => {
             app.editor.delete_line_by_end();
+        }
+        // R79: `Enter` auto-indents the new line. The rule is the pure
+        // `auto_indent`: a blank previous line inherits nothing, a block-opening
+        // one (SELECT/FROM/WHERE/AND/OR/JOIN/ON/SET/VALUES / `(` `[` `{` `,` /
+        // an unclosed bracket) adds two spaces, and every other line passes its
+        // own indent down. A selection replaces normally, so this only fires on
+        // a bare Enter. Off when `editor_indent` is disabled in `tui.json`.
+        (KeyModifiers::NONE, KeyCode::Enter) if app.editor_indent && !app.editor.is_selecting() => {
+            let lines = app.editor.lines().to_vec();
+            let (row, _) = app.editor.cursor();
+            let indent = auto_indent(&lines, row);
+            app.editor.insert_newline();
+            if !indent.is_empty() {
+                app.editor.insert_str(indent);
+            }
+            app.editor_vp.note_key(&k);
+        }
+        // R79: `(` / `[` auto-close and leave the caret between the pair. The
+        // lexer decides: inside a string literal, quoted identifier or comment
+        // the bracket is typed literally. A selection replaces normally.
+        (KeyModifiers::NONE, KeyCode::Char(c @ ('(' | '[')))
+            if app.editor_pairs && !app.editor.is_selecting() =>
+        {
+            let text = app.editor_sql();
+            let (row, col) = app.editor.cursor();
+            let off = text_offset(&text, row, col).unwrap_or_else(|| text.chars().count());
+            match pair_action(&text, off, c) {
+                PairAction::Pair(close) => {
+                    app.editor.insert_char(c);
+                    app.editor.insert_char(close);
+                    app.editor.move_cursor(CursorMove::Back);
+                    app.editor_vp.note_key(&k);
+                }
+                _ => {
+                    app.editor.input(k);
+                }
+            }
+        }
+        // R79: `)` / `]` step over an identical closer already sitting after
+        // the caret instead of typing a second one (again, code only).
+        (KeyModifiers::NONE, KeyCode::Char(c @ (')' | ']')))
+            if app.editor_pairs && !app.editor.is_selecting() =>
+        {
+            let text = app.editor_sql();
+            let (row, col) = app.editor.cursor();
+            let off = text_offset(&text, row, col).unwrap_or_else(|| text.chars().count());
+            match pair_action(&text, off, c) {
+                PairAction::Skip => app.editor.move_cursor(CursorMove::Forward),
+                _ => {
+                    app.editor.input(k);
+                }
+            }
         }
         // Readline-style line editing rides tui-textarea's built-in bindings,
         // which reach `_` below: Ctrl-A / Home = line head, Ctrl-E / End = line

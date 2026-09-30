@@ -1246,9 +1246,12 @@ pub(crate) fn footer_hints_ctx(ctx: FooterCtx) -> Vec<Hint> {
                 ("1-9", t("直跳")),
             ],
             Focus::Editor => vec![
+                // R79: order is the narrow-screen priority. `Ctrl-J` (run) and
+                // `Alt-/` (complete) are the two keys a small terminal must keep,
+                // so they lead and survive the 42-column tier trimming.
                 ("Ctrl-J", t("运行")),
-                ("Alt-Enter", t("当前句")),
                 ("Alt-/", t("补全")),
+                ("Alt-Enter", t("当前句")),
                 ("Alt-P", t("片段")),
                 ("Enter", t("换行")),
                 ("↑↓", t("历史")),

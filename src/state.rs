@@ -2008,6 +2008,12 @@ pub(crate) struct App {
     pub(crate) num_fmt: NumFmt,
     /// R76: alternate-row banding in the result grid (config, default on).
     pub(crate) stripe: bool,
+    /// R79: auto-indent the new line after `Enter` inside a SQL block (input
+    /// behaviour, default on; `tui.json` can turn it off).
+    pub(crate) editor_indent: bool,
+    /// R79: auto-close `(` / `[` and skip over an existing closer (input
+    /// behaviour, default on; `tui.json` can turn it off).
+    pub(crate) editor_pairs: bool,
     /// Column names hidden for this browsing session (Ctrl-Shift-H).
     pub(crate) col_hidden: HashSet<String>,
     pub(crate) col_picker_open: bool,

@@ -57,6 +57,12 @@ pub(crate) struct TuiConfig {
     pub(crate) num_fmt: Option<NumFmt>,
     /// R76: alternate-row banding in the result grid (`None` = default on).
     pub(crate) stripe: Option<bool>,
+    /// R79: editor auto-indent on `Enter` (`None` = default on). An input
+    /// behaviour, not a visual one, so it ships on unless `tui.json` says
+    /// otherwise.
+    pub(crate) editor_indent: Option<bool>,
+    /// R79: editor bracket auto-pairing (`None` = default on).
+    pub(crate) editor_pairs: Option<bool>,
     pub(crate) tables: HashMap<(String, String), TablePrefs>,
     /// R72: persisted per-column widths, LRU-ordered (oldest first). Capped at
     /// [`COL_WIDTH_MEM_MAX`] on load and on save.
@@ -96,6 +102,8 @@ impl TuiConfig {
                 .and_then(|s| s.as_str())
                 .and_then(NumFmt::from_key),
             stripe: v.get("stripe").and_then(|b| b.as_bool()),
+            editor_indent: v.get("editor_indent").and_then(|b| b.as_bool()),
+            editor_pairs: v.get("editor_pairs").and_then(|b| b.as_bool()),
             ..Self::default()
         };
         if let Some(tables) = v.get("tables").and_then(|t| t.as_object()) {
@@ -348,6 +356,12 @@ impl TuiConfig {
         }
         if let Some(s) = self.stripe {
             root.insert("stripe".into(), serde_json::Value::Bool(s));
+        }
+        if let Some(e) = self.editor_indent {
+            root.insert("editor_indent".into(), serde_json::Value::Bool(e));
+        }
+        if let Some(e) = self.editor_pairs {
+            root.insert("editor_pairs".into(), serde_json::Value::Bool(e));
         }
         root.insert("tables".into(), serde_json::Value::Object(tables));
         if !self.col_widths.is_empty() {

@@ -1093,6 +1093,8 @@ pub static ALL_KEYS: &[&str] = &[
     "配对括号",
     "最近表 / 集合 / Redis key 后退 / 前进（浏览器语义，最多 50 个，跨库可用）",
     "跳到配对括号（光标在 ()[]{} 上或旁；否则照常输入 %；停在括号上时配对项自动高亮）",
+    "回车自动缩进：上一行以 SELECT/FROM/WHERE/AND/OR/JOIN/ON/SET/VALUES 或 ( [ { , 结尾，或含未闭合括号时，新行继承缩进 + 2 空格；纯空白行不继承（默认开；tui.json 的 editor_indent 可关）",
+    "括号自动补对：输入 ( / [ 自动补上 ) / ] 并把光标停在中间；光标处已是相同的右括号时按 ) / ] 直接跳过；字符串 / 注释内照常输入（默认开；tui.json 的 editor_pairs 可关）",
     "行首 / 行尾（Home / End 同）",
     "删至行尾（kill line）",
     "删前一个词",
@@ -3424,6 +3426,12 @@ fn en_of(zh: &'static str) -> Option<&'static str> {
         }
         "跳到配对括号（光标在 ()[]{} 上或旁；否则照常输入 %；停在括号上时配对项自动高亮）" => {
             Some("jump to the matching bracket (cursor on or beside ()[]{}; otherwise types %; the match under the cursor is highlighted automatically)")
+        }
+        "回车自动缩进：上一行以 SELECT/FROM/WHERE/AND/OR/JOIN/ON/SET/VALUES 或 ( [ { , 结尾，或含未闭合括号时，新行继承缩进 + 2 空格；纯空白行不继承（默认开；tui.json 的 editor_indent 可关）" => {
+            Some("auto-indent on Enter: when the previous line ends with SELECT/FROM/WHERE/AND/OR/JOIN/ON/SET/VALUES or ( [ { , or has an unclosed bracket, the new line inherits its indent + 2 spaces; a blank line inherits nothing (on by default; set editor_indent in tui.json to disable)")
+        }
+        "括号自动补对：输入 ( / [ 自动补上 ) / ] 并把光标停在中间；光标处已是相同的右括号时按 ) / ] 直接跳过；字符串 / 注释内照常输入（默认开；tui.json 的 editor_pairs 可关）" => {
+            Some("bracket auto-pairing: typing ( or [ inserts ) / ] and leaves the caret between; when the caret already sits on the same closer, ) / ] steps over it; inside a string / comment the bracket is typed literally (on by default; set editor_pairs in tui.json to disable)")
         }
         "行首 / 行尾（Home / End 同）" => Some("line head / tail (Home / End too)"),
         "删至行尾（kill line）" => Some("kill to end of line"),
