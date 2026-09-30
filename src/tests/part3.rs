@@ -9234,3 +9234,304 @@ pub(crate) fn r88_key_is_in_footer_mini_and_full_help() {
         .collect();
     assert!(mini.contains(&"F2"), "mini help dropped F2: {mini:?}");
 }
+
+// ─── R91: pinned reference row (`g s`) + frozen current column (`g f`) ──────
+
+/// The first differing column is found by index, and only named when both rows
+/// are loaded; a shorter row still reports the first missing index.
+#[test]
+pub(crate) fn first_diff_col_reports_the_first_changed_column() {
+    let cols = vec!["a".to_string(), "b".to_string(), "c".to_string()];
+    let a = vec![Val::Text("1".into()), Val::Text("x".into()), Val::Null];
+    let b = vec![Val::Text("1".into()), Val::Text("y".into()), Val::Null];
+    assert_eq!(first_diff_col(&cols, &a, &b).as_deref(), Some("b"));
+    assert_eq!(first_diff_col(&cols, &a, &a), None);
+    // A value appearing past the shorter row's end is a difference at that index.
+    assert_eq!(
+        first_diff_col(&cols, &a, &[Val::Text("1".into())]).as_deref(),
+        Some("b")
+    );
+    // No name available (columns shorter than the values) → a positional label.
+    assert_eq!(
+        first_diff_col(&[], &[Val::Null], &[Val::Text("1".into())]).as_deref(),
+        Some("#1")
+    );
+}
+
+/// `g s` pins the focused row as the reference; the status offset and the first
+/// differing column are computed client-side from the loaded rows.
+#[test]
+pub(crate) fn ref_row_offset_and_first_diff_column() {
+    let (tx, _rx) = tokio::sync::mpsc::unbounded_channel::<OpResult>();
+    let mut app = r91_ref_app();
+    app.sel = 2;
+    toggle_ref_row(&mut app);
+    assert!(app.ref_row.is_some(), "g s pins the row");
+    assert!(app.status.contains("第 3 行"), "{}", app.status);
+
+    // Same row: offset 0, no column.
+    let (d, col) = ref_offset(&app).unwrap();
+    assert_eq!(d, 0);
+    assert_eq!(col, None);
+
+    // Three rows down, `name` is the first (and only) differing column.
+    app.sel = 5;
+    let (d, col) = ref_offset(&app).unwrap();
+    assert_eq!(d, 3);
+    assert_eq!(col.as_deref(), Some("name"));
+    assert_eq!(
+        ref_display_row(&app),
+        Some(2),
+        "the pinned row is display 2"
+    );
+
+    // `g s` again clears it.
+    key(
+        &mut app,
+        &tx,
+        KeyEvent::new(KeyCode::Char('g'), KeyModifiers::NONE),
+    );
+    key(
+        &mut app,
+        &tx,
+        KeyEvent::new(KeyCode::Char('s'), KeyModifiers::NONE),
+    );
+    assert!(app.ref_row.is_none(), "g s again clears the reference row");
+    assert!(ref_offset(&app).is_none());
+}
+
+/// The marker and offset only cover the loaded window: a reference row on
+/// another page names no column and draws no marker, without a query.
+#[test]
+pub(crate) fn ref_row_outside_the_loaded_page_is_marked_absent() {
+    let mut app = r91_ref_app();
+    app.sel = 2;
+    toggle_ref_row(&mut app);
+    // Jump to page 2: the reference row (abs 3) is not part of this page's rows.
+    let ps = app.page_state.as_mut().unwrap();
+    ps.page = 1;
+    app.sel = 0;
+    assert_eq!(cursor_abs_row(&app), 51);
+    let (d, col) = ref_offset(&app).unwrap();
+    assert_eq!(d, 48, "offset still spans pages");
+    // The cursor row is always loaded, so the first differing column is still
+    // named; only the *marker* needs the reference row to be in the window.
+    assert_eq!(col.as_deref(), Some("name"));
+    assert_eq!(ref_display_row(&app), None, "not in the loaded window");
+}
+
+/// Switching tables / re-querying drops the reference row via `clear_grid`.
+#[test]
+pub(crate) fn clear_grid_drops_the_reference_row() {
+    let mut app = r91_ref_app();
+    app.sel = 1;
+    toggle_ref_row(&mut app);
+    assert!(app.ref_row.is_some());
+    app.clear_grid();
+    assert!(
+        app.ref_row.is_none(),
+        "a new grid starts without a reference row"
+    );
+}
+
+/// The `g s` / `g f` keys are documented in the footer, the mini sheet (which
+/// reuses the footer group) and the full `?` sheet at once.
+#[test]
+pub(crate) fn r91_keys_are_in_footer_mini_and_full_help() {
+    assert!(
+        HELP_ROWS.iter().any(|(k, _)| *k == "g s"),
+        "full help is missing g s"
+    );
+    assert!(
+        HELP_ROWS.iter().any(|(k, _)| *k == "g f"),
+        "full help is missing g f"
+    );
+    let hints = footer_hints_ctx(FooterCtx {
+        view: FooterView::Browse,
+        focus: Focus::Preview,
+        has_connection: true,
+    });
+    assert!(
+        hints.iter().any(|h| h.0 == "gs" && h.1 == t("钉行")),
+        "result footer names gs: {hints:?}"
+    );
+    assert!(
+        hints.iter().any(|h| h.0 == "gf" && h.1 == t("冻结列")),
+        "result footer names gf: {hints:?}"
+    );
+    let mini: Vec<&str> = hints
+        .iter()
+        .filter(|h| h.0 != "?" && h.0 != "F1")
+        .map(|h| h.0)
+        .collect();
+    assert!(
+        mini.contains(&"gs") && mini.contains(&"gf"),
+        "mini help: {mini:?}"
+    );
+}
+
+/// `g f` freezes the *focused* column (up to two) and unfreezes it on a second
+/// press; `z` still owns column 0.
+#[test]
+pub(crate) fn g_f_freezes_the_focused_column_up_to_two() {
+    let (tx, _rx) = tokio::sync::mpsc::unbounded_channel::<OpResult>();
+    let mut app = r91_ref_app();
+    // Freezing needs a grid wide enough to still scroll; use the 8-column
+    // fixture (`z` pins column 0, so `g f` is exercised on later columns).
+    app.set_grid(sample_grid());
+    // `z` already pins column 0, so one `g f` reaches the two-column cap.
+    app.col_cursor = 2;
+    press_g(&mut app, &tx, 'f');
+    assert_eq!(app.frozen_cols, vec![2], "g f pins the focused column");
+    app.focus = Focus::Preview;
+    app.col_cursor = 5;
+    press_g(&mut app, &tx, 'f');
+    assert_eq!(app.frozen_cols, vec![2], "the cap covers the z pin as well");
+    assert!(app.status.contains("最多冻结 2 列"), "{}", app.status);
+    // With the first-column pin off there is room for two `g f` pins.
+    app.freeze_first = false;
+    app.col_cursor = 5;
+    press_g(&mut app, &tx, 'f');
+    assert_eq!(app.frozen_cols, vec![2, 5]);
+    // A third is refused (the message names the cap), not silently dropped.
+    app.col_cursor = 7;
+    press_g(&mut app, &tx, 'f');
+    assert_eq!(app.frozen_cols, vec![2, 5]);
+    // Pressing again on a frozen column unfreezes it.
+    app.col_cursor = 2;
+    press_g(&mut app, &tx, 'f');
+    assert_eq!(app.frozen_cols, vec![5]);
+    // Column 0 is `z`'s, and `g f` there toggles the same flag.
+    app.col_cursor = 0;
+    press_g(&mut app, &tx, 'f');
+    assert!(app.freeze_first, "g f on column 0 toggles the z pin");
+}
+
+/// A pinned column never enters the scroll window, and the window always keeps
+/// a non-pinned cursor on screen — the offset matrix the renderer relies on.
+#[test]
+pub(crate) fn pinned_columns_stay_out_of_the_scroll_window_matrix() {
+    let widths = vec![10usize; 10];
+    for pinned in [vec![0usize], vec![3usize], vec![0usize, 3], vec![2, 7]] {
+        for avail in [11usize, 21, 31, 41, 100] {
+            for cursor in 0..widths.len() {
+                let (off, vis) = window_for_cursor_pinned(&widths, cursor, 0, avail, &pinned);
+                assert!(
+                    !pinned.contains(&off),
+                    "pinned {pinned:?} avail {avail} cursor {cursor}: off {off} is pinned"
+                );
+                let win = scroll_window_cols(widths.len(), off, vis, &pinned);
+                assert!(
+                    win.iter().all(|c| !pinned.contains(c)),
+                    "pinned {pinned:?}: window {win:?} leaked a pinned column"
+                );
+                if !pinned.contains(&cursor) {
+                    assert!(
+                        win.contains(&cursor),
+                        "pinned {pinned:?} avail {avail}: window {win:?} dropped cursor {cursor}"
+                    );
+                }
+            }
+        }
+    }
+    // The concrete prefix case the old API expressed: pin column 0, and the
+    // window starts at 1 and never scrolls into it.
+    assert_eq!(window_for_cursor_pinned(&widths, 0, 0, 21, &[0]), (1, 2));
+}
+
+/// Panning by whole columns keeps the cursor inside the window the renderer will
+/// draw, skipping pinned columns.
+#[test]
+pub(crate) fn pan_window_pinned_keeps_the_cursor_in_the_window() {
+    let widths = vec![10usize; 10];
+    let pinned = vec![0usize, 4];
+    for off in 0..10 {
+        for cursor in 0..10 {
+            let vis = visible_scroll_cols(&widths, off, 31, &pinned).max(1);
+            let (next_off, next_cursor) = pan_window_pinned(10, &pinned, off, cursor, vis, 1);
+            assert!(!pinned.contains(&next_off));
+            if !pinned.contains(&next_cursor) {
+                let win = scroll_window_cols(10, next_off, vis, &pinned);
+                assert!(
+                    win.contains(&next_cursor),
+                    "pan left cursor {next_cursor} outside {win:?}"
+                );
+            }
+        }
+    }
+}
+
+/// The pin set is capped at two, drops out-of-range indices, and gives up before
+/// it starves the scrollable area.
+#[test]
+pub(crate) fn effective_frozen_cols_caps_and_needs_room() {
+    let widths = vec![10usize; 10];
+    // `z` plus one `g f` pin → two, ascending.
+    assert_eq!(
+        effective_frozen_cols(true, &[5, 2], 10, &widths, 2, 60),
+        vec![0, 2]
+    );
+    // A third candidate never survives the cap.
+    assert_eq!(
+        effective_frozen_cols(true, &[5, 2, 7], 10, &widths, 2, 60),
+        vec![0, 2]
+    );
+    // Out of range is ignored, and a 2-column grid is never pinned.
+    assert!(effective_frozen_cols(false, &[9], 3, &widths, 2, 60).is_empty());
+    assert!(effective_frozen_cols(true, &[], 2, &widths, 2, 60).is_empty());
+    // Not enough room for a pinned block plus one scrollable minimum column.
+    assert!(effective_frozen_cols(true, &[], 10, &widths, 2, 15).is_empty());
+    // The label compacts a contiguous run and lists a split pin set.
+    assert_eq!(frozen_label(&[]), String::new());
+    assert_eq!(frozen_label(&[0]), "1|");
+    assert_eq!(frozen_label(&[0, 1]), "1-2|");
+    assert_eq!(frozen_label(&[0, 3]), "1,4|");
+}
+
+/// End to end: the pinned row draws `❮` and the status bar carries its offset.
+#[test]
+pub(crate) fn ref_row_draws_marker_and_status_offset() {
+    let mut app = r91_ref_app();
+    app.focus = Focus::Preview;
+    app.sel = 0;
+    toggle_ref_row(&mut app);
+    app.sel = 2;
+    let info = context_info(&app);
+    assert!(info.contains("Δ+2"), "{info}");
+    assert!(info.contains("(name)"), "{info}");
+
+    let rows = draw(&mut app, 80, 24);
+    assert!(
+        rows.iter().any(|r| r.contains('❮')),
+        "the reference row marker is drawn: {rows:?}"
+    );
+}
+
+/// An app with a browsed 2-column table page, ready for the R91 gestures.
+pub(crate) fn r91_ref_app() -> App {
+    let mut app = r85_open_table_app();
+    let grid = Grid {
+        columns: vec!["id".into(), "name".into()],
+        types: Vec::new(),
+        rows: (0..8)
+            .map(|i| vec![Val::Text("1".into()), Val::Text(format!("n{i}"))])
+            .collect(),
+        note: String::new(),
+    };
+    app.set_grid(grid);
+    app
+}
+
+/// Press `g` then `ch` in the results pane.
+pub(crate) fn press_g(app: &mut App, tx: &Tx, ch: char) {
+    key(
+        app,
+        tx,
+        KeyEvent::new(KeyCode::Char('g'), KeyModifiers::NONE),
+    );
+    key(
+        app,
+        tx,
+        KeyEvent::new(KeyCode::Char(ch), KeyModifiers::NONE),
+    );
+}

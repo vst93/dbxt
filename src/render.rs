@@ -504,6 +504,25 @@ pub(crate) fn context_info(app: &App) -> String {
     if let Some(hint) = &app.nav_landing {
         parts.push(hint.clone());
     }
+    // R91: the pinned reference row's offset rides near the head of the block so
+    // it survives the tail truncation on a narrow status bar. The first
+    // differing column is named only when both rows are in the loaded window.
+    if let Some((delta, col)) = ref_offset(app) {
+        let mut s = if delta == 0 {
+            "Δ0".to_string()
+        } else if delta > 0 {
+            format!("Δ+{delta}")
+        } else {
+            format!("Δ{delta}")
+        };
+        if let Some(col) = col {
+            s.push_str(&format!(
+                " ({})",
+                truncate_disp(&fix_double_encoding(&col), 16)
+            ));
+        }
+        parts.push(s);
+    }
     // R65: where the open data view lives (`db.table`, table alone when narrow).
     // The connection name leads the left block, so only the location is added
     // here. Sits ahead of the other persistent fields so the identity survives
@@ -530,7 +549,7 @@ pub(crate) fn context_info(app: &App) -> String {
     if let Some(grid) = &app.grid {
         if app.grid_kind != GridKind::Columns && !grid.columns.is_empty() {
             let ncols = grid.columns.len();
-            if app.grid_frozen + app.vis_cols.max(1) >= ncols {
+            if app.pinned_grid_cols().len() + app.vis_cols.max(1) >= ncols {
                 fits = Some(ncols);
             }
         }
@@ -582,13 +601,9 @@ pub(crate) fn context_info(app: &App) -> String {
     if app.grid_kind != GridKind::Columns {
         if let Some(grid) = &app.grid {
             let ncols = grid.columns.len();
-            if ncols > 0 && app.grid_frozen + app.vis_cols.max(1) < ncols {
+            if ncols > 0 && app.pinned_grid_cols().len() + app.vis_cols.max(1) < ncols {
                 if let Some(name) = grid.columns.get(app.col_cursor) {
-                    let pin = match app.grid_frozen {
-                        0 => String::new(),
-                        1 => "1|".to_string(),
-                        f => format!("1-{f}|"),
-                    };
+                    let pin = frozen_label(&app.pinned_grid_cols());
                     parts.push(tf(
                         "列 {}{} {}/{}",
                         &[
@@ -1353,6 +1368,10 @@ pub(crate) fn footer_hints_ctx(ctx: FooterCtx) -> Vec<Hint> {
                 ("gv", t("定位值")),
                 ("|", t("跳列")),
                 (":", t("跳行")),
+                // R91: pin the focused column / the focused row (placed early so
+                // the mini cheat-sheet reaches them on a small screen).
+                ("gf", t("冻结列")),
+                ("gs", t("钉行")),
                 // R80 additions: the R51–R79 keys that were missing here.
                 // `v` already leads this group; the epoch preview it shows is
                 // passive (no key), so it stays documented in the full help.
@@ -2739,24 +2758,32 @@ pub(crate) fn render_grid(
     // R55: a session column-width override wins over the natural width, so a
     // manual `<` / `>` adjustment survives page turns and re-queries.
     apply_col_width_overrides(app, grid, &mut widths);
-    let frozen =
-        effective_frozen_widths(app.freeze_first, ncols, &widths, gutter as usize, inner_w);
-    let left_w: usize = gutter as usize
-        + if frozen > 0 {
-            frozen + widths[..frozen].iter().sum::<usize>()
-        } else {
-            0
-        };
+    // R91: pin the focused column(s) at the left edge. The `z` first-column
+    // toggle and the `g f` set are merged, capped at `MAX_FROZEN_COLS` and
+    // dropped when the grid could no longer scroll.
+    let pinned = effective_frozen_cols(
+        app.freeze_first,
+        &app.frozen_cols,
+        ncols,
+        &widths,
+        gutter as usize,
+        inner_w,
+    );
+    let pinned_w: usize = pinned.iter().map(|&c| widths[c]).sum();
+    let left_w: usize = gutter as usize + pinned.len() + pinned_w;
     const GAP: usize = 1;
     let avail = inner_w.saturating_sub(left_w + GAP).max(MIN_CELL_WIDTH);
     app.grid_avail = avail;
     let (off, visible) =
-        window_for_cursor_widths(&widths, app.col_cursor, app.col_offset, avail, frozen);
+        window_for_cursor_pinned(&widths, app.col_cursor, app.col_offset, avail, &pinned);
     app.col_offset = off;
     app.vis_cols = visible;
     app.grid_gutter = gutter;
-    app.grid_frozen = frozen;
+    app.grid_frozen = pinned.len();
+    app.grid_frozen_cols = pinned.clone();
     app.grid_widths = widths.clone();
+    // R91: the scrollable columns actually drawn, skipping the pinned ones.
+    let win = scroll_window_cols(ncols, off, visible, &pinned);
 
     // Sort / filter marks only make sense for a browsed table.
     let (sort_keys, filter_text) = if kind == GridKind::TableData {
@@ -2793,13 +2820,13 @@ pub(crate) fn render_grid(
 
     // ── pinned block: row-number gutter + optionally the first data column ──
     let mut left_widths: Vec<usize> = vec![gutter as usize];
-    left_widths.extend(widths[..frozen].iter().copied());
+    left_widths.extend(pinned.iter().map(|&c| widths[c]));
     let mut lheader: Vec<Cell> = vec![gutter_header_cell()];
-    for (ci, w) in widths.iter().enumerate().take(frozen) {
+    for &ci in &pinned {
         let name = &grid.columns[ci];
         lheader.push(col_header_cell(
             &fix_double_encoding(name),
-            *w,
+            widths[ci],
             ci == cc,
             sort_of(name),
             filt_of(name),
@@ -2808,11 +2835,11 @@ pub(crate) fn render_grid(
     let mut lrows: Vec<Row> = Vec::new();
     for (i, row) in grid.rows.iter().enumerate().skip(start).take(h) {
         let mut cells: Vec<Cell> = vec![gutter_cell(i, i == sel)];
-        for (ci, w) in widths.iter().enumerate().take(frozen) {
+        for &ci in &pinned {
             cells.push(match row.get(ci) {
                 Some(v) => cell_widget_hl(
                     v,
-                    *w,
+                    widths[ci],
                     i == sel && ci == cc,
                     needle,
                     find,
@@ -2862,11 +2889,11 @@ pub(crate) fn render_grid(
                 height: inner.height,
             };
             let mut rheader: Vec<Cell> = Vec::new();
-            for (ci, w) in widths.iter().enumerate().skip(off).take(visible) {
+            for &ci in &win {
                 let name = &grid.columns[ci];
                 rheader.push(col_header_cell(
                     &fix_double_encoding(name),
-                    *w,
+                    widths[ci],
                     ci == cc,
                     sort_of(name),
                     filt_of(name),
@@ -2875,11 +2902,11 @@ pub(crate) fn render_grid(
             let mut rrows: Vec<Row> = Vec::new();
             for (i, row) in grid.rows.iter().enumerate().skip(start).take(h) {
                 let mut cells: Vec<Cell> = Vec::new();
-                for (ci, w) in widths.iter().enumerate().skip(off).take(visible) {
+                for &ci in &win {
                     cells.push(match row.get(ci) {
                         Some(v) => cell_widget_hl(
                             v,
-                            *w,
+                            widths[ci],
                             i == sel && ci == cc,
                             needle,
                             find,
@@ -2902,13 +2929,40 @@ pub(crate) fn render_grid(
             }
             let rtable = Table::new(
                 rrows,
-                (off..off + visible)
-                    .map(|ci| Constraint::Length(widths[ci] as u16))
+                win.iter()
+                    .map(|&ci| Constraint::Length(widths[ci] as u16))
                     .collect::<Vec<_>>(),
             )
             .header(Row::new(rheader))
             .column_spacing(1);
             f.render_widget(rtable, right_area);
+        }
+    }
+
+    // ── reference-row marker (R91) ──
+    // The pinned row gets a light `❮` at the right edge of the results pane. It
+    // is an overlay, so it never perturbs the column layout, and it is only
+    // drawn when the row is inside the loaded window (paging past it shows
+    // nothing instead of issuing a query). The pinned-result strip above the
+    // live grid has focus forced to the sidebar, so it never inherits the
+    // live grid's reference marker.
+    if focused {
+        if let Some(rd) = ref_display_row_in(app, nrows) {
+            if rd >= start && rd < start + h && inner.width > 0 {
+                let y = inner.y + 1 + (rd - start) as u16;
+                let x = inner.x + inner.width - 1;
+                if y < inner.y + inner.height {
+                    f.buffer_mut().set_stringn(
+                        x,
+                        y,
+                        "❮",
+                        1,
+                        Style::default()
+                            .fg(Color::Yellow)
+                            .add_modifier(Modifier::BOLD),
+                    );
+                }
+            }
         }
     }
 
@@ -2938,7 +2992,7 @@ pub(crate) fn render_grid(
     app.rects.hbar_visible = false;
     app.rects.hbar_prev = Rect::default();
     app.rects.hbar_next = Rect::default();
-    let scrollable_total = ncols.saturating_sub(frozen);
+    let scrollable_total = ncols.saturating_sub(pinned.len());
     // R47b: auto-hide. The bar only appears for a moment after a horizontal
     // scroll (`poke_hbar`), so the bottom border is not a permanent thick band.
     // The `列 k/N` readout in the status line still names the window at rest.
@@ -2947,15 +3001,17 @@ pub(crate) fn render_grid(
     // terminal squeezes the pane to nothing) has no row to draw it on and
     // `area.height - 1` would underflow.
     if hbar_shown && visible > 0 && scrollable_total > visible && inner_w >= 16 && area.height > 0 {
-        let win_start = off.saturating_sub(frozen);
-        let pin = match frozen {
-            0 => String::new(),
-            1 => "1|".to_string(),
-            f => format!("1-{f}|"),
+        // The window's position within the *scrollable* sequence (the pinned
+        // block is not part of it).
+        let win_start = off.saturating_sub(pinned.iter().filter(|&&c| c < off).count());
+        let (first_num, last_num) = match (win.first(), win.last()) {
+            (Some(f), Some(l)) => (f + 1, l + 1),
+            _ => (off + 1, off + visible),
         };
+        let pin = frozen_label(&pinned);
         let label = tf(
             "列 {}{}-{}/{}",
-            &[&(pin), &(off + 1), &(off + visible), &(ncols)],
+            &[&(pin), &(first_num), &(last_num), &(ncols)],
         );
         // One cell at each end is a tap target for panning a whole window — the
         // touch-friendly control for phones whose terminal sends no h-wheel.

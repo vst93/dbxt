@@ -1303,7 +1303,8 @@ pub(crate) fn col_at_x(app: &App, rel_x: i32) -> Option<usize> {
     if rel_x < x {
         return None; // row-number gutter
     }
-    for ci in 0..app.grid_frozen {
+    let pinned = app.pinned_grid_cols();
+    for &ci in &pinned {
         x += 1; // column spacing
         let w = app.grid_widths.get(ci).copied().unwrap_or(MIN_CELL_WIDTH) as i32;
         if rel_x < x + w {
@@ -1312,8 +1313,9 @@ pub(crate) fn col_at_x(app: &App, rel_x: i32) -> Option<usize> {
         x += w;
     }
     x += 1; // gap between the pinned block and the scrollable window
-    for k in 0..app.vis_cols {
-        let ci = app.col_offset + k;
+    let ncols = app.grid_widths.len();
+    let win = scroll_window_cols(ncols, app.col_offset, app.vis_cols, &pinned);
+    for &ci in &win {
         let w = app.grid_widths.get(ci).copied().unwrap_or(MIN_CELL_WIDTH) as i32;
         if rel_x < x + w {
             return Some(ci);
@@ -1511,17 +1513,22 @@ pub(crate) fn hbar_click(app: &mut App, x: u16, y: u16) -> bool {
     if ncols == 0 {
         return true;
     }
-    let frozen = app.grid_frozen;
-    let total = ncols.saturating_sub(frozen).max(1);
+    let pinned = app.pinned_grid_cols();
+    let scroll: Vec<usize> = (0..ncols).filter(|c| !pinned.contains(c)).collect();
+    if scroll.is_empty() {
+        return true;
+    }
+    let total = scroll.len();
     let rel = (x - r.x) as usize;
     let frac = if r.width > 1 {
         rel as f64 / (r.width - 1) as f64
     } else {
         0.0
     };
-    let target = frozen + (frac * (total.saturating_sub(1)) as f64).round() as usize;
-    app.col_cursor = target.min(ncols - 1);
-    app.col_offset = app.col_cursor;
+    let pos = (frac * (total.saturating_sub(1)) as f64).round() as usize;
+    let target = scroll[pos.min(total - 1)];
+    app.col_cursor = target;
+    app.col_offset = target;
     // R47b: a tap on the track is a horizontal scroll, so keep the bar up.
     app.poke_hbar();
     true
@@ -2946,10 +2953,10 @@ pub(crate) fn fit_all_col_widths(app: &mut App) {
         return;
     }
     let ncols = grid.columns.len();
-    let cols = auto_fit_columns(
+    let cols = auto_fit_columns_pinned(
         app.col_offset,
         app.vis_cols,
-        app.grid_frozen,
+        &app.pinned_grid_cols(),
         ncols,
         app.term_w,
     );

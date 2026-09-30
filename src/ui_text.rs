@@ -4235,6 +4235,35 @@ fn en_of(zh: &'static str) -> Option<&'static str> {
         "DBX 桌面的连接分组（▾ 组名 [n]）；h l / ← → 折叠展开，折叠态写入 tui.json 跨会话记忆；无分组则平铺" => {
             Some("DBX Desktop connection groups (▾ name [n]); h l / ← → fold / unfold, the fold state is written to tui.json and remembered across sessions; flat when there are no groups")
         }
+        // ── R91: reference-row pin (`g s`) + frozen current column (`g f`) ──
+        "已取消参照行" => Some("Reference row cleared"),
+        "语句列表没有可钉的行" => Some("The statement list has no row to pin"),
+        "没有可钉的结果行" => Some("No result row to pin"),
+        "已钉参照行 · 第 {} 行 · g s 取消" => {
+            Some("Reference row pinned · row {} · g s to clear")
+        }
+        "没有可冻结的列" => Some("No column to freeze"),
+        "列太少 · 无需冻结" => Some("Too few columns to freeze"),
+        "最多冻结 {} 列 · 先对已冻结列再按 g f 解冻" => {
+            Some("At most {} columns can be frozen · press g f on a frozen column to unfreeze")
+        }
+        "已解冻第 {} 列" => Some("Unfroze column {}"),
+        "已冻结第 {} 列 · 横向滚动时始终可见" => {
+            Some("Froze column {} · stays visible while panning")
+        }
+        "g… d=表结构 t=表数据 v=定位值 c=列结构 b=切换表 f=冻结列 s=钉行 w=适配列宽 W=全列适配" => {
+            Some("g… d=structure t=data v=locate c=columns b=switch table f=freeze column s=pin row w=fit width W=fit all")
+        }
+        "g… f=字段跳转 s=钉行" => Some("g… f=field jump s=pin row"),
+        "g… f=冻结列 s=钉行" => Some("g… f=freeze column s=pin row"),
+        "冻结列" => Some("freeze col"),
+        "钉行" => Some("pin row"),
+        "冻结 / 解冻当前列：冻结后钉在左缘，横向滚动时始终可见（最多 2 列，再按解冻），冻结列列宽仍可用 < / > 调" => {
+            Some("Freeze / unfreeze the focused column: it pins to the left edge and stays visible while panning (at most 2 columns, press again to unfreeze); a frozen column's width still adjusts with < / >")
+        }
+        "钉住 / 取消参照行：被钉行行尾显 ❮，状态栏显当前行相对它的 Δ 偏移与首个差异列名；换表 / 重新查询自动清除" => {
+            Some("Pin / unpin the reference row: the pinned row shows ❮ at its end and the status bar shows the current row's Δ offset plus the first differing column; switching tables / re-running clears it")
+        }
         _ => None,
     }
 }

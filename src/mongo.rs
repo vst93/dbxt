@@ -11,6 +11,10 @@ pub(crate) fn mongo_docs_key(app: &mut App, tx: &Tx, k: KeyEvent) {
         app.pending_g = false;
         if k.modifiers.is_empty() && k.code == KeyCode::Char('f') {
             open_mongo_field_prompt(app);
+        } else if k.modifiers.is_empty() && k.code == KeyCode::Char('s') {
+            // R91: `gs` pins the focused document row as the reference row, the
+            // same gesture as in the SQL / Redis grids.
+            toggle_ref_row(app);
         }
         return;
     }
@@ -57,10 +61,11 @@ pub(crate) fn mongo_docs_key(app: &mut App, tx: &Tx, k: KeyEvent) {
         // R82: `c` extracts a dotted sub-path from the focused document and
         // copies it (client-side; the document row is never re-fetched).
         KeyCode::Char('c') => open_mongo_path_prompt(app),
-        // R82: `g` starts the `gf` field-name jump chord.
+        // R82: `g` starts the `gf` field-name jump chord; R91 adds `gs` for the
+        // reference row.
         KeyCode::Char('g') => {
             app.pending_g = true;
-            app.status = t("g… f=字段跳转").into();
+            app.status = t("g… f=字段跳转 s=钉行").into();
         }
         KeyCode::Char('/') => open_result_filter(app),
         KeyCode::Char('\\') => open_cell_find(app),

@@ -275,6 +275,21 @@ impl Grid {
     }
 }
 
+/// R91: a pinned "reference" row of a result grid. The row-end `❮` marker and
+/// the status-bar `Δ` offset both read from it; nothing is re-queried, and the
+/// snapshot of the cell values is what lets the first differing column be named
+/// even after the row has scrolled out of the loaded window.
+#[derive(Clone, PartialEq, Debug)]
+pub(crate) struct RefRow {
+    /// Absolute 1-based row number, in the same space as [`cursor_abs_row`].
+    pub(crate) abs: usize,
+    /// The row's unfiltered cell values (all columns) at pin time.
+    pub(crate) values: Vec<Val>,
+    /// Column names parallel to `values`, captured so the first differing
+    /// column can still be named if the visible column set changes.
+    pub(crate) columns: Vec<String>,
+}
+
 // ─── app state ───────────────────────────────────────────────────────────────
 
 /// SSH login method offered by the connection form. The string values match
@@ -2136,6 +2151,8 @@ pub(crate) struct App {
     pub(crate) row_sel_anchor: Option<usize>,
     pub(crate) col_offset: usize, // leftmost column of the scrollable window
     pub(crate) col_cursor: usize, // focused column (cell cursor)
+    /// R91: `g s` — the pinned reference row of the current result grid, if any.
+    pub(crate) ref_row: Option<RefRow>,
     /// R47b: while `Instant::now() < deadline` the horizontal scroll bar is
     /// drawn. A horizontal scroll (wheel / drag / pan / column jump) refreshes
     /// it; at rest the bar hides so the bottom border is not a permanent thick
@@ -2145,6 +2162,10 @@ pub(crate) struct App {
     /// Width cap actually used for the last render (compact mode aware).
     pub(crate) grid_max_cell: usize,
     pub(crate) freeze_first: bool, // pin the first data column (row-number gutter is always pinned)
+    /// R91: `g f` — additional pinned columns (ascending, deduped). The first
+    /// column keeps its own `z` toggle; together they pin at most
+    /// [`MAX_FROZEN_COLS`]. Out-of-range indices are ignored at render time.
+    pub(crate) frozen_cols: Vec<usize>,
     pub(crate) cell_popup: Option<CellPopup>,
     pub(crate) row_popup: Option<RowPopup>,
     /// Compact / expandable execution-error overlay (R41).
@@ -2481,6 +2502,10 @@ pub(crate) struct App {
     // grid geometry captured while rendering, used to map clicks back to cells
     pub(crate) grid_gutter: u16,
     pub(crate) grid_frozen: usize,
+    /// R91: the actual pinned columns captured at the last render, so click
+    /// mapping / panning / the header readout know *which* columns are frozen
+    /// (not merely how many).
+    pub(crate) grid_frozen_cols: Vec<usize>,
     pub(crate) grid_widths: Vec<usize>,
     /// width available to the scrollable column window, captured while rendering.
     /// `pan_columns` recomputes the visible-column count from it so the cell

@@ -614,9 +614,63 @@ pub(crate) fn toggle_freeze_first(app: &mut App) {
     };
 }
 
+/// R91: `g f` — pin / unpin the *focused* column at the left edge. The wide-table
+/// twin of `z` (which only ever pins column 0): at most [`MAX_FROZEN_COLS`]
+/// columns are pinned in total, and pressing the key on an already-pinned column
+/// unfreezes it. Purely a render-time layout choice, zero queries.
+pub(crate) fn toggle_freeze_col(app: &mut App) {
+    let Some(ncols) = active_col_count(app) else {
+        app.status = t("没有可冻结的列").into();
+        return;
+    };
+    if ncols < 3 {
+        app.status = t("列太少 · 无需冻结").into();
+        return;
+    }
+    let col = app.col_cursor.min(ncols - 1);
+    if col == 0 {
+        if !app.freeze_first && app.frozen_cols.len() >= MAX_FROZEN_COLS {
+            app.status = tf(
+                "最多冻结 {} 列 · 先对已冻结列再按 g f 解冻",
+                &[&(MAX_FROZEN_COLS)],
+            );
+            return;
+        }
+        toggle_freeze_first(app);
+        return;
+    }
+    if let Some(pos) = app.frozen_cols.iter().position(|&c| c == col) {
+        app.frozen_cols.remove(pos);
+        app.flash(tf("已解冻第 {} 列", &[&(col + 1)]));
+        return;
+    }
+    let total = app.frozen_cols.len() + usize::from(app.freeze_first);
+    if total >= MAX_FROZEN_COLS {
+        app.status = tf(
+            "最多冻结 {} 列 · 先对已冻结列再按 g f 解冻",
+            &[&(MAX_FROZEN_COLS)],
+        );
+        return;
+    }
+    app.frozen_cols.push(col);
+    app.frozen_cols.sort_unstable();
+    app.flash(tf("已冻结第 {} 列 · 横向滚动时始终可见", &[&(col + 1)]));
+}
+
 /// Keys for a Redis value grid: edit the string / hash field, expire, rename,
 /// delete, plus the shared search / copy / popup infrastructure.
 pub(crate) fn redis_value_key(app: &mut App, tx: &Tx, k: KeyEvent) {
+    // R91: the `g` chord lives here too — `gf` freezes the focused column and
+    // `gs` pins the reference row, matching the SQL / MongoDB grids.
+    if app.pending_g {
+        app.pending_g = false;
+        if k.modifiers.is_empty() && k.code == KeyCode::Char('f') {
+            toggle_freeze_col(app);
+        } else if k.modifiers.is_empty() && k.code == KeyCode::Char('s') {
+            toggle_ref_row(app);
+        }
+        return;
+    }
     if k.modifiers.contains(KeyModifiers::CONTROL) {
         match k.code {
             KeyCode::Char('e') => app.focus = Focus::Editor,
@@ -657,6 +711,12 @@ pub(crate) fn redis_value_key(app: &mut App, tx: &Tx, k: KeyEvent) {
         KeyCode::Char('Y') => copy_cell_value(app),
         KeyCode::Char(':') => open_goto_row(app),
         KeyCode::Char('z') => toggle_freeze_first(app),
+        // R91: `g` starts the chord — `gf` freezes the focused column, `gs` pins
+        // the reference row.
+        KeyCode::Char('g') => {
+            app.pending_g = true;
+            app.status = t("g… f=冻结列 s=钉行").into();
+        }
         KeyCode::Up | KeyCode::Char('k') => move_cursor(app, tx, -1),
         KeyCode::Down | KeyCode::Char('j') => move_cursor(app, tx, 1),
         KeyCode::Left | KeyCode::Char('h') => move_col_cursor(app, -1),

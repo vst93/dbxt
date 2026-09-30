@@ -11,6 +11,103 @@ pub(crate) fn cursor_abs_row(app: &App) -> usize {
     }
 }
 
+/// R91: `g s` — pin / unpin the focused row as the reference row. The snapshot
+/// is taken from the *unfiltered* grid so hidden columns and an active row
+/// filter cannot shift the comparison. Pure client-side, zero queries.
+pub(crate) fn toggle_ref_row(app: &mut App) {
+    if app.ref_row.is_some() {
+        app.ref_row = None;
+        app.flash(t("已取消参照行").into());
+        return;
+    }
+    if app.script.as_ref().is_some_and(|s| s.drilled.is_none()) {
+        app.status = t("语句列表没有可钉的行").into();
+        return;
+    }
+    let Some(values) = focused_full_row_ref(app).cloned() else {
+        app.status = t("没有可钉的结果行").into();
+        return;
+    };
+    let Some(columns) = full_grid_ref(app).map(|g| g.columns.clone()) else {
+        app.status = t("没有可钉的结果行").into();
+        return;
+    };
+    let abs = cursor_abs_row(app);
+    app.ref_row = Some(RefRow {
+        abs,
+        values,
+        columns,
+    });
+    app.flash(tf("已钉参照行 · 第 {} 行 · g s 取消", &[&abs]));
+}
+
+/// R91: the display-row index (into the currently loaded grid) of the pinned
+/// reference row, or `None` when it is not in the loaded window. Paging past it
+/// shows no marker rather than issuing a query.
+#[cfg(test)]
+pub(crate) fn ref_display_row(app: &App) -> Option<usize> {
+    ref_display_row_in(app, result_row_count(app))
+}
+
+/// [`ref_display_row`] against an explicit display-row count. The render pass
+/// takes `app.grid` out before drawing, so it hands the loaded row count in
+/// directly instead of reading it back from the app.
+pub(crate) fn ref_display_row_in(app: &App, n: usize) -> Option<usize> {
+    let r = app.ref_row.as_ref()?;
+    let (page, size) = page_base(app);
+    for d in 0..n {
+        let Some(src) = full_row_at(app, d) else {
+            continue;
+        };
+        let abs = match &app.page_state {
+            Some(_) => abs_row(page, size, src),
+            None => src + 1,
+        };
+        if abs == r.abs {
+            return Some(d);
+        }
+    }
+    None
+}
+
+/// R91: the cursor's signed offset from the pinned reference row, with the name
+/// of the first differing column when both rows are loaded. `None` when no
+/// reference row is pinned.
+pub(crate) fn ref_offset(app: &App) -> Option<(i64, Option<String>)> {
+    let r = app.ref_row.as_ref()?;
+    let delta = cursor_abs_row(app) as i64 - r.abs as i64;
+    let col = if delta == 0 {
+        None
+    } else {
+        focused_full_row_ref(app).and_then(|row| first_diff_col(&r.columns, &r.values, row))
+    };
+    Some((delta, col))
+}
+
+/// R91: the first column whose cell differs between the reference row and the
+/// current row (by index, `None` when the rows match).
+pub(crate) fn first_diff_col(columns: &[String], a: &[Val], b: &[Val]) -> Option<String> {
+    let n = a.len().max(b.len());
+    for i in 0..n {
+        if a.get(i) != b.get(i) {
+            return Some(
+                columns
+                    .get(i)
+                    .cloned()
+                    .unwrap_or_else(|| format!("#{}", i + 1)),
+            );
+        }
+    }
+    None
+}
+
+fn page_base(app: &App) -> (usize, usize) {
+    match &app.page_state {
+        Some(ps) => (ps.page, ps.page_size),
+        None => (0, 0),
+    }
+}
+
 /// Show the focused cell's full value in a modal (truncated cells stay readable).
 pub(crate) fn open_cell_popup(app: &mut App) {
     let Some(grid) = active_grid(app) else {

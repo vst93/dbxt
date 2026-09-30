@@ -918,7 +918,7 @@ pub(crate) fn has_h_scroll(app: &App) -> bool {
         if n == 0 {
             return false;
         }
-        return n > app.grid_frozen + visible_now(app, grid, app.col_offset);
+        return n > app.pinned_grid_cols().len() + visible_now_pinned(app, grid, app.col_offset);
     }
     let Some(grid) = active_grid(app) else {
         return false;
@@ -927,7 +927,7 @@ pub(crate) fn has_h_scroll(app: &App) -> bool {
     if n == 0 {
         return false;
     }
-    n > app.grid_frozen + visible_now(app, &grid, app.col_offset)
+    n > app.pinned_grid_cols().len() + visible_now_pinned(app, &grid, app.col_offset)
 }
 
 /// Column count of the active grid, without cloning its rows.
@@ -945,34 +945,35 @@ pub(crate) fn active_col_count(app: &App) -> Option<usize> {
     app.grid.as_ref().map(|g| g.columns.len())
 }
 
-/// How many columns fit starting at `off`, using the geometry the last render
-/// captured. Exact rather than remembered, so a pan can place the cell cursor
-/// where the renderer will actually keep the window. Uses the cached widths
-/// when they belong to the on-screen grid, so a wheel event never rescans the
-/// result set.
-pub(crate) fn visible_now(app: &App, grid: &Grid, off: usize) -> usize {
+/// R91: how many non-pinned columns fit starting at `off`, using the geometry
+/// the last render captured and skipping the pinned columns (they sit in the
+/// left block). Exact rather than remembered, so a pan can place the cell cursor
+/// where the renderer will actually keep the window; the cached widths mean a
+/// wheel event never rescans the result set.
+pub(crate) fn visible_now_pinned(app: &App, grid: &Grid, off: usize) -> usize {
     let avail = app.grid_avail.max(MIN_CELL_WIDTH);
     let max_cell = app.grid_max_cell.max(MIN_CELL_WIDTH);
+    let pinned = app.pinned_grid_cols();
     if let Some((epoch, cell, widths)) = &app.width_cache {
         if *epoch == app.grid_epoch
             && *cell == max_cell
             && widths.len() == grid.columns.len()
             && app.grid.as_ref().is_some_and(|g| std::ptr::eq(g, grid))
         {
-            return visible_cols_from_widths(widths, off, avail).max(1);
+            return visible_scroll_cols(widths, off, avail, &pinned).max(1);
         }
     }
-    visible_cols(grid, off, avail, max_cell).max(1)
+    let widths = natural_widths_fmt(grid, max_cell, app.num_fmt);
+    visible_scroll_cols(&widths, off, avail, &pinned).max(1)
 }
 
-/// [`visible_now`] for the active grid, preferring the cache and avoiding a grid
-/// clone on the hot pan path.
-pub(crate) fn active_visible_cols(app: &App, off: usize) -> usize {
+/// R91: [`visible_now_pinned`] for the active grid.
+pub(crate) fn active_visible_cols_pinned(app: &App, off: usize) -> usize {
     if let Some(grid) = app.grid.as_ref() {
-        return visible_now(app, grid, off);
+        return visible_now_pinned(app, grid, off);
     }
     match active_grid(app) {
-        Some(g) => visible_now(app, &g, off),
+        Some(g) => visible_now_pinned(app, &g, off),
         None => 1,
     }
 }
@@ -980,6 +981,7 @@ pub(crate) fn active_visible_cols(app: &App, off: usize) -> usize {
 /// Pure core of `pan_columns`: move the window by `delta` columns and place the
 /// cell cursor inside it. `vis` is the number of columns that fit at the new
 /// origin, so the result is exactly what `window_for_cursor` will keep.
+#[cfg(test)]
 pub(crate) fn pan_window(
     n: usize,
     frozen: usize,
@@ -998,6 +1000,42 @@ pub(crate) fn pan_window(
         cursor.clamp(next, hi)
     } else {
         cursor
+    };
+    (next, cursor)
+}
+
+/// R91: [`pan_window`] for an arbitrary pinned-column set. `off` and the result
+/// are the window origin *within the scrollable columns*; the pinned ones are
+/// skipped. The cursor is kept inside the new window (pinned cursors stay put).
+pub(crate) fn pan_window_pinned(
+    n: usize,
+    pinned: &[usize],
+    off: usize,
+    cursor: usize,
+    vis: usize,
+    delta: i32,
+) -> (usize, usize) {
+    if n == 0 {
+        return (off, cursor);
+    }
+    let scroll: Vec<usize> = (0..n).filter(|c| !pinned.contains(c)).collect();
+    if scroll.is_empty() {
+        return (off, cursor);
+    }
+    let pos = scroll.iter().position(|&c| c == off).unwrap_or(0);
+    let tpos = (pos as i32 + delta).clamp(0, scroll.len() as i32 - 1) as usize;
+    let next = scroll[tpos];
+    let cursor = if pinned.contains(&cursor) {
+        cursor
+    } else {
+        let win = scroll_window_cols(n, next, vis.max(1), pinned);
+        if win.contains(&cursor) {
+            cursor
+        } else if cursor < next {
+            next
+        } else {
+            win.last().copied().unwrap_or(next)
+        }
     };
     (next, cursor)
 }
@@ -1027,13 +1065,17 @@ pub(crate) fn pan_columns(app: &mut App, delta: i32) -> bool {
     let Some(n) = active_col_count(app) else {
         return false;
     };
-    let min_off = app.grid_frozen.min(n - 1);
-    let target = (app.col_offset as i32 + delta).clamp(min_off as i32, n as i32 - 1) as usize;
-    let vis = active_visible_cols(app, target);
-    let (off, cursor) = pan_window(
+    let pinned = app.pinned_grid_cols();
+    let Some(first) = next_scroll_col(0, n, &pinned) else {
+        return false;
+    };
+    let target = (app.col_offset as i32 + delta).clamp(first as i32, n as i32 - 1) as usize;
+    let anchor = next_scroll_col(target.min(n - 1), n, &pinned).unwrap_or(first);
+    let vis = active_visible_cols_pinned(app, anchor);
+    let (off, cursor) = pan_window_pinned(
         n,
-        app.grid_frozen,
-        app.col_offset,
+        &pinned,
+        next_scroll_col(app.col_offset.min(n - 1), n, &pinned).unwrap_or(first),
         app.col_cursor,
         vis,
         delta,
@@ -1202,10 +1244,25 @@ impl App {
         self.rebuild_view();
     }
 
+    /// R91: the pinned columns for the last render, or a prefix of `grid_frozen`
+    /// when only the count was set (tests set the count directly).
+    pub(crate) fn pinned_grid_cols(&self) -> Vec<usize> {
+        if !self.grid_frozen_cols.is_empty() {
+            self.grid_frozen_cols.clone()
+        } else {
+            (0..self.grid_frozen).collect()
+        }
+    }
+
     pub(crate) fn clear_grid(&mut self) {
         self.grid = None;
         self.grid_full = None;
         self.result_rows.clear();
+        // R91: a reference row belongs to the result set it was pinned on.
+        self.ref_row = None;
+        // The render-captured pin geometry no longer matches a new grid.
+        self.grid_frozen_cols.clear();
+        self.grid_frozen = 0;
         // R57: a row selection belongs to the grid it was started on.
         self.row_sel_anchor = None;
         // A value locate belongs to the grid it was started on; a new result
@@ -1392,6 +1449,9 @@ impl App {
         );
         self.col_offset = tab.col_offset;
         self.col_cursor = tab.col_cursor;
+        // R91: the reference row belongs to the result that was on screen; a
+        // tab flip shows a different grid.
+        self.ref_row = None;
         self.page_state = None;
         self.cell_popup = None;
         self.row_popup = None;

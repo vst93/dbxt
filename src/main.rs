@@ -4560,10 +4560,12 @@ impl App {
             sel: 0,
             col_offset: 0,
             col_cursor: 0,
+            ref_row: None,
             hbar_until: None,
             vis_cols: 0,
             grid_max_cell: 44,
             freeze_first: true,
+            frozen_cols: Vec::new(),
             cell_popup: None,
             error_popup: None,
             row_popup: None,
@@ -4703,6 +4705,7 @@ impl App {
             pending_table: None,
             grid_gutter: 0,
             grid_frozen: 0,
+            grid_frozen_cols: Vec::new(),
             grid_widths: Vec::new(),
             grid_avail: 0,
             grid_epoch: 0,
@@ -5648,6 +5651,9 @@ fn apply_op_result(app: &mut App, res: OpResult, tx: &Tx) {
                 app.result_filter = None;
                 app.clear_col_filter();
                 app.clear_cell_find();
+                // R91: a fresh run is a new result set; the pinned reference row
+                // does not carry over (a Ctrl-N load-more keeps it).
+                app.ref_row = None;
             }
             // A statement that returned no columns is a write/DDL, and one that
             // reports affected rows (e.g. `INSERT … RETURNING`) changed data too:

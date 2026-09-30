@@ -769,6 +769,9 @@ pub(crate) fn browse_key(app: &mut App, tx: &Tx, k: KeyEvent) {
             | KeyCode::Char('g')
             // R82: `gf` jumps to a field in the MongoDB document grid.
             | KeyCode::Char('f')
+            // R91: `gs` pins the focused row as the reference row (`gf` freezes
+            // the focused column in the SQL / Redis grids).
+            | KeyCode::Char('s')
             // R85: `g w` fits the focused column to its content.
             | KeyCode::Char('w')
                 if k.modifiers.is_empty() =>
@@ -3033,6 +3036,7 @@ pub(crate) fn auto_fit_width(grid: &Grid, ci: usize, mode: NumFmt) -> usize {
 /// first [`AUTO_FIT_NARROW_MAX`] entries, so a phone grid keeps its layout
 /// instead of thrashing. Pure, so the visible-window and narrow-screen rules are
 /// testable without a backend.
+#[cfg(test)]
 pub(crate) fn auto_fit_columns(
     offset: usize,
     vis: usize,
@@ -3050,6 +3054,32 @@ pub(crate) fn auto_fit_columns(
         let vis = if vis == 0 { ncols - start } else { vis };
         let end = (start + vis).min(ncols);
         cols.extend(start..end);
+    }
+    if term_w < AUTO_FIT_NARROW_W {
+        cols.truncate(AUTO_FIT_NARROW_MAX);
+    }
+    cols
+}
+
+/// R91: [`auto_fit_columns`] for an arbitrary pinned-column set. The pinned
+/// columns are always included (they are on screen), then the scrollable window
+/// from `offset` / `vis`, then the same narrow-screen truncation.
+pub(crate) fn auto_fit_columns_pinned(
+    offset: usize,
+    vis: usize,
+    pinned: &[usize],
+    ncols: usize,
+    term_w: u16,
+) -> Vec<usize> {
+    if ncols == 0 {
+        return Vec::new();
+    }
+    let mut cols: Vec<usize> = pinned.iter().copied().filter(|&c| c < ncols).collect();
+    cols.sort_unstable();
+    cols.dedup();
+    if let Some(start) = next_scroll_col(offset.min(ncols - 1), ncols, pinned) {
+        let take = if vis == 0 { ncols - start } else { vis };
+        cols.extend(scroll_window_cols(ncols, start, take, pinned));
     }
     if term_w < AUTO_FIT_NARROW_W {
         cols.truncate(AUTO_FIT_NARROW_MAX);
@@ -3078,6 +3108,7 @@ pub(crate) fn natural_width(grid: &Grid, ci: usize, max_cell: usize) -> usize {
 /// per-grid width cache so scrolling a 20k-row result never rescans it. Uses the
 /// raw value text (`NumFmt::Original`); the render path calls
 /// [`natural_widths_fmt`] so a comma-separated number still fits its column.
+#[cfg(test)]
 pub(crate) fn natural_widths(grid: &Grid, max_cell: usize) -> Vec<usize> {
     natural_widths_fmt(grid, max_cell, NumFmt::Original)
 }
@@ -3105,13 +3136,14 @@ pub(crate) fn natural_widths_fmt(grid: &Grid, max_cell: usize, mode: NumFmt) -> 
 /// How many columns starting at `off` fit in `avail` display columns using their
 /// natural widths. Content-sized columns keep a narrow `id` narrow instead of
 /// stretching it to fill the pane.
+#[cfg(test)]
 pub(crate) fn visible_cols(grid: &Grid, off: usize, avail: usize, max_cell: usize) -> usize {
     let widths = natural_widths(grid, max_cell);
     visible_cols_from_widths(&widths, off, avail)
 }
 
-/// [`visible_cols`] against precomputed widths (the render path uses the
-/// cached vector so it never rebuilds it).
+/// [`visible_cols`] against precomputed widths (test / pinned-set helpers).
+#[cfg(test)]
 pub(crate) fn visible_cols_from_widths(widths: &[usize], off: usize, avail: usize) -> usize {
     let n = widths.len();
     if n == 0 || off >= n {
@@ -3181,6 +3213,17 @@ pub(crate) fn full_grid(app: &App) -> Option<Grid> {
     app.grid_full.clone()
 }
 
+/// Borrowing twin of [`full_grid`], for hot read-only paths (the R91 reference
+/// offset runs every frame and must not deep-clone a 20k-row grid).
+pub(crate) fn full_grid_ref(app: &App) -> Option<&Grid> {
+    if let Some(s) = &app.script {
+        if let Some(i) = s.drilled {
+            return s.outcomes.get(i).map(|o| &o.grid);
+        }
+    }
+    app.grid_full.as_ref()
+}
+
 /// The focused row read from the unfiltered grid. An active result search keeps
 /// a display→source row map, so the row must come from `full_grid` — reading it
 /// from the on-screen (filtered) grid with the full-grid index would fail or
@@ -3189,6 +3232,13 @@ pub(crate) fn focused_full_row(app: &App) -> Option<Vec<Val>> {
     let grid = full_grid(app)?;
     let idx = app.full_row_index()?;
     grid.rows.get(idx).cloned()
+}
+
+/// Borrowing twin of [`focused_full_row`].
+pub(crate) fn focused_full_row_ref(app: &App) -> Option<&Vec<Val>> {
+    let grid = full_grid_ref(app)?;
+    let idx = app.full_row_index()?;
+    grid.rows.get(idx)
 }
 
 /// `display` row index (into the on-screen, filtered grid) → index into the
@@ -3265,6 +3315,7 @@ pub(crate) fn effective_frozen(
 }
 
 /// [`effective_frozen`] against precomputed widths.
+#[cfg(test)]
 pub(crate) fn effective_frozen_widths(
     freeze_first: bool,
     ncols: usize,
@@ -3272,17 +3323,129 @@ pub(crate) fn effective_frozen_widths(
     gutter: usize,
     inner_w: usize,
 ) -> usize {
-    if !freeze_first {
+    effective_frozen_cols(freeze_first, &[], ncols, widths, gutter, inner_w).len()
+}
+
+/// R91: the most columns that may be pinned at the left edge (the row-number
+/// gutter is always pinned and is not counted).
+pub(crate) const MAX_FROZEN_COLS: usize = 2;
+
+/// R91: the pinned columns for the current layout, ascending. Starts from the
+/// frame's candidates (column 0 when `z` is on, plus the `g f` set), dedupes
+/// them, caps at [`MAX_FROZEN_COLS`], then drops trailing candidates until the
+/// grid can still scroll: at least two scrollable columns must remain and the
+/// pinned block plus a gap plus one minimum-width column must fit.
+pub(crate) fn effective_frozen_cols(
+    freeze_first: bool,
+    frozen_cols: &[usize],
+    ncols: usize,
+    widths: &[usize],
+    gutter: usize,
+    inner_w: usize,
+) -> Vec<usize> {
+    if ncols == 0 {
+        return Vec::new();
+    }
+    let mut cand: Vec<usize> = Vec::new();
+    if freeze_first {
+        cand.push(0);
+    }
+    for &c in frozen_cols {
+        if c < ncols && !cand.contains(&c) {
+            cand.push(c);
+        }
+    }
+    cand.sort_unstable();
+    cand.truncate(MAX_FROZEN_COLS);
+    while !cand.is_empty() {
+        let k = cand.len();
+        if ncols.saturating_sub(k) < 2 {
+            cand.pop();
+            continue;
+        }
+        let block = gutter
+            + k
+            + cand
+                .iter()
+                .map(|&c| widths.get(c).copied().unwrap_or(MIN_CELL_WIDTH))
+                .sum::<usize>();
+        if block + 1 + MIN_CELL_WIDTH <= inner_w {
+            break;
+        }
+        cand.pop();
+    }
+    cand
+}
+
+/// R91: the first non-pinned column at or after `from`, or `None` when every
+/// remaining column is pinned.
+pub(crate) fn next_scroll_col(from: usize, ncols: usize, pinned: &[usize]) -> Option<usize> {
+    (from..ncols).find(|c| !pinned.contains(c))
+}
+
+/// R91: how many non-pinned columns starting at the scrollable index `off` fit
+/// in `avail` display cells. Pinned columns live in the left block and do not
+/// consume `avail`.
+pub(crate) fn visible_scroll_cols(
+    widths: &[usize],
+    off: usize,
+    avail: usize,
+    pinned: &[usize],
+) -> usize {
+    let n = widths.len();
+    if n == 0 || off >= n {
         return 0;
     }
-    if ncols < 3 {
-        return 0;
+    let mut used = 0usize;
+    let mut count = 0usize;
+    for (ci, w) in widths.iter().enumerate().skip(off) {
+        if pinned.contains(&ci) {
+            continue;
+        }
+        let add = w + if count > 0 { 1 } else { 0 };
+        if count > 0 && used + add > avail {
+            break;
+        }
+        used += add;
+        count += 1;
+        if used >= avail {
+            break;
+        }
     }
-    let w0 = widths.first().copied().unwrap_or(MIN_CELL_WIDTH);
-    if gutter + 1 + w0 + 1 + MIN_CELL_WIDTH <= inner_w {
-        1
+    count.max(1)
+}
+
+/// R91: the `vis` non-pinned columns shown from the scrollable index `off`.
+pub(crate) fn scroll_window_cols(
+    ncols: usize,
+    off: usize,
+    vis: usize,
+    pinned: &[usize],
+) -> Vec<usize> {
+    (off.min(ncols)..ncols)
+        .filter(|c| !pinned.contains(c))
+        .take(vis)
+        .collect()
+}
+
+/// R91: the readable prefix on the horizontal scroll bar (`1|`, `1-2|`, `1,4|`),
+/// naming the columns pinned at the left edge.
+pub(crate) fn frozen_label(cols: &[usize]) -> String {
+    if cols.is_empty() {
+        return String::new();
+    }
+    let mut nums: Vec<usize> = cols.iter().map(|c| c + 1).collect();
+    nums.sort_unstable();
+    nums.dedup();
+    if nums.len() >= 2 && nums.windows(2).all(|w| w[1] == w[0] + 1) {
+        format!("{}-{}|", nums[0], nums[nums.len() - 1])
     } else {
-        0
+        let joined = nums
+            .iter()
+            .map(|n| n.to_string())
+            .collect::<Vec<_>>()
+            .join(",");
+        format!("{joined}|")
     }
 }
 
@@ -3302,7 +3465,9 @@ pub(crate) fn window_for_cursor(
     window_for_cursor_widths(&widths, cursor, start, avail, frozen)
 }
 
-/// [`window_for_cursor`] against precomputed widths.
+/// [`window_for_cursor`] against precomputed widths. R91: a prefix of `frozen`
+/// pinned columns is expressed as the general pinned set.
+#[cfg(test)]
 pub(crate) fn window_for_cursor_widths(
     widths: &[usize],
     cursor: usize,
@@ -3310,24 +3475,54 @@ pub(crate) fn window_for_cursor_widths(
     avail: usize,
     frozen: usize,
 ) -> (usize, usize) {
+    let prefix: Vec<usize> = (0..frozen).collect();
+    window_for_cursor_pinned(widths, cursor, start, avail, &prefix)
+}
+
+/// R91: [`window_for_cursor_widths`] for an arbitrary pinned-column set. The
+/// pinned columns are shown in the left block, so the scrollable window is a
+/// contiguous run of the *remaining* columns and skips the pinned ones.
+pub(crate) fn window_for_cursor_pinned(
+    widths: &[usize],
+    cursor: usize,
+    start: usize,
+    avail: usize,
+    pinned: &[usize],
+) -> (usize, usize) {
     let n = widths.len();
     if n == 0 {
         return (0, 0);
     }
-    let mut off = start.max(frozen).min(n - 1);
-    let mut visible = visible_cols_from_widths(widths, off, avail).max(1);
-    if cursor < frozen {
+    let is_pinned = |c: usize| pinned.contains(&c);
+    let mut off = match next_scroll_col(start.min(n - 1), n, pinned) {
+        Some(c) => c,
+        None => match (0..n).rev().find(|&c| !is_pinned(c)) {
+            Some(c) => c,
+            None => return (0, 0),
+        },
+    };
+    let mut visible = visible_scroll_cols(widths, off, avail, pinned).max(1);
+    if is_pinned(cursor) {
         return (off, visible);
     }
     let mut guard = 0usize;
-    while cursor >= off + visible && off + visible < n && guard <= n {
-        off += 1;
-        visible = visible_cols_from_widths(widths, off, avail).max(1);
+    loop {
+        let win = scroll_window_cols(n, off, visible, pinned);
+        if win.contains(&cursor) || guard > n {
+            break;
+        }
+        match next_scroll_col(off + 1, n, pinned) {
+            Some(next) => {
+                off = next;
+                visible = visible_scroll_cols(widths, off, avail, pinned).max(1);
+            }
+            None => break,
+        }
         guard += 1;
     }
     if cursor < off {
-        off = cursor;
-        visible = visible_cols_from_widths(widths, off, avail).max(1);
+        off = next_scroll_col(cursor, n, pinned).unwrap_or(off);
+        visible = visible_scroll_cols(widths, off, avail, pinned).max(1);
     }
     (off, visible)
 }

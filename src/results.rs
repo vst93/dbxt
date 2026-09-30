@@ -153,11 +153,19 @@ pub(crate) fn preview_key(app: &mut App, tx: &Tx, k: KeyEvent) {
                 fit_all_col_widths(app);
                 return;
             }
-            // R82: `gf` is only meaningful in the MongoDB document grid, which
-            // resolves the chord before this block; elsewhere it stays a no-op
-            // rather than silently opening the WHERE filter.
+            // R91: `gf` pins / unpins the focused data column at the left edge
+            // (up to two columns). In the MongoDB document grid `gf` stays the
+            // R82 field jump — that grid resolves the chord before this block.
             KeyCode::Char('f') if k.modifiers.is_empty() => {
                 app.pending_g = false;
+                toggle_freeze_col(app);
+                return;
+            }
+            // R91: `gs` pins / unpins the focused row as the *reference* row, so
+            // a wide grid can be read against a fixed baseline (status bar `Δ`).
+            KeyCode::Char('s') if k.modifiers.is_empty() => {
+                app.pending_g = false;
+                toggle_ref_row(app);
                 return;
             }
             KeyCode::Esc => {
@@ -259,7 +267,7 @@ pub(crate) fn preview_key(app: &mut App, tx: &Tx, k: KeyEvent) {
         KeyCode::Char('g') => {
             app.pending_g = true;
             app.status =
-                t("g… d=表结构 t=表数据 v=定位值 c=列结构 b=切换表 w=适配列宽 W=全列适配").into();
+                t("g… d=表结构 t=表数据 v=定位值 c=列结构 b=切换表 f=冻结列 s=钉行 w=适配列宽 W=全列适配").into();
         }
         KeyCode::Char('s') => sort_column(app, tx, false),
         KeyCode::Char('f') => open_filter_prompt(app),
