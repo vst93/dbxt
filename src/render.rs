@@ -1286,6 +1286,8 @@ pub(crate) fn footer_hints_ctx(ctx: FooterCtx) -> Vec<Hint> {
                 ("x", t("断开连接")),
                 ("Alt+a-z", t("首字母跳")),
                 ("Alt-1..9", t("切连接")),
+                // R85: `g t` jumps to a table in the current database.
+                ("gt", t("跳表")),
                 ("d", t("切库")),
                 ("L", t("打开 SQLite")),
                 ("Tab", t("SQL")),
@@ -1346,6 +1348,9 @@ pub(crate) fn footer_hints_ctx(ctx: FooterCtx) -> Vec<Hint> {
                 ("Alt-0", t("清列宽")),
                 ("gd/gt", t("结构/数据")),
                 ("gb", t("切换表")),
+                // R85: content auto-fit column widths.
+                ("gw", t("适配列宽")),
+                ("gW", t("全列适配")),
                 ("[ ]", t("切标签")),
                 ("Alt-W", t("关标签")),
                 ("Alt-O", t("语句耗时")),

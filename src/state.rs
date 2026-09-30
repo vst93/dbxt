@@ -1534,6 +1534,17 @@ impl ColWidthMemory {
         self.scopes.remove(scope).map(|m| m.len()).unwrap_or(0)
     }
 
+    /// R85: set `col`'s override to an absolute width (the auto-fit `g w` / `g W`
+    /// gesture), clamped like a manual adjustment, and return the stored value.
+    pub(crate) fn set(&mut self, scope: &str, col: &str, width: usize) -> usize {
+        let w = width.clamp(MIN_CELL_WIDTH, COL_W_MAX);
+        self.scopes
+            .entry(scope.to_string())
+            .or_default()
+            .insert(col.to_string(), w);
+        w
+    }
+
     /// Widen / narrow `col` by `delta` display cells and return the new width.
     /// The first adjustment starts from `current` (the width on screen), so a key
     /// press is always a small step from what the user sees.

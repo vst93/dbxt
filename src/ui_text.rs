@@ -1163,7 +1163,23 @@ pub static ALL_KEYS: &[&str] = &[
     "无可钉住的结果（先打开一张表或执行查询）",
     "无可钉住的结果",
     "📌 已钉住结果区 · 切换表/库仍显示 · Alt-F 解除",
-    "g… d=表结构 t=表数据 v=定位值 c=列结构 b=切换表",
+    "g… d=表结构 t=表数据 v=定位值 c=列结构 b=切换表 w=适配列宽 W=全列适配",
+    // R85: content auto-fit column widths (`g w` / `g W`)
+    "没有可适配列宽的结果",
+    "没有可适配的列",
+    "列宽 {} 已按内容适配 → {} 格 · 已记忆（跨会话 · g W 全列 / 0 复位 / Alt-0 清除）",
+    "列宽 {} 已按内容适配 → {} 格 · 会话内记忆（g W 全列 / 0 复位）",
+    " · 窄屏仅适配可视前几列",
+    "已按内容适配 {} 列 · 已记忆（跨会话 · g w 当前列 / 0 复位 / Alt-0 清除）{}",
+    "已按内容适配 {} 列 · 会话内记忆（g w 当前列 / 0 复位）{}",
+    // R85: sidebar table jump (`g t`)
+    "g… t=跳表（当前库）",
+    "当前库还没有可跳转的表",
+    "适配列宽",
+    "全列适配",
+    "跳表",
+    "跳表：输入表名前缀模糊跳转当前库内表（复用树已缓存表名，Enter 打开；纯客户端零查询）",
+    "按内容一键适配列宽：g w 当前列、g W 全部可视列；扫已加载单元格显示宽度取 P95（去超长异常值）并钳到 6~40 格，宽字符按终端格宽算；写回列宽记忆通道（浏览表跨会话持久化，查询结果会话内）；窄屏 <80 列只适配可视前几列防抖；纯客户端零查询",
     "无可显示的列（先打开一张表或执行查询）",
     " 列结构 · {} · {} 列 · / 过滤 · j/k 选 · Enter 跳列 · Esc 关 ",
     " 列结构 · {} · {}/{} 列 · 过滤「{}」· Enter 跳列 · Esc 关 ",
@@ -1544,9 +1560,36 @@ fn en_of(zh: &'static str) -> Option<&'static str> {
         "📌 已钉住结果区 · 切换表/库仍显示 · Alt-F 解除" => Some(
             "📌 Results pinned · stays visible after switching tables/DBs · Alt-F to unpin",
         ),
-        "g… d=表结构 t=表数据 v=定位值 c=列结构 b=切换表" => {
-            Some("g… d=structure t=data v=locate c=columns b=switch table")
-        }
+        "g… d=表结构 t=表数据 v=定位值 c=列结构 b=切换表 w=适配列宽 W=全列适配" => Some(
+            "g… d=structure t=data v=locate c=columns b=switch table w=fit width W=fit all",
+        ),
+        // ── R85: content auto-fit column widths + sidebar table jump ──
+        "没有可适配列宽的结果" => Some("No result grid to fit a column width"),
+        "没有可适配的列" => Some("No columns to fit"),
+        "列宽 {} 已按内容适配 → {} 格 · 已记忆（跨会话 · g W 全列 / 0 复位 / Alt-0 清除）" => Some(
+            "Column {} fitted to content → {} cells · remembered (cross-session · g W for all / 0 resets / Alt-0 clears)",
+        ),
+        "列宽 {} 已按内容适配 → {} 格 · 会话内记忆（g W 全列 / 0 复位）" => Some(
+            "Column {} fitted to content → {} cells · session-only (g W for all / 0 resets)",
+        ),
+        " · 窄屏仅适配可视前几列" => Some(" · narrow screen fits only the leading visible columns"),
+        "已按内容适配 {} 列 · 已记忆（跨会话 · g w 当前列 / 0 复位 / Alt-0 清除）{}" => Some(
+            "Fitted {} columns to content · remembered (cross-session · g w current column / 0 resets / Alt-0 clears){}",
+        ),
+        "已按内容适配 {} 列 · 会话内记忆（g w 当前列 / 0 复位）{}" => Some(
+            "Fitted {} columns to content · session-only (g w current column / 0 resets){}",
+        ),
+        "g… t=跳表（当前库）" => Some("g… t=jump to table (current DB)"),
+        "当前库还没有可跳转的表" => Some("No table to jump to in the current database"),
+        "适配列宽" => Some("fit width"),
+        "全列适配" => Some("fit all"),
+        "跳表" => Some("jump table"),
+        "跳表：输入表名前缀模糊跳转当前库内表（复用树已缓存表名，Enter 打开；纯客户端零查询）" => Some(
+            "Jump-table: type a table-name prefix to fuzzy-jump to a table in the current database (the tree's cached names; Enter opens; pure client-side, zero queries)",
+        ),
+        "按内容一键适配列宽：g w 当前列、g W 全部可视列；扫已加载单元格显示宽度取 P95（去超长异常值）并钳到 6~40 格，宽字符按终端格宽算；写回列宽记忆通道（浏览表跨会话持久化，查询结果会话内）；窄屏 <80 列只适配可视前几列防抖；纯客户端零查询" => Some(
+            "One-key content auto-fit: g w the focused column, g W every visible column; scans loaded cells' display width, takes the 95th percentile (drops a long outlier) and clamps to 6–40 cells, wide characters by terminal cell width; writes back into the column-width memory (a browsed table persists across sessions, a query result stays session-only); below 80 columns only the leading visible columns are fitted; pure client-side, zero queries",
+        ),
         "无可显示的列（先打开一张表或执行查询）" => {
             Some("No columns to show (open a table or run a query first)")
         }

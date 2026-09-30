@@ -731,19 +731,48 @@ pub(crate) fn browse_key(app: &mut App, tx: &Tx, k: KeyEvent) {
     // The `g` chord (`gd` / `gt` / `gv` / `gc`) is resolved before the global `?`
     // / `d` shortcuts: `gd` reaches the results pane instead of opening the
     // database picker, and any other key clears a stale pending `g`.
+    // R85: in the sidebar the same chord prefix carries `g t` (jump to a table in
+    // the current database); the two surfaces never overlap because only one
+    // pane owns the keyboard at a time.
+    if app.pending_g && app.focus == Focus::Sidebar {
+        match k.code {
+            KeyCode::Char('t') if k.modifiers.is_empty() => {
+                app.pending_g = false;
+                open_tree_table_jump(app);
+                return;
+            }
+            KeyCode::Esc => {
+                app.pending_g = false;
+                return;
+            }
+            _ => app.pending_g = false,
+        }
+    }
     if app.pending_g {
         match k.code {
-            // `gg` (go to top, R42) is resolved in the results pane too, so the
-            // chord must reach `preview_key` instead of being cleared here.
             KeyCode::Char('d')
             | KeyCode::Char('t')
             | KeyCode::Char('v')
             | KeyCode::Char('c')
             | KeyCode::Char('b')
+            // `gg` (go to top, R42) is resolved in the results pane too, so the
+            // chord must reach `preview_key` instead of being cleared here.
             | KeyCode::Char('g')
             // R82: `gf` jumps to a field in the MongoDB document grid.
             | KeyCode::Char('f')
+            // R85: `g w` fits the focused column to its content.
+            | KeyCode::Char('w')
                 if k.modifiers.is_empty() =>
+            {
+                preview_key(app, tx, k);
+                return;
+            }
+            // R85: `g W` (the uppercase twin) fits every visible column. A
+            // terminal reports SHIFT for an uppercase char, so the `is_empty`
+            // guard above cannot apply here — only Ctrl / Alt would collide.
+            KeyCode::Char('W')
+                if !k.modifiers.contains(KeyModifiers::CONTROL)
+                    && !k.modifiers.contains(KeyModifiers::ALT) =>
             {
                 preview_key(app, tx, k);
                 return;
@@ -1862,6 +1891,17 @@ pub(crate) fn sidebar_key(app: &mut App, tx: &Tx, k: KeyEvent) {
         // automatically and Enter jumps to the first hit then clears the
         // needle. Pure client-side, never a query.
         KeyCode::Char('f') => open_tree_search(app),
+        // R85: `g` starts the sidebar chord — `g t` jumps to a table in the
+        // current database (the free key in this pane; `g d` / `g t` belong to
+        // the results pane and only one pane owns the keyboard at a time).
+        // Consistent with the results-pane chord: the next key is either the
+        // second half or cancels the chord. It shadows a one-step filter seeded
+        // with `g` (`/` then `g` still reaches that), the same trade every other
+        // bound letter here already makes.
+        KeyCode::Char('g') if k.modifiers.is_empty() => {
+            app.pending_g = true;
+            app.status = t("g… t=跳表（当前库）").into();
+        }
         // `t` — jump straight to one of the last five browsed tables.
         KeyCode::Char('t') => open_recent_tables(app),
         // Tree navigation: `j`/`k` walk the whole tree (connections, databases,
@@ -2715,6 +2755,24 @@ pub(crate) fn truncate_table_name(s: &str, max: usize) -> String {
 
 pub(crate) const MIN_CELL_WIDTH: usize = 6;
 
+/// R85: widest a column gets under content auto-fit (`g w` / `g W`). Matches the
+/// inline cell abbreviation cap, so a fitted column never draws more than one
+/// full cell.
+pub(crate) const AUTO_FIT_MAX: usize = 40;
+
+/// R85: percentile used by the auto-fit scan. The 95th trims a column's long
+/// outlier (a memo / JSON blob) so it does not stretch every row.
+pub(crate) const AUTO_FIT_PCT: u32 = 95;
+
+/// R85: a terminal narrower than this gets the *partial* `g W`: only the
+/// leading visible columns are fitted, so a phone grid is not re-laid-out
+/// wholesale on one keystroke.
+pub(crate) const AUTO_FIT_NARROW_W: u16 = 80;
+
+/// R85: how many leading visible columns `g W` fits on a narrow (<80 col)
+/// terminal.
+pub(crate) const AUTO_FIT_NARROW_MAX: usize = 4;
+
 /// Narrowest a column may get in the compact (mobile) column-width mode. Below
 /// this a value is no longer identifiable at a glance.
 pub(crate) const COMPACT_MIN_CELL: usize = 6;
@@ -2889,6 +2947,67 @@ pub(crate) fn apply_row_filters(grid: Grid, row_needle: &str, col: Option<(&str,
         rows: keep.into_iter().map(|i| rows[i].clone()).collect(),
         note,
     }
+}
+
+/// R85: nearest-rank percentile over a scratch slice (sorted in place). The
+/// `pct`% of the sample at or below the returned value; an empty sample is `0`.
+/// Pure, so the auto-fit width rule is unit-testable without a backend.
+pub(crate) fn percentile_usize(values: &mut [usize], pct: u32) -> usize {
+    if values.is_empty() {
+        return 0;
+    }
+    values.sort_unstable();
+    let n = values.len();
+    let rank = ((pct as usize) * n).div_ceil(100);
+    values[rank.clamp(1, n) - 1]
+}
+
+/// R85: the content-adaptive width of one column: the [`AUTO_FIT_PCT`]
+/// percentile of its loaded cells' display widths (outlier-trimmed), never
+/// narrower than the header, clamped to `[MIN_CELL_WIDTH, AUTO_FIT_MAX]`.
+/// Multibyte / wide characters go through the same `unicode-width` channel the
+/// renderer uses. Pure and query-free — it only reads cells already in memory.
+pub(crate) fn auto_fit_width(grid: &Grid, ci: usize, mode: NumFmt) -> usize {
+    let header = disp_width(grid.columns.get(ci).map(String::as_str).unwrap_or(""));
+    let mut widths: Vec<usize> = grid
+        .rows
+        .iter()
+        .filter_map(|r| r.get(ci))
+        .map(|v| cell_text_width_fmt(v, grid.col_type(ci), mode))
+        .collect();
+    percentile_usize(&mut widths, AUTO_FIT_PCT)
+        .max(header)
+        .clamp(MIN_CELL_WIDTH, AUTO_FIT_MAX)
+}
+
+/// R85: the columns `g W` fits, in display order: the frozen (pinned) columns
+/// plus the scroll window (`offset` / `vis` from the last render). When the
+/// terminal is narrower than [`AUTO_FIT_NARROW_W`] the list is truncated to the
+/// first [`AUTO_FIT_NARROW_MAX`] entries, so a phone grid keeps its layout
+/// instead of thrashing. Pure, so the visible-window and narrow-screen rules are
+/// testable without a backend.
+pub(crate) fn auto_fit_columns(
+    offset: usize,
+    vis: usize,
+    frozen: usize,
+    ncols: usize,
+    term_w: u16,
+) -> Vec<usize> {
+    if ncols == 0 {
+        return Vec::new();
+    }
+    let frozen = frozen.min(ncols);
+    let mut cols: Vec<usize> = (0..frozen).collect();
+    let start = offset.min(ncols).max(frozen);
+    if start < ncols {
+        let vis = if vis == 0 { ncols - start } else { vis };
+        let end = (start + vis).min(ncols);
+        cols.extend(start..end);
+    }
+    if term_w < AUTO_FIT_NARROW_W {
+        cols.truncate(AUTO_FIT_NARROW_MAX);
+    }
+    cols
 }
 
 /// Natural width of one grid column: the widest of its header and cells,

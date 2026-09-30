@@ -135,6 +135,24 @@ pub(crate) fn preview_key(app: &mut App, tx: &Tx, k: KeyEvent) {
                 preview_home(app);
                 return;
             }
+            // `g w` — R85: fit the focused column to its loaded content (95th
+            // percentile width, clamped [6, 40]), remembered like a manual `<`
+            // / `>`. Pure client-side scan of the page already in memory.
+            KeyCode::Char('w') if k.modifiers.is_empty() => {
+                app.pending_g = false;
+                fit_col_width(app);
+                return;
+            }
+            // `g W` — R85: fit every visible column; on a narrow (<80 col)
+            // terminal only the leading visible columns (see `auto_fit_columns`).
+            KeyCode::Char('W')
+                if !k.modifiers.contains(KeyModifiers::CONTROL)
+                    && !k.modifiers.contains(KeyModifiers::ALT) =>
+            {
+                app.pending_g = false;
+                fit_all_col_widths(app);
+                return;
+            }
             // R82: `gf` is only meaningful in the MongoDB document grid, which
             // resolves the chord before this block; elsewhere it stays a no-op
             // rather than silently opening the WHERE filter.
@@ -237,10 +255,11 @@ pub(crate) fn preview_key(app: &mut App, tx: &Tx, k: KeyEvent) {
             }
         }
         // `g` starts the `gd` (goto structure) / `gt` (goto data) / `gb`
-        // (switch table) chord.
+        // (switch table) / `gw` (fit width) chord.
         KeyCode::Char('g') => {
             app.pending_g = true;
-            app.status = t("g… d=表结构 t=表数据 v=定位值 c=列结构 b=切换表").into();
+            app.status =
+                t("g… d=表结构 t=表数据 v=定位值 c=列结构 b=切换表 w=适配列宽 W=全列适配").into();
         }
         KeyCode::Char('s') => sort_column(app, tx, false),
         KeyCode::Char('f') => open_filter_prompt(app),
@@ -2327,6 +2346,20 @@ pub(crate) fn open_table_jump(app: &mut App) {
     app.table_jump_needle.clear();
     app.table_jump_list.select(Some(0));
     table_jump_report(app);
+}
+
+/// R85: `g t` in the sidebar opens the same in-database table switcher the data
+/// view's `g b` uses — the tree's own cached table list for the current database,
+/// type-to-filter, Enter opens the highlighted table. A thin named entry point so
+/// the sidebar has its own status hint while both surfaces share one overlay and
+/// one keymap; the list comes from the sidebar's already-cached metadata, so it is
+/// **zero queries** and a workspace `/` filter never hides a table from it.
+pub(crate) fn open_tree_table_jump(app: &mut App) {
+    if app.tables_all.is_empty() {
+        app.status = t("当前库还没有可跳转的表").into();
+        return;
+    }
+    open_table_jump(app);
 }
 
 /// The `g b` switcher's rows: the current database's tables (the cached

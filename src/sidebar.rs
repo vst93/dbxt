@@ -2740,6 +2740,105 @@ pub(crate) fn adjust_col_width(app: &mut App, delta: i32) {
     }
 }
 
+/// R85: `g w` — fit the focused result column to its loaded content. The width
+/// is the 95th-percentile display width of the column's cells (outlier-trimmed),
+/// never narrower than the header, clamped to `[6, 40]`; it is written back into
+/// the same width-memory channel a manual `<` / `>` uses (persisted for a browsed
+/// table, session-only for a query result). Zero queries: the scan reads the page
+/// already in memory.
+pub(crate) fn fit_col_width(app: &mut App) {
+    let Some(grid) = active_grid(app) else {
+        app.status = t("没有可适配列宽的结果").into();
+        return;
+    };
+    // The drilled script list has no grid column under the cursor.
+    if app.script.as_ref().is_some_and(|s| s.drilled.is_none()) {
+        app.status = t("展开一条语句结果后再调列宽").into();
+        return;
+    }
+    let Some(name) = grid.columns.get(app.col_cursor).cloned() else {
+        return;
+    };
+    let w = auto_fit_width(&grid, app.col_cursor, app.num_fmt);
+    let scope = col_width_scope(app);
+    app.col_width_mem.set(&scope, &name, w);
+    let disp = fix_double_encoding(&name);
+    if let Some((conn, db, schema, table)) = col_width_table_key(app) {
+        app.config
+            .set_col_width(&conn, &db, &schema, &table, &name, w);
+        app.persist();
+        app.status = tf(
+            "列宽 {} 已按内容适配 → {} 格 · 已记忆（跨会话 · g W 全列 / 0 复位 / Alt-0 清除）",
+            &[&disp, &w],
+        );
+    } else {
+        app.status = tf(
+            "列宽 {} 已按内容适配 → {} 格 · 会话内记忆（g W 全列 / 0 复位）",
+            &[&disp, &w],
+        );
+    }
+}
+
+/// R85: `g W` — fit every *visible* column of the results grid to its loaded
+/// content (the same rule as `g w`). On a terminal narrower than
+/// [`AUTO_FIT_NARROW_W`] only the first [`AUTO_FIT_NARROW_MAX`] visible columns
+/// are fitted, so a phone layout does not thrash. A browsed table persists each
+/// width; a query result keeps them for the session. Zero queries.
+pub(crate) fn fit_all_col_widths(app: &mut App) {
+    let Some(grid) = active_grid(app) else {
+        app.status = t("没有可适配列宽的结果").into();
+        return;
+    };
+    if app.script.as_ref().is_some_and(|s| s.drilled.is_none()) {
+        app.status = t("展开一条语句结果后再调列宽").into();
+        return;
+    }
+    let ncols = grid.columns.len();
+    let cols = auto_fit_columns(
+        app.col_offset,
+        app.vis_cols,
+        app.grid_frozen,
+        ncols,
+        app.term_w,
+    );
+    if cols.is_empty() {
+        app.status = t("没有可适配的列").into();
+        return;
+    }
+    let scope = col_width_scope(app);
+    let key = col_width_table_key(app);
+    let mode = app.num_fmt;
+    let mut n = 0usize;
+    for ci in cols {
+        let name = grid.columns[ci].clone();
+        let w = auto_fit_width(&grid, ci, mode);
+        app.col_width_mem.set(&scope, &name, w);
+        if let Some((conn, db, schema, table)) = &key {
+            app.config.set_col_width(conn, db, schema, table, &name, w);
+        }
+        n += 1;
+    }
+    if key.is_some() {
+        app.persist();
+    }
+    let note = if app.term_w < AUTO_FIT_NARROW_W {
+        t(" · 窄屏仅适配可视前几列")
+    } else {
+        ""
+    };
+    app.status = if key.is_some() {
+        tf(
+            "已按内容适配 {} 列 · 已记忆（跨会话 · g w 当前列 / 0 复位 / Alt-0 清除）{}",
+            &[&n, &note],
+        )
+    } else {
+        tf(
+            "已按内容适配 {} 列 · 会话内记忆（g w 当前列 / 0 复位）{}",
+            &[&n, &note],
+        )
+    };
+}
+
 /// `0` on the focused result column: drop the remembered width (session and, for
 /// a browsed table, on disk) so the column returns to its natural, content-sized
 /// width on the next frame.

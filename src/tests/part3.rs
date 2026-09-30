@@ -7678,3 +7678,322 @@ pub(crate) fn sqlite_scan_lists_dirs_and_db_files() {
     assert!(matches!(&rows[0], SqliteRow::File(p) if sqlite_file_name(p) == "b.sqlite3"));
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+// ── R85: content auto-fit column widths (`g w` / `g W`) + sidebar table jump ──
+
+/// R85: the auto-fit scan uses a nearest-rank P95 (so one long outlier does not
+/// stretch the column), counts wide (CJK) cells at their terminal width, and
+/// clamps to `[6, AUTO_FIT_MAX]` with the header never truncated.
+#[test]
+pub(crate) fn auto_fit_p95_handles_wide_chars_and_clamps() {
+    // Nearest-rank P95: 19 narrow values + one huge outlier → the outlier is
+    // dropped; an empty sample is 0.
+    let mut sample: Vec<usize> = std::iter::repeat_n(10usize, 19).chain([1000]).collect();
+    assert_eq!(percentile_usize(&mut sample, 95), 10);
+    assert_eq!(percentile_usize(&mut [], 95), 0);
+
+    let grid = |cols: Vec<&str>, rows: Vec<Vec<Val>>| Grid {
+        columns: cols.into_iter().map(str::to_string).collect(),
+        types: Vec::new(),
+        rows,
+        note: String::new(),
+    };
+
+    // A wide-character cell (日本語 = 6 terminal cells) drives the width.
+    let wide = grid(
+        vec!["c"],
+        vec![
+            vec![Val::Text("日本語".into())],
+            vec![Val::Text("ok".into())],
+            vec![Val::Text("x".into())],
+        ],
+    );
+    assert_eq!(auto_fit_width(&wide, 0, NumFmt::Original), 6);
+
+    // Narrow cells clamp up to the 6-cell floor.
+    let narrow = grid(vec!["i"], vec![vec![Val::Text("1".into())]]);
+    assert_eq!(auto_fit_width(&narrow, 0, NumFmt::Original), MIN_CELL_WIDTH);
+
+    // A long header is never truncated below its own width...
+    let named = grid(vec!["long_column_name"], vec![vec![Val::Text("1".into())]]);
+    assert_eq!(auto_fit_width(&named, 0, NumFmt::Original), 16);
+
+    // ...and the cap holds even for a 100-wide header. The cap matches the
+    // inline cell abbreviation, so a fitted column draws at most one full cell.
+    let huge = grid(vec![&"x".repeat(100)], vec![vec![Val::Text("1".into())]]);
+    assert_eq!(auto_fit_width(&huge, 0, NumFmt::Original), AUTO_FIT_MAX);
+    assert_eq!(AUTO_FIT_MAX, CELL_TEXT_MAX);
+}
+
+/// R85: `g W`'s column set is the visible window (pinned columns + the scroll
+/// window), and a narrow (<80 col) terminal only fits its leading columns so the
+/// phone layout does not thrash.
+#[test]
+pub(crate) fn auto_fit_columns_limits_the_narrow_screen() {
+    // Wide terminal: every visible column, from the current offset.
+    assert_eq!(auto_fit_columns(0, 3, 0, 10, 110), vec![0, 1, 2]);
+    assert_eq!(auto_fit_columns(2, 6, 0, 10, 110), vec![2, 3, 4, 5, 6, 7]);
+    // No render yet (vis == 0): fall back to the rest of the grid.
+    assert_eq!(auto_fit_columns(0, 0, 0, 5, 110), vec![0, 1, 2, 3, 4]);
+    // A pinned first column is visible and included, before the scroll window.
+    assert_eq!(auto_fit_columns(1, 2, 1, 10, 110), vec![0, 1, 2]);
+    // Narrow (<80): only the leading visible columns.
+    assert_eq!(
+        auto_fit_columns(0, 8, 0, 10, 42),
+        (0..AUTO_FIT_NARROW_MAX).collect::<Vec<_>>()
+    );
+    // ...and the cap still counts the pinned column first.
+    assert_eq!(
+        auto_fit_columns(0, 8, 1, 10, 42),
+        (0..AUTO_FIT_NARROW_MAX).collect::<Vec<_>>()
+    );
+    // ...but the cap never exceeds the visible window itself.
+    assert_eq!(auto_fit_columns(0, 2, 0, 10, 42), vec![0, 1]);
+    // Degenerate inputs stay in range.
+    assert!(auto_fit_columns(0, 4, 0, 0, 110).is_empty());
+    assert!(auto_fit_columns(5, 4, 0, 5, 110).is_empty());
+}
+
+fn r85_open_table_app() -> App {
+    let mut app = test_app();
+    app.picker_open = false;
+    app.selected = Some(test_conn("mysql"));
+    app.backend_kind = Backend::Sql;
+    app.databases = vec!["shop".into()];
+    app.schema = "shop".into();
+    app.grid_kind = GridKind::TableData;
+    app.page_state = Some(orders_page(None));
+    app.focus = Focus::Preview;
+    app
+}
+
+/// R85: `g w` fits the focused column from the loaded content (zero queries),
+/// writes it into the same memory a manual `<` / `>` uses, and restores the
+/// browsed table's width from `tui.json`.
+#[test]
+pub(crate) fn g_w_fits_the_focused_column_from_loaded_content() {
+    let (tx, _rx) = tokio::sync::mpsc::unbounded_channel::<OpResult>();
+    let mut app = r85_open_table_app();
+    let mut rows: Vec<Vec<Val>> = (0..19)
+        .map(|i| vec![Val::Text(i.to_string()), Val::Text("short".into())])
+        .collect();
+    rows.push(vec![Val::Text("20".into()), Val::Text("x".repeat(500))]);
+    let grid = Grid {
+        columns: vec!["id".into(), "note".into()],
+        types: vec!["int".into(), "text".into()],
+        rows,
+        note: String::new(),
+    };
+    app.set_grid(grid);
+    app.col_cursor = 1;
+    app.term_w = 110;
+
+    key(
+        &mut app,
+        &tx,
+        KeyEvent::new(KeyCode::Char('g'), KeyModifiers::NONE),
+    );
+    assert!(app.pending_g);
+    key(
+        &mut app,
+        &tx,
+        KeyEvent::new(KeyCode::Char('w'), KeyModifiers::NONE),
+    );
+    assert!(!app.pending_g);
+    // values: header 4 + 19 x "short" (5) + one 500-wide outlier → P95 = 5 →
+    // floor 6 (the outlier is trimmed).
+    let scope = col_width_scope(&app);
+    assert_eq!(app.col_width_mem.get(&scope, "note"), Some(MIN_CELL_WIDTH));
+    // Persisted for the browsed table (session + tui.json channel).
+    assert_eq!(
+        app.config
+            .col_width("id-mysql", "shop", "", "orders", "note"),
+        Some(MIN_CELL_WIDTH)
+    );
+    assert!(app.status.contains("已按内容适配"), "{}", app.status);
+}
+
+/// R85: `g W` fits every visible column, and on a narrow (<80 col) terminal only
+/// its leading columns — the phone-safe partial fit.
+#[test]
+pub(crate) fn g_shift_w_fits_visible_columns_and_limits_on_narrow() {
+    let (tx, _rx) = tokio::sync::mpsc::unbounded_channel::<OpResult>();
+    let mut app = r85_open_table_app();
+    app.set_grid(sample_grid());
+    app.col_offset = 0;
+    app.vis_cols = 3;
+    app.term_w = 110;
+
+    key(
+        &mut app,
+        &tx,
+        KeyEvent::new(KeyCode::Char('g'), KeyModifiers::NONE),
+    );
+    key(
+        &mut app,
+        &tx,
+        KeyEvent::new(KeyCode::Char('W'), KeyModifiers::SHIFT),
+    );
+    let scope = col_width_scope(&app);
+    assert_eq!(
+        app.col_width_mem.overrides(&scope).map(HashMap::len),
+        Some(3),
+        "wide terminal fits all three visible columns"
+    );
+
+    // Narrow terminal: only the leading AUTO_FIT_NARROW_MAX visible columns.
+    app.col_width_mem = Default::default();
+    app.vis_cols = 8;
+    app.term_w = 42;
+    key(
+        &mut app,
+        &tx,
+        KeyEvent::new(KeyCode::Char('g'), KeyModifiers::NONE),
+    );
+    key(
+        &mut app,
+        &tx,
+        KeyEvent::new(KeyCode::Char('W'), KeyModifiers::SHIFT),
+    );
+    assert_eq!(
+        app.col_width_mem.overrides(&scope).map(HashMap::len),
+        Some(AUTO_FIT_NARROW_MAX),
+        "narrow terminal fits only the leading visible columns"
+    );
+    assert!(app.status.contains("窄屏"), "{}", app.status);
+}
+
+/// R85: `g t` in the sidebar opens the current database's table switcher from
+/// the tree's cached list (zero queries), reusing the `g b` overlay; typing
+/// narrows it.
+#[test]
+pub(crate) fn sidebar_g_t_opens_the_cached_table_jump() {
+    let (tx, _rx) = tokio::sync::mpsc::unbounded_channel::<OpResult>();
+    let mut app = test_app();
+    app.picker_open = false;
+    app.selected = Some(test_conn("mysql"));
+    app.backend_kind = Backend::Sql;
+    app.databases = vec!["shop".into()];
+    app.schema = "shop".into();
+    app.tables_all = vec![
+        table_info("orders", "TABLE"),
+        table_info("order_items", "TABLE"),
+        table_info("users", "TABLE"),
+    ];
+    app.tables = app.tables_all.clone();
+    app.focus = Focus::Sidebar;
+
+    key(
+        &mut app,
+        &tx,
+        KeyEvent::new(KeyCode::Char('g'), KeyModifiers::NONE),
+    );
+    assert!(app.pending_g, "g arms the sidebar chord");
+    key(
+        &mut app,
+        &tx,
+        KeyEvent::new(KeyCode::Char('t'), KeyModifiers::NONE),
+    );
+    assert!(app.table_jump_open, "g t opens the table jump");
+    assert!(!app.pending_g);
+
+    // Type-to-filter narrows the cached list; a prefix finds the table.
+    for ch in "us".chars() {
+        key(
+            &mut app,
+            &tx,
+            KeyEvent::new(KeyCode::Char(ch), KeyModifiers::NONE),
+        );
+    }
+    let names: Vec<String> = table_jump_rows(&app).into_iter().map(|r| r.0).collect();
+    assert_eq!(names, vec!["users"]);
+    assert!(app.status.contains("1/3"), "{}", app.status);
+
+    key(
+        &mut app,
+        &tx,
+        KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE),
+    );
+    assert!(!app.table_jump_open, "Esc closes the jump");
+}
+
+/// R85: with no cached tables the sidebar chord reports instead of opening an
+/// empty overlay, and a key other than `t` cancels the chord (no filter leak).
+#[test]
+pub(crate) fn sidebar_g_t_without_tables_reports_and_other_keys_cancel() {
+    let (tx, _rx) = tokio::sync::mpsc::unbounded_channel::<OpResult>();
+    let mut app = test_app();
+    app.picker_open = false;
+    app.selected = Some(test_conn("mysql"));
+    app.backend_kind = Backend::Sql;
+    app.databases = vec!["shop".into()];
+    app.schema = "shop".into();
+    app.focus = Focus::Sidebar;
+
+    key(
+        &mut app,
+        &tx,
+        KeyEvent::new(KeyCode::Char('g'), KeyModifiers::NONE),
+    );
+    assert!(app.pending_g);
+    key(
+        &mut app,
+        &tx,
+        KeyEvent::new(KeyCode::Char('x'), KeyModifiers::NONE),
+    );
+    assert!(!app.pending_g, "a non-chord key cancels the chord");
+    assert!(!app.table_jump_open);
+
+    // Empty cache: `g t` reports, it never opens an empty overlay.
+    key(
+        &mut app,
+        &tx,
+        KeyEvent::new(KeyCode::Char('g'), KeyModifiers::NONE),
+    );
+    key(
+        &mut app,
+        &tx,
+        KeyEvent::new(KeyCode::Char('t'), KeyModifiers::NONE),
+    );
+    assert!(!app.table_jump_open);
+    assert!(app.status.contains("当前库还没有"), "{}", app.status);
+}
+
+/// R85: the two new chords ship in all three surfaces together — the footer hint
+/// group (which the mini cheat-sheet reuses verbatim) and the full `?` sheet.
+#[test]
+pub(crate) fn r85_keys_are_in_footer_mini_and_full_help() {
+    // Full cheat-sheet rows.
+    assert!(HELP_ROWS.iter().any(|(k, _)| *k == "g w / gW"));
+    assert!(HELP_ROWS.iter().any(|(k, _)| *k == "g t"));
+
+    // Footer / mini hints. The mini sheet calls `footer_hints_ctx` with the same
+    // context, so a hint here is a hint there too.
+    let mut app = test_app();
+    app.picker_open = false;
+    app.selected = Some(test_conn("mysql"));
+    app.backend_kind = Backend::Sql;
+    app.databases = vec!["shop".into()];
+    app.schema = "shop".into();
+    app.tables_all = vec![table_info("users", "TABLE")];
+    app.grid_kind = GridKind::Query;
+    app.set_grid(sample_grid());
+
+    app.focus = Focus::Preview;
+    let hints = footer_hints_ctx(footer_ctx_inner(&app, false));
+    assert!(
+        hints.iter().any(|h| h.0 == "gw" && h.1 == t("适配列宽")),
+        "results footer names g w: {hints:?}"
+    );
+    assert!(
+        hints.iter().any(|h| h.0 == "gW" && h.1 == t("全列适配")),
+        "results footer names g W: {hints:?}"
+    );
+
+    app.focus = Focus::Sidebar;
+    let hints = footer_hints_ctx(footer_ctx_inner(&app, false));
+    assert!(
+        hints.iter().any(|h| h.0 == "gt" && h.1 == t("跳表")),
+        "sidebar footer names g t: {hints:?}"
+    );
+}
