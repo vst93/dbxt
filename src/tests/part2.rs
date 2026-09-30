@@ -908,6 +908,204 @@ pub(crate) fn col_width_scope_is_stable_across_pages() {
     assert!(col_width_scope(&app).starts_with("q\u{0}"));
 }
 
+// ── R72: column-width memory persists to tui.json ──
+
+/// A `(database, table)` page state for the width tests.
+pub(crate) fn width_page(table: &str) -> PageState {
+    PageState {
+        table: table.into(),
+        schema: String::new(),
+        table_type: Some("TABLE".into()),
+        page: 0,
+        page_size: PAGE_SIZE,
+        total: None,
+        total_lower_bound: false,
+        has_next: false,
+        filter: String::new(),
+        order_by: None,
+        keyset: None,
+    }
+}
+
+/// R72: widths written for two tables round-trip through `tui.json` and are
+/// looked up by the full `(conn, db, schema, table, col)` identity.
+#[test]
+pub(crate) fn config_persists_and_restores_col_widths() {
+    let path = std::env::temp_dir().join(format!("dbxt-cw-{}.json", Uuid::new_v4()));
+    let mut cfg = TuiConfig::default();
+    cfg.set_col_width("c1", "shop", "", "orders", "id", 14);
+    cfg.set_col_width("c1", "shop", "", "orders", "name", 30);
+    cfg.set_col_width("c2", "shop", "", "users", "id", 8);
+    cfg.save(&path);
+    let back = TuiConfig::load(&path);
+    assert_eq!(back.col_width("c1", "shop", "", "orders", "id"), Some(14));
+    assert_eq!(back.col_width("c1", "shop", "", "orders", "name"), Some(30));
+    assert_eq!(back.col_width("c2", "shop", "", "users", "id"), Some(8));
+    // A different connection / table / column is a different identity.
+    assert_eq!(back.col_width("c1", "shop", "", "orders", "missing"), None);
+    assert_eq!(back.col_width("c1", "shop", "", "users", "id"), None);
+    assert_eq!(back.col_width("c9", "shop", "", "orders", "id"), None);
+    let _ = std::fs::remove_file(&path);
+}
+
+/// R72: the persisted list is capped at `COL_WIDTH_MEM_MAX` and drops the
+/// least-recently-adjusted entries first.
+#[test]
+pub(crate) fn col_widths_lru_caps_and_evicts_oldest() {
+    let path = std::env::temp_dir().join(format!("dbxt-cw-lru-{}.json", Uuid::new_v4()));
+    let mut cfg = TuiConfig::default();
+    for i in 0..(COL_WIDTH_MEM_MAX + 25) {
+        cfg.set_col_width("c1", "db", "", "t", &format!("col{i}"), 10 + (i % 5));
+    }
+    cfg.save(&path);
+    let back = TuiConfig::load(&path);
+    assert_eq!(back.col_widths.len(), COL_WIDTH_MEM_MAX);
+    assert!(back.col_width("c1", "db", "", "t", "col0").is_none());
+    assert!(
+        back.col_width(
+            "c1",
+            "db",
+            "",
+            "t",
+            &format!("col{}", COL_WIDTH_MEM_MAX + 24)
+        )
+        .is_some(),
+        "the most recent entry survives the cap"
+    );
+    let _ = std::fs::remove_file(&path);
+}
+
+/// R72: clearing one column / a whole table removes exactly those entries and
+/// leaves other tables alone; a fresh session's save merges rather than wipes.
+#[test]
+pub(crate) fn config_clears_col_widths_and_merges_sessions() {
+    let path = std::env::temp_dir().join(format!("dbxt-cw-clear-{}.json", Uuid::new_v4()));
+    let mut cfg = TuiConfig::default();
+    cfg.set_col_width("c1", "db", "", "t", "a", 12);
+    cfg.set_col_width("c1", "db", "", "t", "b", 13);
+    cfg.set_col_width("c1", "db", "", "u", "a", 14);
+    cfg.save(&path);
+
+    // A second session only knows about one entry; its save must not wipe the
+    // others, and a clear removes just the named column.
+    let mut b = TuiConfig::default();
+    b.set_col_width("c1", "db", "", "t", "b", 15);
+    b.save(&path);
+    let after = TuiConfig::load(&path);
+    assert_eq!(after.col_width("c1", "db", "", "t", "a"), Some(12));
+    assert_eq!(after.col_width("c1", "db", "", "t", "b"), Some(15));
+    assert_eq!(after.col_width("c1", "db", "", "u", "a"), Some(14));
+
+    let mut c = TuiConfig::load(&path);
+    c.clear_col_width("c1", "db", "", "t", "a");
+    c.save(&path);
+    let after = TuiConfig::load(&path);
+    assert_eq!(after.col_width("c1", "db", "", "t", "a"), None);
+    assert_eq!(after.col_width("c1", "db", "", "t", "b"), Some(15));
+
+    let mut d = TuiConfig::load(&path);
+    assert_eq!(d.clear_table_col_widths("c1", "db", "", "t"), 1);
+    assert_eq!(d.clear_table_col_widths("c1", "db", "", "t"), 0);
+    d.save(&path);
+    let after = TuiConfig::load(&path);
+    assert_eq!(after.col_width("c1", "db", "", "t", "b"), None);
+    assert_eq!(after.col_width("c1", "db", "", "u", "a"), Some(14));
+    let _ = std::fs::remove_file(&path);
+}
+
+/// R72: the renderer applies the session override first, then the persisted one,
+/// and leaves a column with neither at its natural width.
+#[test]
+pub(crate) fn col_width_overrides_apply_session_then_persisted() {
+    let mut app = tree_app();
+    app.grid_kind = GridKind::TableData;
+    app.page_state = Some(width_page("orders"));
+    // Persisted for `id`; the session remembers a manual `name`.
+    app.config
+        .set_col_width("id-mysql", "shop", "", "orders", "id", 20);
+    let scope = col_width_scope(&app);
+    app.col_width_mem.adjust(&scope, "name", 10, 2);
+    let grid = Grid {
+        columns: vec!["id".into(), "name".into(), "note".into()],
+        rows: vec![],
+        note: String::new(),
+    };
+    let mut widths = vec![5usize, 5, 5];
+    apply_col_width_overrides(&app, &grid, &mut widths);
+    assert_eq!(widths, vec![20, 12, 5]);
+}
+
+/// R72: the session memory can drop one column or a whole scope.
+#[test]
+pub(crate) fn col_width_memory_reset_and_clear_scope() {
+    let mut mem = ColWidthMemory::default();
+    mem.adjust("s", "a", 10, 2);
+    mem.adjust("s", "b", 10, 2);
+    mem.adjust("t", "a", 10, 2);
+    assert_eq!(mem.clear_scope("s"), 2);
+    assert!(mem.overrides("s").is_none());
+    assert_eq!(mem.get("t", "a"), Some(12));
+    mem.reset("t", "a");
+    assert_eq!(mem.get("t", "a"), None);
+}
+
+/// R72: `0` resets just the focused column (session + disk); `Alt-0` forgets the
+/// whole table. `Alt-0` (not `Ctrl-0`) because most terminals collapse `Ctrl-0`
+/// to a plain `0`, which is the single-column reset.
+#[test]
+pub(crate) fn reset_and_clear_col_width_keys() {
+    let (tx, _rx) = tokio::sync::mpsc::unbounded_channel::<OpResult>();
+    let mut app = tree_app();
+    app.grid_kind = GridKind::TableData;
+    app.page_state = Some(width_page("orders"));
+    app.set_grid(Grid {
+        columns: vec!["id".into(), "name".into()],
+        rows: vec![vec![Val::Text("1".into()), Val::Text("a".into())]],
+        note: String::new(),
+    });
+    app.focus = Focus::Preview;
+    app.grid_widths = vec![20, 10];
+    app.col_cursor = 0;
+    app.config
+        .set_col_width("id-mysql", "shop", "", "orders", "id", 20);
+    app.config
+        .set_col_width("id-mysql", "shop", "", "orders", "name", 10);
+    let scope = col_width_scope(&app);
+    app.col_width_mem.adjust(&scope, "id", 6, 14);
+    app.col_width_mem.adjust(&scope, "name", 6, 4);
+
+    // `0` drops the focused column only.
+    preview_key(
+        &mut app,
+        &tx,
+        KeyEvent::new(KeyCode::Char('0'), KeyModifiers::NONE),
+    );
+    assert_eq!(
+        app.config.col_width("id-mysql", "shop", "", "orders", "id"),
+        None
+    );
+    assert_eq!(
+        app.config
+            .col_width("id-mysql", "shop", "", "orders", "name"),
+        Some(10)
+    );
+    assert_eq!(app.col_width_mem.get(&scope, "id"), None);
+    assert_eq!(app.col_width_mem.get(&scope, "name"), Some(10));
+
+    // Alt-0 clears the whole table (session + disk).
+    preview_key(
+        &mut app,
+        &tx,
+        KeyEvent::new(KeyCode::Char('0'), KeyModifiers::ALT),
+    );
+    assert_eq!(
+        app.config
+            .col_width("id-mysql", "shop", "", "orders", "name"),
+        None
+    );
+    assert!(app.col_width_mem.overrides(&scope).is_none());
+}
+
 // ── R48: pinned result pane ──
 
 /// R48: `Alt-F` (results pane) toggles a pin; the pinned grid survives a
@@ -1416,8 +1614,9 @@ pub(crate) fn col_stats_lines_cover_each_state() {
         avg: 2.0,
         scanned: 5,
         truncated: false,
+        spark: String::new(),
     };
-    let joined = col_stats_lines("total", Some(&num), 40)
+    let joined = col_stats_lines("total", Some(&num), 40, false)
         .iter()
         .map(|l| l.to_string())
         .collect::<Vec<_>>()
@@ -1432,7 +1631,7 @@ pub(crate) fn col_stats_lines_cover_each_state() {
         scanned: 5000,
         ..num.clone()
     };
-    let joined = col_stats_lines("name", Some(&text), 40)
+    let joined = col_stats_lines("name", Some(&text), 40, false)
         .iter()
         .map(|l| l.to_string())
         .collect::<Vec<_>>()
@@ -1440,12 +1639,104 @@ pub(crate) fn col_stats_lines_cover_each_state() {
     assert!(joined.contains("（非数值列）"), "{joined}");
     assert!(joined.contains("（按前 5000 行统计）"), "{joined}");
 
-    let none = col_stats_lines("name", None, 40)
+    let none = col_stats_lines("name", None, 40, false)
         .iter()
         .map(|l| l.to_string())
         .collect::<Vec<_>>()
         .join("\n");
     assert!(none.contains("打开表数据后可用"), "{none}");
+}
+
+// ── R72: value-distribution sparkline ──
+
+/// R72: the eight-level sparkline puts a bar in the matching bucket, leaves an
+/// empty bucket blank, and gives a single distinct value one centred bar.
+#[test]
+pub(crate) fn sparkline_buckets_numbers_and_lengths() {
+    // Two values at the ends of the range: a bar at each end, blanks between.
+    assert_eq!(sparkline_numeric(&[0.0, 10.0], 12), "█          █");
+    // A single distinct value centres in one bucket.
+    let single = sparkline_numeric(&[5.0, 5.0, 5.0], 12);
+    assert_eq!(single.chars().count(), 12);
+    assert_eq!(single.chars().filter(|c| *c == '█').count(), 1);
+    assert_eq!(single.chars().position(|c| c == '█'), Some(6));
+    // Levels scale with the bucket count.
+    assert_eq!(spark_from_buckets(&[1, 2, 3]), "▃▆█");
+    // An all-zero histogram is all spaces, never a misleading bar.
+    assert_eq!(spark_from_buckets(&[0, 0, 0]), "   ");
+    // Lengths bucket the same way (all-equal lengths land in one bucket).
+    let lens = sparkline_lengths(&[2, 2, 2], 12);
+    assert_eq!(lens.chars().filter(|c| *c == '█').count(), 1);
+    assert_eq!(sparkline_lengths(&[1, 2, 3], 3), "███");
+    // Empty inputs render nothing.
+    assert!(sparkline_numeric(&[], 12).is_empty());
+    assert!(sparkline_lengths(&[], 12).is_empty());
+}
+
+/// R72: `col_stats` fills a fixed-width sparkline from the sampled values —
+/// numeric buckets for a numeric column, length buckets for a text one, and
+/// nothing at all when there is no data.
+#[test]
+pub(crate) fn col_stats_builds_a_sparkline() {
+    let numeric = Grid {
+        columns: vec!["n".into()],
+        rows: (1..=12).map(|i| vec![Val::Text(i.to_string())]).collect(),
+        note: String::new(),
+    };
+    let s = col_stats(&numeric, 0, 100);
+    assert_eq!(s.spark.chars().count(), COL_SPARK_W);
+    assert!(s.spark.contains('█'), "{}", s.spark);
+
+    let text = Grid {
+        columns: vec!["s".into()],
+        rows: vec![
+            vec![Val::Text("a".into())],
+            vec![Val::Text("bb".into())],
+            vec![Val::Text("bbbb".into())],
+        ],
+        note: String::new(),
+    };
+    let s = col_stats(&text, 0, 100);
+    assert_eq!(s.spark.chars().count(), COL_SPARK_W);
+    assert!(s.spark.contains('█'), "{}", s.spark);
+
+    let empty = Grid {
+        columns: vec!["s".into()],
+        rows: Vec::new(),
+        note: String::new(),
+    };
+    assert!(col_stats(&empty, 0, 100).spark.is_empty());
+}
+
+/// R72: the stats line appends the sparkline only when asked (the caller drops
+/// it on a narrow terminal).
+#[test]
+pub(crate) fn col_stats_lines_show_sparkline_on_demand() {
+    let stats = ColStats {
+        non_null: 4,
+        nulls: 1,
+        distinct: 3,
+        numeric: true,
+        min: 1.0,
+        max: 3.0,
+        avg: 2.0,
+        scanned: 5,
+        truncated: false,
+        spark: "█▁█▁█▁█▁█▁█▁".into(),
+    };
+    let with = col_stats_lines("total", Some(&stats), 60, true)
+        .iter()
+        .map(|l| l.to_string())
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(with.contains('█'), "{with}");
+    assert!(with.contains("去重 3"), "{with}");
+    let without = col_stats_lines("total", Some(&stats), 60, false)
+        .iter()
+        .map(|l| l.to_string())
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(!without.contains('█'), "{without}");
 }
 
 /// R66: the popup draws the value stats — beside the list on a wide terminal,
@@ -1485,6 +1776,8 @@ pub(crate) fn cols_popup_renders_value_stats() {
     assert!(wide.contains("值分布·total"), "{wide}");
     assert!(wide.contains("min10·max20"), "{wide}");
     assert!(wide.contains("avg15"), "{wide}");
+    // R72: the sparkline rides beside the distinct count on a wide terminal.
+    assert!(wide.contains("去重2██"), "{wide}");
     // `j` moves to the text column: the counts stay, the numeric tail turns
     // into a non-numeric note.
     cols_popup_key(
@@ -1498,6 +1791,8 @@ pub(crate) fn cols_popup_renders_value_stats() {
     let phone = compact(draw(&mut app, 42, 22));
     assert!(phone.contains("值分布·note"), "{phone}");
     assert!(phone.contains("非空3"), "{phone}");
+    // R72: below 56 columns the sparkline is dropped.
+    assert!(!phone.contains("去重2█"), "{phone}");
 
     // No loaded data: the popup still opens from the cached metadata and
     // hints instead of showing an empty stats pane.

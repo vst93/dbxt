@@ -1429,11 +1429,12 @@ pub(crate) enum RenameTarget {
     Group { id: String },
 }
 
-/// Session-only per-column width overrides for result grids (R55). Keyed by a
-/// scope string (connection + database + schema + table, or a query bucket) and
-/// then by column *name*, so page turns, re-queries and reopening the same table
-/// in one session keep the widths. Never written to disk: the next launch starts
-/// from the natural, content-sized widths again.
+/// Per-column width overrides for result grids (R55, persisted in R72). Keyed by
+/// a scope string (connection + database + schema + table, or a query bucket)
+/// and then by column *name*, so page turns, re-queries and reopening the same
+/// table in one session keep the widths. A browsed table's widths are additionally
+/// mirrored into [`TuiConfig`] so they survive a restart; a plain query result
+/// stays session-only.
 #[derive(Clone, Debug, Default, PartialEq)]
 pub(crate) struct ColWidthMemory {
     pub(crate) scopes: HashMap<String, HashMap<String, usize>>,
@@ -1442,6 +1443,23 @@ pub(crate) struct ColWidthMemory {
 impl ColWidthMemory {
     pub(crate) fn get(&self, scope: &str, col: &str) -> Option<usize> {
         self.scopes.get(scope).and_then(|m| m.get(col)).copied()
+    }
+
+    /// Drop one column's session override, so the renderer falls back to the
+    /// natural width (or a persisted width, which the caller clears too).
+    pub(crate) fn reset(&mut self, scope: &str, col: &str) {
+        if let Some(m) = self.scopes.get_mut(scope) {
+            m.remove(col);
+            if m.is_empty() {
+                self.scopes.remove(scope);
+            }
+        }
+    }
+
+    /// Drop every session override for one scope. Returns how many columns were
+    /// dropped.
+    pub(crate) fn clear_scope(&mut self, scope: &str) -> usize {
+        self.scopes.remove(scope).map(|m| m.len()).unwrap_or(0)
     }
 
     /// Widen / narrow `col` by `delta` display cells and return the new width.

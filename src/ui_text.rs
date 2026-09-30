@@ -1123,7 +1123,7 @@ pub static ALL_KEYS: &[&str] = &[
     "切换表",
     "列 {} 不在当前视图（可能已隐藏）",
     "切换同库其他表：输入即过滤的浮层（复用最近表样式，↑↓/j/k 选），Enter 打开该表数据",
-    "列结构弹层：列名 / 类型 / 键(PRI/UNI/MUL) / 默认值 / 可空 / 注释；右侧就地显示选中列的值分布（非空/空/去重，数值列 min/max/avg；缓存元数据+已加载数据，不额外查库；/ 过滤列名；Enter 跳到该列）",
+    "列结构弹层：列名 / 类型 / 键(PRI/UNI/MUL) / 默认值 / 可空 / 注释；右侧就地显示选中列的值分布（非空/空/去重，去重旁附 12 格分布 sparkline，数值列 min/max/avg；缓存元数据+已加载数据，不额外查库；窄屏 < 56 列隐藏 sparkline；/ 过滤列名；Enter 跳到该列）",
     // R66: `gc` column value distribution (client-side, zero-query)
     "值分布",
     "值分布 · {}",
@@ -1444,8 +1444,8 @@ fn en_of(zh: &'static str) -> Option<&'static str> {
         "分组行无连接池：x 无动作（不会误进表过滤）" => Some(
             "A group row has no connection pool: x does nothing (it no longer leaks into the table filter)",
         ),
-        "列结构弹层：列名 / 类型 / 键(PRI/UNI/MUL) / 默认值 / 可空 / 注释；右侧就地显示选中列的值分布（非空/空/去重，数值列 min/max/avg；缓存元数据+已加载数据，不额外查库；/ 过滤列名；Enter 跳到该列）" => Some(
-            "Column-structure popup: name / type / key (PRI/UNI/MUL) / default / nullable / comment; the selected column's value distribution is shown in place (non-null/null/distinct; min/max/avg for a numeric column; cached metadata + loaded rows, no extra query; / filters by name; Enter jumps to that column)",
+        "列结构弹层：列名 / 类型 / 键(PRI/UNI/MUL) / 默认值 / 可空 / 注释；右侧就地显示选中列的值分布（非空/空/去重，去重旁附 12 格分布 sparkline，数值列 min/max/avg；缓存元数据+已加载数据，不额外查库；窄屏 < 56 列隐藏 sparkline；/ 过滤列名；Enter 跳到该列）" => Some(
+            "Column-structure popup: name / type / key (PRI/UNI/MUL) / default / nullable / comment; the selected column's value distribution is shown in place (non-null/null/distinct; a 12-cell distribution sparkline beside the distinct count; min/max/avg for a numeric column; cached metadata + loaded rows, no extra query; the sparkline hides below 56 columns; / filters by name; Enter jumps to that column)",
         ),
         // ── R66: `gc` column value distribution (client-side, zero-query) ──
         "值分布" => Some("Value distribution"),
@@ -3412,12 +3412,23 @@ fn en_of(zh: &'static str) -> Option<&'static str> {
         "已经在同层的最上 / 最下" => Some("already at the top / bottom of its level"),
         "已移动 {} {}" => Some("moved {} {}"),
         "没有可调整列宽的结果" => Some("no result to resize"),
+        "没有可复位列宽的结果" => Some("no result to reset"),
         "展开一条语句结果后再调列宽" => {
             Some("open a statement's result before resizing columns")
         }
-        "列宽 {} → {} 格 · 会话内记忆（< 收窄 / > 加宽）" => {
-            Some("column {} → {} cells · remembered for this session (< narrow / > widen)")
+        "列宽 {} → {} 格 · 已记忆（跨会话 · < 收窄 / > 加宽 / 0 复位 / Alt-0 清除）" => {
+            Some("column {} → {} cells · remembered across launches (< narrow / > widen / 0 reset / Alt-0 clear)")
         }
+        "列宽 {} → {} 格 · 会话内记忆（< 收窄 / > 加宽 / 0 复位）" => {
+            Some("column {} → {} cells · remembered for this session (< narrow / > widen / 0 reset)")
+        }
+        "列宽 {} 已复位为默认" => Some("column {} reset to its default width"),
+        "列宽 {} 本就是默认" => Some("column {} already had the default width"),
+        "查询结果无跨会话列宽记忆" => {
+            Some("a query result has no remembered column widths")
+        }
+        "已清除该表 {} 个列宽记忆" => Some("cleared {} remembered column widths for this table"),
+        "该表没有列宽记忆" => Some("this table has no remembered column widths"),
         "清空" => Some("clear"),
         "分组" => Some("group"),
         "结构/改名" => Some("structure/rename"),
@@ -3431,8 +3442,11 @@ fn en_of(zh: &'static str) -> Option<&'static str> {
         "在同一层内上 / 下移动连接或分组（改桌面分组顺序并写回 sidebar_layout；顶层未分组连接按名称排序）" => {
             Some("move a connection or group up / down within its level (rewrites the desktop group order and saves sidebar_layout; top-level ungrouped connections sort by name)")
         }
-        "收窄 / 加宽当前列，会话内记忆（翻页 / 重新查询不丢，不跨会话持久化）" => {
-            Some("narrow / widen the focused column, remembered for this session (survives paging / re-querying; not persisted across launches)")
+        "收窄 / 加宽 / 复位当前列（按 库.表+列名 记忆并跨会话持久化；0 复位当前列）" => {
+            Some("narrow / widen / reset the focused column (remembered per db.table+column and persisted across launches; 0 resets the column)")
+        }
+        "清除当前表全部列宽记忆（会话 + tui.json）" => {
+            Some("clear every remembered column width for this table (session + tui.json)")
         }
         // R56: popup column-name filter / `:` row jump.
         "过滤列名…" => Some("Filter column names…"),

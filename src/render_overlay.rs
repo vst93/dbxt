@@ -499,11 +499,15 @@ pub(crate) fn render_cols_popup(f: &mut Frame, area: Rect, app: &mut App) {
         .filter(|r| cols_popup_matches(r, &app.cols_popup_needle))
         .collect();
     // R56: the popup carries two extra columns now, so it opens wider than the
-    // R48 72-column cap; a narrow terminal still uses the full width.
+    // R48 72-column cap; a narrow terminal still uses the full width. R72: with
+    // the distribution sparkline it may grow a little more, so the column list
+    // keeps its width while the stats pane fits the counts + 12-cell sparkline.
+    let show_spark = area.width >= COL_SPARK_MIN_W;
+    let cap = if show_spark { 112 } else { 96 };
     let w = if area.width < 48 {
         area.width
     } else {
-        area.width.min(96)
+        area.width.min(cap)
     };
     let inner_w = w.saturating_sub(2) as usize;
     // R66: the value stats follow the highlighted row. The lookup is client-side
@@ -514,7 +518,14 @@ pub(crate) fn render_cols_popup(f: &mut Frame, area: Rect, app: &mut App) {
     let stats = sel_name.as_deref().and_then(|n| cols_popup_stats(app, n));
     let side_by_side = inner_w >= COL_STATS_SIDE_MIN && !rows.is_empty();
     let stats_text_w = if side_by_side {
-        (inner_w / 3).clamp(18, 32)
+        let base = (inner_w / 3).clamp(18, 32);
+        if show_spark {
+            // The counts line plus a 12-cell sparkline needs ~46 cells; grow the
+            // pane but never starve the column list below ~24 cells.
+            base.max(46).min(inner_w.saturating_sub(24)).max(18)
+        } else {
+            base
+        }
     } else {
         inner_w.saturating_sub(2).max(8)
     };
@@ -525,6 +536,7 @@ pub(crate) fn render_cols_popup(f: &mut Frame, area: Rect, app: &mut App) {
             sel_name.as_deref().unwrap_or(""),
             stats.as_ref(),
             stats_text_w,
+            show_spark,
         )
     };
     let total_lines = if stats_lines.is_empty() {

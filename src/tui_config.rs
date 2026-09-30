@@ -13,6 +13,39 @@ pub(crate) struct TablePrefs {
     pub(crate) order_by: Option<String>,
 }
 
+/// Cap on persisted per-column width overrides (R72). The list is LRU-ordered
+/// (most recently adjusted last); a save past the cap drops the oldest entries
+/// so a long-lived config can never grow without bound.
+pub(crate) const COL_WIDTH_MEM_MAX: usize = 200;
+
+/// One persisted column-width override (R72). The identity is
+/// `(conn, db, schema, table, col)` — the same scope the session memory uses,
+/// minus the query bucket (a plain query result is never persisted).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct ColWidthEntry {
+    pub(crate) conn: String,
+    pub(crate) db: String,
+    pub(crate) schema: String,
+    pub(crate) table: String,
+    pub(crate) col: String,
+    pub(crate) width: usize,
+}
+
+impl ColWidthEntry {
+    /// Canonical identity string, used for the in-memory dirty / removed sets.
+    pub(crate) fn key(&self) -> String {
+        format!(
+            "{}\u{0}{}\u{0}{}\u{0}{}\u{0}{}",
+            self.conn, self.db, self.schema, self.table, self.col
+        )
+    }
+}
+
+/// Canonical identity for a width override, matching [`ColWidthEntry::key`].
+pub(crate) fn col_width_key(conn: &str, db: &str, schema: &str, table: &str, col: &str) -> String {
+    format!("{conn}\u{0}{db}\u{0}{schema}\u{0}{table}\u{0}{col}")
+}
+
 /// The whole on-disk config. Parsing is deliberately forgiving: a missing file,
 /// an unknown version, a truncated body or a single malformed table entry all
 /// fall back to defaults instead of failing to start.
@@ -21,6 +54,14 @@ pub(crate) struct TuiConfig {
     /// Global compact-column default, used when a table has no stored choice.
     pub(crate) compact: Option<bool>,
     pub(crate) tables: HashMap<(String, String), TablePrefs>,
+    /// R72: persisted per-column widths, LRU-ordered (oldest first). Capped at
+    /// [`COL_WIDTH_MEM_MAX`] on load and on save.
+    pub(crate) col_widths: Vec<ColWidthEntry>,
+    /// Width identities this session set / changed (merged into the file on
+    /// save).
+    pub(crate) dirty_widths: HashSet<String>,
+    /// Width identities this session cleared (removed from the file on save).
+    pub(crate) removed_widths: HashSet<String>,
     /// Whether this session changed the global compact default. Untouched
     /// globals are left to whatever another session last wrote.
     pub(crate) dirty_global: bool,
@@ -79,7 +120,118 @@ impl TuiConfig {
                 }
             }
         }
+        if let Some(arr) = v.get("col_widths").and_then(|a| a.as_array()) {
+            let mut entries: Vec<ColWidthEntry> = Vec::new();
+            for e in arr {
+                let Some(o) = e.as_object() else {
+                    continue;
+                };
+                let s = |k: &str| o.get(k).and_then(|x| x.as_str()).map(str::to_string);
+                let (Some(conn), Some(db), Some(schema), Some(table), Some(col)) =
+                    (s("conn"), s("db"), s("schema"), s("table"), s("col"))
+                else {
+                    continue;
+                };
+                let Some(w) = o.get("w").and_then(|x| x.as_u64()) else {
+                    continue;
+                };
+                entries.push(ColWidthEntry {
+                    conn,
+                    db,
+                    schema,
+                    table,
+                    col,
+                    width: (w as usize).clamp(MIN_CELL_WIDTH, COL_W_MAX),
+                });
+            }
+            // Keep the LRU tail (most recent) when a hand-edited file overflows.
+            if entries.len() > COL_WIDTH_MEM_MAX {
+                let drop = entries.len() - COL_WIDTH_MEM_MAX;
+                entries.drain(0..drop);
+            }
+            cfg.col_widths = entries;
+        }
         cfg
+    }
+
+    /// The remembered width for one `(conn, db, schema, table, col)`, if any.
+    pub(crate) fn col_width(
+        &self,
+        conn: &str,
+        db: &str,
+        schema: &str,
+        table: &str,
+        col: &str,
+    ) -> Option<usize> {
+        let key = col_width_key(conn, db, schema, table, col);
+        self.col_widths
+            .iter()
+            .find(|e| e.key() == key)
+            .map(|e| e.width)
+    }
+
+    /// Remember / update one column's width, moving it to the LRU head.
+    pub(crate) fn set_col_width(
+        &mut self,
+        conn: &str,
+        db: &str,
+        schema: &str,
+        table: &str,
+        col: &str,
+        width: usize,
+    ) {
+        let key = col_width_key(conn, db, schema, table, col);
+        self.col_widths.retain(|e| e.key() != key);
+        self.col_widths.push(ColWidthEntry {
+            conn: conn.to_string(),
+            db: db.to_string(),
+            schema: schema.to_string(),
+            table: table.to_string(),
+            col: col.to_string(),
+            width: width.clamp(MIN_CELL_WIDTH, COL_W_MAX),
+        });
+        self.removed_widths.remove(&key);
+        self.dirty_widths.insert(key);
+    }
+
+    /// Forget one column's remembered width.
+    pub(crate) fn clear_col_width(
+        &mut self,
+        conn: &str,
+        db: &str,
+        schema: &str,
+        table: &str,
+        col: &str,
+    ) {
+        let key = col_width_key(conn, db, schema, table, col);
+        self.col_widths.retain(|e| e.key() != key);
+        self.dirty_widths.remove(&key);
+        self.removed_widths.insert(key);
+    }
+
+    /// Forget every remembered width for one table. Returns how many entries
+    /// were dropped.
+    pub(crate) fn clear_table_col_widths(
+        &mut self,
+        conn: &str,
+        db: &str,
+        schema: &str,
+        table: &str,
+    ) -> usize {
+        let prefix = format!("{conn}\u{0}{db}\u{0}{schema}\u{0}{table}\u{0}");
+        let mut keys: Vec<String> = Vec::new();
+        for e in &self.col_widths {
+            let key = e.key();
+            if key.starts_with(&prefix) {
+                keys.push(key);
+            }
+        }
+        for key in &keys {
+            self.col_widths.retain(|e| &e.key() != key);
+            self.dirty_widths.remove(key);
+            self.removed_widths.insert(key.clone());
+        }
+        keys.len()
     }
 
     /// Write the config back, merging with whatever is on disk so two dbxt
@@ -105,6 +257,27 @@ impl TuiConfig {
             } else if let Some(prefs) = self.tables.get(key) {
                 merged.tables.insert(key.clone(), prefs.clone());
             }
+        }
+        // Column widths: drop the ones this session cleared, then re-apply the
+        // ones it changed (each moved to the LRU head), then cap the list.
+        if !self.removed_widths.is_empty() {
+            merged
+                .col_widths
+                .retain(|e| !self.removed_widths.contains(&e.key()));
+        }
+        for key in &self.dirty_widths {
+            merged.col_widths.retain(|e| &e.key() != key);
+        }
+        // Re-append this session's entries in their own LRU order (most recent
+        // last), so a HashSet iteration never scrambles the eviction order.
+        for e in &self.col_widths {
+            if self.dirty_widths.contains(&e.key()) {
+                merged.col_widths.push(e.clone());
+            }
+        }
+        if merged.col_widths.len() > COL_WIDTH_MEM_MAX {
+            let drop = merged.col_widths.len() - COL_WIDTH_MEM_MAX;
+            merged.col_widths.drain(0..drop);
         }
         merged.write(path);
     }
@@ -151,6 +324,23 @@ impl TuiConfig {
             root.insert("compact".into(), serde_json::Value::Bool(c));
         }
         root.insert("tables".into(), serde_json::Value::Object(tables));
+        if !self.col_widths.is_empty() {
+            let arr: Vec<serde_json::Value> = self
+                .col_widths
+                .iter()
+                .map(|e| {
+                    let mut m = serde_json::Map::new();
+                    m.insert("conn".into(), serde_json::Value::String(e.conn.clone()));
+                    m.insert("db".into(), serde_json::Value::String(e.db.clone()));
+                    m.insert("schema".into(), serde_json::Value::String(e.schema.clone()));
+                    m.insert("table".into(), serde_json::Value::String(e.table.clone()));
+                    m.insert("col".into(), serde_json::Value::String(e.col.clone()));
+                    m.insert("w".into(), serde_json::Value::from(e.width as u64));
+                    serde_json::Value::Object(m)
+                })
+                .collect();
+            root.insert("col_widths".into(), serde_json::Value::Array(arr));
+        }
         if let Some(parent) = path.parent() {
             let _ = std::fs::create_dir_all(parent);
         }

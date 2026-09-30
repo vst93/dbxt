@@ -108,6 +108,12 @@ const COL_STATS_SCAN_LIMIT: usize = 5000;
 /// R66: minimum `g c` popup inner width for the stats to sit *beside* the column
 /// list; below it they stack under the list, so a phone still shows them.
 const COL_STATS_SIDE_MIN: usize = 64;
+/// R72: width of the value-distribution sparkline beside the `g c` distinct
+/// count, in display cells (one bar per bucket).
+const COL_SPARK_W: usize = 12;
+/// R72: below this terminal width the sparkline is dropped, so a phone keeps the
+/// plain non-null / null / distinct counts readable.
+const COL_SPARK_MIN_W: u16 = 56;
 /// A `.sql` file larger than this warns before its script is executed.
 const FILE_LOAD_WARN_BYTES: u64 = 2 * 1024 * 1024;
 /// Rows fetched per chunk from each side of a data compare. Small enough to

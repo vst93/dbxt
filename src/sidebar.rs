@@ -2470,8 +2470,25 @@ pub(crate) fn col_width_scope(app: &App) -> String {
     format!("q\u{0}{conn}")
 }
 
-/// `<` / `>` on the focused result column: widen / narrow it, remembered for
-/// the session. Never persisted.
+/// The `(conn, db, schema, table)` a column-width override is persisted under,
+/// or `None` for a grid that is not a browsed table (a plain query result keeps
+/// its widths for the session only).
+pub(crate) fn col_width_table_key(app: &App) -> Option<(String, String, String, String)> {
+    if app.grid_kind != GridKind::TableData {
+        return None;
+    }
+    let ps = app.page_state.as_ref()?;
+    let conn = app
+        .selected
+        .as_ref()
+        .map(|c| c.id.clone())
+        .unwrap_or_default();
+    Some((conn, app.current_db(), ps.schema.clone(), ps.table.clone()))
+}
+
+/// `<` / `>` on the focused result column: widen / narrow it. A browsed table's
+/// widths are persisted to `tui.json` (R72); a query result keeps them for the
+/// session only.
 pub(crate) fn adjust_col_width(app: &mut App, delta: i32) {
     let Some(grid) = active_grid(app) else {
         app.status = t("没有可调整列宽的结果").into();
@@ -2493,24 +2510,102 @@ pub(crate) fn adjust_col_width(app: &mut App, delta: i32) {
     let scope = col_width_scope(app);
     let next = app.col_width_mem.adjust(&scope, &name, current, delta);
     let disp = fix_double_encoding(&name);
-    app.status = tf(
-        "列宽 {} → {} 格 · 会话内记忆（< 收窄 / > 加宽）",
-        &[&disp, &next],
-    );
+    if let Some((conn, db, schema, table)) = col_width_table_key(app) {
+        app.config
+            .set_col_width(&conn, &db, &schema, &table, &name, next);
+        app.persist();
+        app.status = tf(
+            "列宽 {} → {} 格 · 已记忆（跨会话 · < 收窄 / > 加宽 / 0 复位 / Alt-0 清除）",
+            &[&disp, &next],
+        );
+    } else {
+        app.status = tf(
+            "列宽 {} → {} 格 · 会话内记忆（< 收窄 / > 加宽 / 0 复位）",
+            &[&disp, &next],
+        );
+    }
 }
 
-/// Apply the session overrides to the natural widths of `grid`, in place.
-pub(crate) fn apply_col_width_overrides(app: &App, grid: &Grid, widths: &mut [usize]) {
-    let scope = col_width_scope(app);
-    let Some(map) = app.col_width_mem.overrides(&scope) else {
+/// `0` on the focused result column: drop the remembered width (session and, for
+/// a browsed table, on disk) so the column returns to its natural, content-sized
+/// width on the next frame.
+pub(crate) fn reset_col_width(app: &mut App) {
+    let Some(grid) = active_grid(app) else {
+        app.status = t("没有可复位列宽的结果").into();
         return;
     };
+    if app.script.as_ref().is_some_and(|s| s.drilled.is_none()) {
+        app.status = t("展开一条语句结果后再调列宽").into();
+        return;
+    }
+    let Some(name) = grid.columns.get(app.col_cursor).cloned() else {
+        return;
+    };
+    let scope = col_width_scope(app);
+    let had_mem = app.col_width_mem.get(&scope, &name).is_some();
+    app.col_width_mem.reset(&scope, &name);
+    let mut had_disk = false;
+    if let Some((conn, db, schema, table)) = col_width_table_key(app) {
+        if app
+            .config
+            .col_width(&conn, &db, &schema, &table, &name)
+            .is_some()
+        {
+            app.config
+                .clear_col_width(&conn, &db, &schema, &table, &name);
+            app.persist();
+            had_disk = true;
+        }
+    }
+    let disp = fix_double_encoding(&name);
+    app.status = if had_mem || had_disk {
+        tf("列宽 {} 已复位为默认", &[&disp])
+    } else {
+        tf("列宽 {} 本就是默认", &[&disp])
+    };
+}
+
+/// `Alt-0` in the results pane: forget every remembered column width for the
+/// current browsed table (session + disk). A query result has no persisted
+/// widths, so it reports instead of pretending to clear.
+pub(crate) fn clear_table_col_widths(app: &mut App) {
+    let Some((conn, db, schema, table)) = col_width_table_key(app) else {
+        app.status = t("查询结果无跨会话列宽记忆").into();
+        return;
+    };
+    let scope = col_width_scope(app);
+    let n_mem = app.col_width_mem.clear_scope(&scope);
+    let n_disk = app
+        .config
+        .clear_table_col_widths(&conn, &db, &schema, &table);
+    if n_disk > 0 {
+        app.persist();
+    }
+    let n = n_mem.max(n_disk);
+    if n == 0 {
+        app.status = t("该表没有列宽记忆").into();
+    } else {
+        app.status = tf("已清除该表 {} 个列宽记忆", &[&n]);
+    }
+}
+
+/// Apply the session overrides (and, for a browsed table, the persisted ones) to
+/// the natural widths of `grid`, in place.
+pub(crate) fn apply_col_width_overrides(app: &App, grid: &Grid, widths: &mut [usize]) {
+    let scope = col_width_scope(app);
+    let mem = app.col_width_mem.overrides(&scope);
+    let key = col_width_table_key(app);
     for (ci, name) in grid.columns.iter().enumerate() {
         if ci >= widths.len() {
             break;
         }
-        if let Some(w) = map.get(name) {
-            widths[ci] = (*w).clamp(MIN_CELL_WIDTH, COL_W_MAX);
+        let remembered = mem.and_then(|m| m.get(name).copied()).or_else(|| {
+            key.as_ref().and_then(|(conn, db, schema, table)| {
+                app.config.col_width(conn, db, schema, table, name)
+            })
+        });
+        if let Some(w) = remembered {
+            widths[ci] = w.clamp(MIN_CELL_WIDTH, COL_W_MAX);
         }
     }
 }

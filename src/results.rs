@@ -56,6 +56,13 @@ pub(crate) fn preview_key(app: &mut App, tx: &Tx, k: KeyEvent) {
         toggle_pin_results(app);
         return;
     }
+    // R72: Alt-0 forgets every remembered column width for the current browsed
+    // table (session + tui.json). `Ctrl-0` was rejected: most terminals — tmux
+    // included — collapse it to a plain `0`, which is the single-column reset.
+    if k.modifiers.contains(KeyModifiers::ALT) && k.code == KeyCode::Char('0') {
+        clear_table_col_widths(app);
+        return;
+    }
     let screen = viewport_rows(app) as u16;
     let ddl = app.struct_view == StructView::Ddl && app.ddl.is_some();
     // Vim-style count prefix and the `g` chord are handled before the search /
@@ -237,11 +244,13 @@ pub(crate) fn preview_key(app: &mut App, tx: &Tx, k: KeyEvent) {
         // paragraph motion applied to a sparse column. `n` / `p` stay page turns.
         KeyCode::Char('}') => jump_nonblank_row(app, 1),
         KeyCode::Char('{') => jump_nonblank_row(app, -1),
-        // R55: `<` / `>` narrow / widen the focused column, remembered for the
-        // session per table (never persisted). The terminal twin of dragging a
-        // column border.
+        // R55: `<` / `>` narrow / widen the focused column, remembered per table
+        // (persisted to tui.json since R72; a query result stays session-only).
+        // The terminal twin of dragging a column border.
         KeyCode::Char('<') => adjust_col_width(app, -2),
         KeyCode::Char('>') => adjust_col_width(app, 2),
+        // R72: `0` drops the focused column's remembered width, back to natural.
+        KeyCode::Char('0') => reset_col_width(app),
         // `y` in the script *list* copies the focused statement's whole result
         // as CSV (the same format Ctrl-Y export leads with, R22); in a grid it
         // keeps copying the focused row as an INSERT statement.
@@ -1638,6 +1647,10 @@ pub(crate) struct ColStats {
     pub(crate) avg: f64,
     pub(crate) scanned: usize,
     pub(crate) truncated: bool,
+    /// R72: a `COL_SPARK_W`-wide block sparkline of the sampled values — numeric
+    /// buckets for a numeric column, value-length buckets otherwise. Empty when
+    /// there is nothing to sample.
+    pub(crate) spark: String,
 }
 
 /// Parse one cell as a finite number for the stats. A blank, a non-numeric text
@@ -1665,17 +1678,22 @@ pub(crate) fn col_stats(grid: &Grid, col: usize, limit: usize) -> ColStats {
     let mut num_max = f64::NEG_INFINITY;
     let mut num_sum = 0.0f64;
     let mut all_numeric = true;
+    // R72: the sampled values / lengths feeding the distribution sparkline.
+    let mut nums: Vec<f64> = Vec::new();
+    let mut lens: Vec<usize> = Vec::new();
     for row in grid.rows.iter().take(scanned) {
         match row.get(col) {
             None | Some(Val::Null) => nulls += 1,
             Some(Val::Text(s)) => {
                 non_null += 1;
                 distinct.insert(s.clone());
+                lens.push(s.chars().count());
                 match parse_stat_num(s) {
                     Some(v) => {
                         num_min = num_min.min(v);
                         num_max = num_max.max(v);
                         num_sum += v;
+                        nums.push(v);
                     }
                     None => all_numeric = false,
                 }
@@ -1683,6 +1701,11 @@ pub(crate) fn col_stats(grid: &Grid, col: usize, limit: usize) -> ColStats {
         }
     }
     let numeric = non_null > 0 && all_numeric;
+    let spark = if numeric {
+        sparkline_numeric(&nums, COL_SPARK_W)
+    } else {
+        sparkline_lengths(&lens, COL_SPARK_W)
+    };
     ColStats {
         non_null,
         nulls,
@@ -1697,7 +1720,69 @@ pub(crate) fn col_stats(grid: &Grid, col: usize, limit: usize) -> ColStats {
         },
         scanned,
         truncated,
+        spark,
     }
+}
+
+/// R72: the eight block glyphs a sparkline draws with.
+const SPARK_BLOCKS: [char; 8] = ['▁', '▂', '▃', '▄', '▅', '▆', '▇', '█'];
+
+/// R72: turn per-bucket counts into a `width`-glyph sparkline. A non-empty bucket
+/// always draws at least the lowest block, and an empty bucket draws a space so a
+/// gap in the distribution stays visible; an all-zero input is all spaces.
+pub(crate) fn spark_from_buckets(buckets: &[usize]) -> String {
+    let max = buckets.iter().copied().max().unwrap_or(0);
+    let mut out = String::with_capacity(buckets.len());
+    for &c in buckets {
+        if c == 0 || max == 0 {
+            out.push(' ');
+            continue;
+        }
+        let lvl = ((c * 7) as f64 / max as f64).round() as usize;
+        out.push(SPARK_BLOCKS[lvl.clamp(1, 7)]);
+    }
+    out
+}
+
+/// R72: bucket `values` into `width` equal bins across `[min, max]` and render
+/// the sparkline. A single distinct value (or an empty slice) lands in one
+/// bucket.
+pub(crate) fn sparkline_numeric(values: &[f64], width: usize) -> String {
+    if values.is_empty() || width == 0 {
+        return String::new();
+    }
+    let min = values.iter().copied().fold(f64::INFINITY, f64::min);
+    let max = values.iter().copied().fold(f64::NEG_INFINITY, f64::max);
+    let mut buckets = vec![0usize; width];
+    for &v in values {
+        let idx = if max > min {
+            (((v - min) / (max - min)) * (width - 1) as f64).round() as usize
+        } else {
+            width / 2
+        };
+        buckets[idx.min(width - 1)] += 1;
+    }
+    spark_from_buckets(&buckets)
+}
+
+/// R72: bucket string lengths into `width` equal bins across `[min, max]` and
+/// render the sparkline (the text-column counterpart of [`sparkline_numeric`]).
+pub(crate) fn sparkline_lengths(lens: &[usize], width: usize) -> String {
+    if lens.is_empty() || width == 0 {
+        return String::new();
+    }
+    let min = *lens.iter().min().unwrap();
+    let max = *lens.iter().max().unwrap();
+    let mut buckets = vec![0usize; width];
+    for &l in lens {
+        let idx = if max > min {
+            (((l - min) as f64 / (max - min) as f64) * (width - 1) as f64).round() as usize
+        } else {
+            width / 2
+        };
+        buckets[idx.min(width - 1)] += 1;
+    }
+    spark_from_buckets(&buckets)
 }
 
 /// Render a float for the stats pane: an integer stays bare (`12`), a fraction
@@ -1726,11 +1811,14 @@ pub(crate) fn cols_popup_stats(app: &App, name: &str) -> Option<ColStats> {
 
 /// R66: the stats pane's lines, clipped to `width`. An unknown column (no data
 /// loaded, or a metadata column absent from the page) degrades to an explicit
-/// hint instead of a blank pane.
+/// hint instead of a blank pane. `show_spark` (R72) appends the value
+/// distribution sparkline beside the distinct count; the caller drops it on a
+/// narrow terminal.
 pub(crate) fn col_stats_lines(
     name: &str,
     stats: Option<&ColStats>,
     width: usize,
+    show_spark: bool,
 ) -> Vec<Line<'static>> {
     let title = if name.is_empty() {
         t("值分布").to_string()
@@ -1749,13 +1837,23 @@ pub(crate) fn col_stats_lines(
             Style::default().fg(Color::DarkGray),
         ))),
         Some(s) => {
-            out.push(Line::from(truncate_disp(
-                &tf(
-                    "非空 {} · 空 {} · 去重 {}",
-                    &[&s.non_null, &s.nulls, &s.distinct],
-                ),
-                width,
-            )));
+            let counts = tf(
+                "非空 {} · 空 {} · 去重 {}",
+                &[&s.non_null, &s.nulls, &s.distinct],
+            );
+            let spark = if show_spark { s.spark.as_str() } else { "" };
+            if spark.is_empty() {
+                out.push(Line::from(truncate_disp(&counts, width)));
+            } else {
+                // Keep the counts readable: clip them to leave room for the
+                // fixed-width sparkline plus a two-cell gap.
+                let room = width.saturating_sub(disp_width(spark) + 2).max(4);
+                out.push(Line::from(vec![
+                    Span::raw(truncate_disp(&counts, room)),
+                    Span::raw("  "),
+                    Span::styled(spark.to_string(), Style::default().fg(Color::Cyan)),
+                ]));
+            }
             if s.numeric {
                 out.push(Line::from(truncate_disp(
                     &tf(
