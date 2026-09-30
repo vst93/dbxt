@@ -8198,3 +8198,317 @@ pub(crate) fn r85_keys_are_in_footer_mini_and_full_help() {
         "sidebar footer names g t: {hints:?}"
     );
 }
+
+// ── R87: connection-tree quick actions, recent-connection stack, fold memory ──
+
+/// An R87 fixture connection with an arbitrary id / name.
+fn r87_conn(id: &str, name: &str) -> ConnectionConfig {
+    new_connection_config(
+        id.to_string(),
+        name.to_string(),
+        parse_database_type("mysql").unwrap(),
+        "127.0.0.1".into(),
+        3306,
+        "u".into(),
+        "p".into(),
+        None,
+        false,
+        None,
+    )
+    .unwrap()
+}
+
+/// An R87 sidebar app: one active SQL connection named `shop-mysql` with two
+/// tables loaded, so `/` can filter and Enter can land.
+fn r87_tree_app() -> (App, Tx) {
+    let (tx, _rx) = tokio::sync::mpsc::unbounded_channel::<OpResult>();
+    let mut app = test_app();
+    app.picker_open = false;
+    app.selected = Some(r87_conn("id-mysql", "shop-mysql"));
+    app.connections = vec![app.selected.clone().unwrap()];
+    app.backend_kind = Backend::Sql;
+    app.databases = vec!["shop".into()];
+    app.schema = "shop".into();
+    app.tables_all = vec![
+        table_info("orders", "TABLE"),
+        table_info("order_items", "TABLE"),
+        table_info("users", "TABLE"),
+    ];
+    app.tables = app.tables_all.clone();
+    app.focus = Focus::Sidebar;
+    rebuild_side_rows(&mut app);
+    (app, tx)
+}
+
+/// R87:A1 — `/` filter, Enter activates the first matching tree node. A table
+/// needle lands on (and opens) that table; a connection needle switches to it;
+/// a miss leaves a bilingual status hint and no popup.
+#[test]
+pub(crate) fn r87_filter_enter_activates_the_first_match() {
+    run_rt(|| {
+        let (mut app, tx) = r87_tree_app();
+
+        // Table match: `us` → the `users` table row.
+        open_table_filter(&mut app);
+        for ch in "us".chars() {
+            key(
+                &mut app,
+                &tx,
+                KeyEvent::new(KeyCode::Char(ch), KeyModifiers::NONE),
+            );
+        }
+        key(
+            &mut app,
+            &tx,
+            KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+        );
+        let row = app.side_rows[app.side_sel].clone();
+        match row {
+            SideRow::Table { table, .. } => {
+                assert_eq!(app.tables[table].name, "users");
+            }
+            other => panic!("expected the users table row, got {other:?}"),
+        }
+
+        // Connection match: a second saved connection named `shop-pg`.
+        clear_table_filter(&mut app);
+        let pg = r87_conn("id-pg", "shop-pg");
+        app.connections.push(pg.clone());
+        rebuild_side_rows(&mut app);
+        open_table_filter(&mut app);
+        for ch in "pg".chars() {
+            key(
+                &mut app,
+                &tx,
+                KeyEvent::new(KeyCode::Char(ch), KeyModifiers::NONE),
+            );
+        }
+        key(
+            &mut app,
+            &tx,
+            KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+        );
+        assert_eq!(
+            app.selected.as_ref().map(|c| c.id.as_str()),
+            Some("id-pg"),
+            "filter Enter switches to the matched connection"
+        );
+
+        // No match: status hint only, no popup, filter kept.
+        let (mut app, tx) = r87_tree_app();
+        open_table_filter(&mut app);
+        for ch in "zzz".chars() {
+            key(
+                &mut app,
+                &tx,
+                KeyEvent::new(KeyCode::Char(ch), KeyModifiers::NONE),
+            );
+        }
+        key(
+            &mut app,
+            &tx,
+            KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+        );
+        assert!(app.status.contains("无匹配"), "{}", app.status);
+        assert!(
+            app.error_popup.is_none(),
+            "a filter miss never pops an error"
+        );
+    });
+}
+
+/// R87:A2 — the recent-connection stack is an LRU capped at eight, most-recent
+/// first, and re-activating an old entry promotes it without duplicating.
+#[test]
+pub(crate) fn r87_recent_connection_stack_is_lru_capped_at_eight() {
+    run_rt(|| {
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel::<OpResult>();
+        let mut app = test_app();
+        for i in 0..10 {
+            let cfg = r87_conn(&format!("id-{i}"), &format!("conn-{i}"));
+            activate_connection(&mut app, &tx, cfg, None, None);
+        }
+        assert_eq!(app.conn_recent.len(), CONN_RECENT_MAX);
+        assert_eq!(app.conn_recent[0], "id-9");
+        assert_eq!(app.conn_recent[CONN_RECENT_MAX - 1], "id-2");
+
+        activate_connection(&mut app, &tx, r87_conn("id-5", "conn-5"), None, None);
+        assert_eq!(app.conn_recent[0], "id-5");
+        assert_eq!(app.conn_recent.len(), CONN_RECENT_MAX);
+        assert_eq!(app.conn_recent.iter().filter(|id| *id == "id-5").count(), 1);
+    });
+}
+
+/// R87:A2 — `Alt-Shift-H` opens the recent-connection overlay and Enter jumps
+/// straight back; `Alt-H` keeps its query-history meaning.
+#[test]
+pub(crate) fn r87_recent_connection_overlay_switches_back() {
+    run_rt(|| {
+        let (mut app, tx) = r87_tree_app();
+        let pg = r87_conn("id-pg", "shop-pg");
+        app.connections.push(pg);
+        app.conn_recent = vec!["id-mysql".into(), "id-pg".into()];
+        rebuild_side_rows(&mut app);
+
+        key(
+            &mut app,
+            &tx,
+            KeyEvent::new(KeyCode::Char('H'), KeyModifiers::ALT),
+        );
+        assert!(app.conn_recent_open, "Alt-Shift-H opens the recent list");
+        let rows = conn_recent_rows(&app);
+        assert_eq!(rows.len(), 2);
+        assert!(rows[0].2.contains("当前"));
+        let overlay_hints = footer_hints_ctx(FooterCtx {
+            view: FooterView::ConnRecent,
+            focus: Focus::Sidebar,
+            has_connection: true,
+        });
+        assert!(
+            overlay_hints
+                .iter()
+                .any(|h| h.0 == "Enter" && h.1 == t("直连")),
+            "recent-connection overlay footer names Enter: {overlay_hints:?}"
+        );
+
+        // Move to `shop-pg` and connect.
+        key(
+            &mut app,
+            &tx,
+            KeyEvent::new(KeyCode::Down, KeyModifiers::NONE),
+        );
+        key(
+            &mut app,
+            &tx,
+            KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+        );
+        assert!(!app.conn_recent_open);
+        assert_eq!(app.selected.as_ref().map(|c| c.id.as_str()), Some("id-pg"));
+
+        // `Alt-H` still opens the query history.
+        key(
+            &mut app,
+            &tx,
+            KeyEvent::new(KeyCode::Char('h'), KeyModifiers::ALT),
+        );
+        assert!(app.history_open, "Alt-H remains the query-history panel");
+    });
+}
+
+/// R87:A3 — `P` on the connection tree probes the connection under the cursor
+/// and the reply is reported on the status bar: RTT on success (refreshing the
+/// R63 latency cache), the failure reason otherwise, never a popup.
+#[test]
+pub(crate) fn r87_health_probe_reports_rtt_and_failure_on_the_status_bar() {
+    run_rt(|| {
+        let (mut app, tx) = r87_tree_app();
+        key(
+            &mut app,
+            &tx,
+            KeyEvent::new(KeyCode::Char('P'), KeyModifiers::SHIFT),
+        );
+        assert!(app.status.contains("探测"), "{}", app.status);
+
+        apply_op_result(
+            &mut app,
+            OpResult::HealthProbe {
+                id: "id-mysql".into(),
+                name: "shop-mysql".into(),
+                rtt: Some(Duration::from_millis(7)),
+                error: None,
+            },
+            &tx,
+        );
+        assert!(app.status.contains("探测成功"), "{}", app.status);
+        assert!(app.status.contains("7ms"), "{}", app.status);
+        assert_eq!(
+            app.server_rtts.get("id-mysql"),
+            Some(&Duration::from_millis(7))
+        );
+
+        apply_op_result(
+            &mut app,
+            OpResult::HealthProbe {
+                id: "id-mysql".into(),
+                name: "shop-mysql".into(),
+                rtt: None,
+                error: Some("connection refused".into()),
+            },
+            &tx,
+        );
+        assert!(app.status.contains("探测失败"), "{}", app.status);
+        assert!(app.status.contains("connection refused"), "{}", app.status);
+        assert!(
+            app.error_popup.is_none(),
+            "a probe failure never pops an error"
+        );
+    });
+}
+
+/// R87:B4 — group fold state now persists in `tui.json`, and a session that
+/// never folds anything does not clobber another session's state.
+#[test]
+pub(crate) fn r87_group_fold_state_persists_in_tui_json() {
+    let path = std::env::temp_dir().join(format!("dbxt-fold-{}.json", Uuid::new_v4()));
+    let mut cfg = TuiConfig::default();
+    cfg.set_group_closed("grp-a", true);
+    cfg.save(&path);
+    let back = TuiConfig::load(&path);
+    assert!(back.group_closed.contains("grp-a"));
+
+    // A session that never touched fold state leaves the on-disk set alone.
+    let untouched = TuiConfig::default();
+    untouched.save(&path);
+    assert!(TuiConfig::load(&path).group_closed.contains("grp-a"));
+
+    // Opening removes it again.
+    let mut cfg2 = TuiConfig::load(&path);
+    cfg2.set_group_closed("grp-a", false);
+    cfg2.save(&path);
+    assert!(!TuiConfig::load(&path).group_closed.contains("grp-a"));
+    let _ = std::fs::remove_file(&path);
+
+    // The App-side helper mirrors the change into the config object.
+    let mut app = test_app();
+    set_group_open(&mut app, "grp-b", false);
+    assert!(app.group_closed.contains("grp-b"));
+    assert!(app.config.group_closed.contains("grp-b"));
+    set_group_open(&mut app, "grp-b", true);
+    assert!(!app.group_closed.contains("grp-b"));
+    assert!(!app.config.group_closed.contains("grp-b"));
+}
+
+/// R87:C — every new key ships in the footer (which the mini sheet reuses) and
+/// in the full `?` sheet, all three at once.
+#[test]
+pub(crate) fn r87_keys_are_in_footer_mini_and_full_help() {
+    // Full cheat-sheet rows.
+    assert!(HELP_ROWS.iter().any(|(k, _)| *k == "Alt-Shift-H"));
+    assert!(HELP_ROWS.iter().any(|(k, _)| k.starts_with("P（连接根")));
+
+    // Picker footer names `P`; the mini sheet calls `footer_hints_ctx` with the
+    // same context, so a hint here is a hint there too.
+    let picker = footer_hints_ctx(FooterCtx {
+        view: FooterView::ConnPicker,
+        focus: Focus::Sidebar,
+        has_connection: false,
+    });
+    assert!(
+        picker.iter().any(|h| h.0 == "P" && h.1 == t("探测")),
+        "picker footer names P: {picker:?}"
+    );
+
+    // Sidebar footer names both `P` and the recent-connection key.
+    let (app, _tx) = r87_tree_app();
+    let hints = footer_hints_ctx(footer_ctx_inner(&app, false));
+    assert!(
+        hints.iter().any(|h| h.0 == "P" && h.1 == t("探测")),
+        "sidebar footer names P: {hints:?}"
+    );
+    assert!(
+        hints
+            .iter()
+            .any(|h| h.0 == "Alt-⇧H" && h.1 == t("最近连接")),
+        "sidebar footer names Alt-Shift-H: {hints:?}"
+    );
+}

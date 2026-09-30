@@ -217,6 +217,12 @@ enum Op {
     /// Mongo `db.version()`) whose reply is cached for the session. A failure is
     /// not an error the user must see; it just leaves the status bar unnamed.
     ServerVersion(Box<ConnectionConfig>),
+    /// R87: an explicit, user-invoked health probe (`P` on the connection tree).
+    /// One minimal round trip per backend (`SELECT 1` / `PING` / `db.runCommand({ping:1})`),
+    /// whose duration is reported as the connection's latency. Never runs
+    /// automatically — this is the one place the browse redline allows a second
+    /// query, and only on a deliberate keystroke.
+    HealthProbe(Box<ConnectionConfig>),
     /// R43: enumerate a non-active connection's databases for the sidebar tree.
     /// `gen` is that connection's own request id, so only the newest reply for
     /// that root is kept.
@@ -504,6 +510,15 @@ enum OpResult {
         id: String,
         version: Option<String>,
         rtt: Option<Duration>,
+    },
+    /// R87: the reply to an explicit `P` health probe. `rtt` is `Some` on a
+    /// successful round trip, `error` is `Some` with the (localized) failure
+    /// reason otherwise. Either way the status bar — never a popup — reports it.
+    HealthProbe {
+        id: String,
+        name: String,
+        rtt: Option<Duration>,
+        error: Option<String>,
     },
     /// R48/R55: the parsed desktop sidebar groups plus the raw store value.
     /// The raw JSON is kept so a group rename / row move can patch just the
@@ -1290,6 +1305,48 @@ async fn fetch_server_version(backend: &LocalBackend, cfg: &ConnectionConfig) ->
     }
 }
 
+/// R87: one minimal round trip for the explicit `P` health probe, timed. The
+/// driver-specific probe is `SELECT 1` (SQL), `PING` (Redis) and
+/// `db.runCommand({ping:1})` (Mongo). Returns the round-trip duration, or the
+/// driver's error text so the status bar can name the failure.
+async fn probe_connection(
+    backend: &LocalBackend,
+    cfg: &ConnectionConfig,
+) -> Result<Duration, String> {
+    let started = Instant::now();
+    match cfg.db_type.as_str() {
+        "redis" | "keydb" | "valkey" => backend
+            .execute_redis_command(cfg, 0, "PING", true)
+            .await
+            .map(|_| ())
+            .map_err(|e| e.to_string()),
+        "mongodb" | "mongo" => {
+            let db = cfg
+                .database
+                .clone()
+                .filter(|d| !d.trim().is_empty())
+                .unwrap_or_else(|| "admin".to_string());
+            match dbx_core::mongo_shell::parse("db.runCommand({ ping: 1 })") {
+                Ok(cmd) => backend
+                    .execute_mongo_command(cfg, &db, &cmd)
+                    .await
+                    .map(|_| ())
+                    .map_err(|e| e.to_string()),
+                Err(e) => Err(e),
+            }
+        }
+        _ => {
+            let db = cfg.database.clone().unwrap_or_default();
+            backend
+                .execute_query(cfg, &db, "SELECT 1", Some(1), Some(5))
+                .await
+                .map(|_| ())
+                .map_err(|e| e.to_string())
+        }
+    }
+    .map(|_| started.elapsed())
+}
+
 async fn run_op(backend: &LocalBackend, op: Op, tx: &Tx) -> OpResult {
     match op {
         Op::ListConnections => match backend.load_connections().await {
@@ -1411,6 +1468,30 @@ async fn run_op(backend: &LocalBackend, op: Op, tx: &Tx) -> OpResult {
                 id: cfg.id.clone(),
                 version,
                 rtt,
+            }
+        }
+        // R87: an explicit `P` probe — one minimal round trip, timed. This is
+        // the single user-invoked exception to the "no query on the browse hot
+        // path" redline.
+        Op::HealthProbe(cfg) => {
+            let (id, name) = (cfg.id.clone(), cfg.name.clone());
+            match probe_connection(backend, &cfg).await {
+                Ok(rtt) => OpResult::HealthProbe {
+                    id,
+                    name,
+                    rtt: Some(rtt),
+                    error: None,
+                },
+                Err(e) => OpResult::HealthProbe {
+                    id,
+                    name,
+                    rtt: None,
+                    error: Some(if cfg.has_effective_ssh_tunnels() {
+                        ssh_connect_error_message(&cfg, &e)
+                    } else {
+                        e
+                    }),
+                },
             }
         }
         // R47b: pure registry reads. `is_connection_open` never opens a
@@ -4196,6 +4277,9 @@ impl App {
             conn_sort: ConnSort::Name,
             conn_gen: 0,
             last_conn_id: None,
+            conn_recent: Vec::new(),
+            conn_recent_open: false,
+            conn_recent_list: ListState::default(),
             conn_pointers: HashMap::new(),
             pending_restore: None,
             switch_notice: None,
@@ -4225,7 +4309,7 @@ impl App {
             sidebar_layout: SidebarLayout::default(),
             sidebar_layout_raw: None,
             rename_edit: None,
-            group_closed: std::collections::HashSet::new(),
+            group_closed: config.group_closed.clone(),
             db_sizes: std::collections::HashMap::new(),
             db_size_state: std::collections::HashMap::new(),
             db_size_gen: std::collections::HashMap::new(),
@@ -4869,6 +4953,23 @@ fn apply_op_result(app: &mut App, res: OpResult, tx: &Tx) {
                 app.server_versions.insert(id, v);
             }
         }
+        // R87: the explicit `P` probe reply. A success refreshes the R63 latency
+        // cache in place and reports the RTT; a failure is only ever a status
+        // line — never a popup — so a flaky link cannot hijack the UI.
+        OpResult::HealthProbe {
+            id,
+            name,
+            rtt,
+            error,
+        } => match rtt {
+            Some(d) => {
+                app.server_rtts.insert(id, d);
+                app.status = tf("✓ {} 探测成功 · RTT {}", &[&name, &format_rtt(d)]);
+            }
+            None => {
+                app.status = tf("⚠ {} 探测失败：{}", &[&name, &error.unwrap_or_default()]);
+            }
+        },
         OpResult::Databases {
             databases: dbs,
             warning,

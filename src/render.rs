@@ -61,6 +61,9 @@ pub(crate) fn ui(f: &mut Frame, app: &mut App) {
     if app.recent_open {
         render_recent_tables(f, f.area(), app);
     }
+    if app.conn_recent_open {
+        render_conn_recent(f, f.area(), app);
+    }
     if app.table_jump_open {
         render_table_jump(f, f.area(), app);
     }
@@ -794,6 +797,8 @@ pub(crate) enum FooterView {
     TransferPrompt,
     TransferReport,
     Recent,
+    /// R87: the session's recent-connection list (`Alt-Shift-H`).
+    ConnRecent,
     /// R65: the in-data-view table switcher (`g b`).
     TableJump,
     ColPicker,
@@ -946,6 +951,8 @@ pub(crate) fn footer_ctx_inner(app: &App, include_help: bool) -> FooterCtx {
         FooterView::DbDiff
     } else if app.recent_open {
         FooterView::Recent
+    } else if app.conn_recent_open {
+        FooterView::ConnRecent
     } else if app.table_jump_open {
         FooterView::TableJump
     } else if app.col_picker_open {
@@ -1116,6 +1123,7 @@ pub(crate) fn footer_hints_ctx(ctx: FooterCtx) -> Vec<Hint> {
             ("Esc", t("关闭")),
         ],
         FooterView::Recent => vec![("↑↓", t("选择")), ("Enter", t("直达")), ("Esc", t("关闭"))],
+        FooterView::ConnRecent => vec![("↑↓", t("选择")), ("Enter", t("直连")), ("Esc", t("关闭"))],
         FooterView::TableJump => vec![
             ("a-z", t("过滤")),
             ("↑↓", t("选择")),
@@ -1203,6 +1211,7 @@ pub(crate) fn footer_hints_ctx(ctx: FooterCtx) -> Vec<Hint> {
             ("c", t("新建")),
             ("e", t("编辑")),
             ("p", t("复制")),
+            ("P", t("探测")),
             ("s", t("排序")),
             ("x", t("删除")),
             ("q", t("显隐")),
@@ -1271,6 +1280,7 @@ pub(crate) fn footer_hints_ctx(ctx: FooterCtx) -> Vec<Hint> {
                 ("Alt-1..9", t("直切")),
                 ("c", t("新建")),
                 ("p", t("复制")),
+                ("P", t("探测")),
                 ("d", t("断开连接")),
                 ("q", t("显隐")),
             ],
@@ -1288,6 +1298,9 @@ pub(crate) fn footer_hints_ctx(ctx: FooterCtx) -> Vec<Hint> {
                 ("Alt-1..9", t("切连接")),
                 // R85: `g t` jumps to a table in the current database.
                 ("gt", t("跳表")),
+                // R87: `P` health probe + the session's recent-connection list.
+                ("P", t("探测")),
+                ("Alt-⇧H", t("最近连接")),
                 ("d", t("切库")),
                 ("L", t("打开 SQLite")),
                 ("Tab", t("SQL")),

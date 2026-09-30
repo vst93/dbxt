@@ -5,6 +5,10 @@ pub(crate) fn rect_contains(r: Rect, x: u16, y: u16) -> bool {
     r.width > 0 && r.height > 0 && x >= r.x && x < r.x + r.width && y >= r.y && y < r.y + r.height
 }
 
+/// R87: how many recent connections the `Alt-Shift-H` overlay remembers (the
+/// most recent first). Small enough to read on a phone-width terminal.
+pub(crate) const CONN_RECENT_MAX: usize = 8;
+
 pub(crate) fn connect_selected(app: &mut App, tx: &Tx) {
     let Some(idx) = app.conn_list.selected() else {
         return;
@@ -88,6 +92,129 @@ pub(crate) fn toggle_last_connection(app: &mut App, tx: &Tx) {
     switch_connection(app, tx, idx);
 }
 
+/// R87: open the recent-connection overlay (`Alt-Shift-H`). It lists the
+/// connections this session actually activated, most recent first; Enter
+/// switches straight back. Purely session state — no query, no store write.
+pub(crate) fn open_conn_recent(app: &mut App) {
+    if app.conn_recent.is_empty() {
+        app.status = t("本会话还没有连接记录 · 先连接一个数据库").into();
+        return;
+    }
+    app.conn_recent_open = true;
+    app.conn_recent_list.select(Some(0));
+    app.status = tf(
+        "最近连接 {} 个 · ↑↓ 选择 · Enter 直连 · Esc 关",
+        &[&(conn_recent_rows(app).len())],
+    );
+}
+
+/// The rows of the recent-connection overlay: `(connection id, name, subtitle)`
+/// for every remembered id that still resolves to a connection config. Dangling
+/// ids (a connection deleted after it was used) are dropped, and a subtitle
+/// flags the currently active connection.
+pub(crate) fn conn_recent_rows(app: &App) -> Vec<(String, String, String)> {
+    let mut out = Vec::new();
+    for id in &app.conn_recent {
+        let Some(cfg) = app.connections.iter().find(|c| &c.id == id) else {
+            continue;
+        };
+        let here = app.selected.as_ref().is_some_and(|c| &c.id == id);
+        out.push((
+            cfg.id.clone(),
+            cfg.name.clone(),
+            format!(
+                "{}{}{}",
+                fix_double_encoding(cfg.db_type.as_str()),
+                if cfg.read_only { " · 只读" } else { "" },
+                if here { " · 当前" } else { "" },
+            ),
+        ));
+    }
+    out
+}
+
+/// Enter on a recent-connection row: switch to it (through the normal switch
+/// path, so its per-connection pointer is restored too).
+pub(crate) fn conn_recent_apply(app: &mut App, tx: &Tx) {
+    let rows = conn_recent_rows(app);
+    let Some(i) = app.conn_recent_list.selected() else {
+        return;
+    };
+    let Some((id, name, _)) = rows.get(i).cloned() else {
+        return;
+    };
+    app.conn_recent_open = false;
+    let Some(idx) = app.connections.iter().position(|c| c.id == id) else {
+        app.status = tf("连接 {} 不在已保存列表中", &[&name]);
+        return;
+    };
+    switch_connection(app, tx, idx);
+}
+
+/// Modal key handler for the recent-connection overlay.
+pub(crate) fn conn_recent_key(app: &mut App, tx: &Tx, k: KeyEvent) {
+    let n = conn_recent_rows(app).len();
+    match k.code {
+        KeyCode::Esc | KeyCode::Char('q') => {
+            app.conn_recent_open = false;
+            app.flash(t("已关闭最近连接").into());
+        }
+        KeyCode::Up | KeyCode::Char('k') => {
+            if n > 0 {
+                let i = app
+                    .conn_recent_list
+                    .selected()
+                    .map(|i| i.saturating_sub(1))
+                    .unwrap_or(0);
+                app.conn_recent_list.select(Some(i));
+            }
+        }
+        KeyCode::Down | KeyCode::Char('j') => {
+            if n > 0 {
+                let i = app
+                    .conn_recent_list
+                    .selected()
+                    .map(|i| (i + 1).min(n - 1))
+                    .unwrap_or(0);
+                app.conn_recent_list.select(Some(i));
+            }
+        }
+        KeyCode::Enter => conn_recent_apply(app, tx),
+        _ => {}
+    }
+}
+
+/// R87: `P` on the connection tree — send one minimal probe to the connection
+/// under the cursor (or the active one on a db / table row) and report the RTT
+/// or the failure reason on the status bar. An explicit user action is the only
+/// thing that may query on the browse path, and it is exactly one packet.
+pub(crate) fn probe_current_connection(app: &mut App, tx: &Tx) {
+    let target = match app.side_rows.get(app.side_sel) {
+        Some(SideRow::Conn { idx, .. }) => side_root_cfg(app, *idx).cloned(),
+        _ => app.selected.clone(),
+    };
+    let Some(cfg) = target else {
+        app.status = t("没有可探测的连接").into();
+        return;
+    };
+    app.status = tf("探测 {} …", &[&(cfg.name)]);
+    app.spawn(tx, Op::HealthProbe(Box::new(cfg)));
+}
+
+/// R87: `P` on the connection picker — the picker twin of
+/// [`probe_current_connection`], probing the highlighted connection.
+pub(crate) fn probe_picker_connection(app: &mut App, tx: &Tx) {
+    let Some(idx) = app.conn_list.selected() else {
+        app.status = t("没有可探测的连接").into();
+        return;
+    };
+    let Some(cfg) = app.connections.get(idx).cloned() else {
+        return;
+    };
+    app.status = tf("探测 {} …", &[&(cfg.name)]);
+    app.spawn(tx, Op::HealthProbe(Box::new(cfg)));
+}
+
 /// Where the user currently is, for the per-connection restore memory.
 pub(crate) fn snapshot_pointer(app: &App) -> ConnPointer {
     ConnPointer {
@@ -114,6 +241,12 @@ pub(crate) fn activate_connection(
     app.conn_gen = app.conn_gen.wrapping_add(1);
     let gen = app.conn_gen;
     app.selected = Some(cfg.clone());
+    // R87: record this connection as the most recent one (LRU, session-only).
+    // Every activation — picker connect, `Alt-<n>`, `Alt-``, a recent-list jump
+    // — funnels through here, so this is the single update point.
+    app.conn_recent.retain(|id| id != &cfg.id);
+    app.conn_recent.insert(0, cfg.id.clone());
+    app.conn_recent.truncate(CONN_RECENT_MAX);
     // R47b: the pool is opening now; the dot turns half-filled until the
     // database list (or the status refresh) confirms it is live.
     app.conn_connecting.insert(cfg.id.clone());
@@ -927,6 +1060,7 @@ pub(crate) fn mouse(app: &mut App, tx: &Tx, m: MouseEvent) {
         || app.template_open
         || app.col_picker_open
         || app.recent_open
+        || app.conn_recent_open
         || app.table_jump_open
         || app.table_prompt.is_some()
         || app.tree_search_prompt.is_some()
@@ -1043,6 +1177,7 @@ pub(crate) fn mouse(app: &mut App, tx: &Tx, m: MouseEvent) {
                 || app.template_open
                 || app.col_picker_open
                 || app.recent_open
+                || app.conn_recent_open
                 || app.table_jump_open
                 || app.table_prompt.is_some()
                 || app.tree_search_prompt.is_some()
@@ -2015,6 +2150,20 @@ pub(crate) fn tree_search_first_pos(app: &App) -> Option<usize> {
         .position(|r| side_row_matches_needle(app, r, &needle))
 }
 
+/// R87: first tree row matching `needle` that is directly actionable — a
+/// connection, database or table. Group headers are skipped: Enter on a group
+/// only folds it, and the `/` filter's Enter is meant to take the user to the
+/// matched connection / database / table in one step.
+pub(crate) fn first_actionable_tree_hit(app: &App, needle: &str) -> Option<usize> {
+    let needle = needle.trim().to_lowercase();
+    if needle.is_empty() {
+        return None;
+    }
+    app.side_rows.iter().position(|r| {
+        !matches!(r, SideRow::Group { .. }) && side_row_matches_needle(app, r, &needle)
+    })
+}
+
 /// Number of direct hits in the current tree rows.
 pub(crate) fn tree_search_hits(app: &App) -> usize {
     let needle = app.tree_search.trim().to_lowercase();
@@ -2116,7 +2265,7 @@ pub(crate) fn tree_search_confirm(app: &mut App) {
             // Un-fold the hit's ancestors so the landing is actually visible
             // (the search had force-opened them only for the duration).
             if let Some(g) = group {
-                app.group_closed.remove(&g);
+                set_group_open(app, &g, true);
             }
             if let Some(cid) = conn {
                 app.tree_conn_open.insert(cid.clone());
@@ -2996,6 +3145,23 @@ pub(crate) fn side_focus_parent(app: &mut App) {
     }
 }
 
+/// R87: set one sidebar group's fold state and persist it when it actually
+/// changes (R48 fold state used to live only for the session). The on-disk set
+/// is mirrored through `TuiConfig`, so a hand-edited / concurrent `tui.json` is
+/// merged rather than clobbered, and merely walking the tree never writes.
+pub(crate) fn set_group_open(app: &mut App, id: &str, open: bool) {
+    let was_open = !app.group_closed.contains(id);
+    if open {
+        app.group_closed.remove(id);
+    } else {
+        app.group_closed.insert(id.to_string());
+    }
+    if was_open != open {
+        app.config.set_group_closed(id, !open);
+        app.persist();
+    }
+}
+
 /// `l` / `→`: expand the tree row under the cursor (a group unfolds, a
 /// connection loads its databases, a database reveals its tables). On an
 /// already-expanded node it steps into its first child, vim-tree style. Every
@@ -3008,7 +3174,7 @@ pub(crate) fn side_expand(app: &mut App, tx: &Tx) {
     match row {
         SideRow::Group { id, .. } => {
             if app.group_closed.contains(&id) {
-                app.group_closed.remove(&id);
+                set_group_open(app, &id, true);
                 rebuild_side_rows(app);
             } else {
                 side_step_into_child(app);
@@ -3072,7 +3238,7 @@ pub(crate) fn side_collapse(app: &mut App) {
     match row {
         SideRow::Group { id, .. } => {
             if !app.group_closed.contains(&id) {
-                app.group_closed.insert(id);
+                set_group_open(app, &id, false);
                 rebuild_side_rows(app);
             } else {
                 side_focus_parent(app);

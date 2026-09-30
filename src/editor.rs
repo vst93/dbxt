@@ -98,11 +98,9 @@ pub(crate) fn side_activate(app: &mut App, tx: &Tx) {
     };
     match row {
         SideRow::Group { id, .. } => {
-            if app.group_closed.contains(&id) {
-                app.group_closed.remove(&id);
-            } else {
-                app.group_closed.insert(id);
-            }
+            // R87: toggle the fold state and persist it (via `set_group_open`).
+            let open = app.group_closed.contains(&id);
+            set_group_open(app, &id, open);
             rebuild_side_rows(app);
         }
         SideRow::Conn { idx, .. } => {

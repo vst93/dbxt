@@ -76,6 +76,7 @@ pub(crate) fn reset_overlays_for_backend_switch(app: &mut App) {
     app.export_path = None;
     app.export_pending = None;
     app.recent_open = false;
+    app.conn_recent_open = false;
     app.col_picker_open = false;
     app.cols_popup_open = false;
     app.cols_popup_needle.clear();
@@ -684,6 +685,12 @@ pub(crate) fn browse_key(app: &mut App, tx: &Tx, k: KeyEvent) {
         return;
     }
 
+    // R87: the recent-connection overlay (Alt-Shift-H) is modal too.
+    if app.conn_recent_open {
+        conn_recent_key(app, tx, k);
+        return;
+    }
+
     // R65: the in-data-view table switcher (`g b`) is modal too.
     if app.table_jump_open {
         table_jump_key(app, tx, k);
@@ -984,7 +991,19 @@ pub(crate) fn browse_key(app: &mut App, tx: &Tx, k: KeyEvent) {
                 open_recent_tables(app);
                 return;
             }
-            KeyCode::Char('h') | KeyCode::Char('H') => {
+            // R87: the query-history panel keeps `Alt-H`; the free sibling
+            // `Alt-Shift-H` opens the session's recent-connection list (the
+            // terminal may report Shift as a plain uppercase `H`, so both spell
+            // the same intent).
+            KeyCode::Char('H') => {
+                open_conn_recent(app);
+                return;
+            }
+            KeyCode::Char('h') if k.modifiers.contains(KeyModifiers::SHIFT) => {
+                open_conn_recent(app);
+                return;
+            }
+            KeyCode::Char('h') => {
                 open_history(app, tx);
                 return;
             }
@@ -1524,6 +1543,15 @@ pub(crate) fn sidebar_key(app: &mut App, tx: &Tx, k: KeyEvent) {
             }
             // Duplicate the highlighted connection into the form.
             KeyCode::Char('p') => duplicate_connection(app),
+            // R87: `p` is already duplicate, so the uppercase twin `P` sends a
+            // one-packet health probe to the highlighted connection (status-bar
+            // RTT / failure reason, never a popup).
+            KeyCode::Char('P')
+                if !k.modifiers.contains(KeyModifiers::CONTROL)
+                    && !k.modifiers.contains(KeyModifiers::ALT) =>
+            {
+                probe_picker_connection(app, tx);
+            }
             // Edit the highlighted connection in place (form prefilled).
             KeyCode::Char('e') => edit_connection(app),
             // Cycle the picker order: name → type → colour.
@@ -1852,6 +1880,16 @@ pub(crate) fn sidebar_key(app: &mut App, tx: &Tx, k: KeyEvent) {
         }
         // Duplicate the current connection into the form (new id on save).
         KeyCode::Char('p') => duplicate_connection(app),
+        // R87: `P` on the tree probes the connection under the cursor (or the
+        // active one) with one minimal packet and reports the RTT / failure on
+        // the status bar. Plain `p` stays duplicate, so the uppercase twin is
+        // the free, mnemonic slot.
+        KeyCode::Char('P')
+            if !k.modifiers.contains(KeyModifiers::CONTROL)
+                && !k.modifiers.contains(KeyModifiers::ALT) =>
+        {
+            probe_current_connection(app, tx);
+        }
         // `Y` — copy the connection under the cursor as `xxx-copy` (password +
         // SSH tunnel included) and show the new root immediately (R45).
         KeyCode::Char('Y') => copy_connection_at_cursor(app, tx),
@@ -1993,7 +2031,7 @@ pub(crate) fn sidebar_key(app: &mut App, tx: &Tx, k: KeyEvent) {
             } else {
                 open_table_filter_with(app, Some(c));
                 app.status = tf(
-                    "过滤「{}」· {} 个命中 · Enter 打开首位",
+                    "过滤「{}」· {} 个命中 · Enter 首个匹配",
                     &[&(app.table_filter), &(app.tables.len())],
                 );
             }

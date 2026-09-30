@@ -1894,6 +1894,13 @@ pub(crate) struct App {
     /// The connection the user was on before the current one (R41 `Alt-Tab` /
     /// `Alt-`` toggles the two). Updated by every switch, including `Alt-<n>`.
     pub(crate) last_conn_id: Option<String>,
+    /// R87: the connections this session has activated, most-recent first
+    /// (LRU, capped at [`CONN_RECENT_MAX`]). Session-only bookkeeping; `Alt-Shift-H`
+    /// lists them and Enter switches straight back.
+    pub(crate) conn_recent: Vec<String>,
+    /// R87: the recent-connection overlay (`Alt-Shift-H`) is open.
+    pub(crate) conn_recent_open: bool,
+    pub(crate) conn_recent_list: ListState,
     /// Per-connection memory of where the user was browsing (`database` /
     /// `schema` / open table), so switching back lands on the same spot when it
     /// still exists. Keyed by connection id.

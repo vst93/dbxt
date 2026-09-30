@@ -71,6 +71,10 @@ pub(crate) struct TuiConfig {
     /// most-recent first. These are plain file paths, never connections — a
     /// quick-open stays out of the connection store entirely.
     pub(crate) sqlite_recent: Vec<PathBuf>,
+    /// R87: sidebar group ids the user collapsed (R48 fold state). Persisted so
+    /// a long tree keeps its fold state across restarts; group ids are short and
+    /// few, so the whole set rides `tui.json`.
+    pub(crate) group_closed: HashSet<String>,
     pub(crate) tables: HashMap<(String, String), TablePrefs>,
     /// R72: persisted per-column widths, LRU-ordered (oldest first). Capped at
     /// [`COL_WIDTH_MEM_MAX`] on load and on save.
@@ -96,6 +100,10 @@ pub(crate) struct TuiConfig {
     /// separate so a session that never used the picker cannot clobber another
     /// session's list.
     pub(crate) dirty_sqlite_recent: bool,
+    /// R87: whether this session changed the sidebar fold state. Kept separate
+    /// so a session that never collapsed a group cannot clobber another
+    /// session's fold state.
+    pub(crate) dirty_group_closed: bool,
 }
 
 impl TuiConfig {
@@ -128,6 +136,14 @@ impl TuiConfig {
             // Keep the most recent five; a hand-edited overflow is truncated.
             paths.truncate(SQLITE_RECENT_MAX);
             cfg.sqlite_recent = paths;
+        }
+        if let Some(arr) = v.get("group_closed").and_then(|a| a.as_array()) {
+            cfg.group_closed = arr
+                .iter()
+                .filter_map(|x| x.as_str())
+                .filter(|s| !s.trim().is_empty())
+                .map(str::to_string)
+                .collect();
         }
         if let Some(tables) = v.get("tables").and_then(|t| t.as_object()) {
             for (db, by_table) in tables {
@@ -297,6 +313,9 @@ impl TuiConfig {
         if self.dirty_sqlite_recent {
             merged.sqlite_recent = self.sqlite_recent.clone();
         }
+        if self.dirty_group_closed {
+            merged.group_closed = self.group_closed.clone();
+        }
         for key in &self.dirty {
             let all_default = self
                 .tables
@@ -397,6 +416,18 @@ impl TuiConfig {
                 .collect();
             root.insert("sqlite_recent".into(), serde_json::Value::Array(arr));
         }
+        if !self.group_closed.is_empty() {
+            let mut ids: Vec<&String> = self.group_closed.iter().collect();
+            ids.sort();
+            root.insert(
+                "group_closed".into(),
+                serde_json::Value::Array(
+                    ids.into_iter()
+                        .map(|id| serde_json::Value::String(id.clone()))
+                        .collect(),
+                ),
+            );
+        }
         root.insert("tables".into(), serde_json::Value::Object(tables));
         if !self.col_widths.is_empty() {
             let arr: Vec<serde_json::Value> = self
@@ -465,6 +496,20 @@ impl TuiConfig {
         self.sqlite_recent.insert(0, path.to_path_buf());
         self.sqlite_recent.truncate(SQLITE_RECENT_MAX);
         self.dirty_sqlite_recent = true;
+    }
+
+    /// R87: record one sidebar group's fold state, marking it changed only when
+    /// the state actually moves (so merely walking the tree never writes the
+    /// file). `closed` = the group should be collapsed.
+    pub(crate) fn set_group_closed(&mut self, id: &str, closed: bool) {
+        let changed = if closed {
+            self.group_closed.insert(id.to_string())
+        } else {
+            self.group_closed.remove(id)
+        };
+        if changed {
+            self.dirty_group_closed = true;
+        }
     }
 
     /// R83: forget one SQLite file from the recent list.

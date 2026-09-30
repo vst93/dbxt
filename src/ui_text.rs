@@ -4125,6 +4125,51 @@ fn en_of(zh: &'static str) -> Option<&'static str> {
         "JSON 字段就地展开 / 收起（对象 / 数组；缩进多行块，超出弹层可滚动；y / Y 始终复制原始值）" => {
             Some("Expand / collapse a JSON field in place (object / array; an indented multi-line block that scrolls inside the popup; y / Y always copy the raw value)")
         }
+        // ── R87: connection-tree quick actions ──
+        "探测" => Some("probe"),
+        "P（连接根 / 库 / 表行）" => {
+            Some("P (connection root / database / table row)")
+        }
+        "直连" => Some("connect"),
+        "最近连接" => Some("recent connections"),
+        "没有可探测的连接" => Some("No connection to probe"),
+        "探测 {} …" => Some("Probing {} …"),
+        "✓ {} 探测成功 · RTT {}" => Some("✓ {} probe OK · RTT {}"),
+        "⚠ {} 探测失败：{}" => Some("⚠ {} probe failed: {}"),
+        "本会话还没有连接记录 · 先连接一个数据库" => {
+            Some("No connection yet this session · connect to one first")
+        }
+        "最近连接 {} 个 · ↑↓ 选择 · Enter 直连 · Esc 关" => {
+            Some("{} recent connections · ↑↓ select · Enter connect · Esc close")
+        }
+        " 最近连接 · ↑↓ Enter 直连 · Esc 关 " => {
+            Some(" recent connections · ↑↓ Enter connect · Esc close ")
+        }
+        "已关闭最近连接" => Some("Recent connections closed"),
+        "连接 {} 不在已保存列表中" => {
+            Some("Connection {} is not in the saved list")
+        }
+        "过滤「{}」· 无匹配 · Esc 清除" => {
+            Some("Filter [{}] · no match · Esc clear")
+        }
+        "过滤「{}」· {} 个命中 · Enter 首个匹配" => {
+            Some("Filter [{}] · {} hits · Enter opens the first match")
+        }
+        " 过滤表名 {}/{} · Enter 首个匹配 · Esc 清除 " => Some(
+            " filter tables {}/{} · Enter opens the first match · Esc clears ",
+        ),
+        "过滤：命中表名 / 库名 / 连接名，父节点保留；Enter 直达首个匹配（连接=切换连接 · 库=切到该库 · 表=浏览数据），无匹配时状态栏双语提示；Esc 清除" => {
+            Some("Filter: matches table / database / connection names and keeps the ancestors; Enter jumps to the first match (connection = switch · database = switch · table = browse), a miss shows a status hint; Esc clears")
+        }
+        "健康探测：对连接发一次最小包（SQL = SELECT 1 · Redis = PING · Mongo = db.runCommand({ping:1})），状态栏显示 RTT 或失败原因；失败不弹错误框，只走状态栏（用户显式动作，例外于零查询红线，只发一包）" => {
+            Some("Health probe: sends one minimal packet to the connection (SQL = SELECT 1 · Redis = PING · Mongo = db.runCommand({ping:1})); the status bar shows the RTT or the failure reason; a failure never pops an error box (an explicit user action, the one exception to the zero-query redline, one packet only)")
+        }
+        "最近连接：本会话连接过的连接（最多 8 个，最近在前），↑↓ 选择 · Enter 直连 · Esc 关（Alt-H 是查询历史，故取 Shift 兄弟键）" => {
+            Some("Recent connections: the connections used this session (up to 8, most recent first); ↑↓ select · Enter connects · Esc closes (Alt-H is query history, so the Shift sibling key is used)")
+        }
+        "DBX 桌面的连接分组（▾ 组名 [n]）；h l / ← → 折叠展开，折叠态写入 tui.json 跨会话记忆；无分组则平铺" => {
+            Some("DBX Desktop connection groups (▾ name [n]); h l / ← → fold / unfold, the fold state is written to tui.json and remembered across sessions; flat when there are no groups")
+        }
         _ => None,
     }
 }

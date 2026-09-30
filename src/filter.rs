@@ -395,9 +395,12 @@ pub(crate) fn table_filter_key(app: &mut App, tx: &Tx, k: KeyEvent) {
         return;
     }
     match k.code {
-        // Enter goes straight to the first hit: type a few letters, Enter, and
-        // you are browsing. The filter stays active so Esc returns to the
-        // filtered sidebar rather than a 500-row list.
+        // Enter resolves the filter: it jumps the tree cursor onto the first
+        // matching node and activates it — a connection switches, a database
+        // switches, a table opens. That is the filter's whole point (type a few
+        // letters, Enter, you are there), and it is one step instead of
+        // filter → clear → hunt → open. The filter stays active so Esc still
+        // returns to the filtered sidebar.
         KeyCode::Enter => {
             app.table_filter = app
                 .table_prompt
@@ -406,21 +409,25 @@ pub(crate) fn table_filter_key(app: &mut App, tx: &Tx, k: KeyEvent) {
                 .unwrap_or_default();
             app.table_prompt = None;
             apply_table_filter(app);
-            let (n, total) = (app.tables.len(), app.tables_all.len());
-            if n == 0 {
-                app.status = tf("过滤「{}」· 0 个表命中", &[&app.table_filter]);
+            let needle = app.table_filter.clone();
+            if needle.trim().is_empty() {
+                // No needle: Enter is just the tree's own Enter on the cursor.
+                side_activate(app, tx);
                 return;
             }
-            app.table_list.select(Some(0));
-            app.status = if app.table_filter.is_empty() {
-                tf("{} 个表/视图", &[&(total)])
-            } else {
-                tf(
-                    "过滤「{}」· 打开第 1 个命中 · Esc 清除",
-                    &[&(app.table_filter)],
-                )
-            };
-            open_table_data(app, tx);
+            match first_actionable_tree_hit(app, &needle) {
+                Some(pos) => {
+                    app.side_sel = pos;
+                    side_mirror_table(app);
+                    side_activate(app, tx);
+                    rebuild_side_rows(app);
+                }
+                // Bilingual status only — never a popup, and the filter stays put
+                // so the user can refine the needle.
+                None => {
+                    app.status = tf("过滤「{}」· 无匹配 · Esc 清除", &[&needle]);
+                }
+            }
         }
         KeyCode::Esc => {
             clear_table_filter(app);

@@ -924,6 +924,54 @@ pub(crate) fn render_recent_tables(f: &mut Frame, area: Rect, app: &mut App) {
     f.render_stateful_widget(list, box_area, &mut app.recent_list);
 }
 
+/// R87: the session's recent-connection list (`Alt-Shift-H`). Enter switches
+/// straight back to the highlighted connection (its per-connection pointer is
+/// restored too), so hopping between the last few databases is two keystrokes.
+pub(crate) fn render_conn_recent(f: &mut Frame, area: Rect, app: &mut App) {
+    let rows = conn_recent_rows(app);
+    let w = area.width.min(if app.layout_mode == LayoutMode::Narrow {
+        area.width
+    } else {
+        54
+    });
+    let (y, h) = overlay_list_box(rows.len().max(1), area);
+    let x = area.x + (area.width.saturating_sub(w)) / 2;
+    let box_area = Rect {
+        x,
+        y,
+        width: w,
+        height: h,
+    };
+    f.render_widget(Clear, box_area);
+    let items: Vec<ListItem> = rows
+        .iter()
+        .map(|(_, name, sub)| {
+            ListItem::new(Line::from(vec![
+                Span::styled("● ", Style::default().fg(Color::Green)),
+                Span::styled(
+                    fix_double_encoding(name),
+                    Style::default().add_modifier(Modifier::BOLD),
+                ),
+                Span::styled(format!("  {sub}"), Style::default().fg(Color::Cyan)),
+            ]))
+        })
+        .collect();
+    let list = List::new(items)
+        .block(
+            Block::default()
+                .borders(Borders::ALL)
+                .title(t(" 最近连接 · ↑↓ Enter 直连 · Esc 关 "))
+                .border_set(border::ROUNDED)
+                .border_style(Style::default().fg(Color::Cyan)),
+        )
+        .highlight_style(
+            Style::default()
+                .bg(Color::DarkGray)
+                .add_modifier(Modifier::BOLD),
+        );
+    f.render_stateful_widget(list, box_area, &mut app.conn_recent_list);
+}
+
 /// R65: the in-data-view table switcher (`g b`). A type-to-filter list of the
 /// current database's tables, drawn like the recent-table overlay: the needle
 /// rides the title and the highlighted row is the one Enter opens.
@@ -2876,7 +2924,7 @@ pub(crate) fn render_table_filter(f: &mut Frame, area: Rect, app: &mut App) {
         area,
         app.table_prompt.as_mut(),
         &tf(
-            " 过滤表名 {}/{} · Enter 打开首位 · Esc 清除 ",
+            " 过滤表名 {}/{} · Enter 首个匹配 · Esc 清除 ",
             &[&(app.tables.len()), &(app.tables_all.len())],
         ),
         t(" 过滤表名 · Enter/Esc "),
