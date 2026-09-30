@@ -2658,6 +2658,10 @@ pub(crate) fn filter_grid(grid: &Grid, hidden: &HashSet<String>) -> Grid {
     }
     Grid {
         columns: keep.iter().map(|&i| grid.columns[i].clone()).collect(),
+        types: keep
+            .iter()
+            .map(|&i| grid.types.get(i).cloned().unwrap_or_default())
+            .collect(),
         rows: grid
             .rows
             .iter()
@@ -2742,11 +2746,13 @@ pub(crate) fn apply_row_filters(grid: Grid, row_needle: &str, col: Option<(&str,
     }
     let Grid {
         columns,
+        types,
         rows,
         note,
     } = grid;
     Grid {
         columns,
+        types,
         rows: keep.into_iter().map(|i| rows[i].clone()).collect(),
         note,
     }
@@ -2770,13 +2776,21 @@ pub(crate) fn natural_width(grid: &Grid, ci: usize, max_cell: usize) -> usize {
 
 /// Natural width of every column in one row-major pass. One scan of the grid
 /// beats one full scan per column (cache locality), and the result feeds the
-/// per-grid width cache so scrolling a 20k-row result never rescans it.
+/// per-grid width cache so scrolling a 20k-row result never rescans it. Uses the
+/// raw value text (`NumFmt::Original`); the render path calls
+/// [`natural_widths_fmt`] so a comma-separated number still fits its column.
 pub(crate) fn natural_widths(grid: &Grid, max_cell: usize) -> Vec<usize> {
+    natural_widths_fmt(grid, max_cell, NumFmt::Original)
+}
+
+/// [`natural_widths`] against a specific big-number display mode: the width pass
+/// and the render pass must agree, or a `1,234,567` would be truncated.
+pub(crate) fn natural_widths_fmt(grid: &Grid, max_cell: usize, mode: NumFmt) -> Vec<usize> {
     let mut widths: Vec<usize> = grid.columns.iter().map(|c| disp_width(c)).collect();
     for row in &grid.rows {
         for (ci, w) in widths.iter_mut().enumerate() {
             if let Some(v) = row.get(ci) {
-                let cw = cell_text_width(v);
+                let cw = cell_text_width_fmt(v, grid.col_type(ci), mode);
                 if cw > *w {
                     *w = cw;
                 }

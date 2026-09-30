@@ -63,6 +63,7 @@ pub(crate) use crate::input::*;
 pub(crate) use crate::jsonview::*;
 pub(crate) use crate::mongo::*;
 pub(crate) use crate::nav::*;
+pub(crate) use crate::numfmt::*;
 pub(crate) use crate::parity::*;
 pub(crate) use crate::redis::*;
 pub(crate) use crate::render::*;

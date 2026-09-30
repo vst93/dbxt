@@ -53,6 +53,10 @@ pub(crate) fn col_width_key(conn: &str, db: &str, schema: &str, table: &str, col
 pub(crate) struct TuiConfig {
     /// Global compact-column default, used when a table has no stored choice.
     pub(crate) compact: Option<bool>,
+    /// R76: global big-number display mode for result cells (`None` = default).
+    pub(crate) num_fmt: Option<NumFmt>,
+    /// R76: alternate-row banding in the result grid (`None` = default on).
+    pub(crate) stripe: Option<bool>,
     pub(crate) tables: HashMap<(String, String), TablePrefs>,
     /// R72: persisted per-column widths, LRU-ordered (oldest first). Capped at
     /// [`COL_WIDTH_MEM_MAX`] on load and on save.
@@ -65,6 +69,10 @@ pub(crate) struct TuiConfig {
     /// Whether this session changed the global compact default. Untouched
     /// globals are left to whatever another session last wrote.
     pub(crate) dirty_global: bool,
+    /// R76: whether this session changed a global *display* pref (`num_fmt` /
+    /// `stripe`). Kept separate from `dirty_global` so toggling one never
+    /// clobbers the other.
+    pub(crate) dirty_display: bool,
     /// `(database, table)` entries this session actually changed. Saving merges
     /// only these into the on-disk file, so two dbxt sessions (or a hand-edit)
     /// no longer clobber each other's tables; an entry reset to defaults is
@@ -83,6 +91,11 @@ impl TuiConfig {
         };
         let mut cfg = Self {
             compact: v.get("compact").and_then(|b| b.as_bool()),
+            num_fmt: v
+                .get("num_fmt")
+                .and_then(|s| s.as_str())
+                .and_then(NumFmt::from_key),
+            stripe: v.get("stripe").and_then(|b| b.as_bool()),
             ..Self::default()
         };
         if let Some(tables) = v.get("tables").and_then(|t| t.as_object()) {
@@ -246,6 +259,10 @@ impl TuiConfig {
         if self.dirty_global {
             merged.compact = self.compact;
         }
+        if self.dirty_display {
+            merged.num_fmt = self.num_fmt;
+            merged.stripe = self.stripe;
+        }
         for key in &self.dirty {
             let all_default = self
                 .tables
@@ -323,6 +340,15 @@ impl TuiConfig {
         if let Some(c) = self.compact {
             root.insert("compact".into(), serde_json::Value::Bool(c));
         }
+        if let Some(m) = self.num_fmt {
+            root.insert(
+                "num_fmt".into(),
+                serde_json::Value::String(m.key().to_string()),
+            );
+        }
+        if let Some(s) = self.stripe {
+            root.insert("stripe".into(), serde_json::Value::Bool(s));
+        }
         root.insert("tables".into(), serde_json::Value::Object(tables));
         if !self.col_widths.is_empty() {
             let arr: Vec<serde_json::Value> = self
@@ -370,6 +396,18 @@ impl TuiConfig {
     pub(crate) fn set_compact(&mut self, value: Option<bool>) {
         self.compact = value;
         self.dirty_global = true;
+    }
+
+    /// R76: set the global big-number display mode.
+    pub(crate) fn set_num_fmt(&mut self, value: NumFmt) {
+        self.num_fmt = Some(value);
+        self.dirty_display = true;
+    }
+
+    /// R76: set the global alternate-row banding switch.
+    pub(crate) fn set_stripe(&mut self, value: bool) {
+        self.stripe = Some(value);
+        self.dirty_display = true;
     }
 }
 

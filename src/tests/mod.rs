@@ -100,6 +100,7 @@ pub(crate) fn sample_grid() -> Grid {
             })
             .collect(),
         note: String::new(),
+        types: Vec::new(),
     }
 }
 

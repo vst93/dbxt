@@ -12,6 +12,7 @@ mod input;
 mod jsonview;
 mod mongo;
 mod nav;
+mod numfmt;
 mod parity;
 mod prelude;
 mod redis;
@@ -895,7 +896,7 @@ fn stmt_outcome(sql: String, b: BatchStatementResult) -> StmtOutcome {
     } else {
         note_of(&result)
     };
-    let grid = Grid::from_query(result.columns, &result.rows, note);
+    let grid = Grid::from_query(result.columns, result.column_types, &result.rows, note);
     StmtOutcome {
         sql,
         grid,
@@ -1558,6 +1559,7 @@ async fn run_op(backend: &LocalBackend, op: Op, tx: &Tx) -> OpResult {
             {
                 Ok(r) => {
                     let columns = r.columns;
+                    let types = r.column_types;
                     let mut rows = r.rows;
                     let ms = r.execution_time_ms;
                     let has_next = if reverse {
@@ -1574,7 +1576,7 @@ async fn run_op(backend: &LocalBackend, op: Op, tx: &Tx) -> OpResult {
                     // Primary-key tuples of this page's edges, carried back so
                     // `n`/`p` can seek from here.
                     let keyset = keyset_cursor(&keyset_pk, keyset_asc, &columns, &rows);
-                    let grid = Grid::from_query(columns, &rows, format!("{ms}ms"));
+                    let grid = Grid::from_query(columns, types, &rows, format!("{ms}ms"));
                     // Row count: cached if the session already knows it, else a
                     // bounded sample. Counting only up to the cap keeps the first
                     // page fast on a huge table — a full InnoDB `COUNT(*)` is a
@@ -1941,6 +1943,7 @@ async fn run_op(backend: &LocalBackend, op: Op, tx: &Tx) -> OpResult {
                     let qr = dbx_core::mongo_ops::mongo_indexes_query_result(specs, 500);
                     let grid = Grid::from_query(
                         qr.columns,
+                        qr.column_types,
                         &qr.rows,
                         tf("{} 个索引", &[&(qr.rows.len())]),
                     );
@@ -4103,6 +4106,8 @@ impl App {
         drag_pan: DragPan,
     ) -> Self {
         let config_compact = config.compact;
+        let config_num_fmt = config.num_fmt.unwrap_or_default();
+        let config_stripe = config.stripe.unwrap_or(true);
         let mut app = Self {
             backend,
             page: Page::Browse,
@@ -4197,6 +4202,8 @@ impl App {
             error_popup: None,
             row_popup: None,
             compact: config_compact,
+            num_fmt: config_num_fmt,
+            stripe: config_stripe,
             col_hidden: HashSet::new(),
             col_picker_open: false,
             col_picker_list: ListState::default(),
@@ -5261,7 +5268,12 @@ fn apply_op_result(app: &mut App, res: OpResult, tx: &Tx) {
             app.pending_write = false;
             let note = note_of(&r);
             let truncated = r.truncated;
-            let grid = Grid::from_query(r.columns.clone(), &r.rows, note.clone());
+            let grid = Grid::from_query(
+                r.columns.clone(),
+                r.column_types.clone(),
+                &r.rows,
+                note.clone(),
+            );
             let base = if direct {
                 tf(
                     "直跑历史 · {} · {} 行 · {}",
@@ -6455,6 +6467,7 @@ fn columns_grid(cols: &[ColumnInfo]) -> Grid {
         .collect();
     Grid {
         columns,
+        types: Vec::new(),
         rows,
         note: tf("{} 字段", &[&(cols.len())]),
     }

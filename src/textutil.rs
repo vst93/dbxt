@@ -240,6 +240,7 @@ pub(crate) fn redis_value_view(v: RedisValue) -> RedisValueView {
         ttl: v.ttl,
         grid: Grid {
             columns,
+            types: Vec::new(),
             rows,
             note,
         },
@@ -509,6 +510,7 @@ pub(crate) fn mongo_docs_grid(docs: &[serde_json::Value]) -> Grid {
         .collect();
     Grid {
         columns: keys,
+        types: Vec::new(),
         rows,
         note: tf("{} 个文档", &[&(docs.len())]),
     }

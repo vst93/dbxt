@@ -1158,6 +1158,7 @@ pub(crate) fn every_call_site_has_english() {
         include_str!("../sidebar.rs"),
         include_str!("../editor.rs"),
         include_str!("../mongo.rs"),
+        include_str!("../numfmt.rs"),
         include_str!("../results.rs"),
         include_str!("../nav.rs"),
         include_str!("../diffui.rs"),
@@ -2381,6 +2382,7 @@ pub(crate) fn r30_big_grid(rows: usize) -> Grid {
         columns: cols,
         rows: data,
         note: String::new(),
+        types: Vec::new(),
     }
 }
 
@@ -4805,6 +4807,7 @@ pub(crate) fn orders_app(cols: &[(&str, &str)], rows: usize) -> App {
             })
             .collect(),
         note: String::new(),
+        types: Vec::new(),
     };
     app.set_grid(grid);
     app.focus = Focus::Preview;
@@ -5394,6 +5397,7 @@ pub(crate) fn long_cells_abbreviate_and_null_stays_grey() {
         columns: vec!["c".into()],
         rows: vec![vec![Val::Text("b".repeat(80))]],
         note: String::new(),
+        types: Vec::new(),
     });
     app.focus = Focus::Preview;
     app.sel = 0;
@@ -5741,6 +5745,7 @@ fn json_cell_app(raw: &str) -> App {
         columns: vec!["payload".into()],
         rows: vec![vec![Val::Text(raw.into())]],
         note: String::new(),
+        types: Vec::new(),
     });
     app.focus = Focus::Preview;
     app.sel = 0;
@@ -5854,6 +5859,7 @@ pub(crate) fn script_status_names_total_elapsed() {
             columns: vec!["a".into()],
             rows: vec![vec![Val::Text("1".into())]],
             note: String::new(),
+            types: Vec::new(),
         },
         error: None,
         affected: 0,
@@ -6105,4 +6111,310 @@ pub(crate) fn table_info_card_renders_at_phone_and_desktop_sizes() {
             "the card stays open while the cursor is on a table ({w}x{h})"
         );
     }
+}
+
+// ── R76: big-number display layer + zebra stripes ──
+
+/// Render one grid into a headless buffer through the real `render_grid`, so a
+/// test can assert on the drawn text and the per-row style.
+pub(crate) fn grid_buffer(app: &mut App, grid: &Grid, w: u16, h: u16) -> ratatui::buffer::Buffer {
+    use ratatui::backend::TestBackend;
+    use ratatui::Terminal;
+    let mut term = Terminal::new(TestBackend::new(w.max(1), h.max(1))).unwrap();
+    term.draw(|f| {
+        let area = f.area();
+        render_grid(f, area, app, grid, GridKind::Query, "t", false);
+    })
+    .unwrap();
+    term.backend().buffer().clone()
+}
+
+pub(crate) fn buffer_text(buf: &ratatui::buffer::Buffer) -> String {
+    (0..buf.area.height)
+        .map(|y| {
+            (0..buf.area.width)
+                .map(|x| buf.cell((x, y)).map(|c| c.symbol()).unwrap_or(" "))
+                .collect::<String>()
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+#[test]
+pub(crate) fn numfmt_cycles_groups_and_abbreviates() {
+    assert_eq!(NumFmt::default(), NumFmt::Thousands);
+    assert_eq!(NumFmt::Original.next(), NumFmt::Thousands);
+    assert_eq!(NumFmt::Thousands.next(), NumFmt::Abbrev);
+    assert_eq!(NumFmt::Abbrev.next(), NumFmt::Original);
+    for m in [NumFmt::Original, NumFmt::Thousands, NumFmt::Abbrev] {
+        assert_eq!(NumFmt::from_key(m.key()), Some(m), "{m:?} round-trips");
+    }
+    // Aliases are tolerated; junk is not.
+    assert_eq!(NumFmt::from_key("COMMA"), Some(NumFmt::Thousands));
+    assert_eq!(NumFmt::from_key("short"), Some(NumFmt::Abbrev));
+    assert_eq!(NumFmt::from_key("nope"), None);
+
+    let t = Some("BIGINT");
+    assert_eq!(format_number("1234567", t, NumFmt::Original), None);
+    assert_eq!(
+        format_number("1234567", t, NumFmt::Thousands).as_deref(),
+        Some("1,234,567")
+    );
+    assert_eq!(
+        format_number("1234567", t, NumFmt::Abbrev).as_deref(),
+        Some("1.2M")
+    );
+    assert_eq!(
+        format_number("3400000000", t, NumFmt::Abbrev).as_deref(),
+        Some("3.4G")
+    );
+    assert_eq!(
+        format_number("-1234567", t, NumFmt::Thousands).as_deref(),
+        Some("-1,234,567")
+    );
+    // Six significant digits is the threshold; five stays exactly as sent.
+    for m in [NumFmt::Thousands, NumFmt::Abbrev] {
+        assert_eq!(format_number("12345", t, m), None);
+    }
+}
+
+#[test]
+pub(crate) fn numfmt_floats_group_only_the_integer_part() {
+    let t = Some("DECIMAL(12,2)");
+    assert_eq!(
+        format_number("1234567.89", t, NumFmt::Thousands).as_deref(),
+        Some("1,234,567.89")
+    );
+    assert_eq!(
+        format_number("1234567.89", t, NumFmt::Abbrev).as_deref(),
+        Some("1.2M")
+    );
+    // Scientific notation is left alone (grouping would misstate its shape),
+    // and a leading zero does not count toward the six-digit threshold.
+    assert_eq!(format_number("1.2e7", t, NumFmt::Thousands), None);
+    assert_eq!(format_number("000123", t, NumFmt::Thousands), None);
+}
+
+#[test]
+pub(crate) fn numfmt_only_touches_numeric_columns() {
+    // A VARCHAR holding digits is a string, not a number.
+    for ct in [
+        Some("VARCHAR"),
+        Some("TEXT"),
+        Some("CHAR(20)"),
+        Some("JSON"),
+        None,
+        Some(""),
+    ] {
+        assert_eq!(
+            format_number("1234567", ct, NumFmt::Thousands),
+            None,
+            "{ct:?}"
+        );
+        assert_eq!(format_number("1234567", ct, NumFmt::Abbrev), None, "{ct:?}");
+    }
+    // Numeric aliases, spaces and an unsigned suffix still qualify; a `POINT`
+    // that merely contains "INT" does not.
+    assert_eq!(
+        format_number("1234567", Some("INT UNSIGNED"), NumFmt::Thousands).as_deref(),
+        Some("1,234,567")
+    );
+    assert_eq!(
+        format_number("1234567", Some("  decimal(10,2) "), NumFmt::Thousands).as_deref(),
+        Some("1,234,567")
+    );
+    assert_eq!(
+        format_number("1234567", Some("POINT"), NumFmt::Thousands),
+        None
+    );
+}
+
+#[test]
+pub(crate) fn numfmt_display_layer_keeps_underlying_values() {
+    let v = Val::Text("1234567".into());
+    assert_eq!(
+        display_value(&v, Some("INT"), NumFmt::Thousands).0,
+        "1,234,567"
+    );
+    assert_eq!(display_value(&v, Some("INT"), NumFmt::Abbrev).0, "1.2M");
+    // NULL / '' keep their own presentation regardless of mode.
+    assert_eq!(
+        display_value(&Val::Null, Some("INT"), NumFmt::Abbrev).0,
+        "NULL"
+    );
+    assert_eq!(
+        display_value(&Val::Text(String::new()), Some("INT"), NumFmt::Thousands).0,
+        "''"
+    );
+    // The width pass agrees with the text that is actually drawn.
+    assert_eq!(cell_text_width_fmt(&v, Some("INT"), NumFmt::Thousands), 9);
+    assert_eq!(cell_text_width_fmt(&v, Some("INT"), NumFmt::Original), 7);
+    // The copy path never sees the formatter.
+    assert_eq!(cell_copy_text(&v), "1234567");
+}
+
+#[test]
+pub(crate) fn numfmt_mode_changes_only_the_drawn_text() {
+    let mut app = test_app();
+    app.picker_open = false;
+    let grid = Grid {
+        columns: vec!["n".into()],
+        types: vec!["BIGINT".into()],
+        rows: vec![vec![Val::Text("1234567".into())]],
+        note: String::new(),
+    };
+    let shown = |app: &mut App| buffer_text(&grid_buffer(app, &grid, 24, 8));
+    app.num_fmt = NumFmt::Original;
+    let raw = shown(&mut app);
+    assert!(raw.contains("1234567"), "raw:\n{raw}");
+    assert!(!raw.contains("1,234,567"));
+    app.num_fmt = NumFmt::Thousands;
+    let grouped = shown(&mut app);
+    assert!(grouped.contains("1,234,567"), "grouped:\n{grouped}");
+    app.num_fmt = NumFmt::Abbrev;
+    let short = shown(&mut app);
+    assert!(short.contains("1.2M"), "abbrev:\n{short}");
+    assert!(!short.contains("1234567"));
+}
+
+#[test]
+pub(crate) fn stripe_bands_alternate_rows_and_can_be_disabled() {
+    let mut app = test_app();
+    app.picker_open = false;
+    app.num_fmt = NumFmt::Original;
+    app.stripe = true;
+    app.sel = 99; // no cursor row, so the banding style is purely alternate rows
+    let grid = Grid {
+        columns: vec!["c".into()],
+        types: Vec::new(),
+        rows: (0..6).map(|i| vec![Val::Text(format!("v{i}"))]).collect(),
+        note: String::new(),
+    };
+    let buf = grid_buffer(&mut app, &grid, 20, 12);
+    // The first data row sits just under the header (border inner y=1, header
+    // y=1, row 0 at y=2).
+    let dim_at = |buf: &ratatui::buffer::Buffer, row: u16| {
+        buf.cell((1, 2 + row))
+            .expect("row cell")
+            .modifier
+            .contains(Modifier::DIM)
+    };
+    assert!(!dim_at(&buf, 0), "even row 0 is not banded");
+    assert!(dim_at(&buf, 1), "odd row 1 is banded");
+    assert!(!dim_at(&buf, 2));
+    assert!(dim_at(&buf, 3));
+
+    app.stripe = false;
+    let buf = grid_buffer(&mut app, &grid, 20, 12);
+    for row in 0..6 {
+        assert!(!dim_at(&buf, row), "stripe off removes the band at {row}");
+    }
+}
+
+#[test]
+pub(crate) fn hash_and_percent_keys_cycle_display_and_flash() {
+    let (tx, _rx) = tokio::sync::mpsc::unbounded_channel::<OpResult>();
+    let mut app = test_app();
+    app.picker_open = false;
+    app.selected = Some(test_conn("mysql"));
+    app.backend_kind = Backend::Sql;
+    app.grid_kind = GridKind::Query;
+    app.set_grid(Grid {
+        columns: vec!["n".into()],
+        types: vec!["BIGINT".into()],
+        rows: vec![vec![Val::Text("1234567".into())]],
+        note: String::new(),
+    });
+    app.focus = Focus::Preview;
+    app.sel = 0;
+    app.col_cursor = 0;
+    app.num_fmt = NumFmt::Original;
+    let hash = KeyEvent::new(KeyCode::Char('#'), KeyModifiers::NONE);
+    key(&mut app, &tx, hash);
+    assert_eq!(app.num_fmt, NumFmt::Thousands);
+    assert_eq!(app.status, tf("大数字显示 · {}", &[&(t("千分位"))]));
+    key(&mut app, &tx, hash);
+    assert_eq!(app.num_fmt, NumFmt::Abbrev);
+    assert_eq!(app.status, tf("大数字显示 · {}", &[&(t("缩写"))]));
+    key(&mut app, &tx, hash);
+    assert_eq!(app.num_fmt, NumFmt::Original);
+    assert_eq!(app.status, tf("大数字显示 · {}", &[&(t("原样"))]));
+
+    // `Y` still copies the raw value: commas never leak into the clipboard.
+    app.num_fmt = NumFmt::Thousands;
+    app.status.clear();
+    key(
+        &mut app,
+        &tx,
+        KeyEvent::new(KeyCode::Char('Y'), KeyModifiers::SHIFT),
+    );
+    assert!(app.status.contains("= 1234567"), "raw copy: {}", app.status);
+    assert!(
+        !app.status.contains("1,234,567"),
+        "formatted value leaked: {}",
+        app.status
+    );
+
+    // `%` toggles the stripes and flashes the bilingual state.
+    assert!(app.stripe, "the stripe switch defaults on");
+    key(
+        &mut app,
+        &tx,
+        KeyEvent::new(KeyCode::Char('%'), KeyModifiers::NONE),
+    );
+    assert!(!app.stripe);
+    assert_eq!(app.status, t("斑马纹 关（% 开启）"));
+    key(
+        &mut app,
+        &tx,
+        KeyEvent::new(KeyCode::Char('%'), KeyModifiers::NONE),
+    );
+    assert!(app.stripe);
+    assert_eq!(app.status, t("斑马纹 开（% 关闭）"));
+}
+
+#[test]
+pub(crate) fn hash_is_literal_in_the_editor_and_never_cycles_numfmt() {
+    let (tx, _rx) = tokio::sync::mpsc::unbounded_channel::<OpResult>();
+    let mut app = test_app();
+    app.picker_open = false;
+    app.focus = Focus::Editor;
+    app.num_fmt = NumFmt::Thousands;
+    app.set_editor_text("");
+    key(
+        &mut app,
+        &tx,
+        KeyEvent::new(KeyCode::Char('#'), KeyModifiers::NONE),
+    );
+    assert_eq!(app.editor.lines().join(""), "#");
+    assert_eq!(app.num_fmt, NumFmt::Thousands, "editor `#` must not cycle");
+}
+
+#[test]
+pub(crate) fn numfmt_and_stripe_persist_without_clobbering_compact() {
+    let path = std::env::temp_dir().join(format!("dbxt-r76-{}.json", Uuid::new_v4()));
+    let mut cfg = TuiConfig::default();
+    cfg.set_num_fmt(NumFmt::Abbrev);
+    cfg.set_stripe(false);
+    cfg.save(&path);
+    let back = TuiConfig::load(&path);
+    assert_eq!(back.num_fmt, Some(NumFmt::Abbrev));
+    assert_eq!(back.stripe, Some(false));
+
+    // A session that only changed the compact default must not clobber the
+    // display prefs (they live behind their own dirty flag).
+    let mut b = TuiConfig::default();
+    b.set_compact(Some(true));
+    b.save(&path);
+    let after = TuiConfig::load(&path);
+    assert_eq!(after.compact, Some(true));
+    assert_eq!(after.num_fmt, Some(NumFmt::Abbrev), "num_fmt survives");
+    assert_eq!(after.stripe, Some(false), "stripe survives");
+
+    // Wrong-typed fields degrade to the default instead of failing the load.
+    std::fs::write(&path, r#"{"num_fmt":7,"stripe":"yes"}"#).unwrap();
+    let bad = TuiConfig::load(&path);
+    assert_eq!(bad.num_fmt, None);
+    assert_eq!(bad.stripe, None);
+    let _ = std::fs::remove_file(&path);
 }

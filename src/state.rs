@@ -209,6 +209,10 @@ pub(crate) fn sanitize_cell(s: &str) -> String {
 #[derive(Clone, Default)]
 pub(crate) struct Grid {
     pub(crate) columns: Vec<String>,
+    /// Driver-reported type name per column, parallel to `columns`. Empty when
+    /// the source has no types (schemaless stores, some fallback paths); the
+    /// big-number display layer treats an empty/unknown type as “leave alone”.
+    pub(crate) types: Vec<String>,
     pub(crate) rows: Vec<Vec<Val>>,
     pub(crate) note: String,
 }
@@ -216,17 +220,24 @@ pub(crate) struct Grid {
 impl Grid {
     pub(crate) fn from_query(
         columns: Vec<String>,
+        types: Vec<String>,
         rows: &[Vec<serde_json::Value>],
         note: String,
     ) -> Self {
         Self {
             columns,
+            types,
             rows: rows
                 .iter()
                 .map(|row| row.iter().map(value_to_val).collect())
                 .collect(),
             note,
         }
+    }
+
+    /// The driver-reported type of column `ci`, if any.
+    pub(crate) fn col_type(&self, ci: usize) -> Option<&str> {
+        self.types.get(ci).map(String::as_str)
     }
 }
 
@@ -1961,6 +1972,10 @@ pub(crate) struct App {
     // ── mobile efficiency ──
     /// Compact column-width mode (`None` = automatic for a narrow terminal).
     pub(crate) compact: Option<bool>,
+    /// R76: big-number display mode for result cells (`#` cycles it).
+    pub(crate) num_fmt: NumFmt,
+    /// R76: alternate-row banding in the result grid (config, default on).
+    pub(crate) stripe: bool,
     /// Column names hidden for this browsing session (Ctrl-Shift-H).
     pub(crate) col_hidden: HashSet<String>,
     pub(crate) col_picker_open: bool,

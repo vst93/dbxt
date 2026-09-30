@@ -1306,6 +1306,14 @@ pub(crate) const HELP_ROWS: &[(&str, &str)] = &[
         "紧凑列宽 开 / 关（窄屏默认自动开，按 库.表 记住）",
     ),
     (
+        "#",
+        "大数字显示：原样 → 千分位 → 缩写 三档循环（1,234,567 / 1.2M；仅数字列，复制 / 编辑仍用原值，跨会话记住）",
+    ),
+    (
+        "%",
+        "斑马纹：结果集奇偶行底色微差 开 / 关（默认开，跨会话记住）",
+    ),
+    (
         "< / > / 0",
         "收窄 / 加宽 / 复位当前列（按 库.表+列名 记忆并跨会话持久化；0 复位当前列）",
     ),
@@ -1683,7 +1691,7 @@ pub(crate) fn help_context_tokens(app: &App) -> Vec<String> {
     // The results surface: the spec's `v / Y / *` trio leads, so the quick-access
     // block opens on exactly the keys the user is looking at.
     if ctx.view == FooterView::Browse && app.focus == Focus::Preview {
-        for k in ["*", "Y", "v", "y", "<", ">", "gg", "G"] {
+        for k in ["*", "Y", "v", "y", "<", ">", "gg", "G", "#", "%"] {
             push(&mut out, k);
         }
     }

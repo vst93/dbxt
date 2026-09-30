@@ -246,6 +246,9 @@ pub(crate) fn preview_key(app: &mut App, tx: &Tx, k: KeyEvent) {
         // `*` filters to the focused column: type a value (pre-filled from the
         // cell under the cursor) to keep only rows whose cell contains it.
         KeyCode::Char('*') => open_col_filter(app),
+        // R76: `#` cycles the big-number display mode for this result set.
+        // Display-only: `Y` / edit still see the driver's original value.
+        KeyCode::Char('#') => cycle_num_fmt(app),
         // `|` jumps straight to a column by number or name prefix (wide tables).
         KeyCode::Char('|') => open_col_jump(app),
         // R56: `:` jumps straight to a row by number (or `:$` for the last), the
@@ -279,6 +282,10 @@ pub(crate) fn preview_key(app: &mut App, tx: &Tx, k: KeyEvent) {
         KeyCode::Char('Y') => copy_cell_value(app),
         // Bare-key aliases for the two view commands (mobile reachability).
         KeyCode::Char('w') => toggle_compact(app),
+        // R76: `%` toggles alternate-row banding (zebra stripes) and remembers
+        // it in tui.json. Free in the results pane (the editor keeps `%` for
+        // its bracket jump), so it never shadows a data action.
+        KeyCode::Char('%') => toggle_stripe(app),
         KeyCode::Char('c') => open_col_picker(app),
         // Delete the focused row: builds a bound `DELETE … WHERE …` and routes it
         // through the same red confirmation layer as every other write.
@@ -1492,6 +1499,33 @@ pub(crate) fn toggle_compact(app: &mut App) {
         app.config.entry(&db, &ps.schema, &ps.table).compact = app.compact;
     }
     app.persist();
+}
+
+/// R76: `#` — cycle the big-number cell display through original → thousands
+/// → abbreviated. A pure display layer: the underlying values are untouched, so
+/// `Y` (copy value) and the edit dialog still see exactly what the driver sent.
+/// The chosen mode persists in `tui.json` and is applied on the next launch.
+pub(crate) fn cycle_num_fmt(app: &mut App) {
+    app.num_fmt = app.num_fmt.next();
+    // Widths depend on the mode (a `1,234,567` is wider than `1234567`), so the
+    // cached natural widths must be rebuilt for the new text.
+    app.width_cache = None;
+    app.config.set_num_fmt(app.num_fmt);
+    app.persist();
+    app.flash(tf("大数字显示 · {}", &[&(app.num_fmt.label())]));
+}
+
+/// R76: `%` — toggle alternate-row banding (zebra stripes). Persisted as a
+/// global display pref so it survives the next launch.
+pub(crate) fn toggle_stripe(app: &mut App) {
+    app.stripe = !app.stripe;
+    app.config.set_stripe(app.stripe);
+    app.persist();
+    app.flash(if app.stripe {
+        t("斑马纹 开（% 关闭）").to_string()
+    } else {
+        t("斑马纹 关（% 开启）").to_string()
+    });
 }
 
 /// Ctrl-Shift-H — open the column-visibility picker for the grid on screen.

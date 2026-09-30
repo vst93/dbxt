@@ -2357,14 +2357,16 @@ pub(crate) fn render_grid(
     // content width, capped per layout.
     let max_cell = grid_max_cell(app, ncols, inner_w, gutter);
     app.grid_max_cell = max_cell;
+    // R76: capture the big-number mode before the mutable width call below.
+    let num_fmt = app.num_fmt;
     // Column widths are content-sized, so building them scans every cell. Cache
     // them per displayed grid (and width cap) so scrolling 20k rows is a lookup,
     // not a rescan. The drilled-script grid is rebuilt per frame, so it skips
     // the cache.
     let mut widths: Vec<usize> = if cache {
-        app.column_widths(grid, max_cell)
+        app.column_widths(grid, max_cell, num_fmt)
     } else {
-        natural_widths(grid, max_cell)
+        natural_widths_fmt(grid, max_cell, num_fmt)
     };
     // R55: a session column-width override wins over the natural width, so a
     // manual `<` / `>` adjustment survives page turns and re-queries.
@@ -2413,6 +2415,8 @@ pub(crate) fn render_grid(
         .min(nrows.saturating_sub(h.min(nrows)));
     let sel = app.sel;
     let cc = app.col_cursor;
+    // R76: alternate-row banding, captured once for the row loops below.
+    let stripe = app.stripe;
     // R57: the row-select block, if any, drawn as full-row reverse video.
     let sel_range = app.row_sel_anchor.map(|a| (a.min(sel), a.max(sel)));
 
@@ -2445,6 +2449,8 @@ pub(crate) fn render_grid(
                     needle,
                     find,
                     find_current == Some((i, ci)),
+                    grid.col_type(ci),
+                    num_fmt,
                 ),
                 None => Cell::from(""),
             });
@@ -2454,6 +2460,8 @@ pub(crate) fn render_grid(
             r = r.style(row_select_style());
         } else if i == sel {
             r = r.style(highlight_style());
+        } else if stripe && i % 2 == 1 {
+            r = r.style(stripe_style());
         }
         lrows.push(r);
     }
@@ -2508,6 +2516,8 @@ pub(crate) fn render_grid(
                             needle,
                             find,
                             find_current == Some((i, ci)),
+                            grid.col_type(ci),
+                            num_fmt,
                         ),
                         None => Cell::from(""),
                     });
@@ -2517,6 +2527,8 @@ pub(crate) fn render_grid(
                     r = r.style(row_select_style());
                 } else if i == sel {
                     r = r.style(highlight_style());
+                } else if stripe && i % 2 == 1 {
+                    r = r.style(stripe_style());
                 }
                 rrows.push(r);
             }
@@ -2746,27 +2758,40 @@ pub(crate) fn render_columns_grid(
         Constraint::Percentage(26),
     ];
     let cc = app.col_cursor;
+    let num_fmt = app.num_fmt;
+    let stripe = app.stripe;
     let mut header = vec![gutter_header_cell()];
     header.extend(grid.columns.iter().enumerate().map(|(ci, c)| {
         let shown = fix_double_encoding(c);
         col_header_cell(&shown, disp_width(&shown), ci == cc, None, false)
     }));
-    let rows: Vec<Row> =
-        grid.rows
-            .iter()
-            .enumerate()
-            .map(|(i, row)| {
-                let mut cells = vec![gutter_cell(i, i == app.sel)];
-                cells.extend(row.iter().enumerate().map(|(ci, v)| {
-                    cell_widget_hl(v, 40, i == app.sel && ci == cc, None, None, false)
-                }));
-                let mut r = Row::new(cells);
-                if i == app.sel {
-                    r = r.style(highlight_style());
-                }
-                r
-            })
-            .collect();
+    let rows: Vec<Row> = grid
+        .rows
+        .iter()
+        .enumerate()
+        .map(|(i, row)| {
+            let mut cells = vec![gutter_cell(i, i == app.sel)];
+            cells.extend(row.iter().enumerate().map(|(ci, v)| {
+                cell_widget_hl(
+                    v,
+                    40,
+                    i == app.sel && ci == cc,
+                    None,
+                    None,
+                    false,
+                    grid.col_type(ci),
+                    num_fmt,
+                )
+            }));
+            let mut r = Row::new(cells);
+            if i == app.sel {
+                r = r.style(highlight_style());
+            } else if stripe && i % 2 == 1 {
+                r = r.style(stripe_style());
+            }
+            r
+        })
+        .collect();
     let table = Table::new(rows, widths)
         .header(Row::new(header))
         .column_spacing(1)
@@ -2839,6 +2864,15 @@ pub(crate) fn highlight_style() -> Style {
     Style::default()
         .bg(Color::Rgb(38, 48, 38))
         .add_modifier(Modifier::BOLD)
+}
+
+/// R76: alternate-row banding in the result grid. Uses the terminal's own dim
+/// attribute rather than a fixed background, so the band reads as a subtle
+/// difference on a light *and* a dark theme (a hard-coded grey would be too
+/// strong on one and invisible on the other). The cursor row / row-select block
+/// style replaces it, so the active row is never dimmed.
+pub(crate) fn stripe_style() -> Style {
+    Style::default().add_modifier(Modifier::DIM)
 }
 
 /// R57: a row inside the rows-select block — full-row reverse video so a
@@ -2935,7 +2969,9 @@ pub(crate) fn abbreviate_cell_text(text: &str) -> String {
 
 /// R58: a cell value's contribution to its column width, capped at the inline
 /// abbreviation so a long value no longer stretches its column past what is
-/// actually drawn.
+/// actually drawn. R76: the display-formatted variant lives in `numfmt`; this
+/// unchanged-value form is what the tests pin.
+#[cfg(test)]
 pub(crate) fn cell_text_width(v: &Val) -> usize {
     let w = disp_width(v.text());
     if w > CELL_TEXT_MAX {
@@ -2949,7 +2985,10 @@ pub(crate) fn cell_text_width(v: &Val) -> usize {
 /// search hit. `needle` is the `/` row-search substring; `find` is the R64
 /// cell-find substring and `find_current` marks the match the cursor landed on
 /// (painted with the accent colour even while focused, so `n`/`N` have a clear
-/// anchor).
+/// anchor). `col_type` / `mode` drive the R76 big-number display layer, which
+/// only changes the drawn text — never the underlying value. The signature grew
+/// for that pair, so the argument-count lint is waived here.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn cell_widget_hl(
     v: &Val,
     w: usize,
@@ -2957,6 +2996,8 @@ pub(crate) fn cell_widget_hl(
     needle: Option<&str>,
     find: Option<&str>,
     find_current: bool,
+    col_type: Option<&str>,
+    mode: NumFmt,
 ) -> Cell<'static> {
     let is_hit = |n: Option<&str>| {
         n.is_some_and(|n| {
@@ -2967,32 +3008,18 @@ pub(crate) fn cell_widget_hl(
             !n.is_empty() && s.to_lowercase().contains(n)
         })
     };
+    let (text, base_style) = display_value(v, col_type, mode);
+    let shown = truncate_disp(&abbreviate_cell_text(&text), w);
     if find_current {
-        let (text, _) = value_display(v);
-        return Cell::from(Span::styled(
-            truncate_disp(&abbreviate_cell_text(&text), w),
-            find_current_style(),
-        ));
+        return Cell::from(Span::styled(shown, find_current_style()));
     }
     if focused {
-        let (text, _) = value_display(v);
-        return Cell::from(Span::styled(
-            truncate_disp(&abbreviate_cell_text(&text), w),
-            focused_cell_style(),
-        ));
+        return Cell::from(Span::styled(shown, focused_cell_style()));
     }
     if is_hit(needle) || is_hit(find) {
-        let (text, _) = value_display(v);
-        return Cell::from(Span::styled(
-            truncate_disp(&abbreviate_cell_text(&text), w),
-            search_hit_style(),
-        ));
+        return Cell::from(Span::styled(shown, search_hit_style()));
     }
-    match v {
-        Val::Null => Cell::from(Span::styled("NULL", null_style())),
-        Val::Text(s) if s.is_empty() => Cell::from(Span::styled("''", empty_string_style())),
-        Val::Text(s) => Cell::from(Span::raw(truncate_disp(&abbreviate_cell_text(s), w))),
-    }
+    Cell::from(Span::styled(shown, base_style))
 }
 
 pub(crate) fn render_script_list(f: &mut Frame, area: Rect, app: &mut App, script: &ScriptView) {

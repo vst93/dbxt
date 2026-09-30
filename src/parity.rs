@@ -1292,6 +1292,7 @@ impl App {
         let rows = map.iter().map(|&i| cols.rows[i].clone()).collect();
         self.grid = Some(Grid {
             columns: cols.columns,
+            types: cols.types,
             rows,
             note: cols.note,
         });
@@ -1300,15 +1301,23 @@ impl App {
 
     /// Natural column widths for `grid` at `max_cell`, served from the cache
     /// unless the displayed grid or the width cap changed. This is the single
-    /// hot-path cost the render loop used to pay on every frame.
-    pub(crate) fn column_widths(&mut self, grid: &Grid, max_cell: usize) -> Vec<usize> {
+    /// hot-path cost the render loop used to pay on every frame. R76: `mode`
+    /// feeds the big-number display layer, so the cached widths match what the
+    /// render pass actually draws (the cache is cleared whenever `mode`
+    /// changes).
+    pub(crate) fn column_widths(
+        &mut self,
+        grid: &Grid,
+        max_cell: usize,
+        mode: NumFmt,
+    ) -> Vec<usize> {
         if let Some((epoch, cell, widths)) = &self.width_cache {
             if *epoch == self.grid_epoch && *cell == max_cell && widths.len() == grid.columns.len()
             {
                 return widths.clone();
             }
         }
-        let widths = natural_widths(grid, max_cell);
+        let widths = natural_widths_fmt(grid, max_cell, mode);
         self.width_cache = Some((self.grid_epoch, max_cell, widths.clone()));
         widths
     }

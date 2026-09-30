@@ -202,6 +202,7 @@ pub(crate) fn sample_script(n: usize) -> ScriptView {
                 columns: vec!["x".into()],
                 rows: vec![vec![Val::Text(format!("{i}"))]],
                 note: String::new(),
+                types: Vec::new(),
             },
             error: None,
             affected: 0,
@@ -346,6 +347,7 @@ pub(crate) fn large_cell_popup_wraps_once_and_reuses_cache() {
         columns: vec!["v".into()],
         rows: vec![vec![Val::Text(big)]],
         note: String::new(),
+        types: Vec::new(),
     });
     app.focus = Focus::Preview;
     app.sel = 0;
@@ -472,6 +474,7 @@ pub(crate) fn row_popup_title_carries_the_primary_key() {
         columns: vec!["id".into(), "name".into()],
         rows: vec![vec![Val::Text("4821".into()), Val::Text("ada".into())]],
         note: String::new(),
+        types: Vec::new(),
     });
     app.page_state = Some(page_of("orders"));
     app.table_meta = Some(TableMeta {
@@ -625,6 +628,7 @@ pub(crate) fn row_popup_filter_matches_name_or_value() {
             Val::Text("berlin".into()),
         ]],
         note: String::new(),
+        types: Vec::new(),
     });
     app.focus = Focus::Preview;
     app.sel = 0;
@@ -653,6 +657,7 @@ pub(crate) fn row_popup_body_stacks_on_narrow_widths() {
         columns: vec!["id".into(), "name".into()],
         rows: vec![vec![Val::Text("1".into()), Val::Text("ada".into())]],
         note: String::new(),
+        types: Vec::new(),
     });
     app.focus = Focus::Preview;
     app.sel = 0;
@@ -684,6 +689,7 @@ pub(crate) fn row_popup_y_and_shift_y_copy_the_selected_field() {
         columns: vec!["id".into(), "name".into()],
         rows: vec![vec![Val::Text("7".into()), Val::Text("seven".into())]],
         note: String::new(),
+        types: Vec::new(),
     });
     app.focus = Focus::Preview;
     app.sel = 0;
@@ -1430,6 +1436,7 @@ pub(crate) fn focused_row_survives_an_active_result_search() {
             vec![Val::Text("bob".into())],
         ],
         note: String::new(),
+        types: Vec::new(),
     });
     assert_eq!(focused_full_row(&app).unwrap()[0].text(), "ada");
 
@@ -1511,6 +1518,7 @@ pub(crate) fn export_handles_huge_and_binary_cells_in_every_format() {
             Val::Text(huge.clone()),
         ]],
         note: String::new(),
+        types: Vec::new(),
     };
     for format in EXPORT_FORMATS {
         let out = render_export_content(
@@ -1642,6 +1650,7 @@ pub(crate) fn export_stream_matches_string_builders() {
             ],
         ],
         note: String::new(),
+        types: Vec::new(),
     };
     assert_stream_matches(&app, &grid, "shop", "orders");
 
@@ -1666,6 +1675,7 @@ pub(crate) fn export_stream_matches_on_edge_grids() {
         columns: vec!["id".into(), "name".into()],
         rows: Vec::new(),
         note: String::new(),
+        types: Vec::new(),
     };
     assert_stream_matches(&app, &empty, "shop", "t");
 
@@ -1673,6 +1683,7 @@ pub(crate) fn export_stream_matches_on_edge_grids() {
         columns: Vec::new(),
         rows: vec![Vec::new()],
         note: String::new(),
+        types: Vec::new(),
     };
     assert_stream_matches(&app, &no_cols, "shop", "t");
 
@@ -1687,6 +1698,7 @@ pub(crate) fn export_stream_matches_on_edge_grids() {
                 .map(|i| vec![Val::Text(i.to_string()), Val::Text(format!("n{i}"))])
                 .collect(),
             note: String::new(),
+            types: Vec::new(),
         };
         assert_stream_matches(&app, &grid, "shop", "t");
     }
@@ -1747,6 +1759,7 @@ pub(crate) fn natural_widths_matches_the_per_column_reference() {
             ],
         ],
         note: String::new(),
+        types: Vec::new(),
     };
     for max_cell in [MIN_CELL_WIDTH, 12, 44] {
         let all = natural_widths(&grid, max_cell);
@@ -2365,6 +2378,7 @@ pub(crate) fn natural_width_is_content_sized() {
             vec![Val::Text("22".into()), Val::Null],
         ],
         note: String::new(),
+        types: Vec::new(),
     };
     assert_eq!(natural_width(&grid, 0, 44), MIN_CELL_WIDTH);
     assert_eq!(natural_width(&grid, 1, 44), 14);
@@ -2381,6 +2395,7 @@ pub(crate) fn visible_cols_fits_content_widths() {
             Val::Text("1234567890".into()),
         ]],
         note: String::new(),
+        types: Vec::new(),
     };
     // 10-wide columns + 1 space each: two fit in 21, three need 32
     assert_eq!(visible_cols(&grid, 0, 21, 44), 2);
@@ -3265,7 +3280,7 @@ pub(crate) fn capture_grid_cells(
         .map(|row| {
             Row::new(
                 row.iter()
-                    .map(|v| cell_widget_hl(v, 8, false, None, None, false))
+                    .map(|v| cell_widget_hl(v, 8, false, None, None, false, None, NumFmt::Original))
                     .collect::<Vec<_>>(),
             )
         })
@@ -3360,6 +3375,7 @@ pub(crate) fn csv_export_keeps_null_and_empty_as_empty_fields() {
             Val::Text("NULL".into()),
         ]],
         note: String::new(),
+        types: Vec::new(),
     };
     // NULL and '' are both empty fields (RFC 4180), a literal "NULL" is not.
     assert_eq!(grid_to_csv(&grid), "a,b,c\n,,NULL\n");
@@ -3371,6 +3387,7 @@ pub(crate) fn ten_col_grid() -> Grid {
         columns,
         rows: vec![vec![Val::Text("1234567890".into()); 10]],
         note: String::new(),
+        types: Vec::new(),
     }
 }
 
@@ -3400,6 +3417,7 @@ pub(crate) fn frozen_first_column_needs_room() {
         columns: vec!["a".into(), "b".into()],
         rows: vec![vec![Val::Text("1".into()), Val::Text("2".into())]],
         note: String::new(),
+        types: Vec::new(),
     };
     assert_eq!(effective_frozen(true, &narrow, 2, 40, 44), 0);
 }
@@ -3431,6 +3449,7 @@ pub(crate) fn window_clamps_when_columns_are_narrow() {
         columns: vec!["a".into(), "b".into(), "c".into()],
         rows: vec![vec![Val::Text("x".into()); 3]],
         note: String::new(),
+        types: Vec::new(),
     };
     // avail 0 still shows one column
     assert_eq!(window_for_cursor(&grid, 0, 0, 0, 44, 0), (0, 1));
@@ -4723,6 +4742,7 @@ pub(crate) fn shift_y_copies_the_focused_cell() {
         columns: vec!["id".into(), "name".into()],
         rows: vec![vec![Val::Text("7".into()), Val::Text("seven".into())]],
         note: String::new(),
+        types: Vec::new(),
     });
     app.focus = Focus::Preview;
     app.sel = 0;
@@ -4767,6 +4787,7 @@ pub(crate) fn page_keys_move_a_screen_and_clamp_at_the_edges() {
         columns: vec!["c".into()],
         rows: (0..40).map(|i| vec![Val::Text(i.to_string())]).collect(),
         note: String::new(),
+        types: Vec::new(),
     });
     app.focus = Focus::Preview;
     app.sel = 0;
@@ -4956,6 +4977,7 @@ pub(crate) fn results_ctrl_u_half_pages_up_and_ctrl_d_still_deletes() {
         columns: vec!["c".into()],
         rows: (0..40).map(|i| vec![Val::Text(i.to_string())]).collect(),
         note: String::new(),
+        types: Vec::new(),
     });
     app.focus = Focus::Preview;
     app.sel = 20;
@@ -5019,6 +5041,7 @@ pub(crate) fn results_grid_header_stays_pinned_while_scrolling() {
             .map(|i| vec![Val::Text(format!("row{i}")), Val::Text(format!("v{i}"))])
             .collect(),
         note: String::new(),
+        types: Vec::new(),
     });
     app.focus = Focus::Preview;
     app.sel = 0;

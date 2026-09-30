@@ -1029,6 +1029,7 @@ pub(crate) fn col_width_overrides_apply_session_then_persisted() {
         columns: vec!["id".into(), "name".into(), "note".into()],
         rows: vec![],
         note: String::new(),
+        types: Vec::new(),
     };
     let mut widths = vec![5usize, 5, 5];
     apply_col_width_overrides(&app, &grid, &mut widths);
@@ -1062,6 +1063,7 @@ pub(crate) fn reset_and_clear_col_width_keys() {
         columns: vec!["id".into(), "name".into()],
         rows: vec![vec![Val::Text("1".into()), Val::Text("a".into())]],
         note: String::new(),
+        types: Vec::new(),
     });
     app.focus = Focus::Preview;
     app.grid_widths = vec![20, 10];
@@ -1541,6 +1543,7 @@ pub(crate) fn col_stats_counts_nulls_distinct_and_numbers() {
             vec![Val::Text(" 3 ".into()), Val::Text(String::new())],
         ],
         note: String::new(),
+        types: Vec::new(),
     };
     let n = col_stats(&grid, 0, 100);
     assert_eq!(n.non_null, 4);
@@ -1563,6 +1566,7 @@ pub(crate) fn col_stats_counts_nulls_distinct_and_numbers() {
         columns: vec!["n".into()],
         rows: vec![vec![Val::Text("1".into())], vec![]],
         note: String::new(),
+        types: Vec::new(),
     };
     assert_eq!(col_stats(&short, 0, 100).nulls, 1);
 }
@@ -1575,6 +1579,7 @@ pub(crate) fn col_stats_scan_limit_truncates() {
         columns: vec!["n".into()],
         rows: (1..=5).map(|i| vec![Val::Text(i.to_string())]).collect(),
         note: String::new(),
+        types: Vec::new(),
     };
     let s = col_stats(&grid, 0, 3);
     assert!(s.truncated);
@@ -1682,6 +1687,7 @@ pub(crate) fn col_stats_builds_a_sparkline() {
         columns: vec!["n".into()],
         rows: (1..=12).map(|i| vec![Val::Text(i.to_string())]).collect(),
         note: String::new(),
+        types: Vec::new(),
     };
     let s = col_stats(&numeric, 0, 100);
     assert_eq!(s.spark.chars().count(), COL_SPARK_W);
@@ -1695,6 +1701,7 @@ pub(crate) fn col_stats_builds_a_sparkline() {
             vec![Val::Text("bbbb".into())],
         ],
         note: String::new(),
+        types: Vec::new(),
     };
     let s = col_stats(&text, 0, 100);
     assert_eq!(s.spark.chars().count(), COL_SPARK_W);
@@ -1704,6 +1711,7 @@ pub(crate) fn col_stats_builds_a_sparkline() {
         columns: vec!["s".into()],
         rows: Vec::new(),
         note: String::new(),
+        types: Vec::new(),
     };
     assert!(col_stats(&empty, 0, 100).spark.is_empty());
 }
@@ -1756,6 +1764,7 @@ pub(crate) fn cols_popup_renders_value_stats() {
             vec![Val::Null, Val::Text("a".into())],
         ],
         note: String::new(),
+        types: Vec::new(),
     });
     app.table_meta = Some(TableMeta {
         table: "orders".into(),
@@ -3036,6 +3045,7 @@ pub(crate) fn blank_aware_grid() -> Grid {
             vec![Val::Text("6".into()), Val::Text("yo".into())],
         ],
         note: String::new(),
+        types: Vec::new(),
     }
 }
 
@@ -3719,6 +3729,7 @@ pub(crate) fn grid_to_csv_keeps_null_empty() {
             vec![Val::Text("2".into()), Val::Text("a,b".into())],
         ],
         note: String::new(),
+        types: Vec::new(),
     };
     assert_eq!(grid_to_csv(&grid), "id,name\n1,\n2,\"a,b\"\n");
 }
@@ -3906,6 +3917,7 @@ pub(crate) fn json_export_keeps_leading_zero_strings() {
             Val::Null,
         ]],
         note: String::new(),
+        types: Vec::new(),
     };
     let out = grid_to_json_array(&grid);
     assert!(out.contains("\"zip\": \"0123\""), "{out}");
@@ -3926,6 +3938,7 @@ pub(crate) fn markdown_export_escapes_pipes_and_newlines() {
             vec![Val::Text("l1\nl2".into()), Val::Text("ok".into())],
         ],
         note: String::new(),
+        types: Vec::new(),
     };
     let md = grid_to_markdown(&grid);
     assert!(md.starts_with("| a | b |\n| --- | --- |\n"), "{md}");
@@ -4116,6 +4129,7 @@ pub(crate) fn filter_grid_hides_columns_and_keeps_values_aligned() {
             Val::Text("s".into()),
         ]],
         note: String::new(),
+        types: Vec::new(),
     };
     let hidden: HashSet<String> = ["secret".to_string()].into_iter().collect();
     let out = filter_grid(&grid, &hidden);
@@ -4831,6 +4845,7 @@ pub(crate) fn row_search_keeps_only_matching_rows_and_is_case_insensitive() {
             vec![Val::Text("alice2".into()), Val::Null],
         ],
         note: String::new(),
+        types: Vec::new(),
     };
     // Empty / whitespace-only needles are a no-op.
     assert_eq!(apply_row_filters(grid.clone(), "", None).rows.len(), 3);
@@ -4862,6 +4877,7 @@ pub(crate) fn column_filter_scopes_rows_to_one_named_column() {
             vec![Val::Text("alice2".into()), Val::Null],
         ],
         note: String::new(),
+        types: Vec::new(),
     };
     // `name` containing "alice" keeps Alice + alice2; Bob's city also holds
     // "Beijing" but the filter only looks at `name`.
@@ -5469,6 +5485,7 @@ pub(crate) fn locate_grid() -> Grid {
             vec![Val::Null, Val::Text("dave".into())],
         ],
         note: String::new(),
+        types: Vec::new(),
     }
 }
 
@@ -5591,6 +5608,7 @@ pub(crate) fn cell_find_grid() -> Grid {
             ],
         ],
         note: String::new(),
+        types: Vec::new(),
     }
 }
 
@@ -5636,6 +5654,7 @@ pub(crate) fn compute_cell_find_stops_at_the_ceiling() {
         columns: vec!["c".into()],
         rows,
         note: String::new(),
+        types: Vec::new(),
     });
     app.cell_find_needle = "hit".into();
     compute_cell_find(&mut app);
