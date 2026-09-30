@@ -3325,6 +3325,8 @@ pub(crate) fn data_cmp_fixture() -> DataCompare {
         only_src: 1,
         only_tgt: 1,
         differing: 1,
+        compared: 3,
+        positional: false,
         truncated: false,
         cancelled: false,
     }
@@ -3590,6 +3592,8 @@ pub(crate) fn data_sync_sql_escapes_hostile_values() {
         only_src: 1,
         only_tgt: 0,
         differing: 0,
+        compared: 1,
+        positional: false,
         truncated: false,
         cancelled: false,
     };
@@ -3873,6 +3877,206 @@ pub(crate) fn data_diff_strings_have_english_translations() {
     assert_ne!(ui_text::t_lang("差异", Lang::En), "差异");
     assert_ne!(ui_text::t_lang("数据一致", Lang::En), "数据一致");
     assert_ne!(ui_text::t_lang("同步 SQL", Lang::En), "同步 SQL");
+    // R90 additions.
+    assert_eq!(
+        ui_text::tf_lang("差异 {} 行 / 已比 {} 行", &[&12, &500], Lang::En),
+        "12 difference rows / 500 rows compared"
+    );
+    assert_ne!(ui_text::t_lang("按行序对齐", Lang::En), "按行序对齐");
+    assert_ne!(ui_text::t_lang("已比", Lang::En), "已比");
+    assert_ne!(ui_text::t_lang("差异行", Lang::En), "差异行");
+}
+
+// ── R90: row-order (no-primary-key) compare + CSV export ──
+
+#[test]
+pub(crate) fn data_positional_align_interects_columns_without_pk() {
+    let src = vec![
+        col_full("id", "int", false, None, None, false),
+        col_full("name", "varchar(20)", true, None, None, false),
+        col_full("only_src", "text", true, None, None, false),
+    ];
+    // Target is reordered and uppercases `name`, like a cross-dialect pair.
+    let tgt = vec![
+        col_full("NAME", "varchar(20)", true, None, None, false),
+        col_full("id", "int", false, None, None, false),
+        col_full("only_tgt", "text", true, None, None, false),
+    ];
+    let align = build_positional_align(&src, &tgt, false).unwrap();
+    assert_eq!(align.pk_len, 0);
+    let names: Vec<String> = align.cols.iter().map(|c| c.name.clone()).collect();
+    assert_eq!(names, vec!["id", "name"]);
+    assert_eq!(align.cols[1].tgt_name, "NAME");
+    assert_eq!(
+        align.src_select(),
+        vec!["id".to_string(), "name".to_string()]
+    );
+    // No shared column name is refused rather than silently compared.
+    let other = vec![col_full("x", "int", false, None, None, false)];
+    assert!(build_positional_align(&src, &other, false).is_err());
+}
+
+#[test]
+pub(crate) fn data_positional_select_is_dialect_aware() {
+    let my = parse_database_type("mysql").unwrap();
+    let pg = parse_database_type("postgres").unwrap();
+    let cols = vec!["id".to_string(), "full name".to_string()];
+    let sql = build_positional_select(my, "", "orders", &cols, "status = 'active'", 500);
+    assert!(
+        sql.contains("SELECT `id`, `full name` FROM `orders`"),
+        "{sql}"
+    );
+    assert!(sql.contains("WHERE (status = 'active')"), "{sql}");
+    assert!(sql.ends_with("LIMIT 500"), "{sql}");
+    // Row-order compares never add an ORDER BY; the natural order is the key.
+    assert!(!sql.contains("ORDER BY"), "{sql}");
+    let sql = build_positional_select(pg, "public", "orders", &cols, "", 500);
+    assert!(sql.contains("FROM \"public\".\"orders\""), "{sql}");
+    assert!(!sql.contains("WHERE"), "{sql}");
+    assert!(sql.ends_with("LIMIT 500"), "{sql}");
+}
+
+#[test]
+pub(crate) fn data_positional_rows_use_row_order_keys() {
+    let src = vec![
+        col_full("id", "int", false, None, None, false),
+        col_full("name", "varchar(20)", true, None, None, false),
+    ];
+    let tgt = src.clone();
+    let align = build_positional_align(&src, &tgt, false).unwrap();
+    let s = vec![Val::Text("1".into()), Val::Text("a".into())];
+    let t = vec![Val::Text("1".into()), Val::Text("b".into())];
+    // Same position, different value → a `≠` row keyed by position.
+    let d = compare_positional_row(&align, 0, &s, &t).unwrap();
+    assert_eq!(d.mark, RowMark::Diff);
+    assert_eq!(d.key, "#1");
+    assert_eq!(d.cells.len(), 1);
+    assert_eq!(d.cells[0].col, "name");
+    // Identical rows at the same position produce no diff.
+    assert!(compare_positional_row(&align, 0, &s, &s).is_none());
+    // An only-source row is the 5th position (`#5`) and keeps the whole row.
+    let o = positional_only_row(&align, 4, &s, RowMark::OnlySrc);
+    assert_eq!(o.key, "#5");
+    assert_eq!(o.mark, RowMark::OnlySrc);
+    assert_eq!(o.vals.len(), 2);
+    assert!(o.pk_vals.is_empty());
+    // A row-order result refuses to emit a sync script (no unique key).
+    let dt = parse_database_type("sqlite").unwrap();
+    let cmp = DataCompare {
+        src_label: "a".into(),
+        tgt_label: "b".into(),
+        src_db_type: dt,
+        tgt_schema: String::new(),
+        tgt_table: "b".into(),
+        tgt_db_type: dt,
+        src_count: Some(2),
+        tgt_count: Some(2),
+        filter: String::new(),
+        align,
+        rows: vec![d],
+        only_src: 0,
+        only_tgt: 0,
+        differing: 1,
+        compared: 2,
+        positional: true,
+        truncated: false,
+        cancelled: false,
+    };
+    let sql = generate_data_sync(&cmp);
+    assert!(sql.contains("不生成同步语句"), "{sql}");
+}
+
+#[test]
+pub(crate) fn data_diff_csv_escapes_fields() {
+    let src = vec![
+        col_full("id", "int", false, None, None, true),
+        col_full("note", "text", true, None, None, false),
+    ];
+    let tgt = src.clone();
+    let align = data_align(src, tgt, &["id"], &["id"], false).unwrap();
+    let hostile = "a,b\"c\nd";
+    let diff = compare_data_row(
+        &align,
+        &[Val::Text("1".into()), Val::Text(hostile.into())],
+        &[Val::Text("1".into()), Val::Null],
+    )
+    .unwrap();
+    let only = only_data_row(
+        &align,
+        &[Val::Text("2".into()), Val::Text("x".into())],
+        RowMark::OnlySrc,
+    );
+    let dt = parse_database_type("mysql").unwrap();
+    let cmp = DataCompare {
+        src_label: "a".into(),
+        tgt_label: "b".into(),
+        src_db_type: dt,
+        tgt_schema: String::new(),
+        tgt_table: "b".into(),
+        tgt_db_type: dt,
+        src_count: Some(2),
+        tgt_count: Some(1),
+        filter: String::new(),
+        align,
+        rows: vec![diff, only],
+        only_src: 1,
+        only_tgt: 0,
+        differing: 1,
+        compared: 2,
+        positional: false,
+        truncated: false,
+        cancelled: false,
+    };
+    let csv = data_diff_csv(&cmp);
+    assert!(csv.starts_with("mark,key,column,source,target\n"), "{csv}");
+    // The comma / quote / newline value is quoted and its quotes doubled.
+    assert!(csv.contains("\"a,b\"\"c\nd\""), "{csv}");
+    // NULL renders as `NULL`; the missing target side is an empty field.
+    assert!(csv.contains("≠,1,note,"), "{csv}");
+    assert!(csv.contains(",NULL\n"), "{csv}");
+    // An only-source row lists every aligned column with an empty target.
+    assert!(csv.contains("<,2,id,2,"), "{csv}");
+    assert!(csv.contains("<,2,note,x,"), "{csv}");
+    assert_eq!(data_diff_csv_rows(&cmp), 3);
+}
+
+#[test]
+pub(crate) fn data_diff_key_np_navigates_and_y_exports() {
+    let mut app = test_app();
+    let mut list = ListState::default();
+    list.select(Some(0));
+    app.data_diff = Some(Box::new(DataDiffState {
+        result: data_cmp_fixture(),
+        tab: DataTab::Diff,
+        list,
+        scroll: 0,
+        sync_sql: String::new(),
+    }));
+    let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+    // The fixture has a single `≠` row, so n / p stay clamped at it.
+    data_diff_key(&mut app, &tx, KeyEvent::from(KeyCode::Char('n')));
+    assert_eq!(app.data_diff.as_ref().unwrap().list.selected(), Some(0));
+    data_diff_key(&mut app, &tx, KeyEvent::from(KeyCode::Char('p')));
+    assert_eq!(app.data_diff.as_ref().unwrap().list.selected(), Some(0));
+    // `Y` copies the difference CSV.
+    data_diff_key(&mut app, &tx, KeyEvent::from(KeyCode::Char('Y')));
+    assert!(app.status.contains("差异 CSV"), "{}", app.status);
+    // `Ctrl-E` writes the CSV to a temp file and reports its path.
+    data_diff_key(
+        &mut app,
+        &tx,
+        KeyEvent::new(KeyCode::Char('e'), KeyModifiers::CONTROL),
+    );
+    assert!(app.status.contains("已导出"), "{}", app.status);
+    assert!(app.status.contains("dbxt-diff-"), "{}", app.status);
+    let path = app.status.rsplit("到 ").next().unwrap().trim().to_string();
+    let text = std::fs::read_to_string(&path).unwrap();
+    assert!(text.starts_with("mark,key,column,source,target"), "{text}");
+    let _ = std::fs::remove_file(&path);
+    // The export path helper always lands a `.csv` in the temp dir.
+    let p = diff_export_path();
+    assert!(p.to_string_lossy().contains("dbxt-diff-"));
+    assert_eq!(p.extension().unwrap(), "csv");
 }
 
 // ── data transfer (Alt-T) ──

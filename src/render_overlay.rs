@@ -2051,6 +2051,9 @@ pub(crate) fn render_data_diff(f: &mut Frame, area: Rect, app: &mut App) {
     if cmp.cancelled {
         title.push_str(&format!(" · {} ", t("已中止")));
     }
+    if cmp.positional {
+        title.push_str(&format!(" · {} ", t("按行序对齐")));
+    }
     f.render_widget(Clear, area);
     let block = Block::default()
         .borders(Borders::ALL)
@@ -2064,7 +2067,7 @@ pub(crate) fn render_data_diff(f: &mut Frame, area: Rect, app: &mut App) {
     }
     let count = |v: Option<u64>| v.map(|n| n.to_string()).unwrap_or_else(|| "?".into());
     let summary = format!(
-        "{} {} · {} {} · {} {} · {} {} · {} {}",
+        "{} {} · {} {} · {} {} · {} {} · {} {} · {} {}",
         t("源"),
         count(cmp.src_count),
         t("目标"),
@@ -2075,6 +2078,8 @@ pub(crate) fn render_data_diff(f: &mut Frame, area: Rect, app: &mut App) {
         cmp.only_tgt,
         t("差异"),
         cmp.differing,
+        t("已比"),
+        cmp.compared,
     );
     // Header line: counts + filter.
     let header = if cmp.filter.trim().is_empty() {
@@ -2128,10 +2133,22 @@ pub(crate) fn render_data_diff(f: &mut Frame, area: Rect, app: &mut App) {
                 .join(", ");
             let mut lines = vec![
                 Line::from(Span::styled(
-                    t("按主键归一对齐，分块流式拉取（每块 1000 行）。"),
+                    if cmp.positional {
+                        t("按行序对齐（两侧都无主键，各取前 500 行）：逐行比对，不按键值配对。")
+                    } else {
+                        t("按主键归一对齐，分块流式拉取（每块 1000 行）。")
+                    },
                     Style::default().fg(Color::DarkGray),
                 )),
-                Line::from(Span::raw(format!("{}: {}", t("主键"), pk))),
+                Line::from(Span::raw(format!(
+                    "{}: {}",
+                    t("主键"),
+                    if cmp.positional {
+                        t("（无，按行序）").to_string()
+                    } else {
+                        pk
+                    }
+                ))),
                 Line::from(Span::raw(format!(
                     "{}: {}",
                     t("对比列"),

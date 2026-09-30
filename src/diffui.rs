@@ -1387,6 +1387,55 @@ pub(crate) fn copy_data_summary(app: &mut App) {
     }
 }
 
+/// R90 `Y`: copy every retained difference row as CSV (one line per differing
+/// cell; fields escaped). The plain-text `y` summary stays the ticket-friendly
+/// twin.
+pub(crate) fn copy_data_csv(app: &mut App) {
+    let Some(state) = app.data_diff.as_ref() else {
+        return;
+    };
+    let text = data_diff_csv(&state.result);
+    let rows = data_diff_csv_rows(&state.result);
+    match clipboard_copy(&text) {
+        Some(p) => {
+            app.status = tf(
+                "✓ 已复制差异 CSV（{} 行）· 兜底 {}",
+                &[&rows, &(p.display())],
+            )
+        }
+        None => app.status = tf("✓ 已复制差异 CSV（{} 行）· OSC52 剪贴板", &[&rows]),
+    }
+}
+
+/// R90 `Ctrl-E`: the export path — `dbxt-diff-<epoch-millis>.csv` in the system
+/// temp dir (usually `/tmp`). The millisecond stamp keeps two exports inside the
+/// same second apart.
+pub(crate) fn diff_export_path() -> PathBuf {
+    let ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis())
+        .unwrap_or(0);
+    std::env::temp_dir().join(format!("dbxt-diff-{ms}.csv"))
+}
+
+/// R90 `Ctrl-E`: write the difference CSV to a temp file and report its path.
+/// Unlike the clipboard (`Y`) this is a file the user can open in an editor or
+/// pipe elsewhere; it never touches the database.
+pub(crate) fn export_data_diff(app: &mut App) {
+    let Some(state) = app.data_diff.as_ref() else {
+        return;
+    };
+    let text = data_diff_csv(&state.result);
+    let rows = data_diff_csv_rows(&state.result);
+    let path = diff_export_path();
+    match std::fs::write(&path, text.as_bytes()) {
+        Ok(()) => {
+            app.status = tf("✓ 已导出差异 {} 行到 {}", &[&rows, &(path.display())]);
+        }
+        Err(e) => app.status = tf("✗ 导出失败: {}", &[&e]),
+    }
+}
+
 pub(crate) fn data_diff_key(app: &mut App, _tx: &Tx, k: KeyEvent) {
     match k.code {
         KeyCode::Esc | KeyCode::Char('q') => {
@@ -1394,6 +1443,10 @@ pub(crate) fn data_diff_key(app: &mut App, _tx: &Tx, k: KeyEvent) {
             app.flash(t("已关闭数据对比").into());
         }
         KeyCode::Char('y') => copy_data_summary(app),
+        // R90: `Y` exports the difference rows as CSV; `Ctrl-E` writes them to
+        // `/tmp/dbxt-diff-<ts>.csv` and reports the path.
+        KeyCode::Char('Y') => copy_data_csv(app),
+        KeyCode::Char('e') if k.modifiers.contains(KeyModifiers::CONTROL) => export_data_diff(app),
         KeyCode::Char('g') => {
             if let Some(state) = app.data_diff.as_mut() {
                 if state.sync_sql.is_empty() {
@@ -1416,8 +1469,10 @@ pub(crate) fn data_diff_key(app: &mut App, _tx: &Tx, k: KeyEvent) {
             }
         }
         KeyCode::Enter => open_data_row_popup(app),
-        KeyCode::Up | KeyCode::Char('k') => data_move(app, -1),
-        KeyCode::Down | KeyCode::Char('j') => data_move(app, 1),
+        // R90: `n` / `p` step to the next / previous difference row in the
+        // active tab (aliases of j / k, the gesture the spec names).
+        KeyCode::Up | KeyCode::Char('k') | KeyCode::Char('p') => data_move(app, -1),
+        KeyCode::Down | KeyCode::Char('j') | KeyCode::Char('n') => data_move(app, 1),
         KeyCode::PageUp => data_move(app, -10),
         KeyCode::PageDown => data_move(app, 10),
         KeyCode::Home => {

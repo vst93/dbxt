@@ -435,6 +435,11 @@ pub(crate) struct DataCompare {
     pub(crate) only_src: usize,
     pub(crate) only_tgt: usize,
     pub(crate) differing: usize,
+    /// Rows inspected (both sides): the `已比 N 行` half of the R90 status
+    /// summary.
+    pub(crate) compared: usize,
+    /// No primary key on either side: rows were aligned by position (R90).
+    pub(crate) positional: bool,
     /// The row cap was hit; `rows` holds only the first `DATA_MAX_DIFF_ROWS`.
     pub(crate) truncated: bool,
     /// The user aborted the compare; the rows found so far are kept.
@@ -1452,6 +1457,36 @@ pub(crate) fn build_data_align(
     })
 }
 
+/// Build the row-order aligned plan for two tables that have **no** primary
+/// key (R90): the name-intersection columns in source order, `pk_len = 0`.
+/// Every column is compared and rows are paired by position, so the caller
+/// must bound both sides with the same `LIMIT`.
+pub(crate) fn build_positional_align(
+    src_cols: &[ColumnInfo],
+    tgt_cols: &[ColumnInfo],
+    cross: bool,
+) -> Result<DataAlign, String> {
+    let mut used: HashSet<String> = HashSet::new();
+    let mut cols: Vec<DataCol> = Vec::new();
+    for sc in src_cols {
+        let Some(tc) = find_col(tgt_cols, &sc.name) else {
+            continue;
+        };
+        if !used.insert(col_key(&tc.name)) {
+            continue;
+        }
+        cols.push(make_data_col(sc, tc, cross));
+    }
+    if cols.is_empty() {
+        return Err(t("两表没有可对齐的列（列名交集为空）").into());
+    }
+    Ok(DataAlign {
+        cols,
+        pk_len: 0,
+        cross,
+    })
+}
+
 /// Canonical boolean for a value spelling, or `None` when it is not boolean-ish.
 pub(crate) fn norm_bool(s: &str) -> Option<bool> {
     match s.trim().to_ascii_lowercase().as_str() {
@@ -1601,6 +1636,37 @@ pub(crate) fn only_data_row(align: &DataAlign, row: &[Val], mark: RowMark) -> Da
     }
 }
 
+/// The `#N` label (1-based) a row-order compare uses in place of a primary key.
+pub(crate) fn positional_key(pos: usize) -> String {
+    format!("#{}", pos + 1)
+}
+
+/// Classify two rows paired by position in a row-order compare. The `#N` key
+/// replaces the (absent) primary key so the detail popup and the lists still
+/// name the row.
+pub(crate) fn compare_positional_row(
+    align: &DataAlign,
+    pos: usize,
+    src_row: &[Val],
+    tgt_row: &[Val],
+) -> Option<DataDiffRow> {
+    let mut row = compare_data_row(align, src_row, tgt_row)?;
+    row.key = positional_key(pos);
+    Some(row)
+}
+
+/// A `<` / `>` row for a row-order compare, keyed `#N`.
+pub(crate) fn positional_only_row(
+    align: &DataAlign,
+    pos: usize,
+    row: &[Val],
+    mark: RowMark,
+) -> DataDiffRow {
+    let mut r = only_data_row(align, row, mark);
+    r.key = positional_key(pos);
+    r
+}
+
 /// The decision for the current merge frontier of the chunked compare.
 #[derive(Debug)]
 pub(crate) enum MergeStep {
@@ -1714,6 +1780,31 @@ pub(crate) fn build_data_select(
     sql
 }
 
+/// A plain `SELECT … LIMIT n` used by the row-order (no-primary-key) compare.
+/// The engine's natural order defines the row sequence; the compare is
+/// positional, so the caller caps both sides at the same `limit`.
+pub(crate) fn build_positional_select(
+    db_type: DatabaseType,
+    schema: &str,
+    table: &str,
+    select_cols: &[String],
+    filter: &str,
+    limit: usize,
+) -> String {
+    let cols = select_cols
+        .iter()
+        .map(|c| quote_table_identifier(Some(db_type), c))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let mut sql = format!("SELECT {cols} FROM {}", table_ref(db_type, schema, table));
+    let filter = filter.trim();
+    if !filter.is_empty() {
+        sql.push_str(&format!(" WHERE ({filter})"));
+    }
+    sql.push_str(&format!(" LIMIT {limit}"));
+    sql
+}
+
 /// Chunks a `COUNT(*)` forecast, rounded up (0 rows → 0 chunks).
 pub(crate) fn chunk_ceil(rows: Option<u64>) -> usize {
     match rows {
@@ -1771,6 +1862,13 @@ pub(crate) fn generate_data_sync(cmp: &DataCompare) -> String {
         cmp.tgt_db_type.as_str()
     ));
     out.push_str(&format!("-- {}\n", t("方向：源 → 目标（只生成不执行）")));
+    if cmp.positional {
+        out.push_str(&format!(
+            "-- {}\n",
+            t("行序对齐（无主键）不生成同步语句：缺少唯一定位键")
+        ));
+        return out;
+    }
     if cmp.cross() {
         out.push_str(&format!(
             "-- {}\n",
@@ -1922,7 +2020,85 @@ pub(crate) fn data_diff_summary_text(cmp: &DataCompare) -> String {
     out
 }
 
-// ─── data transfer (Alt-T) ───────────────────────────────────────────────────
+/// R90: the one-line compare verdict shown in the status bar / overlay header:
+/// `差异 12 行 / 已比 500 行` (bilingual). `compared` counts the rows inspected
+/// on both sides, so it is the scale the user actually paid for.
+pub(crate) fn data_diff_status_line(cmp: &DataCompare) -> String {
+    if cmp.equal() {
+        return tf("差异 0 行 / 已比 {} 行", &[&cmp.compared]);
+    }
+    tf("差异 {} 行 / 已比 {} 行", &[&cmp.changed(), &cmp.compared])
+}
+
+/// R90 `Y` / `Ctrl-E`: the retained difference rows as CSV, one line per
+/// differing cell (`mark,key,column,source,target`). A `<` / `>` row lists
+/// every aligned column (the missing side is empty); a `≠` row lists only the
+/// columns that differ. Fields are RFC 4180 quoted, so a value with a comma, a
+/// quote or a newline survives the round trip.
+pub(crate) fn data_diff_csv(cmp: &DataCompare) -> String {
+    let mut out = String::from("mark,key,column,source,target\n");
+    for row in &cmp.rows {
+        match row.mark {
+            RowMark::Diff => {
+                for cell in &row.cells {
+                    out.push_str(&csv_diff_line(
+                        row.mark.sign(),
+                        &row.key,
+                        &cell.col,
+                        &value_display(&cell.src_val).0,
+                        &value_display(&cell.tgt_val).0,
+                    ));
+                }
+            }
+            RowMark::OnlySrc | RowMark::OnlyTgt => {
+                for (i, col) in cmp.align.cols.iter().enumerate() {
+                    let v = row.vals.get(i).cloned().unwrap_or(Val::Null);
+                    let shown = value_display(&v).0;
+                    let (src, tgt) = if row.mark == RowMark::OnlySrc {
+                        (shown.as_str(), "")
+                    } else {
+                        ("", shown.as_str())
+                    };
+                    out.push_str(&csv_diff_line(
+                        row.mark.sign(),
+                        &row.key,
+                        &col.name,
+                        src,
+                        tgt,
+                    ));
+                }
+            }
+        }
+    }
+    out
+}
+
+/// The number of CSV records [`data_diff_csv`] emits (header excluded). Counted
+/// from the structure, not by splitting the text: a quoted value may itself
+/// contain a newline.
+pub(crate) fn data_diff_csv_rows(cmp: &DataCompare) -> usize {
+    cmp.rows
+        .iter()
+        .map(|row| match row.mark {
+            RowMark::Diff => row.cells.len(),
+            RowMark::OnlySrc | RowMark::OnlyTgt => cmp.align.cols.len(),
+        })
+        .sum()
+}
+
+/// One `mark,key,column,source,target` CSV record with every field escaped.
+fn csv_diff_line(mark: &str, key: &str, col: &str, src: &str, tgt: &str) -> String {
+    format!(
+        "{},{},{},{},{}\n",
+        csv_field(mark),
+        csv_field(key),
+        csv_field(col),
+        csv_field(src),
+        csv_field(tgt)
+    )
+}
+
+// ─── data transfer (Alt-T) ───────────────────────────────────────
 //
 // Copies one table's structure and/or rows from the focused connection to
 // another SQL connection (possibly a different dialect). Like the diff

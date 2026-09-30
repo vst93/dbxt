@@ -127,6 +127,10 @@ const DATA_CHUNK: usize = 1000;
 /// counting (so the summary stays accurate) but stops storing rows; a bigger
 /// result should be exported and diffed, not shown in a terminal list.
 const DATA_MAX_DIFF_ROWS: usize = 5000;
+/// R90: rows read from each side of a row-order (no-primary-key) data compare.
+/// Positional align is only meaningful over a bounded read, so both sides are
+/// capped at this; the status line reports the compare as `已比 500 行`.
+const DATA_ROW_ORDER_LIMIT: usize = 500;
 /// A data compare is many sequential bounded queries, so the last-resort
 /// watchdog is generous (every statement still has its own driver timeout).
 const OP_WATCHDOG_DATA_DIFF: Duration = Duration::from_secs(900);
@@ -3222,14 +3226,30 @@ async fn run_data_diff(
     let src_pk = resolve_data_pk(backend, src_cfg, src_db, src_schema, src_table, &src_cols).await;
     let tgt_pk = resolve_data_pk(backend, tgt_cfg, tgt_db, tgt_schema, tgt_table, &tgt_cols).await;
     let cross = src_cfg.db_type != tgt_cfg.db_type;
-    let align = match build_data_align(&src_cols, &tgt_cols, &src_pk, &tgt_pk, cross) {
-        Ok(a) => a,
-        Err(reason) => return OpResult::Error(reason),
+    // R90: no primary key on either side → align by row order (positional).
+    let positional = src_pk.is_empty() && tgt_pk.is_empty();
+    let align = if positional {
+        match build_positional_align(&src_cols, &tgt_cols, cross) {
+            Ok(a) => a,
+            Err(reason) => return OpResult::Error(reason),
+        }
+    } else {
+        match build_data_align(&src_cols, &tgt_cols, &src_pk, &tgt_pk, cross) {
+            Ok(a) => a,
+            Err(reason) => return OpResult::Error(reason),
+        }
     };
     let filter = normalize_where_input(Some(where_input));
     // Forecast both sizes so the user can judge scale before the compare ends.
     let src_count = data_count(backend, src_cfg, src_db, src_schema, src_table, &filter).await;
     let tgt_count = data_count(backend, tgt_cfg, tgt_db, tgt_schema, tgt_table, &filter).await;
+    if positional {
+        return run_positional_data_diff(
+            backend, src_cfg, src_db, src_schema, src_table, tgt_cfg, tgt_db, tgt_schema,
+            tgt_table, align, filter, src_count, tgt_count, gen, cancel, tx,
+        )
+        .await;
+    }
 
     let src_select = align.src_select();
     let tgt_select = align.tgt_select();
@@ -3246,6 +3266,7 @@ async fn run_data_diff(
     let mut only_src = 0usize;
     let mut only_tgt = 0usize;
     let mut differing = 0usize;
+    let mut compared = 0usize;
     let mut truncated = false;
     let mut cancelled = false;
     let mut done = 0usize;
@@ -3330,16 +3351,19 @@ async fn run_data_diff(
             MergeStep::SrcOnly => {
                 let row = src_stream.buf.pop_front().unwrap();
                 only_src += 1;
+                compared += 1;
                 keep!(only_data_row(&align, &row, RowMark::OnlySrc));
             }
             MergeStep::TgtOnly => {
                 let row = tgt_stream.buf.pop_front().unwrap();
                 only_tgt += 1;
+                compared += 1;
                 keep!(only_data_row(&align, &row, RowMark::OnlyTgt));
             }
             MergeStep::Both(diff) => {
                 src_stream.buf.pop_front();
                 tgt_stream.buf.pop_front();
+                compared += 1;
                 if let Some(row) = diff {
                     differing += 1;
                     keep!(row);
@@ -3369,10 +3393,180 @@ async fn run_data_diff(
             only_src,
             only_tgt,
             differing,
+            compared,
+            positional: false,
             truncated,
             cancelled,
         }),
     }
+}
+
+/// R90: the row-order data compare for two tables that have no primary key.
+/// Both sides are read once, capped at [`DATA_ROW_ORDER_LIMIT`] rows, then
+/// paired position by position. Pure classification happens in
+/// [`compare_positional_row`] / [`positional_only_row`], so this worker only
+/// owns the two reads and the row cap.
+#[allow(clippy::too_many_arguments)]
+async fn run_positional_data_diff(
+    backend: &LocalBackend,
+    src_cfg: &ConnectionConfig,
+    src_db: &str,
+    src_schema: &str,
+    src_table: &str,
+    tgt_cfg: &ConnectionConfig,
+    tgt_db: &str,
+    tgt_schema: &str,
+    tgt_table: &str,
+    align: DataAlign,
+    filter: String,
+    src_count: Option<u64>,
+    tgt_count: Option<u64>,
+    gen: u64,
+    cancel: &AtomicBool,
+    _tx: &Tx,
+) -> OpResult {
+    if cancel.load(Ordering::Relaxed) {
+        return OpResult::DataDiffDone {
+            gen,
+            result: Box::new(DataCompare {
+                src_label: data_table_label(src_db, src_schema, src_table),
+                tgt_label: data_table_label(tgt_db, tgt_schema, tgt_table),
+                src_db_type: src_cfg.db_type,
+                tgt_schema: tgt_schema.to_string(),
+                tgt_table: tgt_table.to_string(),
+                tgt_db_type: tgt_cfg.db_type,
+                src_count,
+                tgt_count,
+                filter,
+                align,
+                rows: Vec::new(),
+                only_src: 0,
+                only_tgt: 0,
+                differing: 0,
+                compared: 0,
+                positional: true,
+                truncated: false,
+                cancelled: true,
+            }),
+        };
+    }
+    let src_select = align.src_select();
+    let tgt_select = align.tgt_select();
+    let src_rows = match positional_fetch(
+        backend,
+        src_cfg,
+        src_db,
+        src_schema,
+        src_table,
+        &src_select,
+        &filter,
+    )
+    .await
+    {
+        Ok(r) => r,
+        Err(e) => return OpResult::Error(format!("data diff source: {e}")),
+    };
+    let tgt_rows = match positional_fetch(
+        backend,
+        tgt_cfg,
+        tgt_db,
+        tgt_schema,
+        tgt_table,
+        &tgt_select,
+        &filter,
+    )
+    .await
+    {
+        Ok(r) => r,
+        Err(e) => return OpResult::Error(format!("data diff target: {e}")),
+    };
+    let n = src_rows.len().max(tgt_rows.len());
+    let mut rows: Vec<DataDiffRow> = Vec::new();
+    let (mut only_src, mut only_tgt, mut differing) = (0usize, 0usize, 0usize);
+    let mut truncated = false;
+    for pos in 0..n {
+        match (src_rows.get(pos), tgt_rows.get(pos)) {
+            (Some(s), Some(t)) => {
+                if let Some(row) = compare_positional_row(&align, pos, s, t) {
+                    differing += 1;
+                    if rows.len() < DATA_MAX_DIFF_ROWS {
+                        rows.push(row);
+                    } else {
+                        truncated = true;
+                    }
+                }
+            }
+            (Some(s), None) => {
+                only_src += 1;
+                let row = positional_only_row(&align, pos, s, RowMark::OnlySrc);
+                if rows.len() < DATA_MAX_DIFF_ROWS {
+                    rows.push(row);
+                } else {
+                    truncated = true;
+                }
+            }
+            (None, Some(t)) => {
+                only_tgt += 1;
+                let row = positional_only_row(&align, pos, t, RowMark::OnlyTgt);
+                if rows.len() < DATA_MAX_DIFF_ROWS {
+                    rows.push(row);
+                } else {
+                    truncated = true;
+                }
+            }
+            (None, None) => {}
+        }
+    }
+    OpResult::DataDiffDone {
+        gen,
+        result: Box::new(DataCompare {
+            src_label: data_table_label(src_db, src_schema, src_table),
+            tgt_label: data_table_label(tgt_db, tgt_schema, tgt_table),
+            src_db_type: src_cfg.db_type,
+            tgt_schema: tgt_schema.to_string(),
+            tgt_table: tgt_table.to_string(),
+            tgt_db_type: tgt_cfg.db_type,
+            src_count,
+            tgt_count,
+            filter,
+            align,
+            rows,
+            only_src,
+            only_tgt,
+            differing,
+            compared: n,
+            positional: true,
+            truncated,
+            cancelled: false,
+        }),
+    }
+}
+
+/// Read up to [`DATA_ROW_ORDER_LIMIT`] rows in the engine's natural order.
+async fn positional_fetch(
+    backend: &LocalBackend,
+    cfg: &ConnectionConfig,
+    db: &str,
+    schema: &str,
+    table: &str,
+    select: &[String],
+    filter: &str,
+) -> Result<Vec<Vec<Val>>, String> {
+    let sql = build_positional_select(
+        cfg.db_type,
+        schema,
+        table,
+        select,
+        filter,
+        DATA_ROW_ORDER_LIMIT,
+    );
+    let r = backend
+        .execute_query(cfg, db, &sql, Some(DATA_ROW_ORDER_LIMIT), Some(60))
+        .await?;
+    Ok(r.rows
+        .iter()
+        .map(|row| row.iter().map(value_to_val).collect())
+        .collect())
 }
 
 // ── data transfer worker ──
@@ -6286,12 +6480,8 @@ fn apply_op_result(app: &mut App, res: OpResult, tx: &Tx) {
                 p.loading = false;
             }
             app.diff_picker = None;
-            let only_src = result.only_src;
-            let only_tgt = result.only_tgt;
-            let differing = result.differing;
             let cancelled = result.cancelled;
             let truncated = result.truncated;
-            let equal = result.equal();
             let src = result.src_label.clone();
             let tgt = result.tgt_label.clone();
             let mut state = DataDiffState {
@@ -6304,6 +6494,7 @@ fn apply_op_result(app: &mut App, res: OpResult, tx: &Tx) {
             if data_tab_rows(&state) > 0 {
                 state.list.select(Some(0));
             }
+            let verdict = data_diff_status_line(&state.result);
             app.data_diff = Some(Box::new(state));
             let tail = if truncated {
                 tf(" · ⚠ 已截断（仅前 {} 行）", &[&DATA_MAX_DIFF_ROWS])
@@ -6315,17 +6506,10 @@ fn apply_op_result(app: &mut App, res: OpResult, tx: &Tx) {
             } else {
                 String::new()
             };
-            app.status = if equal {
-                tf(
-                    "数据对比 {} → {} · {} · Tab 切换 · Esc 关{}{}",
-                    &[&src, &tgt, &t("数据一致"), &tail, &stop],
-                )
-            } else {
-                tf(
-                    "数据对比 {} → {} · 仅源 {} · 仅目标 {} · 差异 {}{}{} · Enter 详情 · y 摘要 · g 同步 SQL",
-                    &[&src, &tgt, &only_src, &only_tgt, &differing, &tail, &stop],
-                )
-            };
+            app.status = tf(
+                "数据对比 {} → {} · {} · Tab 切换 · Esc 关{}{}",
+                &[&src, &tgt, &verdict, &tail, &stop],
+            );
         }
         OpResult::TransferNeedsConfirm { gen, estimated } => {
             if gen != app.transfer_gen {

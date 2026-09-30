@@ -4564,6 +4564,8 @@ pub(crate) fn data_literal_handles_arrays_and_binary_like_the_insert_path() {
         only_src: 0,
         only_tgt: 0,
         differing: 1,
+        compared: 1,
+        positional: false,
         truncated: false,
         cancelled: false,
     };

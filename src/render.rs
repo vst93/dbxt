@@ -1101,9 +1101,10 @@ pub(crate) fn footer_hints_ctx(ctx: FooterCtx) -> Vec<Hint> {
         FooterView::DataDiff => vec![
             ("Tab", t("切换")),
             ("Enter", t("展开")),
-            ("y", t("摘要")),
+            ("n/p", t("差异行")),
+            ("y/Y", t("摘要/CSV")),
+            ("^E", t("导出")),
             ("g", t("同步 SQL")),
-            ("↑↓", t("滚动")),
             ("Esc", t("关闭")),
         ],
         FooterView::DataWhere => vec![("Enter", t("开始对比")), ("Esc", t("取消"))],
