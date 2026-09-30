@@ -6,13 +6,17 @@ pub(crate) fn preview_key(app: &mut App, tx: &Tx, k: KeyEvent) {
     // delete-row key, so only `Ctrl-U` fires here (see `half_page_key`). Handled
     // before the per-grid keymaps so the SQL / Redis / Mongo grids share the one
     // rule, and `Ctrl-D` still reaches each grid's own delete untouched.
-    if let Some(dir) = half_page_key(
-        Focus::Preview,
-        k.modifiers.contains(KeyModifiers::CONTROL),
-        k.code,
-    ) {
-        half_screen_move(app, tx, if dir == HalfPage::Down { 1 } else { -1 });
-        return;
+    // R95: row-select mode owns `Ctrl-U` (batch set-value), so the half-page
+    // motion yields to the selection just like `Ctrl-D` yields to delete-row.
+    if app.row_sel_anchor.is_none() {
+        if let Some(dir) = half_page_key(
+            Focus::Preview,
+            k.modifiers.contains(KeyModifiers::CONTROL),
+            k.code,
+        ) {
+            half_screen_move(app, tx, if dir == HalfPage::Down { 1 } else { -1 });
+            return;
+        }
     }
     // A Redis value / Mongo document grid has its own keymap (edit, delete, TTL,
     // rename, JSON filter) that must not fall through to the SQL row actions.

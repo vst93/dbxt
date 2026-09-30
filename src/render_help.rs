@@ -890,6 +890,160 @@ pub(crate) fn render_edit_dialog(f: &mut Frame, area: Rect, app: &mut App) {
                 .border_style(Style::default().fg(Color::Green));
             f.render_widget(Paragraph::new(lines).block(block), box_area);
         }
+        EditKind::BatchSet => {
+            let mut header_lines: Vec<Line> = Vec::new();
+            header_lines.push(Line::from(vec![
+                Span::styled(t("列   "), Style::default().fg(Color::DarkGray)),
+                Span::styled(
+                    d.column.clone(),
+                    Style::default()
+                        .fg(Color::Cyan)
+                        .add_modifier(Modifier::BOLD),
+                ),
+                Span::styled(
+                    format!("  {}", d.data_type.clone().unwrap_or_else(|| "?".into())),
+                    Style::default().fg(Color::DarkGray),
+                ),
+            ]));
+            header_lines.push(Line::from(vec![
+                Span::styled(t("影响 "), Style::default().fg(Color::DarkGray)),
+                Span::styled(
+                    tf("{} 行", &[&d.batch_count]),
+                    Style::default().fg(Color::Green),
+                ),
+                Span::styled(t(" · 主键 "), Style::default().fg(Color::DarkGray)),
+                Span::styled(
+                    truncate_disp(
+                        &d.keys
+                            .iter()
+                            .map(|k| fix_double_encoding(k))
+                            .collect::<Vec<_>>()
+                            .join(", "),
+                        inner_w.saturating_sub(16),
+                    ),
+                    Style::default().fg(Color::Cyan),
+                ),
+            ]));
+            if d.batch_selected > d.batch_count {
+                header_lines.push(Line::from(Span::styled(
+                    tf(
+                        "⚠ 已选 {} 行超过上限 {}，仅更新前 {} 行",
+                        &[&d.batch_selected, &BATCH_SET_MAX_ROWS, &d.batch_count],
+                    ),
+                    Style::default().fg(Color::Yellow),
+                )));
+            }
+            header_lines.push(Line::from(vec![
+                Span::styled("WHERE ", Style::default().fg(Color::DarkGray)),
+                Span::styled(
+                    truncate_disp(&one_line(&d.where_clause), inner_w.saturating_sub(6)),
+                    Style::default().fg(Color::Gray),
+                ),
+            ]));
+            if !d.hist.is_empty() {
+                header_lines.push(Line::from(Span::styled(
+                    tf("模板 ↑↓ 取用 · Del 清除（{} 条）", &[&(d.hist.len())]),
+                    Style::default().fg(Color::DarkGray),
+                )));
+                for (i, v) in d.hist.iter().enumerate() {
+                    let sel = d.hist_idx == Some(i);
+                    header_lines.push(Line::from(Span::styled(
+                        format!(
+                            "  {}{} ",
+                            if sel { "▸" } else { " " },
+                            truncate_disp(v, inner_w.saturating_sub(4))
+                        ),
+                        if sel {
+                            Style::default()
+                                .fg(Color::Black)
+                                .bg(Color::Cyan)
+                                .add_modifier(Modifier::BOLD)
+                        } else {
+                            Style::default().fg(Color::DarkGray)
+                        },
+                    )));
+                }
+            }
+            header_lines.push(Line::from(""));
+            header_lines.push(Line::from(Span::styled(
+                t("生成的 SQL（Enter 确认）"),
+                Style::default().fg(Color::DarkGray),
+            )));
+            for l in wrap_sql_lines(&d.set_value_sql(), inner_w.saturating_sub(2)) {
+                header_lines.push(Line::from(Span::styled(
+                    l,
+                    Style::default().fg(Color::White),
+                )));
+            }
+            let header_h = header_lines.len() as u16;
+            let h = (header_h + 3 + 1 + 2).min(area.height);
+            let box_area = centered_overlay(area, w, h);
+            f.render_widget(Clear, box_area);
+            let block = Block::default()
+                .borders(Borders::ALL)
+                .title(Span::styled(
+                    tf(
+                        " ⌗ 批量置值 {}.{} ",
+                        &[
+                            &(fix_double_encoding(&d.db)),
+                            &(fix_double_encoding(&qualified_display(&d.schema, &d.table))),
+                        ],
+                    ),
+                    Style::default()
+                        .fg(Color::Cyan)
+                        .add_modifier(Modifier::BOLD),
+                ))
+                .border_set(border::THICK)
+                .border_style(Style::default().fg(Color::Cyan));
+            let inner = block.inner(box_area);
+            f.render_widget(block, box_area);
+            let max_header = inner.height.saturating_sub(3 + 1) as usize;
+            let shown: Vec<Line> = header_lines.iter().take(max_header).cloned().collect();
+            let shown_h = shown.len() as u16;
+            let hdr_area = Rect {
+                x: inner.x,
+                y: inner.y,
+                width: inner.width,
+                height: shown_h.min(inner.height),
+            };
+            f.render_widget(Paragraph::new(shown), hdr_area);
+            let ta_y = inner.y + shown_h;
+            let ta_h = 3.min((inner.y + inner.height).saturating_sub(ta_y));
+            if ta_h > 0 {
+                let ta_area = Rect {
+                    x: inner.x,
+                    y: ta_y,
+                    width: inner.width,
+                    height: ta_h,
+                };
+                if let Some(dd) = app.edit_dialog.as_mut() {
+                    let b = Block::default()
+                        .borders(Borders::ALL)
+                        .title(t(" 新值 · Enter 确认 "))
+                        .border_set(border::ROUNDED)
+                        .border_style(Style::default().fg(Color::Green));
+                    dd.new_input.set_block(b);
+                    f.render_widget(&dd.new_input, ta_area);
+                }
+            }
+            let hint_y = ta_y + ta_h;
+            if hint_y < inner.y + inner.height {
+                let hint_area = Rect {
+                    x: inner.x,
+                    y: hint_y,
+                    width: inner.width,
+                    height: 1,
+                };
+                f.render_widget(
+                    Paragraph::new(truncate_disp(
+                        t("Enter 确认 · Esc 取消 · ↑↓ 历史 · Del 清除 · Ctrl-V 转编辑器"),
+                        inner_w,
+                    ))
+                    .style(Style::default().fg(Color::DarkGray)),
+                    hint_area,
+                );
+            }
+        }
     }
 }
 
@@ -1410,7 +1564,11 @@ pub(crate) const HELP_ROWS: &[(&str, &str)] = &[
     ("Y", "复制当前单元格值（状态栏显示列名与字符数）"),
     (
         "V",
-        "行选模式：↑↓ 移动 · Shift+↑↓ / v 扩展 · Ctrl-A 全选本页 · Y 复制 TSV（含列头）· d 生成 DELETE · c 生成 UPDATE 模板 · Esc 退出；d/c 只把语句送进编辑器，绝不执行",
+        "行选模式：↑↓ 移动 · Shift+↑↓ / v 扩展 · Ctrl-A 全选本页 · Ctrl-U 批量置值 · Y 复制 TSV（含列头）· d 生成 DELETE · c 生成 UPDATE 模板 · Esc 退出；d/c 只把语句送进编辑器，绝不执行",
+    ),
+    (
+        "Ctrl-U",
+        "行选模式下批量置值：把选中行的当前列设为同一个值，生成单条 UPDATE … SET 列 = 值 WHERE 主键 IN (…)；先弹出值输入条（留空 = NULL、'文本' 强制字符串、按列类型包装），Enter 再走红色确认层并在确认层显示影响行数，确认后才执行；只读连接在输入前即被拦截。↑↓ 取用该表该列最近 3 个置值模板，Del 清除；单个语句最多 200 行，超出部分会截断并在语句与确认层提示",
     ),
     (
         "/",

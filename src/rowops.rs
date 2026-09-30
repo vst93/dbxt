@@ -1440,6 +1440,14 @@ pub(crate) fn batch_target(app: &App) -> Option<BatchTarget> {
 /// dbxt never runs it.
 pub(crate) fn batch_delete_sql(t: &BatchTarget, rows: &[Vec<Val>]) -> String {
     let table = table_ref(t.db_type, &t.schema, &t.table);
+    format!("DELETE FROM {table}\nWHERE {};", key_where_body(t, rows))
+}
+
+/// R95: the `WHERE` body that names the selected rows — `pk IN (…)` for a
+/// single-column key, a portable `(k1 = … AND k2 = …) OR (…)` chain for a
+/// composite one. Shared by batch `DELETE` and the batch set-value `UPDATE` so
+/// both key a selection exactly the same way.
+pub(crate) fn key_where_body(t: &BatchTarget, rows: &[Vec<Val>]) -> String {
     if t.pks.len() == 1 {
         let pk = &t.pks[0];
         let vals = rows
@@ -1452,13 +1460,12 @@ pub(crate) fn batch_delete_sql(t: &BatchTarget, rows: &[Vec<Val>]) -> String {
             .collect::<Vec<_>>()
             .join(", ");
         return format!(
-            "DELETE FROM {table}\nWHERE {} IN ({});",
+            "{} IN ({})",
             quote_table_identifier(Some(t.db_type), pk),
             vals
         );
     }
-    let clauses = rows
-        .iter()
+    rows.iter()
         .filter_map(|r| {
             let parts = t
                 .pks
@@ -1468,8 +1475,74 @@ pub(crate) fn batch_delete_sql(t: &BatchTarget, rows: &[Vec<Val>]) -> String {
             (!parts.is_empty()).then(|| format!("({})", parts.join(" AND ")))
         })
         .collect::<Vec<_>>()
-        .join("\n   OR ");
-    format!("DELETE FROM {table}\nWHERE {clauses};")
+        .join("\n   OR ")
+}
+
+/// R95: how many selected rows a single batch set-value `UPDATE` may name. A
+/// larger selection is truncated to the first cap rows (with a comment in the
+/// statement and a warning in the confirmation layer) rather than silently
+/// walking into a very long `IN (…)` list.
+pub(crate) const BATCH_SET_MAX_ROWS: usize = 200;
+
+/// R95 `Ctrl-U`: one `UPDATE t SET col = <value> WHERE <key> IN (…)` for the
+/// selected rows, with the value wrapped for the target column's type. A
+/// selection past [`BATCH_SET_MAX_ROWS`] is truncated, and a trailing comment
+/// says so. Pure text — the caller routes the statement through the red
+/// confirmation layer. The live prompt builds the same shape via
+/// [`build_set_value_sql`] from its already-truncated `WHERE` body.
+#[cfg(test)]
+pub(crate) fn batch_set_value_sql(
+    t: &BatchTarget,
+    rows: &[Vec<Val>],
+    column: &str,
+    input: &str,
+) -> String {
+    let capped = &rows[..rows.len().min(BATCH_SET_MAX_ROWS)];
+    let data_type = t
+        .col_index(column)
+        .and_then(|ci| t.types.get(ci).and_then(|x| x.as_deref()));
+    let truncated = (rows.len() > capped.len()).then_some((rows.len(), capped.len()));
+    build_set_value_sql(
+        t.db_type,
+        &t.schema,
+        &t.table,
+        column,
+        data_type,
+        input,
+        &key_where_body(t, capped),
+        truncated,
+    )
+}
+
+/// R95: the low-level builder shared by [`batch_set_value_sql`] and the value
+/// prompt (which already holds the truncated `WHERE` body). `truncated` is
+/// `Some((selected, capped))` when the selection outran the cap.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn build_set_value_sql(
+    db_type: DatabaseType,
+    schema: &str,
+    table: &str,
+    column: &str,
+    data_type: Option<&str>,
+    input: &str,
+    where_body: &str,
+    truncated: Option<(usize, usize)>,
+) -> String {
+    let mut sql = format!(
+        "UPDATE {}\nSET {} = {}\nWHERE {};",
+        table_ref(db_type, schema, table),
+        quote_table_identifier(Some(db_type), column),
+        new_value_literal(input, data_type),
+        where_body
+    );
+    if let Some((selected, capped)) = truncated {
+        sql.push('\n');
+        sql.push_str(&tf(
+            "-- ⚠ 已选择 {} 行，超过上限 {}，仅更新前 {} 行",
+            &[&selected, &BATCH_SET_MAX_ROWS, &capped],
+        ));
+    }
+    sql
 }
 
 /// R57 `c`: an `UPDATE … SET <every non-key column> = <current value> WHERE
@@ -1544,7 +1617,7 @@ pub(crate) fn row_select_status(app: &App) -> String {
     };
     let (lo, hi) = (anchor.min(app.sel), anchor.max(app.sel));
     tf(
-        "行选 {}-{}（{} 行）· Ctrl-A 全选 · ↑↓ 移动 · Shift+↑↓ / v 扩展 · Y 复制 · d 删除语句 · c 更新模板 · Esc 退出",
+        "行选 {}-{}（{} 行）· Ctrl-A 全选 · Ctrl-U 置值 · ↑↓ 移动 · Shift+↑↓ / v 扩展 · Y 复制 · d 删除语句 · c 更新模板 · Esc 退出",
         &[&(lo + 1), &(hi + 1), &(hi - lo + 1)],
     )
 }
@@ -1575,6 +1648,17 @@ pub(crate) fn row_select_key(app: &mut App, tx: &Tx, k: KeyEvent) -> bool {
         && k.code == KeyCode::Char('a')
     {
         row_select_all(app);
+        return true;
+    }
+    // R95: `Ctrl-U` sets the focused column to one value on every selected row
+    // (the value prompt then the red confirmation layer). The results grid keeps
+    // `Ctrl-U` = half-page up outside row-select mode, exactly like `Ctrl-A`
+    // yields to select-all inside it.
+    if k.modifiers.contains(KeyModifiers::CONTROL)
+        && !k.modifiers.contains(KeyModifiers::ALT)
+        && k.code == KeyCode::Char('u')
+    {
+        open_set_value(app);
         return true;
     }
     if k.modifiers.contains(KeyModifiers::CONTROL) || k.modifiers.contains(KeyModifiers::ALT) {
@@ -1800,7 +1884,31 @@ impl EditDialog {
         match self.kind {
             EditKind::Update => self.update_sql(),
             EditKind::Insert => self.insert_sql.clone(),
+            EditKind::BatchSet => self.set_value_sql(),
         }
+    }
+
+    /// R95: the value literal for the batch set-value prompt, wrapped for the
+    /// target column's declared type (numeric bare, text quoted / NULL).
+    pub(crate) fn set_value_literal(&self) -> String {
+        new_value_literal(&self.new_input.lines().join(" "), self.data_type.as_deref())
+    }
+
+    /// R95: the one-statement `UPDATE … SET col = <value> WHERE …;` shown live
+    /// in the value prompt. `where_clause` holds the truncated `WHERE` body.
+    pub(crate) fn set_value_sql(&self) -> String {
+        let truncated = (self.batch_selected > self.batch_count)
+            .then_some((self.batch_selected, self.batch_count));
+        build_set_value_sql(
+            self.cfg.db_type,
+            &self.schema,
+            &self.table,
+            &self.column,
+            self.data_type.as_deref(),
+            &self.new_input.lines().join(" "),
+            &self.where_clause,
+            truncated,
+        )
     }
 }
 
@@ -1966,6 +2074,11 @@ pub(crate) fn edit_cell(app: &mut App) {
         no_pk,
         insert_sql: String::new(),
         insert_preview: Vec::new(),
+        batch_count: 0,
+        batch_selected: 0,
+        hist: Vec::new(),
+        hist_idx: None,
+        hist_draft: String::new(),
     });
     app.status = tf(
         "编辑 {} → Enter 确认执行 · Esc 取消 · Ctrl-V 转编辑器 · Ctrl-T 加入批量",
@@ -2041,6 +2154,11 @@ pub(crate) fn quick_insert(app: &mut App) {
         no_pk: false,
         insert_sql: sql,
         insert_preview: preview,
+        batch_count: 0,
+        batch_selected: 0,
+        hist: Vec::new(),
+        hist_idx: None,
+        hist_draft: String::new(),
     });
     app.status = tf(
         "插入 {} → Enter 确认执行 · Esc 取消 · Ctrl-V 转编辑器 · Ctrl-T 加入批量",
@@ -2057,14 +2175,26 @@ pub(crate) fn edit_dialog_key(app: &mut App, tx: &Tx, k: KeyEvent) {
     let ctrl = k.modifiers.contains(KeyModifiers::CONTROL);
     let plain = k.modifiers.is_empty();
     let insert = d.kind == EditKind::Insert;
+    let batch = d.kind == EditKind::BatchSet;
     let to_editor =
         ctrl && k.code == KeyCode::Char('v') || (insert && plain && k.code == KeyCode::Char('v'));
     let to_batch =
         ctrl && k.code == KeyCode::Char('t') || (insert && plain && k.code == KeyCode::Char('b'));
     if k.code == KeyCode::Esc {
-        app.flash(t("已取消编辑").into());
+        app.flash(
+            if batch {
+                t("已取消置值")
+            } else {
+                t("已取消编辑")
+            }
+            .into(),
+        );
     } else if k.code == KeyCode::Enter {
-        submit_edit_sql(app, tx, d.sql());
+        if batch {
+            submit_batch_set(app, d);
+        } else {
+            submit_edit_sql(app, tx, d.sql());
+        }
     } else if to_editor {
         let sql = d.sql();
         app.set_editor_text(&sql);
@@ -2077,12 +2207,209 @@ pub(crate) fn edit_dialog_key(app: &mut App, tx: &Tx, k: KeyEvent) {
             "已加入批量队列（{} 条）· Ctrl-S 打包提交 · Ctrl-X 清空",
             &[&(app.batch.len())],
         );
+    } else if batch && plain && k.code == KeyCode::Up {
+        batch_hist_step(&mut d, true);
+        app.edit_dialog = Some(d);
+    } else if batch && plain && k.code == KeyCode::Down {
+        batch_hist_step(&mut d, false);
+        app.edit_dialog = Some(d);
+    } else if batch && k.code == KeyCode::Delete && !d.hist.is_empty() {
+        batch_hist_delete(app, &mut d);
+        app.edit_dialog = Some(d);
     } else {
-        if d.kind == EditKind::Update {
+        if matches!(d.kind, EditKind::Update | EditKind::BatchSet) {
+            // Typing leaves history navigation and edits the user's own draft.
+            if batch {
+                d.hist_idx = None;
+            }
             d.new_input.input(k);
         }
         app.edit_dialog = Some(d);
     }
+}
+
+/// R95: replace the value prompt's single-line input.
+fn set_dialog_input(d: &mut EditDialog, text: &str) {
+    d.new_input = TextArea::from(text.split('\n').collect::<Vec<_>>());
+    d.new_input.move_cursor(CursorMove::End);
+}
+
+/// R95: step through the remembered set-value templates (`↑` older, `↓` newer).
+/// The user's own draft is stashed on the first `↑` and restored on the way
+/// back past the newest entry.
+fn batch_hist_step(d: &mut EditDialog, up: bool) {
+    if d.hist.is_empty() {
+        return;
+    }
+    match (up, d.hist_idx) {
+        (true, None) => {
+            d.hist_draft = d.new_input.lines().join(" ");
+            d.hist_idx = Some(0);
+        }
+        (true, Some(i)) => d.hist_idx = Some((i + 1).min(d.hist.len() - 1)),
+        (false, Some(0)) => d.hist_idx = None,
+        (false, Some(i)) => d.hist_idx = Some(i - 1),
+        (false, None) => {}
+    }
+    let text = match d.hist_idx {
+        Some(i) => d.hist.get(i).cloned().unwrap_or_default(),
+        None => std::mem::take(&mut d.hist_draft),
+    };
+    set_dialog_input(d, &text);
+}
+
+/// R95: `Del` — drop the highlighted template, or the column's whole set-value
+/// memory when nothing is highlighted.
+fn batch_hist_delete(app: &mut App, d: &mut EditDialog) {
+    let conn = d.cfg.id.clone();
+    let (db, schema, table, col) = (
+        d.db.clone(),
+        d.schema.clone(),
+        d.table.clone(),
+        d.column.clone(),
+    );
+    match d.hist_idx {
+        Some(i) if i < d.hist.len() => {
+            let value = d.hist.remove(i);
+            if app
+                .config
+                .remove_set_value(&conn, &db, &schema, &table, &col, &value)
+            {
+                app.persist();
+            }
+            d.hist_idx = if d.hist.is_empty() {
+                None
+            } else {
+                Some(i.min(d.hist.len() - 1))
+            };
+            app.status = tf("已清除模板「{}」", &[&value]);
+        }
+        _ => {
+            let n = app
+                .config
+                .clear_set_values(&conn, &db, &schema, &table, &col);
+            if n > 0 {
+                app.persist();
+            }
+            d.hist.clear();
+            d.hist_idx = None;
+            app.status = tf("已清除该列 {} 条置值模板", &[&n]);
+        }
+    }
+    let text = match d.hist_idx {
+        Some(i) => d.hist.get(i).cloned().unwrap_or_default(),
+        None => String::new(),
+    };
+    set_dialog_input(d, &text);
+}
+
+/// R95 `Ctrl-U` (row-select mode): open the batch set-value prompt for the
+/// focused column. The generated `UPDATE … SET col = <value> WHERE key IN (…)`
+/// is previewed live and only runs after the red confirmation layer.
+pub(crate) fn open_set_value(app: &mut App) {
+    if readonly_conn_block(app) {
+        return;
+    }
+    let Some(bt) = batch_target(app) else {
+        app.row_sel_anchor = None;
+        app.status = t("无主键，跳过（表达式 / 聚合 / 无主键结果不支持批量置值）").into();
+        return;
+    };
+    let Some(col) = active_grid(app).and_then(|g| g.columns.get(app.col_cursor).cloned()) else {
+        app.status = t("没有可置值的列").into();
+        return;
+    };
+    if bt.col_index(&col).is_none() {
+        app.status = t("该列不在结果中，无法批量置值").into();
+        return;
+    }
+    let rows = selected_full_rows(app);
+    if rows.is_empty() {
+        app.status = t("没有可操作的行").into();
+        return;
+    }
+    let capped = rows.len().min(BATCH_SET_MAX_ROWS);
+    let where_body = key_where_body(&bt, &rows[..capped]);
+    let data_type = column_type(app, &bt.schema, &bt.table, &col);
+    let Some(cfg) = app.selected.clone() else {
+        return;
+    };
+    let conn = cfg.id.clone();
+    let db = app.current_db();
+    let hist = app
+        .config
+        .set_value_history(&conn, &db, &bt.schema, &bt.table, &col);
+    let mut ta = TextArea::default();
+    ta.set_placeholder_text(t("留空 = NULL · '文本' = 字符串 · ↑↓ 历史"));
+    app.edit_dialog = Some(EditDialog {
+        kind: EditKind::BatchSet,
+        cfg: Box::new(cfg),
+        db,
+        schema: bt.schema.clone(),
+        table: bt.table.clone(),
+        column: col.clone(),
+        data_type,
+        old: Val::Null,
+        new_input: ta,
+        where_clause: where_body,
+        keys: bt.pks.clone(),
+        no_pk: false,
+        insert_sql: String::new(),
+        insert_preview: Vec::new(),
+        batch_count: capped,
+        batch_selected: rows.len(),
+        hist,
+        hist_idx: None,
+        hist_draft: String::new(),
+    });
+    app.status = tf(
+        "批量置值 {}.{}（{} 行）· 输入新值 · Enter 确认 · Esc 取消",
+        &[&(bt.table), &col, &capped],
+    );
+}
+
+/// R95: `Enter` in the value prompt — build the `UPDATE` and hand it to the red
+/// confirmation layer (never executed here). The typed value is remembered as a
+/// template for this column.
+pub(crate) fn submit_batch_set(app: &mut App, d: EditDialog) {
+    let sql = d.sql();
+    if readonly_block(app, &sql) {
+        return;
+    }
+    app.pending_scope = None;
+    let value = d.new_input.lines().join(" ");
+    let conn = d.cfg.id.clone();
+    app.config
+        .push_set_value(&conn, &d.db, &d.schema, &d.table, &d.column, &value);
+    app.persist();
+    app.row_sel_anchor = None;
+    let literal = d.set_value_literal();
+    let mut reasons = vec![
+        tf(
+            "将把 {} 行「{}」设为 {}",
+            &[&d.batch_count, &d.column, &literal],
+        ),
+        t("UPDATE 不可撤销，Enter 后立即执行").into(),
+    ];
+    if d.batch_selected > d.batch_count {
+        reasons.insert(
+            1,
+            tf(
+                "⚠ 已选 {} 行超过上限 {}，仅更新前 {} 行",
+                &[&d.batch_selected, &BATCH_SET_MAX_ROWS, &d.batch_count],
+            ),
+        );
+    }
+    app.confirm = Some(Confirm {
+        sql,
+        reasons,
+        refresh: true,
+        clear_batch: false,
+        conn: None,
+        redis: None,
+        mongo: None,
+    });
+    app.status = t("置值确认 · Enter 执行 · Esc 取消").into();
 }
 
 /// Send a generated write. It still passes the dangerous-statement gate so a

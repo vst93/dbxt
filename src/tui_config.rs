@@ -18,6 +18,15 @@ pub(crate) struct TablePrefs {
 /// so a long-lived config can never grow without bound.
 pub(crate) const COL_WIDTH_MEM_MAX: usize = 200;
 
+/// R95: how many set-value templates are remembered per
+/// `(conn, db, schema, table, column)`.
+pub(crate) const SET_VALUE_MEM_MAX: usize = 3;
+
+/// R95: cap on distinct `(conn, db, schema, table, column)` buckets kept in
+/// `tui.json`. LRU-ordered (most recently used last); a save past the cap drops
+/// the oldest buckets so the file stays bounded on a long-lived config.
+pub(crate) const SET_VALUE_BUCKETS_MAX: usize = 60;
+
 /// R83: how many SQLite files the `L` quick-open picker remembers (in
 /// `tui.json`). Kept small — the list sits at the top of the picker.
 pub(crate) const SQLITE_RECENT_MAX: usize = 5;
@@ -48,6 +57,36 @@ impl ColWidthEntry {
 /// Canonical identity for a width override, matching [`ColWidthEntry::key`].
 pub(crate) fn col_width_key(conn: &str, db: &str, schema: &str, table: &str, col: &str) -> String {
     format!("{conn}\u{0}{db}\u{0}{schema}\u{0}{table}\u{0}{col}")
+}
+
+/// R95: remembered set-value templates for one table column. `values` is
+/// most-recent-first and capped at [`SET_VALUE_MEM_MAX`].
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct SetValueEntry {
+    pub(crate) conn: String,
+    pub(crate) db: String,
+    pub(crate) schema: String,
+    pub(crate) table: String,
+    pub(crate) col: String,
+    pub(crate) values: Vec<String>,
+}
+
+impl SetValueEntry {
+    /// True when this entry belongs to the given column scope.
+    pub(crate) fn is_for(
+        &self,
+        conn: &str,
+        db: &str,
+        schema: &str,
+        table: &str,
+        col: &str,
+    ) -> bool {
+        self.conn == conn
+            && self.db == db
+            && self.schema == schema
+            && self.table == table
+            && self.col == col
+    }
 }
 
 /// The whole on-disk config. Parsing is deliberately forgiving: a missing file,
@@ -111,6 +150,13 @@ pub(crate) struct TuiConfig {
     /// separate from the other display flags so toggling it never rewrites a
     /// value another session owns.
     pub(crate) dirty_stmt_gutter: bool,
+    /// R95: remembered set-value templates per table column, LRU-ordered (most
+    /// recently used last).
+    pub(crate) set_values: Vec<SetValueEntry>,
+    /// R95: whether this session changed the set-value memory. Kept separate so
+    /// a session that never used the prompt cannot clobber another session's
+    /// list.
+    pub(crate) dirty_set_values: bool,
 }
 
 impl TuiConfig {
@@ -219,7 +265,160 @@ impl TuiConfig {
             }
             cfg.col_widths = entries;
         }
+        if let Some(arr) = v.get("set_values").and_then(|a| a.as_array()) {
+            let mut entries: Vec<SetValueEntry> = Vec::new();
+            for e in arr {
+                let Some(o) = e.as_object() else {
+                    continue;
+                };
+                let s = |k: &str| o.get(k).and_then(|x| x.as_str()).map(str::to_string);
+                let (Some(conn), Some(db), Some(schema), Some(table), Some(col)) =
+                    (s("conn"), s("db"), s("schema"), s("table"), s("col"))
+                else {
+                    continue;
+                };
+                let mut values: Vec<String> = o
+                    .get("values")
+                    .and_then(|x| x.as_array())
+                    .map(|a| {
+                        a.iter()
+                            .filter_map(|x| x.as_str())
+                            .filter(|x| !x.trim().is_empty())
+                            .map(str::to_string)
+                            .collect()
+                    })
+                    .unwrap_or_default();
+                values.truncate(SET_VALUE_MEM_MAX);
+                if values.is_empty() {
+                    continue;
+                }
+                entries.push(SetValueEntry {
+                    conn,
+                    db,
+                    schema,
+                    table,
+                    col,
+                    values,
+                });
+            }
+            if entries.len() > SET_VALUE_BUCKETS_MAX {
+                let drop = entries.len() - SET_VALUE_BUCKETS_MAX;
+                entries.drain(0..drop);
+            }
+            cfg.set_values = entries;
+        }
         cfg
+    }
+
+    /// R95: the remembered set-value templates for one column, most recent
+    /// first. Empty when nothing is stored.
+    pub(crate) fn set_value_history(
+        &self,
+        conn: &str,
+        db: &str,
+        schema: &str,
+        table: &str,
+        col: &str,
+    ) -> Vec<String> {
+        self.set_values
+            .iter()
+            .find(|e| e.is_for(conn, db, schema, table, col))
+            .map(|e| e.values.clone())
+            .unwrap_or_default()
+    }
+
+    /// R95: remember one set-value template (LRU: dedupe, most recent first,
+    /// capped at [`SET_VALUE_MEM_MAX`]). A blank value is not a template and is
+    /// ignored. The owning bucket moves to the LRU head.
+    pub(crate) fn push_set_value(
+        &mut self,
+        conn: &str,
+        db: &str,
+        schema: &str,
+        table: &str,
+        col: &str,
+        value: &str,
+    ) {
+        if value.trim().is_empty() {
+            return;
+        }
+        let mut values = self
+            .set_values
+            .iter()
+            .find(|e| e.is_for(conn, db, schema, table, col))
+            .map(|e| e.values.clone())
+            .unwrap_or_default();
+        self.set_values
+            .retain(|e| !e.is_for(conn, db, schema, table, col));
+        values.retain(|v| v != value);
+        values.insert(0, value.to_string());
+        values.truncate(SET_VALUE_MEM_MAX);
+        self.set_values.push(SetValueEntry {
+            conn: conn.to_string(),
+            db: db.to_string(),
+            schema: schema.to_string(),
+            table: table.to_string(),
+            col: col.to_string(),
+            values,
+        });
+        if self.set_values.len() > SET_VALUE_BUCKETS_MAX {
+            let drop = self.set_values.len() - SET_VALUE_BUCKETS_MAX;
+            self.set_values.drain(0..drop);
+        }
+        self.dirty_set_values = true;
+    }
+
+    /// R95: forget one remembered set-value template. Returns true when it was
+    /// present (so the caller can skip a config write on a no-op).
+    pub(crate) fn remove_set_value(
+        &mut self,
+        conn: &str,
+        db: &str,
+        schema: &str,
+        table: &str,
+        col: &str,
+        value: &str,
+    ) -> bool {
+        let mut removed = false;
+        for e in self
+            .set_values
+            .iter_mut()
+            .filter(|e| e.is_for(conn, db, schema, table, col))
+        {
+            let before = e.values.len();
+            e.values.retain(|v| v != value);
+            removed |= e.values.len() != before;
+        }
+        self.set_values.retain(|e| !e.values.is_empty());
+        if removed {
+            self.dirty_set_values = true;
+        }
+        removed
+    }
+
+    /// R95: forget every remembered set-value template for one column. Returns
+    /// how many were dropped.
+    pub(crate) fn clear_set_values(
+        &mut self,
+        conn: &str,
+        db: &str,
+        schema: &str,
+        table: &str,
+        col: &str,
+    ) -> usize {
+        let mut dropped = 0usize;
+        self.set_values.retain(|e| {
+            if e.is_for(conn, db, schema, table, col) {
+                dropped += e.values.len();
+                false
+            } else {
+                true
+            }
+        });
+        if dropped > 0 {
+            self.dirty_set_values = true;
+        }
+        dropped
     }
 
     /// The remembered width for one `(conn, db, schema, table, col)`, if any.
@@ -326,6 +525,9 @@ impl TuiConfig {
         }
         if self.dirty_stmt_gutter {
             merged.stmt_gutter = self.stmt_gutter;
+        }
+        if self.dirty_set_values {
+            merged.set_values = self.set_values.clone();
         }
         for key in &self.dirty {
             let all_default = self
@@ -443,6 +645,34 @@ impl TuiConfig {
             );
         }
         root.insert("tables".into(), serde_json::Value::Object(tables));
+        if !self.set_values.is_empty() {
+            let arr: Vec<serde_json::Value> = self
+                .set_values
+                .iter()
+                .filter(|e| !e.values.is_empty())
+                .map(|e| {
+                    let mut m = serde_json::Map::new();
+                    m.insert("conn".into(), serde_json::Value::String(e.conn.clone()));
+                    m.insert("db".into(), serde_json::Value::String(e.db.clone()));
+                    m.insert("schema".into(), serde_json::Value::String(e.schema.clone()));
+                    m.insert("table".into(), serde_json::Value::String(e.table.clone()));
+                    m.insert("col".into(), serde_json::Value::String(e.col.clone()));
+                    m.insert(
+                        "values".into(),
+                        serde_json::Value::Array(
+                            e.values
+                                .iter()
+                                .map(|v| serde_json::Value::String(v.clone()))
+                                .collect(),
+                        ),
+                    );
+                    serde_json::Value::Object(m)
+                })
+                .collect();
+            if !arr.is_empty() {
+                root.insert("set_values".into(), serde_json::Value::Array(arr));
+            }
+        }
         if !self.col_widths.is_empty() {
             let arr: Vec<serde_json::Value> = self
                 .col_widths

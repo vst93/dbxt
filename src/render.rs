@@ -815,6 +815,8 @@ pub(crate) enum FooterView {
     Confirm,
     SshPrompt,
     EditDialog,
+    /// R95: the row-select batch set-value prompt (`Ctrl-U`).
+    BatchSet,
     HelpFilter,
     Help,
     HelpMini,
@@ -915,7 +917,15 @@ pub(crate) fn footer_ctx_inner(app: &App, include_help: bool) -> FooterCtx {
     } else if app.ssh_prompt.is_some() {
         FooterView::SshPrompt
     } else if app.edit_dialog.is_some() {
-        FooterView::EditDialog
+        if app
+            .edit_dialog
+            .as_ref()
+            .is_some_and(|d| d.kind == EditKind::BatchSet)
+        {
+            FooterView::BatchSet
+        } else {
+            FooterView::EditDialog
+        }
     } else if app.history_confirm.is_some() {
         FooterView::Confirm
     } else if app.rename_edit.is_some() {
@@ -1268,6 +1278,13 @@ pub(crate) fn footer_hints_ctx(ctx: FooterCtx) -> Vec<Hint> {
             ("Esc", t("取消")),
             ("Ctrl-V", t("转编辑器")),
             ("Ctrl-T", t("加入批量")),
+        ],
+        FooterView::BatchSet => vec![
+            ("Enter", t("确认")),
+            ("Esc", t("取消")),
+            ("↑↓", t("历史")),
+            ("Del", t("清除历史")),
+            ("Ctrl-V", t("转编辑器")),
         ],
         FooterView::MongoDoc => vec![("Ctrl-S", t("校验并保存")), ("Esc", t("取消"))],
         FooterView::DbPicker => vec![

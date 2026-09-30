@@ -333,10 +333,13 @@ pub(crate) struct MongoDocDialog {
     pub(crate) error: Option<String>,
 }
 
-#[derive(Clone, Copy, PartialEq)]
+#[derive(Clone, Copy, PartialEq, Debug)]
 pub(crate) enum EditKind {
     Update,
     Insert,
+    /// R95: `Ctrl-U` in row-select mode — one `UPDATE … SET col = <value>
+    /// WHERE <key> IN (…)` for the selected rows, fed by a value prompt.
+    BatchSet,
 }
 
 /// A diff-style confirmation layer for a generated write. UPDATE edits let the
@@ -359,6 +362,18 @@ pub(crate) struct EditDialog {
     // INSERT fields
     pub(crate) insert_sql: String,
     pub(crate) insert_preview: Vec<(String, String)>,
+    // R95 batch set-value fields (also reused by the row-select `Ctrl-U` path)
+    /// Rows actually named in the generated statement (after the batch cap).
+    pub(crate) batch_count: usize,
+    /// Rows the user selected; larger than [`batch_count`] when the cap bit.
+    pub(crate) batch_selected: usize,
+    /// Remembered templates for this column, most recent first.
+    pub(crate) hist: Vec<String>,
+    /// Which entry of [`hist`] is currently in the input (`None` = the user's
+    /// own draft, held in `hist_draft`).
+    pub(crate) hist_idx: Option<usize>,
+    /// The text the user had typed before the first `↑` stepped into history.
+    pub(crate) hist_draft: String,
 }
 
 /// One logical line of a modal text popup together with the style its value

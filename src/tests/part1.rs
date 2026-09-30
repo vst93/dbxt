@@ -1190,6 +1190,11 @@ pub(crate) fn overlays_render_at_extreme_sizes() {
                     no_pk: false,
                     insert_sql: String::new(),
                     insert_preview: Vec::new(),
+                    batch_count: 0,
+                    batch_selected: 0,
+                    hist: Vec::new(),
+                    hist_idx: None,
+                    hist_draft: String::new(),
                 })
             }),
         ),

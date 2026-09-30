@@ -5621,6 +5621,439 @@ pub(crate) fn row_select_d_without_a_primary_key_warns_and_keeps_the_editor() {
     assert_eq!(app.editor_sql(), before);
 }
 
+// ── R95: row-select batch set-value (`Ctrl-U`) + template memory ──
+
+/// R95: the generated `UPDATE` wraps the typed value for the target column's
+/// declared type — numeric bare, text quoted / escaped, `NULL` literal — and
+/// keys the selection with `pk IN (…)` (or a composite `OR` chain).
+#[test]
+pub(crate) fn batch_set_value_sql_wraps_value_by_type_and_keys_by_in() {
+    let t = batch_target_for(
+        DatabaseType::Mysql,
+        &[
+            ("id", "int", true),
+            ("name", "varchar(64)", false),
+            ("note", "text", false),
+        ],
+    );
+    let rows = vec![
+        vec![Val::Text("1".into()), Val::Text("a".into()), Val::Null],
+        vec![Val::Text("2".into()), Val::Text("b".into()), Val::Null],
+    ];
+    // Numeric column: a bare literal.
+    assert_eq!(
+        batch_set_value_sql(&t, &rows, "id", "42"),
+        "UPDATE `public`.`orders`\nSET `id` = 42\nWHERE `id` IN (1, 2);"
+    );
+    // String column: quoted with the quote doubled.
+    assert_eq!(
+        batch_set_value_sql(&t, &rows, "name", "O'Brien"),
+        "UPDATE `public`.`orders`\nSET `name` = 'O''Brien'\nWHERE `id` IN (1, 2);"
+    );
+    // NULL literal (blank / `NULL`, any case).
+    assert_eq!(
+        batch_set_value_sql(&t, &rows, "note", "NULL"),
+        "UPDATE `public`.`orders`\nSET `note` = NULL\nWHERE `id` IN (1, 2);"
+    );
+    // A single selected row still uses the `IN` shape.
+    let one = vec![vec![Val::Text("7".into()), Val::Null, Val::Null]];
+    assert_eq!(
+        batch_set_value_sql(&t, &one, "name", "archived"),
+        "UPDATE `public`.`orders`\nSET `name` = 'archived'\nWHERE `id` IN (7);"
+    );
+    // A quoted input forces a string even for a numeric column.
+    assert_eq!(
+        batch_set_value_sql(&t, &rows, "id", "'42'"),
+        "UPDATE `public`.`orders`\nSET `id` = '42'\nWHERE `id` IN (1, 2);"
+    );
+    // Composite key: portable `(k1 = … AND k2 = …) OR (…)` chain.
+    let tc = batch_target_for(
+        DatabaseType::Postgres,
+        &[
+            ("a", "int", true),
+            ("b", "text", true),
+            ("note", "text", false),
+        ],
+    );
+    let rows = vec![
+        vec![Val::Text("1".into()), Val::Text("x".into()), Val::Null],
+        vec![Val::Text("2".into()), Val::Text("y".into()), Val::Null],
+    ];
+    assert_eq!(
+        batch_set_value_sql(&tc, &rows, "note", "z"),
+        "UPDATE \"public\".\"orders\"\nSET \"note\" = 'z'\nWHERE (\"a\" = 1 AND \"b\" = 'x')\n   OR (\"a\" = 2 AND \"b\" = 'y');"
+    );
+}
+
+/// R95: the type-wrapping matrix behind the set-value prompt (`new_value_literal`
+/// is shared with the single-cell edit dialog).
+#[test]
+pub(crate) fn set_value_literal_type_matrix() {
+    // Blank / NULL → SQL NULL, whatever the column type.
+    assert_eq!(new_value_literal("", Some("int")), "NULL");
+    assert_eq!(new_value_literal("   ", Some("text")), "NULL");
+    assert_eq!(new_value_literal("null", Some("varchar(10)")), "NULL");
+    assert_eq!(new_value_literal("NuLL", None), "NULL");
+    // Numeric column: a real number stays bare, anything else is quoted.
+    assert_eq!(new_value_literal("42", Some("bigint")), "42");
+    assert_eq!(new_value_literal("-3.5", Some("decimal(6,2)")), "-3.5");
+    assert_eq!(new_value_literal("42", Some("varchar(10)")), "'42'");
+    // String column: quoted with quotes doubled.
+    assert_eq!(new_value_literal("O'Brien", Some("text")), "'O''Brien'");
+    // Explicit quotes force a string even for a numeric column / NULL word.
+    assert_eq!(new_value_literal("'42'", Some("int")), "'42'");
+    assert_eq!(new_value_literal("'NULL'", Some("text")), "'NULL'");
+    // Booleans keep their SQL shape.
+    assert_eq!(new_value_literal("true", Some("bool")), "TRUE");
+    assert_eq!(new_value_literal("FALSE", Some("boolean")), "FALSE");
+}
+
+/// R95: a selection past `BATCH_SET_MAX_ROWS` is truncated to the first cap
+/// rows and the statement carries a trailing warning comment.
+#[test]
+pub(crate) fn batch_set_value_sql_truncates_past_the_cap() {
+    let t = batch_target_for(
+        DatabaseType::Mysql,
+        &[("id", "int", true), ("name", "text", false)],
+    );
+    let rows: Vec<Vec<Val>> = (1..=BATCH_SET_MAX_ROWS + 1)
+        .map(|i| vec![Val::Text(i.to_string())])
+        .collect();
+    let sql = batch_set_value_sql(&t, &rows, "name", "x");
+    // Only the first cap rows are named.
+    let inner = sql
+        .split_once("IN (")
+        .and_then(|(_, rest)| rest.split_once(')'))
+        .map(|(list, _)| list)
+        .expect("IN list");
+    assert_eq!(inner.split(',').count(), BATCH_SET_MAX_ROWS);
+    assert!(inner.starts_with("1, 2,"), "{inner}");
+    // The warning names the total and the cap, and is not itself an IN entry.
+    assert!(sql.contains("-- ⚠"), "{sql}");
+    assert!(sql.contains(&(BATCH_SET_MAX_ROWS + 1).to_string()), "{sql}");
+    assert!(sql.contains(&BATCH_SET_MAX_ROWS.to_string()), "{sql}");
+    // At exactly the cap there is no warning.
+    let exact: Vec<Vec<Val>> = (1..=BATCH_SET_MAX_ROWS)
+        .map(|i| vec![Val::Text(i.to_string())])
+        .collect();
+    let sql = batch_set_value_sql(&t, &exact, "name", "x");
+    assert!(!sql.contains("-- ⚠"), "{sql}");
+}
+
+/// R95: the template memory keeps three values per table column, most recent
+/// first, deduped, with remove / clear and a blank-input guard.
+#[test]
+pub(crate) fn set_value_templates_lru_cap_dedupe_and_clear() {
+    let mut cfg = TuiConfig::default();
+    let h = |c: &TuiConfig| c.set_value_history("c1", "shop", "public", "orders", "status");
+    assert!(h(&cfg).is_empty());
+    cfg.push_set_value("c1", "shop", "public", "orders", "status", "active");
+    cfg.push_set_value("c1", "shop", "public", "orders", "status", "archived");
+    cfg.push_set_value("c1", "shop", "public", "orders", "status", "deleted");
+    assert_eq!(h(&cfg), vec!["deleted", "archived", "active"]);
+    // Re-using an old value moves it to the front (no duplicate).
+    cfg.push_set_value("c1", "shop", "public", "orders", "status", "active");
+    assert_eq!(h(&cfg), vec!["active", "deleted", "archived"]);
+    // A fourth distinct value evicts the oldest.
+    cfg.push_set_value("c1", "shop", "public", "orders", "status", "pending");
+    assert_eq!(h(&cfg), vec!["pending", "active", "deleted"]);
+    // Per table column: a different column / table / connection is separate.
+    assert!(cfg
+        .set_value_history("c1", "shop", "public", "orders", "name")
+        .is_empty());
+    assert!(h(&TuiConfig::default()).is_empty());
+    // Blank input is not a template.
+    cfg.push_set_value("c1", "shop", "public", "orders", "status", "   ");
+    assert_eq!(h(&cfg).len(), 3);
+    // Remove one value; a missing value is a no-op.
+    assert!(cfg.remove_set_value("c1", "shop", "public", "orders", "status", "deleted"));
+    assert_eq!(h(&cfg), vec!["pending", "active"]);
+    assert!(!cfg.remove_set_value("c1", "shop", "public", "orders", "status", "nope"));
+    // Clear drops the whole column and reports the count.
+    assert_eq!(
+        cfg.clear_set_values("c1", "shop", "public", "orders", "status"),
+        2
+    );
+    assert_eq!(
+        cfg.clear_set_values("c1", "shop", "public", "orders", "status"),
+        0
+    );
+    assert!(h(&cfg).is_empty());
+}
+
+/// R95: templates round-trip through `tui.json` and stay bounded.
+#[test]
+pub(crate) fn set_value_templates_persist_and_reload() {
+    let path = std::env::temp_dir().join(format!("dbxt-sv-{}.json", Uuid::new_v4()));
+    let mut cfg = TuiConfig::default();
+    cfg.push_set_value("c1", "shop", "public", "orders", "status", "a");
+    cfg.push_set_value("c1", "shop", "public", "orders", "status", "b");
+    cfg.push_set_value("c2", "shop", "", "users", "role", "admin");
+    cfg.save(&path);
+    let back = TuiConfig::load(&path);
+    assert_eq!(
+        back.set_value_history("c1", "shop", "public", "orders", "status"),
+        vec!["b", "a"]
+    );
+    assert_eq!(
+        back.set_value_history("c2", "shop", "", "users", "role"),
+        vec!["admin"]
+    );
+    assert!(back
+        .set_value_history("c1", "shop", "public", "orders", "missing")
+        .is_empty());
+    // A session that never touches the prompt leaves the file alone.
+    let mut other = TuiConfig::load(&path);
+    other.set_compact(Some(true));
+    other.save(&path);
+    let after = TuiConfig::load(&path);
+    assert_eq!(
+        after.set_value_history("c1", "shop", "public", "orders", "status"),
+        vec!["b", "a"]
+    );
+    let _ = std::fs::remove_file(&path);
+}
+
+/// R95: `Ctrl-U` in row-select mode opens the value prompt for the focused
+/// column, previews a single `UPDATE … WHERE pk IN (…)`, and only the red
+/// confirmation layer runs it. The typed value is remembered as a template.
+#[test]
+pub(crate) fn row_select_ctrl_u_opens_prompt_then_confirms() {
+    let tx = test_tx();
+    let mut app = orders_app(&[("id", "int"), ("name", "text")], 6);
+    let db = app.current_db();
+    app.col_cursor = 1; // the `name` column
+    app.sel = 0;
+    key(
+        &mut app,
+        &tx,
+        KeyEvent::new(KeyCode::Char('V'), KeyModifiers::NONE),
+    );
+    key(
+        &mut app,
+        &tx,
+        KeyEvent::new(KeyCode::Down, KeyModifiers::SHIFT),
+    );
+    key(
+        &mut app,
+        &tx,
+        KeyEvent::new(KeyCode::Down, KeyModifiers::SHIFT),
+    );
+    assert_eq!(app.row_sel_anchor, Some(0));
+    assert_eq!(app.sel, 2);
+    key(
+        &mut app,
+        &tx,
+        KeyEvent::new(KeyCode::Char('u'), KeyModifiers::CONTROL),
+    );
+    let d = app.edit_dialog.as_ref().expect("value prompt opened");
+    assert_eq!(d.kind, EditKind::BatchSet);
+    assert_eq!(d.column, "name");
+    assert_eq!(d.batch_count, 3);
+    assert_eq!(d.batch_selected, 3);
+    assert!(
+        d.set_value_sql().contains("WHERE `id` IN (1, 2, 3)"),
+        "{}",
+        d.set_value_sql()
+    );
+    assert!(!app.pending_write, "opening the prompt never runs anything");
+    // Type the new value and confirm.
+    for ch in "archived".chars() {
+        key(
+            &mut app,
+            &tx,
+            KeyEvent::new(KeyCode::Char(ch), KeyModifiers::NONE),
+        );
+    }
+    key(
+        &mut app,
+        &tx,
+        KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+    );
+    assert!(app.edit_dialog.is_none());
+    let c = app.confirm.as_ref().expect("red confirmation layer");
+    assert!(c.sql.contains("SET `name` = 'archived'"), "{}", c.sql);
+    assert!(c.sql.contains("WHERE `id` IN (1, 2, 3)"), "{}", c.sql);
+    assert!(
+        c.reasons.iter().any(|r| r.contains('3')),
+        "impact line missing: {:?}",
+        c.reasons
+    );
+    assert_eq!(app.row_sel_anchor, None, "selection resolved into the SQL");
+    assert!(
+        !app.pending_write,
+        "still nothing ran before the confirm Enter"
+    );
+    // The value became a template for this table column.
+    assert_eq!(
+        app.config
+            .set_value_history("id-mysql", &db, "", "orders", "name"),
+        vec!["archived"]
+    );
+    // Esc cancels the red layer without running.
+    key(
+        &mut app,
+        &tx,
+        KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE),
+    );
+    assert!(app.confirm.is_none());
+    assert!(!app.pending_write);
+}
+
+/// R95: a read-only connection is refused before the prompt opens.
+#[test]
+pub(crate) fn batch_set_value_is_blocked_on_a_readonly_connection() {
+    let tx = test_tx();
+    let mut app = orders_app(&[("id", "int"), ("name", "text")], 3);
+    app.selected.as_mut().unwrap().read_only = true;
+    app.col_cursor = 1;
+    app.sel = 0;
+    key(
+        &mut app,
+        &tx,
+        KeyEvent::new(KeyCode::Char('V'), KeyModifiers::NONE),
+    );
+    key(
+        &mut app,
+        &tx,
+        KeyEvent::new(KeyCode::Char('u'), KeyModifiers::CONTROL),
+    );
+    assert!(app.edit_dialog.is_none());
+    assert!(app.confirm.is_none());
+    assert!(app.status.contains("只读"), "{}", app.status);
+}
+
+/// R95: `↑` / `↓` step through the remembered templates (draft restored on the
+/// way back) and `Del` drops the highlighted one, persisted to `tui.json`.
+#[test]
+pub(crate) fn set_value_prompt_history_navigates_and_deletes() {
+    let tx = test_tx();
+    let mut app = orders_app(&[("id", "int"), ("name", "text")], 3);
+    let db = app.current_db();
+    app.config
+        .push_set_value("id-mysql", &db, "", "orders", "name", "one");
+    app.config
+        .push_set_value("id-mysql", &db, "", "orders", "name", "two");
+    app.col_cursor = 1;
+    app.sel = 0;
+    key(
+        &mut app,
+        &tx,
+        KeyEvent::new(KeyCode::Char('V'), KeyModifiers::NONE),
+    );
+    key(
+        &mut app,
+        &tx,
+        KeyEvent::new(KeyCode::Char('u'), KeyModifiers::CONTROL),
+    );
+    assert_eq!(app.edit_dialog.as_ref().unwrap().hist, vec!["two", "one"]);
+    let text = |app: &App| app.edit_dialog.as_ref().unwrap().new_input.lines().join("");
+    key(
+        &mut app,
+        &tx,
+        KeyEvent::new(KeyCode::Up, KeyModifiers::NONE),
+    );
+    assert_eq!(text(&app), "two");
+    key(
+        &mut app,
+        &tx,
+        KeyEvent::new(KeyCode::Up, KeyModifiers::NONE),
+    );
+    assert_eq!(text(&app), "one");
+    key(
+        &mut app,
+        &tx,
+        KeyEvent::new(KeyCode::Down, KeyModifiers::NONE),
+    );
+    assert_eq!(text(&app), "two");
+    // Back past the newest entry restores the (empty) draft.
+    key(
+        &mut app,
+        &tx,
+        KeyEvent::new(KeyCode::Down, KeyModifiers::NONE),
+    );
+    assert_eq!(text(&app), "");
+    // Highlight the newest again and delete it.
+    key(
+        &mut app,
+        &tx,
+        KeyEvent::new(KeyCode::Up, KeyModifiers::NONE),
+    );
+    key(
+        &mut app,
+        &tx,
+        KeyEvent::new(KeyCode::Delete, KeyModifiers::NONE),
+    );
+    let d = app.edit_dialog.as_ref().unwrap();
+    assert_eq!(d.hist, vec!["one"]);
+    assert_eq!(
+        app.config
+            .set_value_history("id-mysql", &db, "", "orders", "name"),
+        vec!["one"]
+    );
+    // Esc backs out; nothing ran.
+    key(
+        &mut app,
+        &tx,
+        KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE),
+    );
+    assert!(app.edit_dialog.is_none());
+    assert!(!app.pending_write);
+}
+
+/// R95: the prompt has its own footer / mini-help group, the full cheat-sheet
+/// documents `Ctrl-U`, and the line still fits a phone width.
+#[test]
+pub(crate) fn batch_set_footer_mini_help_and_help_row() {
+    let tx = test_tx();
+    let mut app = orders_app(&[("id", "int"), ("name", "text")], 3);
+    app.col_cursor = 1;
+    key(
+        &mut app,
+        &tx,
+        KeyEvent::new(KeyCode::Char('V'), KeyModifiers::NONE),
+    );
+    key(
+        &mut app,
+        &tx,
+        KeyEvent::new(KeyCode::Char('u'), KeyModifiers::CONTROL),
+    );
+    let ctx = footer_ctx(&app);
+    assert_eq!(ctx.view, FooterView::BatchSet);
+    let hints = footer_hints_ctx(ctx);
+    let keys: Vec<&str> = hints.iter().map(|h| h.0).collect();
+    for k in ["Enter", "Esc", "↑↓", "Del", "Ctrl-V"] {
+        assert!(keys.contains(&k), "BatchSet footer dropped {k:?}: {keys:?}");
+    }
+    for h in &hints {
+        assert!(!h.1.is_empty(), "empty description for {:?}", h.0);
+    }
+    // Mini help reuses the same group (it only drops the pinned `?` / `F1`).
+    let mini: Vec<&str> = hints
+        .iter()
+        .filter(|h| h.0 != "?" && h.0 != "F1")
+        .map(|h| h.0)
+        .collect();
+    assert!(mini.contains(&"Del"));
+    // The full cheat-sheet documents the row-select set-value key (a second
+    // `Ctrl-U` row next to the half-page one).
+    assert!(
+        HELP_ROWS
+            .iter()
+            .any(|(k, d)| *k == "Ctrl-U" && d.contains("主键 IN")),
+        "full help missing the Ctrl-U set-value row"
+    );
+    // A phone-width footer still fits without splitting a hint.
+    for width in [42usize, 110] {
+        let (chosen, more) = footer_select(&hints, width);
+        assert!(!chosen.is_empty());
+        assert!(
+            footer_line_width(&chosen, more, "?") <= width,
+            "width {width} overflow"
+        );
+    }
+}
+
 #[test]
 pub(crate) fn redis_ttl_counts_down_locally() {
     assert_eq!(redis_ttl_advance(60, 1), 59);

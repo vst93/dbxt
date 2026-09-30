@@ -170,7 +170,7 @@ pub static TIPS_ZH: &[&str] = &[
     "Ctrl-J 只跑光标处语句，F5 跑整段；有选区则只跑选区",
     "F8 / Shift-F8 在执行失败的语句间前后跳（纯文本定位）",
     "Alt-↓ / Alt-↑ 在多语句间逐条跳，状态栏显示 语句 i/n",
-    "V 进入行选模式：Shift+↑↓ 扩展、Y 复制 TSV、d/c 生成 DELETE/UPDATE",
+    "V 进入行选模式：Shift+↑↓ 扩展、Ctrl-U 批量置值、Y 复制 TSV、d/c 生成 DELETE/UPDATE",
     "/ 隐藏不匹配行，* 按当前列过滤，Esc 清除",
     ": 按行号跳转（:$ 末行），分页表里是整表绝对行号",
     "n / p 翻页，5n 翻 5 页；PgUp/PgDn 整屏",
@@ -204,7 +204,7 @@ pub static TIPS_EN: &[&str] = &[
     "Ctrl-J runs only the statement at the caret, F5 runs the whole script; a selection runs alone",
     "F8 / Shift-F8 jump between failed statements (pure text, no query)",
     "Alt-↓ / Alt-↑ step through statements; the status bar shows statement i/n",
-    "V enters row-select mode: Shift+↑↓ extend, Y copies TSV, d/c generate DELETE/UPDATE",
+    "V enters row-select mode: Shift+↑↓ extend, Ctrl-U batch set-value, Y copies TSV, d/c generate DELETE/UPDATE",
     "/ hides non-matching rows, * filters by the current column, Esc clears",
     ": jumps to a row number (:$ last), absolute across pages in a paged table",
     "n / p page, 5n pages by five; PgUp/PgDn scroll a full screen",
@@ -1428,7 +1428,7 @@ pub static ALL_KEYS: &[&str] = &[
     "跳行：输入行号直达该行，:$ 跳末行（结果 / 表 / Redis / Mongo 均可）",
     // R57: results row selection + batch statements + Redis cursor-preserving delete.
     "当前视图没有可选行",
-    "行选 {}-{}（{} 行）· Ctrl-A 全选 · ↑↓ 移动 · Shift+↑↓ / v 扩展 · Y 复制 · d 删除语句 · c 更新模板 · Esc 退出",
+    "行选 {}-{}（{} 行）· Ctrl-A 全选 · Ctrl-U 置值 · ↑↓ 移动 · Shift+↑↓ / v 扩展 · Y 复制 · d 删除语句 · c 更新模板 · Esc 退出",
     "已退出行选",
     "✓ 已复制 {} 行（TSV，含列头）· 兜底 {}",
     "✓ 已复制 {} 行（TSV，含列头）",
@@ -1438,6 +1438,28 @@ pub static ALL_KEYS: &[&str] = &[
     "无主键，跳过（表达式 / 聚合 / 无主键结果不支持批量更新）",
     "✓ 已生成 UPDATE 模板（{} 行 · 主键 {}）→ 编辑器待确认，未执行",
     "-- {}：仅有主键列，无可更新列",
+    // R95: row-select batch set-value (`Ctrl-U`) + template memory.
+    "无主键，跳过（表达式 / 聚合 / 无主键结果不支持批量置值）",
+    "没有可置值的列",
+    "该列不在结果中，无法批量置值",
+    "批量置值 {}.{}（{} 行）· 输入新值 · Enter 确认 · Esc 取消",
+    "留空 = NULL · '文本' = 字符串 · ↑↓ 历史",
+    "将把 {} 行「{}」设为 {}",
+    "UPDATE 不可撤销，Enter 后立即执行",
+    "⚠ 已选 {} 行超过上限 {}，仅更新前 {} 行",
+    "-- ⚠ 已选择 {} 行，超过上限 {}，仅更新前 {} 行",
+    "置值确认 · Enter 执行 · Esc 取消",
+    "已取消置值",
+    "已清除模板「{}」",
+    "已清除该列 {} 条置值模板",
+    "影响 ",
+    " · 主键 ",
+    "模板 ↑↓ 取用 · Del 清除（{} 条）",
+    " 新值 · Enter 确认 ",
+    "生成的 SQL（Enter 确认）",
+    "Enter 确认 · Esc 取消 · ↑↓ 历史 · Del 清除 · Ctrl-V 转编辑器",
+    " ⌗ 批量置值 {}.{} ",
+    "清除历史",
     "收藏已达上限 {} 条（当前 {}），请先在列表里按 d 删除",
     "暂无收藏 · 编辑器内 Ctrl-O 后按 s 或 Alt-S 收藏",
     "暂无收藏 · 编辑器内 Ctrl-O 后按 s 或 Alt-S 添加",
@@ -3932,9 +3954,9 @@ fn en_of(zh: &'static str) -> Option<&'static str> {
         ),
         // R57: results row selection + batch statements + Redis cursor-preserving delete.
         "当前视图没有可选行" => Some("No selectable rows in this view"),
-        "行选 {}-{}（{} 行）· Ctrl-A 全选 · ↑↓ 移动 · Shift+↑↓ / v 扩展 · Y 复制 · d 删除语句 · c 更新模板 · Esc 退出" => {
+        "行选 {}-{}（{} 行）· Ctrl-A 全选 · Ctrl-U 置值 · ↑↓ 移动 · Shift+↑↓ / v 扩展 · Y 复制 · d 删除语句 · c 更新模板 · Esc 退出" => {
             Some(
-                "Row select {}-{} ({} rows) · Ctrl-A select all · ↑↓ move · Shift+↑↓ / v extend · Y copy · d delete SQL · c update template · Esc exit",
+                "Row select {}-{} ({} rows) · Ctrl-A select all · Ctrl-U set value · ↑↓ move · Shift+↑↓ / v extend · Y copy · d delete SQL · c update template · Esc exit",
             )
         }
         "已退出行选" => Some("Row select off"),
@@ -3956,6 +3978,46 @@ fn en_of(zh: &'static str) -> Option<&'static str> {
             "✓ Generated UPDATE template ({} rows · key {}) → in the editor for review, not executed",
         ),
         "-- {}：仅有主键列，无可更新列" => Some("-- {}: primary key only, no updatable column"),
+        // R95: row-select batch set-value (`Ctrl-U`) + template memory.
+        "无主键，跳过（表达式 / 聚合 / 无主键结果不支持批量置值）" => Some(
+            "No primary key, skipped (batch set-value needs a keyed table, not an expression / aggregate result)",
+        ),
+        "没有可置值的列" => Some("No column to set"),
+        "该列不在结果中，无法批量置值" => {
+            Some("That column is not in the result; cannot batch set-value")
+        }
+        "批量置值 {}.{}（{} 行）· 输入新值 · Enter 确认 · Esc 取消" => Some(
+            "Batch set-value {}.{} ({} rows) · type the new value · Enter confirm · Esc cancel",
+        ),
+        "留空 = NULL · '文本' = 字符串 · ↑↓ 历史" => {
+            Some("blank = NULL · 'text' = string · ↑↓ history")
+        }
+        "将把 {} 行「{}」设为 {}" => Some("Set {} rows' {} to {}"),
+        "UPDATE 不可撤销，Enter 后立即执行" => {
+            Some("UPDATE cannot be undone; Enter runs it immediately")
+        }
+        "⚠ 已选 {} 行超过上限 {}，仅更新前 {} 行" => Some(
+            "⚠ {} rows selected exceed the limit of {}; only the first {} are updated",
+        ),
+        "-- ⚠ 已选择 {} 行，超过上限 {}，仅更新前 {} 行" => Some(
+            "-- ⚠ {} rows selected exceed the limit of {}; only the first {} are updated",
+        ),
+        "置值确认 · Enter 执行 · Esc 取消" => Some("Set-value confirm · Enter run · Esc cancel"),
+        "已取消置值" => Some("Set-value cancelled"),
+        "已清除模板「{}」" => Some("Cleared template \"{}\""),
+        "已清除该列 {} 条置值模板" => Some("Cleared {} set-value templates for this column"),
+        "影响 " => Some("impact "),
+        " · 主键 " => Some(" · key "),
+        "模板 ↑↓ 取用 · Del 清除（{} 条）" => {
+            Some("Templates: ↑↓ pick · Del clear ({} stored)")
+        }
+        " 新值 · Enter 确认 " => Some(" New value · Enter confirm "),
+        "生成的 SQL（Enter 确认）" => Some("Generated SQL (Enter confirms)"),
+        "Enter 确认 · Esc 取消 · ↑↓ 历史 · Del 清除 · Ctrl-V 转编辑器" => Some(
+            "Enter confirm · Esc cancel · ↑↓ history · Del clear · Ctrl-V to editor",
+        ),
+        " ⌗ 批量置值 {}.{} " => Some(" ⌗ Batch set-value {}.{} "),
+        "清除历史" => Some("clear history"),
         // R58: connection query timeout + editor undo/redo visibility + cell abbreviation.
         "默认（60s）" => Some("default (60s)"),
         "不限" => Some("no limit"),
@@ -4345,11 +4407,14 @@ fn en_of(zh: &'static str) -> Option<&'static str> {
         "删除当前行 / Redis 批量删 key（半屏下移让位给此键）" => {
             Some("Delete the current row / batch-delete Redis keys (half-page-down yields to this key)")
         }
-        "行选模式：↑↓ 移动 · Shift+↑↓ / v 扩展 · Ctrl-A 全选本页 · Y 复制 TSV（含列头）· d 生成 DELETE · c 生成 UPDATE 模板 · Esc 退出；d/c 只把语句送进编辑器，绝不执行" => {
+        "行选模式：↑↓ 移动 · Shift+↑↓ / v 扩展 · Ctrl-A 全选本页 · Ctrl-U 批量置值 · Y 复制 TSV（含列头）· d 生成 DELETE · c 生成 UPDATE 模板 · Esc 退出；d/c 只把语句送进编辑器，绝不执行" => {
             Some(
-                "row-select mode: ↑↓ move · Shift+↑↓ / v extend · Ctrl-A select all on this page · Y copy TSV (with header) · d generate DELETE · c generate UPDATE template · Esc exit; d/c only send SQL to the editor, never execute it",
+                "row-select mode: ↑↓ move · Shift+↑↓ / v extend · Ctrl-A select all on this page · Ctrl-U batch set-value · Y copy TSV (with header) · d generate DELETE · c generate UPDATE template · Esc exit; d/c only send SQL to the editor, never execute it",
             )
         }
+        "行选模式下批量置值：把选中行的当前列设为同一个值，生成单条 UPDATE … SET 列 = 值 WHERE 主键 IN (…)；先弹出值输入条（留空 = NULL、'文本' 强制字符串、按列类型包装），Enter 再走红色确认层并在确认层显示影响行数，确认后才执行；只读连接在输入前即被拦截。↑↓ 取用该表该列最近 3 个置值模板，Del 清除；单个语句最多 200 行，超出部分会截断并在语句与确认层提示" => Some(
+            "Batch set-value in row-select mode: set the focused column to one value across the selected rows as a single UPDATE … SET col = value WHERE key IN (…). A value prompt opens first (blank = NULL, 'text' forces a string, wrapped for the column's type), then Enter leads to the red confirmation layer, which shows the affected row count; only confirming runs it. A read-only connection is blocked before the prompt. ↑↓ pick from the last three set-value templates for that table column, Del clears them; a single statement names at most 200 rows, and an overflow is truncated with a warning in the statement and the confirmation layer",
+        ),
         "JSON 字段就地展开 / 收起（对象 / 数组；缩进多行块，超出弹层可滚动；y / Y 始终复制原始值）" => {
             Some("Expand / collapse a JSON field in place (object / array; an indented multi-line block that scrolls inside the popup; y / Y always copy the raw value)")
         }
