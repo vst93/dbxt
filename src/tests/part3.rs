@@ -765,13 +765,7 @@ pub(crate) fn esc_closes_or_abandons_every_overlay() {
         ),
         (
             "cell-popup",
-            Box::new(move |a| {
-                a.cell_popup = Some(CellPopup {
-                    title: "c".into(),
-                    lines: vec![line()],
-                    scroll: 0,
-                })
-            }),
+            Box::new(move |a| a.cell_popup = Some(cell_popup_from_lines("c".into(), vec![line()]))),
             Box::new(|a| a.cell_popup.is_none()),
         ),
         (
@@ -1034,11 +1028,7 @@ pub(crate) fn footer_view_tracks_every_overlay() {
     // the cell; the row popup alone gets its own group.
     app.row_popup = Some(row_popup_from_lines("r".into(), vec![]));
     assert_eq!(footer_ctx(&app).view, FooterView::RowPopup);
-    app.cell_popup = Some(CellPopup {
-        title: "c".into(),
-        lines: vec![],
-        scroll: 0,
-    });
+    app.cell_popup = Some(cell_popup_from_lines("c".into(), vec![]));
     assert_eq!(footer_ctx(&app).view, FooterView::Popup);
     app.cell_popup = None;
     app.row_popup = None;
@@ -1164,6 +1154,7 @@ pub(crate) fn every_call_site_has_english() {
         include_str!("../sqlfmt.rs"),
         include_str!("../search.rs"),
         include_str!("../input.rs"),
+        include_str!("../jsonview.rs"),
         include_str!("../sidebar.rs"),
         include_str!("../editor.rs"),
         include_str!("../mongo.rs"),
@@ -5697,4 +5688,181 @@ pub(crate) fn sidebar_connection_row_shows_latency() {
         side_row_size(&app, &SideRow::Conn { idx: 0, depth: 0 }),
         None
     );
+}
+
+/// R74: only a JSON object/array is pretty-printed; scalars and non-JSON text
+/// stay verbatim so `v` never reformats something it does not understand.
+#[test]
+pub(crate) fn pretty_json_only_accepts_objects_and_arrays() {
+    assert!(pretty_json("{\"a\":1}").is_some());
+    assert!(pretty_json("[1,2,3]").is_some());
+    assert!(pretty_json("  {\"a\": [1, {\"b\": true}]}  ").is_some());
+    for scalar in [
+        "42", "-1.5", "\"x\"", "true", "false", "null", "not json", "{oops", "", "   ",
+    ] {
+        assert!(
+            pretty_json(scalar).is_none(),
+            "{scalar:?} should not be pretty-printed"
+        );
+    }
+}
+
+/// R74: the pretty-JSON token scanner colours keys / strings / numbers / literals
+/// and its tokens concatenate back to the pretty text (so wrapping is lossless).
+#[test]
+pub(crate) fn json_pretty_spans_colour_tokens_losslessly() {
+    let pretty = pretty_json("{\"n\": 42, \"s\": \"x\", \"b\": true, \"z\": null}").unwrap();
+    let lines = pretty_json_spans(&pretty);
+    let all: Vec<&PopupSpan> = lines.iter().flatten().collect();
+    let fg = |t: &str| {
+        all.iter()
+            .find(|s| s.text.contains(t))
+            .and_then(|s| s.style.fg)
+    };
+    assert_eq!(fg("\"n\""), Some(Color::Cyan), "key is cyan");
+    assert_eq!(fg("42"), Some(Color::Yellow), "number is yellow");
+    assert_eq!(fg("\"x\""), Some(Color::Green), "string is green");
+    assert_eq!(fg("true"), Some(Color::Magenta), "bool is magenta");
+    assert_eq!(fg("null"), Some(Color::DarkGray), "null is dim");
+    let joined: Vec<String> = lines
+        .iter()
+        .map(|sp| sp.iter().map(|s| s.text.as_str()).collect::<String>())
+        .collect();
+    assert_eq!(joined.join("\n"), pretty);
+}
+
+fn json_cell_app(raw: &str) -> App {
+    let mut app = test_app();
+    app.picker_open = false;
+    app.selected = Some(test_conn("postgres"));
+    app.backend_kind = Backend::Sql;
+    app.grid_kind = GridKind::Query;
+    app.set_grid(Grid {
+        columns: vec!["payload".into()],
+        rows: vec![vec![Val::Text(raw.into())]],
+        note: String::new(),
+    });
+    app.focus = Focus::Preview;
+    app.sel = 0;
+    app.col_cursor = 0;
+    app
+}
+
+/// R74: a JSON object opens in the pretty view, `J` flips to the raw value and
+/// back, and `y`/`Y` copy the original compact JSON (never the pretty form).
+#[test]
+pub(crate) fn cell_popup_pretty_json_toggle_and_raw_copy() {
+    let raw = "{\"name\":\"alice\",\"tags\":[\"a\",\"b\"]}";
+    let mut app = json_cell_app(raw);
+    let (tx, _rx) = tokio::sync::mpsc::unbounded_channel::<OpResult>();
+    key(
+        &mut app,
+        &tx,
+        KeyEvent::new(KeyCode::Char('v'), KeyModifiers::NONE),
+    );
+    let popup = app.cell_popup.as_ref().expect("cell popup");
+    assert_eq!(popup.raw, raw, "raw copy source is the original");
+    assert!(!popup.raw.contains('\n'), "raw stays compact");
+    assert!(popup.pretty.is_some(), "a JSON object should pretty-print");
+    assert!(popup.show_pretty, "opens in the pretty view");
+    assert!(
+        popup.col.contains("payload"),
+        "copy status names the column"
+    );
+    // The drawn body shows the indented, coloured form.
+    let rows = draw(&mut app, 60, 20);
+    assert!(
+        rows.iter().any(|r| r.contains("\"name\": \"alice\"")),
+        "pretty body missing: {rows:#?}"
+    );
+    // `J` flips back to the raw single line.
+    key(
+        &mut app,
+        &tx,
+        KeyEvent::new(KeyCode::Char('J'), KeyModifiers::NONE),
+    );
+    assert!(!app.cell_popup.as_ref().unwrap().show_pretty);
+    let rows = draw(&mut app, 60, 20);
+    assert!(rows.iter().any(|r| r.contains(raw)), "raw body missing");
+    // `J` again returns to pretty, and the status says so.
+    key(
+        &mut app,
+        &tx,
+        KeyEvent::new(KeyCode::Char('J'), KeyModifiers::NONE),
+    );
+    assert!(app.cell_popup.as_ref().unwrap().show_pretty);
+    assert!(app.status.contains("JSON"), "{}", app.status);
+    // `y` copies the raw value; the status names the column and shows it.
+    app.status.clear();
+    key(
+        &mut app,
+        &tx,
+        KeyEvent::new(KeyCode::Char('y'), KeyModifiers::NONE),
+    );
+    assert!(app.status.contains("已复制"), "{}", app.status);
+    assert!(app.status.contains("payload"), "{}", app.status);
+    assert!(app.status.contains("alice"), "{}", app.status);
+}
+
+/// R74: `J` on a non-JSON cell explains itself and leaves the view alone.
+#[test]
+pub(crate) fn cell_popup_j_rejects_non_json() {
+    let mut app = json_cell_app("hello world");
+    let (tx, _rx) = tokio::sync::mpsc::unbounded_channel::<OpResult>();
+    key(
+        &mut app,
+        &tx,
+        KeyEvent::new(KeyCode::Char('v'), KeyModifiers::NONE),
+    );
+    let popup = app.cell_popup.as_ref().unwrap();
+    assert!(popup.pretty.is_none());
+    assert!(!popup.show_pretty);
+    key(
+        &mut app,
+        &tx,
+        KeyEvent::new(KeyCode::Char('J'), KeyModifiers::NONE),
+    );
+    assert!(app.status.contains("不是 JSON"), "{}", app.status);
+    assert!(!app.cell_popup.as_ref().unwrap().show_pretty);
+    assert!(app.cell_popup.is_some(), "the popup stays open");
+}
+
+/// R74: a multi-statement batch reports `3/7` while it runs and the intermediate
+/// message does not stop the spinner.
+#[test]
+pub(crate) fn query_progress_updates_the_status() {
+    let mut app = test_app();
+    let (tx, _rx) = tokio::sync::mpsc::unbounded_channel::<OpResult>();
+    app.pending_ops = 1;
+    app.loading = true;
+    apply_op_result(&mut app, OpResult::QueryProgress { done: 3, total: 7 }, &tx);
+    assert!(app.status.contains("3/7"), "{}", app.status);
+    assert!(app.loading, "progress must not stop the spinner");
+    assert_eq!(app.pending_ops, 1);
+}
+
+/// R74: a finished multi-statement script names its total elapsed time.
+#[test]
+pub(crate) fn script_status_names_total_elapsed() {
+    let mut app = test_app();
+    app.picker_open = false;
+    app.selected = Some(test_conn("postgres"));
+    let (tx, _rx) = tokio::sync::mpsc::unbounded_channel::<OpResult>();
+    let outcome = |ms: u128| StmtOutcome {
+        sql: "select 1".into(),
+        grid: Grid {
+            columns: vec!["a".into()],
+            rows: vec![vec![Val::Text("1".into())]],
+            note: String::new(),
+        },
+        error: None,
+        affected: 0,
+        ms,
+    };
+    apply_op_result(
+        &mut app,
+        OpResult::Script(vec![outcome(300), outcome(450)]),
+        &tx,
+    );
+    assert!(app.status.contains("750ms"), "{}", app.status);
 }

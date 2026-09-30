@@ -3465,13 +3465,14 @@ pub(crate) fn help_has_no_bare_uppercase_shortcuts() {
     // `G` (vim's go-to-bottom, R42), `Y` (copy connection, R45, which
     // mirrors the vim-ish uppercase twin of the picker's `p`) and `V` (R57
     // linewise row-select, whose lowercase `v` is the cell popup) are the
-    // deliberate exceptions.
+    // deliberate exceptions. `J` (R74, the pretty-JSON toggle inside the cell
+    // popup) joins them: its lowercase `j` is the popup's scroll-down.
     for (key, _) in HELP_ROWS {
         if key.starts_with('—') {
             continue;
         }
         for tok in key.split(['/', ' ', '+']).filter(|t| !t.is_empty()) {
-            if tok == "I" || tok == "G" || tok == "Y" || tok == "V" {
+            if tok == "I" || tok == "G" || tok == "Y" || tok == "V" || tok == "J" {
                 continue;
             }
             assert!(

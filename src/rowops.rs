@@ -27,20 +27,25 @@ pub(crate) fn open_cell_popup(app: &mut App) {
         .get(app.col_cursor)
         .cloned()
         .unwrap_or_default();
+    let col = fix_double_encoding(&col);
     let (text, style) = value_display(v);
+    // The raw value (never the pretty form) is what `y`/`Y` copies.
+    let raw = cell_copy_text(v);
+    let pretty = pretty_json(&raw).map(|p| pretty_json_spans(&p));
+    let show_pretty = pretty.is_some();
     let title = tf(
         "{} · 第 {} 行 · {} 字符",
-        &[
-            &(fix_double_encoding(&col)),
-            &(cursor_abs_row(app)),
-            &(text.chars().count()),
-        ],
+        &[&col, &(cursor_abs_row(app)), &(text.chars().count())],
     );
     app.popup_cache = None;
     app.cell_popup = Some(CellPopup {
         title,
         lines: vec![PopupLine { text, style }],
         scroll: 0,
+        col,
+        raw,
+        pretty,
+        show_pretty,
     });
 }
 
@@ -200,11 +205,20 @@ pub(crate) fn drill_row_popup_cell(app: &mut App) {
         "{} · 第 {} 行 · {} 字符",
         &[&col, &abs, &(text.chars().count())],
     );
+    let pretty = pretty_json(&text).map(|p| pretty_json_spans(&p));
+    let show_pretty = pretty.is_some();
     app.popup_cache = None;
     app.cell_popup = Some(CellPopup {
         title,
-        lines: vec![PopupLine { text, style }],
+        lines: vec![PopupLine {
+            text: text.clone(),
+            style,
+        }],
         scroll: 0,
+        col,
+        raw: text,
+        pretty,
+        show_pretty,
     });
 }
 

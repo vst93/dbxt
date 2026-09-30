@@ -149,27 +149,136 @@ pub(crate) fn render_text_popup(
     scroll: u16,
     cache: &mut Option<PopupCache>,
 ) -> (Rect, Rect, u16) {
-    let w = overlay_width(area.width, 88, 24);
-    let inner_w = w.saturating_sub(4).max(1) as usize;
+    let inner_w = popup_inner_width(area.width);
     // Wrap each logical line on its own so the style that marks NULL / ''
     // survives across physical rows. The result is memoised: re-wrapping a
     // 100 KB value on every scroll frame would stall the TUI (R42).
     if cache.as_ref().is_none_or(|c| c.width != inner_w) {
-        let body: Vec<Line> = lines
-            .iter()
-            .flat_map(|pl| {
-                let style = pl.style;
-                wrap_text(&pl.text, inner_w)
-                    .into_iter()
-                    .map(move |t| Line::from(Span::styled(t, style)))
-            })
-            .collect();
+        *cache = Some(PopupCache {
+            width: inner_w,
+            lines: popup_lines_plain(lines, inner_w),
+        });
+    }
+    let body = &cache.as_ref().expect("popup cache filled above").lines;
+    render_popup_body(f, area, title, body, scroll)
+}
+
+/// R74: the cell popup, which adds the pretty-JSON view. The body is rebuilt
+/// from the raw or pretty source depending on the `J` toggle; the memoised wrap
+/// is keyed on width only, and the toggle clears `cache` before redrawing.
+pub(crate) fn render_cell_popup(
+    f: &mut Frame,
+    area: Rect,
+    popup: &CellPopup,
+    cache: &mut Option<PopupCache>,
+) -> (Rect, Rect, u16) {
+    let inner_w = popup_inner_width(area.width);
+    if cache.as_ref().is_none_or(|c| c.width != inner_w) {
+        let body = match (&popup.pretty, popup.show_pretty) {
+            (Some(pretty), true) => popup_lines_rich(pretty, inner_w),
+            _ => popup_lines_plain(&popup.lines, inner_w),
+        };
         *cache = Some(PopupCache {
             width: inner_w,
             lines: body,
         });
     }
+    let title = if popup.pretty.is_some() {
+        if popup.show_pretty {
+            tf("{} · JSON 美化", &[&popup.title])
+        } else {
+            tf("{} · JSON 原值", &[&popup.title])
+        }
+    } else {
+        popup.title.clone()
+    };
     let body = &cache.as_ref().expect("popup cache filled above").lines;
+    render_popup_body(f, area, &title, body, popup.scroll)
+}
+
+/// The text-popup width (`overlay_width` minus the two borders and padding),
+/// shared by the plain and rich body builders so the wrap and the draw agree.
+pub(crate) fn popup_inner_width(area_w: u16) -> usize {
+    overlay_width(area_w, 88, 24).saturating_sub(4).max(1) as usize
+}
+
+/// Plain popup body: wrap every logical line on its own, carrying its style.
+pub(crate) fn popup_lines_plain(lines: &[PopupLine], inner_w: usize) -> Vec<Line<'static>> {
+    lines
+        .iter()
+        .flat_map(|pl| {
+            let style = pl.style;
+            wrap_text(&pl.text, inner_w)
+                .into_iter()
+                .map(move |t| Line::from(Span::styled(t, style)))
+        })
+        .collect()
+}
+
+/// Rich popup body (the pretty-JSON cell view): wrap every line's styled token
+/// runs, keeping each token's colour across the wrap boundary.
+pub(crate) fn popup_lines_rich(lines: &[Vec<PopupSpan>], inner_w: usize) -> Vec<Line<'static>> {
+    let mut out: Vec<Line<'static>> = Vec::new();
+    for spans in lines {
+        out.extend(wrap_spans(spans, inner_w));
+    }
+    if out.is_empty() {
+        out.push(Line::from(""));
+    }
+    out
+}
+
+/// Wrap one line's styled spans to `width` display columns, one `Line` per
+/// physical row. A span may carry an explicit `\n` (unlikely in pretty JSON,
+/// but the scanner is generic); it starts a new row like a width overflow.
+fn wrap_spans(spans: &[PopupSpan], width: usize) -> Vec<Line<'static>> {
+    let width = width.max(1);
+    let mut out: Vec<Line<'static>> = Vec::new();
+    let mut cur: Vec<Span<'static>> = Vec::new();
+    let mut cur_w = 0usize;
+    for sp in spans {
+        let style = sp.style;
+        let mut seg = String::new();
+        for c in sp.text.chars() {
+            if c == '\n' {
+                if !seg.is_empty() {
+                    cur.push(Span::styled(std::mem::take(&mut seg), style));
+                }
+                out.push(Line::from(std::mem::take(&mut cur)));
+                cur_w = 0;
+                continue;
+            }
+            let cw = UnicodeWidthChar::width(c).unwrap_or(0).max(1);
+            if cur_w + cw > width && cur_w > 0 {
+                if !seg.is_empty() {
+                    cur.push(Span::styled(std::mem::take(&mut seg), style));
+                }
+                out.push(Line::from(std::mem::take(&mut cur)));
+                cur_w = 0;
+            }
+            seg.push(c);
+            cur_w += cw;
+        }
+        if !seg.is_empty() {
+            cur.push(Span::styled(seg, style));
+        }
+    }
+    if !cur.is_empty() || out.is_empty() {
+        out.push(Line::from(cur));
+    }
+    out
+}
+
+/// Draw a pre-built body in the shared scrollable popup frame and report its
+/// geometry (box, inner area, largest scroll offset).
+pub(crate) fn render_popup_body(
+    f: &mut Frame,
+    area: Rect,
+    title: &str,
+    body: &[Line<'static>],
+    scroll: u16,
+) -> (Rect, Rect, u16) {
+    let w = overlay_width(area.width, 88, 24);
     let total = body.len();
     let max_h = area.height.saturating_sub(4).max(3);
     let h = ((total as u16) + 2).min(max_h);
@@ -187,7 +296,7 @@ pub(crate) fn render_text_popup(
         ],
     );
     f.render_widget(
-        Paragraph::new(body.clone()).scroll((scroll, 0)).block(
+        Paragraph::new(body.to_vec()).scroll((scroll, 0)).block(
             Block::default()
                 .borders(Borders::ALL)
                 .title(title)
@@ -1178,7 +1287,7 @@ pub(crate) const HELP_ROWS: &[(&str, &str)] = &[
         "Enter",
         "整行详情（纵向，含隐藏列；看某一行从这里进；结果区双击行同效）",
     ),
-    ("v", "完整单元格（任意模式，不进整行弹层）"),
+    ("v", "完整单元格（任意模式，不进整行弹层；JSON 对象/数组自动美化缩进）"),
     ("o", "整行详情（与 Enter 等价）"),
     ("e", "编辑单元格 → diff 确认后执行"),
     ("i", "快速插入 → diff 确认后执行"),
@@ -1231,6 +1340,17 @@ pub(crate) const HELP_ROWS: &[(&str, &str)] = &[
     ("/", "按列名或值过滤（输入即筛；宽表 40+ 列找列）"),
     ("< 56 cols", "窄屏：每行「字段:」+ 缩进值单列自适应"),
     ("标题", "主键定位：第 12 行 · id=4821"),
+    ("— 单元格弹层（v）—", ""),
+    ("↑ ↓ / j k · PgUp/PgDn", "滚动长值（换行结果缓存，100 KB 单元格也不卡）"),
+    (
+        "J",
+        "JSON 对象/数组：美化 ↔ 原值切换（键/字符串/数字用主题色区分；非 JSON 时提示）",
+    ),
+    (
+        "y / Y",
+        "复制原值（美化视图下仍复制原始 JSON，不复制缩进格式）",
+    ),
+    ("Esc / Enter / q", "关闭（从行弹层下钻时先回行弹层）"),
     ("— 编辑确认层 —", ""),
     ("Enter", "执行（UPDATE / INSERT，SQL 全文可见）"),
     ("Esc", "取消编辑"),

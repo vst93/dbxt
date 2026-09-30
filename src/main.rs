@@ -9,6 +9,7 @@ mod diffui;
 mod editor;
 mod filter;
 mod input;
+mod jsonview;
 mod mongo;
 mod nav;
 mod parity;
@@ -687,6 +688,12 @@ enum OpResult {
     },
     /// Chunk progress; does not count as the op finishing.
     ImportProgress {
+        done: usize,
+        total: usize,
+    },
+    /// R74: per-statement progress for a multi-statement SQL batch; like
+    /// [`OpResult::ImportProgress`] it does not count as the op finishing.
+    QueryProgress {
         done: usize,
         total: usize,
     },
@@ -1646,8 +1653,50 @@ async fn run_op(backend: &LocalBackend, op: Op, tx: &Tx) -> OpResult {
                     timeout_secs: Some(timeout),
                     ..Default::default()
                 };
-                match backend.execute_batch(&cfg, &db, None, &sql, options).await {
+                // R74: run the batch through the core's progress-aware entry
+                // point so the status bar can show `3/7` as statements land.
+                // This is the same call `LocalBackend::execute_batch` makes,
+                // just with a progress callback attached.
+                let progress: Option<dbx_core::query::ExecuteMultiProgressCallback> = {
+                    let tx = tx.clone();
+                    let last = Arc::new(std::sync::Mutex::new(std::time::Instant::now()));
+                    Some(Arc::new(move |p: dbx_core::query::ExecuteMultiProgress| {
+                        // Coalesce to ~10/s (but always forward the last
+                        // statement) so a thousand-statement script cannot
+                        // flood the UI channel.
+                        let now = std::time::Instant::now();
+                        let mut last = last.lock().unwrap_or_else(|e| e.into_inner());
+                        if p.completed < p.total
+                            && now.duration_since(*last) < std::time::Duration::from_millis(100)
+                        {
+                            return;
+                        }
+                        *last = now;
+                        drop(last);
+                        let _ = tx.send(OpResult::QueryProgress {
+                            done: p.completed,
+                            total: p.total,
+                        });
+                    }))
+                };
+                let batch =
+                    dbx_core::query::execute_multi_core_with_options_for_client_and_progress(
+                        backend.state().as_ref(),
+                        &cfg.id,
+                        &db,
+                        &sql,
+                        None,
+                        None,
+                        options,
+                        progress,
+                    )
+                    .await;
+                match batch {
                     Ok(results) => {
+                        let results: Vec<BatchStatementResult> = results
+                            .into_iter()
+                            .map(BatchStatementResult::from)
+                            .collect();
                         let mut outcomes: Vec<StmtOutcome> = Vec::new();
                         let mut total_ms: u64 = 0;
                         for (idx, r) in results.into_iter().enumerate() {
@@ -4480,6 +4529,7 @@ fn apply_op_result(app: &mut App, res: OpResult, tx: &Tx) {
     if matches!(
         res,
         OpResult::ImportProgress { .. }
+            | OpResult::QueryProgress { .. }
             | OpResult::SshPrompt(_)
             | OpResult::SshNotice(_)
             | OpResult::SearchProgress { .. }
@@ -4520,6 +4570,9 @@ fn apply_op_result(app: &mut App, res: OpResult, tx: &Tx) {
             OpResult::ImportProgress { done, total } => {
                 app.import_progress = Some((done, total));
                 app.status = tf("导入 {} / {} 行…", &[&done, &total]);
+            }
+            OpResult::QueryProgress { done, total } => {
+                app.status = tf("执行中… {}/{}", &[&done, &total]);
             }
             OpResult::TransferProgress {
                 gen,
@@ -5291,8 +5344,13 @@ fn apply_op_result(app: &mut App, res: OpResult, tx: &Tx) {
                 );
             } else {
                 app.status = tf(
-                    "脚本 · {} 条语句 · 影响 {} 行 · {} 错误 · Enter 看结果",
-                    &[&(n), &(affected), &(errors)],
+                    "脚本 · {} 条语句 · 影响 {} 行 · {} 错误 · {} · Enter 看结果",
+                    &[
+                        &(n),
+                        &(affected),
+                        &(errors),
+                        &history_duration_label(total_ms),
+                    ],
                 );
             }
         }
@@ -5814,6 +5872,7 @@ fn apply_op_result(app: &mut App, res: OpResult, tx: &Tx) {
             app.import_report = Some(rep);
         }
         OpResult::ImportProgress { .. } => {}
+        OpResult::QueryProgress { .. } => {}
         OpResult::TransferProgress { .. } => {}
         OpResult::ExportDone {
             format,

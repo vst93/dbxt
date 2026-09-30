@@ -1352,10 +1352,19 @@ pub(crate) fn open_data_row_popup(app: &mut App) {
             style: Style::default().fg(Color::DarkGray),
         });
     }
+    let raw = lines
+        .iter()
+        .map(|l| l.text.clone())
+        .collect::<Vec<_>>()
+        .join("\n");
     app.cell_popup = Some(CellPopup {
-        title,
+        title: title.clone(),
         lines,
         scroll: 0,
+        col: title,
+        raw,
+        pretty: None,
+        show_pretty: false,
     });
 }
 

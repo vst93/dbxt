@@ -981,14 +981,13 @@ pub(crate) fn overlays_render_at_extreme_sizes() {
         (
             "cell-popup",
             Box::new(|a| {
-                a.cell_popup = Some(CellPopup {
-                    title: "cell".into(),
-                    lines: vec![PopupLine {
+                a.cell_popup = Some(cell_popup_from_lines(
+                    "cell".into(),
+                    vec![PopupLine {
                         text: "x".into(),
                         style: Style::default(),
                     }],
-                    scroll: 0,
-                })
+                ))
             }),
         ),
         (

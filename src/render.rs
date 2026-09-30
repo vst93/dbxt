@@ -251,8 +251,7 @@ pub(crate) fn ui(f: &mut Frame, app: &mut App) {
     }
     if let Some(popup) = app.cell_popup.as_ref() {
         let cache = &mut app.popup_cache;
-        let (box_area, _inner, _max) =
-            render_text_popup(f, f.area(), &popup.title, &popup.lines, popup.scroll, cache);
+        let (box_area, _inner, _max) = render_cell_popup(f, f.area(), popup, cache);
         app.rects.cell_popup = box_area;
     }
     if app.error_popup.is_some() {
@@ -1111,7 +1110,12 @@ pub(crate) fn footer_hints_ctx(ctx: FooterCtx) -> Vec<Hint> {
         FooterView::FilterPrompt => {
             vec![("Enter", t("应用")), ("Esc", t("取消")), ("⏎", t("清除"))]
         }
-        FooterView::Popup => vec![("↑↓", t("滚动")), ("Esc/Enter", t("关闭"))],
+        FooterView::Popup => vec![
+            ("↑↓", t("滚动")),
+            ("J", t("JSON 美化")),
+            ("y/Y", t("复制原值")),
+            ("Esc/Enter", t("关闭")),
+        ],
         FooterView::RowPopup => vec![
             ("↑↓/n p", t("移动")),
             ("Enter/v", t("看值")),

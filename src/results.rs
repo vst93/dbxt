@@ -481,11 +481,43 @@ pub(crate) fn copy_stmt_result(app: &mut App) {
 }
 
 /// Key handling for the full-cell popup: Esc / q / Enter close it (returning to
-/// the row popup underneath when it was drilled from one), and the arrows scroll
-/// the wrapped value.
+/// the row popup underneath when it was drilled from one), the arrows scroll the
+/// wrapped value, `J` toggles the pretty-JSON view when the value is a JSON
+/// object/array, and `y`/`Y` copy the **original** value (never the pretty form).
 pub(crate) fn cell_popup_key(app: &mut App, k: KeyEvent) {
     if matches!(k.code, KeyCode::Esc | KeyCode::Char('q') | KeyCode::Enter) {
         app.cell_popup = None;
+        return;
+    }
+    // `J`: switch between the pretty and raw JSON views. A non-JSON value says
+    // so instead of silently doing nothing.
+    if k.code == KeyCode::Char('J') {
+        let status = match &mut app.cell_popup {
+            Some(p) if p.pretty.is_some() => {
+                p.show_pretty = !p.show_pretty;
+                p.scroll = 0;
+                Some(if p.show_pretty {
+                    t("JSON 美化视图 · J 切回原值")
+                } else {
+                    t("原值视图 · J 切换 JSON 美化")
+                })
+            }
+            _ => Some(t("该单元格不是 JSON 对象/数组")),
+        };
+        if let Some(s) = status {
+            app.popup_cache = None;
+            app.status = s.into();
+        }
+        return;
+    }
+    // `y` / `Y`: copy the original value, so a pretty view never changes what
+    // lands on the clipboard.
+    if matches!(k.code, KeyCode::Char('y') | KeyCode::Char('Y')) {
+        if let Some(p) = app.cell_popup.as_ref() {
+            let col = p.col.clone();
+            let raw = p.raw.clone();
+            copy_named_value(app, &col, &raw);
+        }
         return;
     }
     let delta: i32 = match k.code {

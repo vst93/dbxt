@@ -1304,6 +1304,21 @@ pub static ALL_KEYS: &[&str] = &[
     "退出保留高亮",
     "编辑器内查找：底栏输入，Enter/F3/Alt-N 下一个、Alt-B 上一个（Shift-Enter / Shift-F3 在支持的终端也可用）；命中高亮 + 状态栏 3/7 计数；大小写不敏感、纯客户端不发查询；Esc 退出保留高亮，下次编辑自动清除",
     "查找命中循环：F3/Alt-N 下一个、Alt-B 上一个（Esc 退出查找后仍可用；无查找词时按下即打开查找框）",
+    "JSON 美化视图 · J 切回原值",
+    "原值视图 · J 切换 JSON 美化",
+    "该单元格不是 JSON 对象/数组",
+    "执行中… {}/{}",
+    "{} · JSON 美化",
+    "{} · JSON 原值",
+    "脚本 · {} 条语句 · 影响 {} 行 · {} 错误 · {} · Enter 看结果",
+    "JSON 美化",
+    "复制原值",
+    "完整单元格（任意模式，不进整行弹层；JSON 对象/数组自动美化缩进）",
+    "— 单元格弹层（v）—",
+    "滚动长值（换行结果缓存，100 KB 单元格也不卡）",
+    "JSON 对象/数组：美化 ↔ 原值切换（键/字符串/数字用主题色区分；非 JSON 时提示）",
+    "复制原值（美化视图下仍复制原始 JSON，不复制缩进格式）",
+    "关闭（从行弹层下钻时先回行弹层）",
 ];
 
 /// The Chinese → English table. Keys must match the source literals exactly.
@@ -3680,6 +3695,34 @@ fn en_of(zh: &'static str) -> Option<&'static str> {
         }
         "查找命中循环：F3/Alt-N 下一个、Alt-B 上一个（Esc 退出查找后仍可用；无查找词时按下即打开查找框）" => {
             Some("Cycle find matches: F3/Alt-N next, Alt-B previous (still works after Esc; with no needle yet the key opens the find box)")
+        }
+        // ── R74: pretty JSON cell view + batch progress ──
+        "JSON 美化视图 · J 切回原值" => Some("JSON pretty view · J back to raw"),
+        "原值视图 · J 切换 JSON 美化" => Some("Raw view · J switch to JSON pretty"),
+        "该单元格不是 JSON 对象/数组" => Some("This cell is not a JSON object/array"),
+        "执行中… {}/{}" => Some("Running… {}/{}"),
+        "{} · JSON 美化" => Some("{} · JSON pretty"),
+        "{} · JSON 原值" => Some("{} · JSON raw"),
+        "脚本 · {} 条语句 · 影响 {} 行 · {} 错误 · {} · Enter 看结果" => Some(
+            "Script · {} statements · {} rows affected · {} errors · {} · Enter for results",
+        ),
+        "JSON 美化" => Some("JSON pretty"),
+        "复制原值" => Some("copy raw"),
+        "完整单元格（任意模式，不进整行弹层；JSON 对象/数组自动美化缩进）" => Some(
+            "full cell (any mode, without the row popup; JSON objects/arrays are pretty-printed)",
+        ),
+        "— 单元格弹层（v）—" => Some("— cell popup (v) —"),
+        "滚动长值（换行结果缓存，100 KB 单元格也不卡）" => Some(
+            "scroll a long value (the wrap is cached, so a 100 KB cell stays smooth)",
+        ),
+        "JSON 对象/数组：美化 ↔ 原值切换（键/字符串/数字用主题色区分；非 JSON 时提示）" => Some(
+            "JSON object/array: toggle pretty ↔ raw (keys/strings/numbers use theme colours; a non-JSON cell says so)",
+        ),
+        "复制原值（美化视图下仍复制原始 JSON，不复制缩进格式）" => Some(
+            "copy the raw value (the pretty view still copies the original JSON, never the indented form)",
+        ),
+        "关闭（从行弹层下钻时先回行弹层）" => {
+            Some("close (when drilled from the row popup, returns there first)")
         }
         _ => None,
     }

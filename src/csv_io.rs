@@ -365,12 +365,28 @@ pub(crate) struct PopupLine {
     pub(crate) style: Style,
 }
 
+/// One styled token run inside a rich popup line (the pretty-JSON cell view).
+#[derive(Clone)]
+pub(crate) struct PopupSpan {
+    pub(crate) text: String,
+    pub(crate) style: Style,
+}
+
 /// A modal showing one cell's full, untruncated value.
 #[derive(Clone)]
 pub(crate) struct CellPopup {
     pub(crate) title: String,
     pub(crate) lines: Vec<PopupLine>,
     pub(crate) scroll: u16,
+    /// Column name, named in the `y`/`Y` copy status.
+    pub(crate) col: String,
+    /// The original cell text — what `y`/`Y` copies, never the pretty form.
+    pub(crate) raw: String,
+    /// Pretty JSON body (styled token runs per line) when [`raw`] is a JSON
+    /// object/array; `None` for every other value.
+    pub(crate) pretty: Option<Vec<Vec<PopupSpan>>>,
+    /// True while the pretty body is shown (JSON cells only).
+    pub(crate) show_pretty: bool,
 }
 
 /// A modal showing every column of the focused row, one per line. Beyond
@@ -420,6 +436,25 @@ pub(crate) fn row_popup_from_lines(title: String, lines: Vec<PopupLine>) -> RowP
         filter: String::new(),
         filtering: false,
         count: String::new(),
+    }
+}
+
+/// Build a plain (non-JSON) cell popup for tests.
+#[cfg(test)]
+pub(crate) fn cell_popup_from_lines(title: String, lines: Vec<PopupLine>) -> CellPopup {
+    let raw = lines
+        .iter()
+        .map(|l| l.text.clone())
+        .collect::<Vec<_>>()
+        .join("\n");
+    CellPopup {
+        title: title.clone(),
+        lines,
+        scroll: 0,
+        col: title,
+        raw,
+        pretty: None,
+        show_pretty: false,
     }
 }
 
