@@ -4080,6 +4080,10 @@ struct ConnConfirm {
     db_type: String,
     /// R47b: true = manual disconnect; false = delete the saved connection.
     disconnect: bool,
+    /// R68: when set, the red layer flips this connection's read-only policy to
+    /// the given value (a connection-level config field) instead of deleting or
+    /// disconnecting it.
+    readonly: Option<bool>,
 }
 
 /// Liveness of one connection root as the sidebar draws it (R47b).
@@ -5997,6 +6001,10 @@ enum Op {
     /// this one row and can never drop the connection's secrets or its live
     /// pools the way a remove-then-add would.
     RenameConn(Box<ConnectionConfig>),
+    /// R68: persist a connection's read-only policy (a connection-level config
+    /// field). Same single-row store upsert as [`Op::RenameConn`], so a toggle
+    /// rewrites only this row and cannot drop secrets or live pools.
+    SetConnReadOnly(Box<ConnectionConfig>),
     /// Remove a saved connection from DBX's store (config only; never touches
     /// the database's data).
     DeleteConn {
@@ -6136,6 +6144,9 @@ enum OpResult {
     /// R55: a connection rename landed; carries the updated config so the
     /// picker and tree can merge it in place.
     ConnRenamed(Box<ConnectionConfig>),
+    /// R68: a connection's read-only policy was persisted; carries the updated
+    /// config so the tree / editor / guards merge the new write policy in place.
+    ConnReadOnlySet(Box<ConnectionConfig>),
     /// A saved connection was removed (id + name for the status line).
     ConnDeleted {
         id: String,
@@ -7921,6 +7932,30 @@ async fn run_op(backend: &LocalBackend, op: Op, tx: &Tx) -> OpResult {
                     OpResult::ConnRenamed(Box::new(cfg))
                 }
                 Err(e) => OpResult::Error(format!("rename: {e}")),
+            }
+        }
+        // R68: persist a read-only toggle through the same single-row upsert as
+        // a rename, so only this connection's row is rewritten (secrets and live
+        // pools untouched) and the kernel's in-memory config map stays in step.
+        Op::SetConnReadOnly(cfg) => {
+            let cfg = *cfg;
+            let id = cfg.id.clone();
+            match backend
+                .state()
+                .storage
+                .save_connections(std::slice::from_ref(&cfg))
+                .await
+            {
+                Ok(()) => {
+                    backend
+                        .state()
+                        .configs
+                        .write()
+                        .await
+                        .insert(id, cfg.clone());
+                    OpResult::ConnReadOnlySet(Box::new(cfg))
+                }
+                Err(e) => OpResult::Error(format!("read_only: {e}")),
             }
         }
         Op::DeleteConn { id, name } => match backend.remove_connection_for_mcp(&id).await {
@@ -12467,6 +12502,26 @@ fn apply_op_result(app: &mut App, res: OpResult, tx: &Tx) {
             }
             app.status = tf("✓ 已重命名连接 {}", &[&name]);
         }
+        // R68: a read-only toggle was persisted. Merge the updated config so the
+        // tree 🔒, the editor badge and every write guard see the new policy.
+        OpResult::ConnReadOnlySet(cfg) => {
+            let id = cfg.id.clone();
+            let name = cfg.name.clone();
+            let ro = cfg.read_only;
+            match app.connections.iter().position(|c| c.id == id) {
+                Some(i) => app.connections[i] = *cfg,
+                None => app.connections.push(*cfg),
+            }
+            if app.selected.as_ref().is_some_and(|c| c.id == id) {
+                app.selected = app.connections.iter().find(|c| c.id == id).cloned();
+            }
+            rebuild_side_rows(app);
+            app.status = if ro {
+                tf("✓ 连接 {} 已设为只读（写操作将被拦截）", &[&name])
+            } else {
+                tf("✓ 连接 {} 已恢复为可写", &[&name])
+            };
+        }
         OpResult::ConnDeleted { id, name } => {
             app.connections.retain(|c| c.id != id);
             // R47b: forget the removed connection's cached liveness.
@@ -14436,6 +14491,12 @@ fn confirm_key(app: &mut App, tx: &Tx, k: KeyEvent) {
                     return;
                 }
                 if let Some(cc) = c.conn {
+                    // R68: a read-only toggle is a config write, so it runs
+                    // before the delete / disconnect branches.
+                    if let Some(new_ro) = cc.readonly {
+                        apply_conn_readonly(app, tx, &cc, new_ro);
+                        return;
+                    }
                     if cc.disconnect {
                         // R47b: drain the pools (manual transactions roll back)
                         // and let the reply collapse the root to a grey dot.
@@ -15552,6 +15613,7 @@ fn sidebar_key(app: &mut App, tx: &Tx, k: KeyEvent) {
                                 name: cfg.name.clone(),
                                 db_type: cfg.db_type.as_str().to_string(),
                                 disconnect: false,
+                                readonly: None,
                             }),
                             redis: None,
                             mongo: None,
@@ -15704,6 +15766,9 @@ fn sidebar_key(app: &mut App, tx: &Tx, k: KeyEvent) {
             KeyCode::Delete => redis_batch_delete(app),
             KeyCode::Char('x') => open_redis_batch_ttl_prompt(app),
             KeyCode::Char('m') => open_redis_batch_rename_prompt(app),
+            // R68: `!` flips the connection's read-only policy from the key
+            // browser too (no tree root row exists in Redis mode).
+            KeyCode::Char('!') if k.modifiers.is_empty() => open_readonly_toggle_confirm(app),
             // Esc clears the client-side filter first, then the selection.
             KeyCode::Esc => {
                 if !app.redis_filter.is_empty() {
@@ -15933,6 +15998,10 @@ fn sidebar_key(app: &mut App, tx: &Tx, k: KeyEvent) {
         {
             app.status = t("分组行：x 无动作（连接根上按 x 断开）").into();
         }
+        // R68: `!` flips the read-only policy of the connection under the cursor
+        // (the active one on a db / table row) behind the red confirmation
+        // layer. Caught before the type-to-filter below so it is never text.
+        KeyCode::Char('!') if k.modifiers.is_empty() => open_readonly_toggle_confirm(app),
         // One-step type-to-filter (R39): any printable character that is not a
         // bound shortcut starts the filter with that character already typed,
         // so a lookup is a single keystroke instead of `/` then type.
@@ -19890,6 +19959,7 @@ fn open_disconnect_confirm(app: &mut App, cfg: &ConnectionConfig) {
             name: cfg.name.clone(),
             db_type: cfg.db_type.as_str().to_string(),
             disconnect: true,
+            readonly: None,
         }),
         redis: None,
         mongo: None,
@@ -19909,6 +19979,74 @@ fn request_disconnect(app: &mut App, idx: usize) {
         return;
     };
     open_disconnect_confirm(app, &c);
+}
+
+/// R68: `!` on the tree flips the read-only policy of the connection under the
+/// cursor (or the active connection when the cursor is on a db / table row),
+/// behind the same red confirmation layer as a disconnect. Read-only is a
+/// connection-level config field persisted through LocalBackend's single-row
+/// upsert, so the policy survives a restart and every write guard reads it.
+fn open_readonly_toggle_confirm(app: &mut App) {
+    let target = match app.side_rows.get(app.side_sel) {
+        Some(SideRow::Conn { idx, .. }) => side_root_cfg(app, *idx).cloned(),
+        _ => app.selected.clone(),
+    };
+    let Some(cfg) = target else {
+        app.status = t("没有可切换的连接").into();
+        return;
+    };
+    // Only a saved connection can be persisted; a synthetic root (an active
+    // connection missing from the store) has no row to write.
+    if !app.connections.iter().any(|c| c.id == cfg.id) {
+        app.status = t("该连接不在已保存列表中，无法保存只读设置").into();
+        return;
+    }
+    let new_value = !cfg.read_only;
+    app.confirm = Some(Confirm {
+        sql: String::new(),
+        reasons: Vec::new(),
+        refresh: false,
+        clear_batch: false,
+        conn: Some(ConnConfirm {
+            id: cfg.id.clone(),
+            name: cfg.name.clone(),
+            db_type: cfg.db_type.as_str().to_string(),
+            disconnect: false,
+            readonly: Some(new_value),
+        }),
+        redis: None,
+        mongo: None,
+    });
+    app.status = if new_value {
+        tf("将连接 {} 设为只读 · Enter 确认 · Esc 取消", &[&cfg.name])
+    } else {
+        tf("将连接 {} 恢复为可写 · Enter 确认 · Esc 取消", &[&cfg.name])
+    };
+}
+
+/// R68: apply a confirmed read-only toggle. The in-memory config (and the
+/// active `selected` copy the write guards read) is updated first so the 🔒 and
+/// the interception are immediate; the store write confirms it, and a failure
+/// surfaces as a red status rather than a silent no-op.
+fn apply_conn_readonly(app: &mut App, tx: &Tx, cc: &ConnConfirm, read_only: bool) {
+    let Some(mut cfg) = app.connections.iter().find(|c| c.id == cc.id).cloned() else {
+        app.status = t("✗ 连接已不存在").into();
+        return;
+    };
+    cfg.read_only = read_only;
+    if let Some(slot) = app.connections.iter_mut().find(|c| c.id == cfg.id) {
+        *slot = cfg.clone();
+    }
+    if app.selected.as_ref().is_some_and(|c| c.id == cfg.id) {
+        app.selected = Some(cfg.clone());
+    }
+    rebuild_side_rows(app);
+    app.status = if read_only {
+        tf("保存连接 {} 只读设置…", &[&cfg.name])
+    } else {
+        tf("保存连接 {} 可写设置…", &[&cfg.name])
+    };
+    app.spawn(tx, Op::SetConnReadOnly(Box::new(cfg)));
 }
 
 /// `s` on a database row: lazily fetch that database's aggregate size and
@@ -21010,6 +21148,11 @@ fn copy_redis_row(app: &mut App) {
 /// Confirm deleting the focused key (DEL). Data-destructive writes always go
 /// through the red layer, like every SQL row delete.
 fn redis_confirm_delete(app: &mut App) {
+    // R68: refuse the gesture up front on a read-only connection (the confirm
+    // layer's Enter would also block, but this names the connection at once).
+    if readonly_conn_block(app) {
+        return;
+    }
     let Some(view) = app.redis_value.clone() else {
         app.status = t("先选中一个 key").into();
         return;
@@ -21298,6 +21441,9 @@ fn redis_remove_keys_in_place(app: &mut App, raws: &[String]) {
 
 /// `Del` in the key browser: batch delete the selected keys.
 fn redis_batch_delete(app: &mut App) {
+    if readonly_conn_block(app) {
+        return;
+    }
     let targets = redis_batch_targets(app);
     if targets.is_empty() {
         app.status = t("先选中一个 key").into();
@@ -21343,6 +21489,9 @@ fn redis_batch_delete(app: &mut App) {
 
 /// `x` in the key browser: open the batch TTL prompt.
 fn open_redis_batch_ttl_prompt(app: &mut App) {
+    if readonly_conn_block(app) {
+        return;
+    }
     let targets = redis_batch_targets(app);
     if targets.is_empty() {
         app.status = t("先选中一个 key").into();
@@ -21363,6 +21512,9 @@ fn open_redis_batch_ttl_prompt(app: &mut App) {
 
 /// `m` in the key browser: open the batch prefix-rename prompt.
 fn open_redis_batch_rename_prompt(app: &mut App) {
+    if readonly_conn_block(app) {
+        return;
+    }
     let targets = redis_batch_targets(app);
     if targets.is_empty() {
         app.status = t("先选中一个 key").into();
@@ -40821,6 +40973,10 @@ const HELP_ROWS: &[(&str, &str)] = &[
         "x（连接根）",
         "断开连接：关闭连接池（未提交手动事务回滚）；树保留灰根，展开可重连",
     ),
+    (
+        "!（连接树 / Redis 键列表）",
+        "切换当前连接只读开关（红色确认）：只读下写语句 / 删行 / Redis 写 / 导入全部拦截；连接根显 🔒",
+    ),
     ("尺寸列", "库大小 / 表行数估计右对齐；终端 <56 列自动隐藏"),
     (
         "分组节点",
@@ -41775,8 +41931,39 @@ fn render_conn_confirm(f: &mut Frame, area: Rect, cc: &ConnConfirm) -> (Rect, Re
     let w = overlay_width(area.width, 72, 30);
     // R47b: the disconnect variant shares this red layer but spells out what a
     // disconnect does (pools close, uncommitted manual transactions roll back)
-    // and that the tree keeps its shape.
-    let (title, body, ok_label) = if cc.disconnect {
+    // and that the tree keeps its shape. R68 adds the read-only toggle variant.
+    let (title, body, ok_label) = if let Some(new_ro) = cc.readonly {
+        let (head, effect, ok) = if new_ro {
+            (
+                tf("将连接 {} ({}) 设为只读？", &[&cc.name, &cc.db_type]),
+                t("开启后写语句 / 删行 / Redis 写 / 导入全部拦截（SELECT/SHOW 照常）"),
+                t("Enter/y 设为只读"),
+            )
+        } else {
+            (
+                tf("将连接 {} ({}) 恢复为可写？", &[&cc.name, &cc.db_type]),
+                t("关闭后该连接可再次执行写操作（重新允许 INSERT/UPDATE/DELETE/DDL）"),
+                t("Enter/y 恢复可写"),
+            )
+        };
+        (
+            t(" ⚠ 切换只读开关 "),
+            vec![
+                Line::from(Span::styled(
+                    head,
+                    Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
+                )),
+                Line::from(""),
+                Line::from(Span::styled(effect, Style::default().fg(Color::Yellow))),
+                Line::from(Span::styled(
+                    t("只改这条连接配置，不改数据库里的任何数据；树上随即显示/隐藏 🔒"),
+                    Style::default().fg(Color::DarkGray),
+                )),
+                Line::from(""),
+            ],
+            ok,
+        )
+    } else if cc.disconnect {
         (
             t(" ⚠ 断开连接 "),
             vec![
@@ -44992,6 +45179,179 @@ mod tests {
         assert!(
             screen.contains("prod-ro"),
             "status badge connection name missing:\n{screen}"
+        );
+    }
+
+    /// R68: `!` on the tree flips the connection's read-only policy behind the
+    /// red confirmation layer, persists it in memory (so the 🔒 and every write
+    /// guard update at once) and flips it back on a second press.
+    #[test]
+    fn readonly_toggle_flips_marker_and_persists() {
+        run_rt(|| {
+            let (tx, _rx) = tokio::sync::mpsc::unbounded_channel::<OpResult>();
+            let mut app = tree_app();
+            app.picker_open = false;
+            app.focus = Focus::Sidebar;
+            app.side_sel = 0;
+            assert!(!app.selected.as_ref().unwrap().read_only);
+
+            let bang = KeyEvent::new(KeyCode::Char('!'), KeyModifiers::NONE);
+            let enter = KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE);
+
+            // `!` opens the red layer carrying the *new* value (true).
+            key(&mut app, &tx, bang);
+            let cc = app
+                .confirm
+                .as_ref()
+                .and_then(|c| c.conn.clone())
+                .expect("a read-only confirm layer");
+            assert_eq!(cc.readonly, Some(true));
+            assert!(!cc.disconnect, "a toggle is not a disconnect");
+            assert!(app.status.contains("设为只读"), "{}", app.status);
+
+            // Enter applies it to the live config and the stored copy.
+            key(&mut app, &tx, enter);
+            assert!(app.confirm.is_none(), "the layer closed");
+            assert!(app.selected.as_ref().unwrap().read_only, "selected flipped");
+            assert!(app.connections[0].read_only, "stored copy flipped");
+            assert!(app.status.contains("只读"), "{}", app.status);
+
+            // The tree now carries the 🔒 on the connection root.
+            let screen = draw(&mut app, 100, 30).join("\n");
+            assert!(screen.contains('🔒'), "tree lock missing:\n{screen}");
+
+            // A second `!` offers the reverse and flips it back to writable.
+            key(&mut app, &tx, bang);
+            let cc = app
+                .confirm
+                .as_ref()
+                .and_then(|c| c.conn.clone())
+                .expect("a second confirm layer");
+            assert_eq!(cc.readonly, Some(false));
+            key(&mut app, &tx, enter);
+            assert!(!app.selected.as_ref().unwrap().read_only);
+            assert!(!app.connections[0].read_only);
+            assert!(app.status.contains("可写"), "{}", app.status);
+        });
+    }
+
+    /// R68: Esc on the read-only confirmation changes nothing (the policy is
+    /// only written on an explicit Enter / y).
+    #[test]
+    fn readonly_toggle_confirmation_cancels() {
+        run_rt(|| {
+            let (tx, _rx) = tokio::sync::mpsc::unbounded_channel::<OpResult>();
+            let mut app = tree_app();
+            app.picker_open = false;
+            app.focus = Focus::Sidebar;
+            app.side_sel = 0;
+            key(
+                &mut app,
+                &tx,
+                KeyEvent::new(KeyCode::Char('!'), KeyModifiers::NONE),
+            );
+            assert!(app.confirm.is_some());
+            key(
+                &mut app,
+                &tx,
+                KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE),
+            );
+            assert!(app.confirm.is_none());
+            assert!(!app.selected.as_ref().unwrap().read_only, "unchanged");
+            assert!(!app.connections[0].read_only, "stored copy unchanged");
+        });
+    }
+
+    /// R68: a read-only connection refuses every named write gesture before it
+    /// can build SQL / a Redis command, and each refusal names the connection.
+    #[test]
+    fn readonly_blocks_row_redis_and_rename_gestures() {
+        let mut app = test_app();
+        let mut cfg = test_conn("mysql");
+        cfg.name = "prod-ro".into();
+        cfg.read_only = true;
+        app.selected = Some(cfg);
+
+        // Row delete in a table-data grid.
+        app.grid_kind = GridKind::TableData;
+        app.page_state = Some(page_of("orders"));
+        app.set_grid(sample_grid());
+        delete_row(&mut app);
+        assert!(app.status.contains("prod-ro"), "{}", app.status);
+        assert!(
+            app.confirm.is_none(),
+            "no delete confirm on a read-only conn"
+        );
+
+        // Redis single-key delete and the batch rename gesture.
+        app.backend_kind = Backend::Redis;
+        app.redis_value = Some(redis_sample_view());
+        redis_confirm_delete(&mut app);
+        assert!(app.confirm.is_none(), "no redis delete confirm");
+        assert!(app.status.contains("prod-ro"), "{}", app.status);
+        open_redis_batch_rename_prompt(&mut app);
+        assert!(app.redis_prompt.is_none(), "no rename prompt");
+        assert!(app.status.contains("prod-ro"), "{}", app.status);
+    }
+
+    /// R68 self-check: the row popup, column picker and favourites panel each
+    /// advance exactly one row per `j`/`k` event, matching the main results
+    /// grid, so a held key scrolls at the same rate everywhere.
+    #[test]
+    fn overlay_scroll_step_matches_the_main_grid() {
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel::<OpResult>();
+        let j = KeyEvent::new(KeyCode::Char('j'), KeyModifiers::NONE);
+
+        // Main results grid.
+        let mut app = test_app();
+        app.grid_kind = GridKind::TableData;
+        app.set_grid(sample_grid());
+        app.focus = Focus::Preview;
+        app.sel = 0;
+        key(&mut app, &tx, j);
+        assert_eq!(app.sel, 1, "main grid advances one row per j");
+
+        // Row popup.
+        app.sel = 0;
+        open_row_popup(&mut app);
+        key(&mut app, &tx, j);
+        assert_eq!(
+            app.row_popup.as_ref().unwrap().cursor,
+            1,
+            "row popup advances one entry per j"
+        );
+
+        // Column picker.
+        let mut app = test_app();
+        app.grid_kind = GridKind::TableData;
+        app.set_grid(sample_grid());
+        app.focus = Focus::Preview;
+        open_col_picker(&mut app);
+        app.col_picker_list.select(Some(0));
+        key(&mut app, &tx, j);
+        assert_eq!(
+            app.col_picker_list.selected(),
+            Some(1),
+            "column picker advances one column per j"
+        );
+
+        // SQL favourites panel.
+        let mut app = test_app();
+        app.snippets = (0..3)
+            .map(|i| SnippetRow {
+                id: format!("s{i}"),
+                label: format!("fav{i}"),
+                sql: "SELECT 1".into(),
+            })
+            .collect();
+        app.snippet_view = (0..3).collect();
+        app.snippet_open = true;
+        app.snippet_list.select(Some(0));
+        key(&mut app, &tx, j);
+        assert_eq!(
+            app.snippet_list.selected(),
+            Some(1),
+            "favourites panel advances one row per j"
         );
     }
 

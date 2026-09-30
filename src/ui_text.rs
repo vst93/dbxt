@@ -159,6 +159,24 @@ pub static ALL_KEYS: &[&str] = &[
     "⚠ 大结果集 · LIMIT {} · 可能较慢",
     "只读连接：写语句被拦截（只允许 SELECT / SHOW / EXPLAIN）",
     "目标连接为只读，拒绝写入",
+    "✓ 连接 {} 已设为只读（写操作将被拦截）",
+    "✓ 连接 {} 已恢复为可写",
+    "没有可切换的连接",
+    "该连接不在已保存列表中，无法保存只读设置",
+    "将连接 {} 设为只读 · Enter 确认 · Esc 取消",
+    "将连接 {} 恢复为可写 · Enter 确认 · Esc 取消",
+    "保存连接 {} 只读设置…",
+    "保存连接 {} 可写设置…",
+    " ⚠ 切换只读开关 ",
+    "将连接 {} ({}) 设为只读？",
+    "开启后写语句 / 删行 / Redis 写 / 导入全部拦截（SELECT/SHOW 照常）",
+    "Enter/y 设为只读",
+    "将连接 {} ({}) 恢复为可写？",
+    "关闭后该连接可再次执行写操作（重新允许 INSERT/UPDATE/DELETE/DDL）",
+    "Enter/y 恢复可写",
+    "只改这条连接配置，不改数据库里的任何数据；树上随即显示/隐藏 🔒",
+    "!（连接树 / Redis 键列表）",
+    "切换当前连接只读开关（红色确认）：只读下写语句 / 删行 / Redis 写 / 导入全部拦截；连接根显 🔒",
     "退出确认",
     " Redis db · ↑↓ Enter · Esc 关 ",
     " SQL 片段 · {} 个 · Enter 插入 · r 刷新 · Esc 关 ",
@@ -1482,6 +1500,41 @@ fn en_of(zh: &'static str) -> Option<&'static str> {
         "目标连接为只读，拒绝写入" => {
             Some("target connection is read-only; write refused")
         }
+        // ── R68 connection-level read-only toggle (`!`) ──
+        "✓ 连接 {} 已设为只读（写操作将被拦截）" => {
+            Some("✓ Connection {} is now read-only (writes will be blocked)")
+        }
+        "✓ 连接 {} 已恢复为可写" => Some("✓ Connection {} is writable again"),
+        "没有可切换的连接" => Some("No connection to toggle"),
+        "该连接不在已保存列表中，无法保存只读设置" => Some(
+            "This connection is not in the saved list; cannot save the read-only setting",
+        ),
+        "将连接 {} 设为只读 · Enter 确认 · Esc 取消" => {
+            Some("Set connection {} read-only · Enter to confirm · Esc to cancel")
+        }
+        "将连接 {} 恢复为可写 · Enter 确认 · Esc 取消" => Some(
+            "Restore connection {} to writable · Enter to confirm · Esc to cancel",
+        ),
+        "保存连接 {} 只读设置…" => Some("Saving the read-only setting for {}…"),
+        "保存连接 {} 可写设置…" => Some("Saving the writable setting for {}…"),
+        " ⚠ 切换只读开关 " => Some(" ⚠ Toggle read-only "),
+        "将连接 {} ({}) 设为只读？" => Some("Set connection {} ({}) read-only?"),
+        "开启后写语句 / 删行 / Redis 写 / 导入全部拦截（SELECT/SHOW 照常）" => Some(
+            "Once on, write statements / row deletes / Redis writes / imports are all blocked (SELECT/SHOW still work)",
+        ),
+        "Enter/y 设为只读" => Some("Enter/y set read-only"),
+        "将连接 {} ({}) 恢复为可写？" => Some("Restore connection {} ({}) to writable?"),
+        "关闭后该连接可再次执行写操作（重新允许 INSERT/UPDATE/DELETE/DDL）" => Some(
+            "Once off, this connection can run writes again (INSERT/UPDATE/DELETE/DDL allowed)",
+        ),
+        "Enter/y 恢复可写" => Some("Enter/y restore writable"),
+        "只改这条连接配置，不改数据库里的任何数据；树上随即显示/隐藏 🔒" => Some(
+            "Only this connection's config changes, no database data; the tree shows/hides 🔒 right away",
+        ),
+        "!（连接树 / Redis 键列表）" => Some("! (connection tree / Redis key list)"),
+        "切换当前连接只读开关（红色确认）：只读下写语句 / 删行 / Redis 写 / 导入全部拦截；连接根显 🔒" => Some(
+            "Toggle the active connection's read-only switch (red confirm): while read-only, write statements / row deletes / Redis writes / imports are all blocked; the connection root shows 🔒",
+        ),
         "退出确认" => Some("quit guard"),
         // ── R46 mouse / touch ──
         "Enter/y 执行" => Some("Enter/y execute"),
