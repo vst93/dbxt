@@ -1696,3 +1696,511 @@ pub(crate) fn file_load_plan_key(app: &mut App, tx: &Tx, k: KeyEvent) {
 }
 
 // ── sidebar table filter (`/`, filter-as-you-type) ──
+
+// ── R101: result-set snapshot diff (Ctrl-Shift-D) ────────────────────────────
+
+/// Local `HH:MM` for the snapshot label. Session-only cosmetics: nothing here
+/// touches the store or the server.
+pub(crate) fn hhmm_now() -> String {
+    chrono::Local::now().format("%H:%M").to_string()
+}
+
+/// The current connection id, or `None` when no connection is selected.
+pub(crate) fn current_conn_id(app: &App) -> Option<String> {
+    app.selected.as_ref().map(|c| c.id.clone())
+}
+
+/// Primary-key columns for the current result grid, filtered to the columns the
+/// result actually carries. Falls back to the browsed table's metadata when the
+/// keyset cursor is absent. An arbitrary query has no metadata, so it returns
+/// empty and the diff matches whole rows.
+pub(crate) fn result_pk_cols(app: &App, columns: &[String]) -> Vec<String> {
+    let present = |pk: &[String]| -> Vec<String> {
+        pk.iter()
+            .filter(|c| columns.iter().any(|x| x == *c))
+            .cloned()
+            .collect()
+    };
+    if let Some(ps) = &app.page_state {
+        if let Some(k) = &ps.keyset {
+            let v = present(&k.pk);
+            if !v.is_empty() && v.len() == k.pk.len() {
+                return v;
+            }
+        }
+    }
+    if let (Some(ps), Some(meta)) = (&app.page_state, &app.table_meta) {
+        if ps.table == meta.table && ps.schema == meta.schema {
+            let pk = pk_from_metadata(&meta.columns, &meta.indexes);
+            let v = present(&pk);
+            if !v.is_empty() && v.len() == pk.len() {
+                return v;
+            }
+        }
+    }
+    Vec::new()
+}
+
+/// One cell encoded for a match key. Length-prefixed so a value containing the
+/// separator can never collide with a different row.
+fn match_cell(v: &Val) -> String {
+    match v {
+        Val::Null => "N;".to_string(),
+        Val::Text(s) => format!("T{}:{}", s.len(), s),
+    }
+}
+
+fn match_key(vals: &[Val]) -> String {
+    let mut out = String::new();
+    for v in vals {
+        out.push_str(&match_cell(v));
+    }
+    out
+}
+
+/// A key cell's display text: NULL stays explicit.
+fn key_text(v: &Val) -> String {
+    match v {
+        Val::Null => "NULL".to_string(),
+        Val::Text(s) => s.clone(),
+    }
+}
+
+/// R101 pure diff: align the snapshot and the current result by column name,
+/// then classify every row. With a primary key the rows are matched by key and
+/// a value change is a `~` row naming its changed columns; without one the whole
+/// aligned row is the key, so a change appears as one `-` and one `+`.
+pub(crate) fn compute_result_diff(
+    snap: &ResultSnapshot,
+    cur_cols: &[String],
+    cur_rows: &[Vec<Val>],
+    cur_pk: &[String],
+) -> ResultDiffState {
+    // Aligned columns = intersection, in current-result order.
+    let aligned: Vec<String> = cur_cols
+        .iter()
+        .filter(|c| snap.columns.iter().any(|s| s == *c))
+        .cloned()
+        .collect();
+    let extra_cols: Vec<String> = cur_cols
+        .iter()
+        .filter(|c| !snap.columns.iter().any(|s| s == *c))
+        .cloned()
+        .collect();
+    let missing_cols: Vec<String> = snap
+        .columns
+        .iter()
+        .filter(|s| !cur_cols.iter().any(|c| c == *s))
+        .cloned()
+        .collect();
+    let cur_idx: Vec<usize> = aligned
+        .iter()
+        .map(|c| cur_cols.iter().position(|x| x == c).unwrap())
+        .collect();
+    let snap_idx: Vec<usize> = aligned
+        .iter()
+        .map(|c| snap.columns.iter().position(|x| x == c).unwrap())
+        .collect();
+    let aligned_row = |row: &[Val], idx: &[usize]| -> Vec<Val> {
+        idx.iter()
+            .map(|&i| row.get(i).cloned().unwrap_or(Val::Null))
+            .collect()
+    };
+
+    // A PK only matches when every key column survived the intersection.
+    let want_pk: Vec<String> = if !cur_pk.is_empty() {
+        cur_pk.to_vec()
+    } else {
+        snap.pk_cols.clone()
+    };
+    let pk_pos: Option<Vec<usize>> = if want_pk.is_empty() {
+        None
+    } else {
+        let pos: Vec<usize> = want_pk
+            .iter()
+            .filter_map(|c| aligned.iter().position(|a| a == c))
+            .collect();
+        if pos.len() == want_pk.len() {
+            Some(pos)
+        } else {
+            None
+        }
+    };
+    let matched_by_pk = pk_pos.is_some();
+
+    let mut rows: Vec<ResultDiffRow> = Vec::new();
+    let (mut added, mut removed, mut changed, mut unchanged) = (0usize, 0usize, 0usize, 0usize);
+
+    if let Some(pk_pos) = pk_pos {
+        let mut snap_by_key: HashMap<String, usize> = HashMap::new();
+        for (i, r) in snap.rows.iter().enumerate() {
+            let key_vals: Vec<Val> = pk_pos
+                .iter()
+                .map(|&p| r.get(snap_idx[p]).cloned().unwrap_or(Val::Null))
+                .collect();
+            snap_by_key.entry(match_key(&key_vals)).or_insert(i);
+        }
+        let mut matched = vec![false; snap.rows.len()];
+        for r in cur_rows.iter() {
+            let cvals = aligned_row(r, &cur_idx);
+            let key_vals: Vec<Val> = pk_pos.iter().map(|&p| cvals[p].clone()).collect();
+            let key_disp = key_vals.iter().map(key_text).collect::<Vec<_>>().join(", ");
+            match snap_by_key.get(&match_key(&key_vals)) {
+                Some(&si) => {
+                    matched[si] = true;
+                    let svals = aligned_row(&snap.rows[si], &snap_idx);
+                    let changed_cols: Vec<usize> = (0..aligned.len())
+                        .filter(|&ai| svals[ai] != cvals[ai])
+                        .collect();
+                    if changed_cols.is_empty() {
+                        unchanged += 1;
+                        rows.push(ResultDiffRow {
+                            kind: ResultDiffKind::Unchanged,
+                            key: key_disp,
+                            vals: cvals,
+                            changed_cols: Vec::new(),
+                        });
+                    } else {
+                        changed += 1;
+                        rows.push(ResultDiffRow {
+                            kind: ResultDiffKind::Changed,
+                            key: key_disp,
+                            vals: cvals,
+                            changed_cols,
+                        });
+                    }
+                }
+                None => {
+                    added += 1;
+                    rows.push(ResultDiffRow {
+                        kind: ResultDiffKind::Added,
+                        key: key_disp,
+                        vals: cvals,
+                        changed_cols: Vec::new(),
+                    });
+                }
+            }
+        }
+        for (si, r) in snap.rows.iter().enumerate() {
+            if matched[si] {
+                continue;
+            }
+            removed += 1;
+            let svals = aligned_row(r, &snap_idx);
+            let key_vals: Vec<Val> = pk_pos.iter().map(|&p| svals[p].clone()).collect();
+            let key_disp = key_vals.iter().map(key_text).collect::<Vec<_>>().join(", ");
+            rows.push(ResultDiffRow {
+                kind: ResultDiffKind::Removed,
+                key: key_disp,
+                vals: svals,
+                changed_cols: Vec::new(),
+            });
+        }
+    } else {
+        // Whole-row multiset match: no PK means no column-level change to name.
+        let mut snap_counts: HashMap<String, usize> = HashMap::new();
+        for r in &snap.rows {
+            let vals = aligned_row(r, &snap_idx);
+            *snap_counts.entry(match_key(&vals)).or_insert(0) += 1;
+        }
+        for (i, r) in cur_rows.iter().enumerate() {
+            let vals = aligned_row(r, &cur_idx);
+            let key = match_key(&vals);
+            if let Some(c) = snap_counts.get_mut(&key) {
+                if *c > 0 {
+                    *c -= 1;
+                    unchanged += 1;
+                    rows.push(ResultDiffRow {
+                        kind: ResultDiffKind::Unchanged,
+                        key: format!("#{}", i + 1),
+                        vals,
+                        changed_cols: Vec::new(),
+                    });
+                    continue;
+                }
+            }
+            added += 1;
+            rows.push(ResultDiffRow {
+                kind: ResultDiffKind::Added,
+                key: format!("#{}", i + 1),
+                vals,
+                changed_cols: Vec::new(),
+            });
+        }
+        for (si, r) in snap.rows.iter().enumerate() {
+            let vals = aligned_row(r, &snap_idx);
+            let key = match_key(&vals);
+            if let Some(c) = snap_counts.get_mut(&key) {
+                if *c > 0 {
+                    *c -= 1;
+                    removed += 1;
+                    rows.push(ResultDiffRow {
+                        kind: ResultDiffKind::Removed,
+                        key: format!("#{}", si + 1),
+                        vals,
+                        changed_cols: Vec::new(),
+                    });
+                }
+            }
+        }
+    }
+
+    // Group `+`, `-`, `~`, unchanged (stable, so within-group order is kept).
+    rows.sort_by_key(|r| r.kind.rank());
+
+    let mut table = ratatui::widgets::TableState::default();
+    if !rows.is_empty() {
+        table.select(Some(0));
+    }
+    ResultDiffState {
+        columns: aligned,
+        rows,
+        added,
+        removed,
+        changed,
+        unchanged,
+        show_all: false,
+        table,
+        taken_at: snap.taken_at.clone(),
+        extra_cols,
+        missing_cols,
+        matched_by_pk,
+    }
+}
+
+/// Indices into `state.rows` that are currently shown (`a` includes unchanged).
+pub(crate) fn result_diff_visible_indices(state: &ResultDiffState) -> Vec<usize> {
+    state
+        .rows
+        .iter()
+        .enumerate()
+        .filter(|(_, r)| state.show_all || r.kind != ResultDiffKind::Unchanged)
+        .map(|(i, _)| i)
+        .collect()
+}
+
+/// The one-line bilingual status summary: `+2 -1 ~3 · 快照 10:32`.
+pub(crate) fn result_diff_summary(state: &ResultDiffState) -> String {
+    let mut s = tf(
+        "+{} -{} ~{} · 快照 {}",
+        &[&state.added, &state.removed, &state.changed, &state.taken_at],
+    );
+    if !state.extra_cols.is_empty() || !state.missing_cols.is_empty() {
+        s.push_str(&tf(
+            " · 列 +{} -{}",
+            &[&state.extra_cols.len(), &state.missing_cols.len()],
+        ));
+    }
+    s
+}
+
+/// `Ctrl-Shift-D` with no snapshot: freeze the current grid in memory. The row
+/// cap is a hard memory guard; nothing is persisted and no query is issued.
+pub(crate) fn save_result_snapshot(app: &mut App) {
+    let Some(conn) = current_conn_id(app) else {
+        app.status = t("未选择连接").into();
+        return;
+    };
+    let Some(grid) = app.grid_full.clone().or_else(|| app.grid.clone()) else {
+        app.status = t("没有可存快照的结果").into();
+        return;
+    };
+    if grid.columns.is_empty() {
+        app.status = t("没有可存快照的结果").into();
+        return;
+    }
+    if grid.rows.len() > RESULT_SNAPSHOT_MAX_ROWS {
+        app.status = tf(
+            "结果 {} 行 > {}，快照未保存（防内存爆）",
+            &[&grid.rows.len(), &RESULT_SNAPSHOT_MAX_ROWS],
+        );
+        return;
+    }
+    let pk_cols = result_pk_cols(app, &grid.columns);
+    let taken_at = hhmm_now();
+    let n = grid.rows.len();
+    app.result_snapshot.insert(
+        conn,
+        ResultSnapshot {
+            columns: grid.columns,
+            rows: grid.rows,
+            pk_cols,
+            taken_at: taken_at.clone(),
+        },
+    );
+    app.result_diff = None;
+    app.status = tf(
+        "快照已存 {} · {} 行 · Ctrl-Shift-D 对比",
+        &[&taken_at, &n],
+    );
+}
+
+/// `Ctrl-Shift-D` with a snapshot: diff the current result against it. Pure
+/// client-side; a missing grid reports the snapshot as stale.
+pub(crate) fn open_result_diff(app: &mut App) {
+    let Some(conn) = current_conn_id(app) else {
+        app.status = t("未选择连接").into();
+        return;
+    };
+    let Some(snap) = app.result_snapshot.get(&conn).cloned() else {
+        app.status = t("快照已失效").into();
+        return;
+    };
+    let Some(grid) = app.grid_full.clone().or_else(|| app.grid.clone()) else {
+        app.result_snapshot.remove(&conn);
+        app.flash(t("快照已失效").into());
+        return;
+    };
+    let pk_cols = result_pk_cols(app, &grid.columns);
+    let state = compute_result_diff(&snap, &grid.columns, &grid.rows, &pk_cols);
+    let summary = result_diff_summary(&state);
+    app.result_diff = Some(Box::new(state));
+    app.status = summary;
+}
+
+/// The two-state `Ctrl-Shift-D`: no snapshot stores one, a snapshot opens the
+/// diff.
+pub(crate) fn snapshot_or_diff(app: &mut App) {
+    if app.backend_kind != Backend::Sql {
+        app.status = t("快照对比仅支持 SQL 结果").into();
+        return;
+    }
+    let has = current_conn_id(app)
+        .is_some_and(|c| app.result_snapshot.contains_key(&c));
+    if has {
+        open_result_diff(app);
+    } else {
+        save_result_snapshot(app);
+    }
+}
+
+/// Drop the current connection's snapshot and close the diff view. Returns
+/// `true` when a snapshot was actually removed. `flash` surfaces the
+/// `快照已失效` notice (used by the connection / clear paths).
+pub(crate) fn invalidate_result_snapshot(app: &mut App, conn: &str, flash: bool) -> bool {
+    if app.result_snapshot.remove(conn).is_some() {
+        app.result_diff = None;
+        if flash {
+            app.flash(t("快照已失效").into());
+        }
+        true
+    } else {
+        false
+    }
+}
+
+/// Invalidate whatever snapshot the active connection holds (switch / clear /
+/// disconnect).
+pub(crate) fn invalidate_current_snapshot(app: &mut App, flash: bool) -> bool {
+    if let Some(conn) = current_conn_id(app) {
+        invalidate_result_snapshot(app, &conn, flash)
+    } else {
+        false
+    }
+}
+
+/// `Ctrl-Shift-X`: forget the current connection's snapshot (and close the diff).
+pub(crate) fn clear_result_snapshot(app: &mut App) {
+    let Some(conn) = current_conn_id(app) else {
+        app.status = t("未选择连接").into();
+        return;
+    };
+    if app.result_snapshot.remove(&conn).is_some() {
+        app.result_diff = None;
+        app.flash(t("快照已清除").into());
+    } else {
+        app.status = t("当前没有快照").into();
+    }
+}
+
+/// R101 `Ctrl-Shift-D` / `Ctrl-Shift-X` in the results pane. Returns `true`
+/// when the key was consumed.
+pub(crate) fn result_snapshot_key(app: &mut App, k: KeyEvent) -> bool {
+    if !k.modifiers.contains(KeyModifiers::CONTROL) || !k.modifiers.contains(KeyModifiers::SHIFT) {
+        return false;
+    }
+    match k.code {
+        KeyCode::Char('d') | KeyCode::Char('D') => {
+            snapshot_or_diff(app);
+            true
+        }
+        KeyCode::Char('x') | KeyCode::Char('X') => {
+            clear_result_snapshot(app);
+            true
+        }
+        _ => false,
+    }
+}
+
+/// Move the diff selection by `delta` rows (keyboard / wheel share this).
+pub(crate) fn result_diff_move(app: &mut App, delta: i32) {
+    let visible = app
+        .result_diff
+        .as_ref()
+        .map(|s| result_diff_visible_indices(s).len())
+        .unwrap_or(0);
+    if visible == 0 {
+        return;
+    }
+    if let Some(s) = app.result_diff.as_mut() {
+        let cur = s.table.selected().unwrap_or(0) as i32;
+        let next = (cur + delta).clamp(0, visible as i32 - 1) as usize;
+        s.table.select(Some(next));
+    }
+}
+
+/// The keymap of the open result-snapshot diff view. It owns the keyboard until
+/// Esc closes it (the snapshot itself survives).
+pub(crate) fn result_diff_key(app: &mut App, k: KeyEvent) {
+    let visible = app
+        .result_diff
+        .as_ref()
+        .map(|s| result_diff_visible_indices(s).len())
+        .unwrap_or(0);
+    let step = |app: &mut App, delta: i32| result_diff_move(app, delta);
+    match k.code {
+        KeyCode::Esc | KeyCode::Char('q') => {
+            app.result_diff = None;
+            app.flash(t("已关闭快照对比").into());
+        }
+        KeyCode::Char('a') => {
+            if let Some(s) = app.result_diff.as_mut() {
+                s.show_all = !s.show_all;
+                let n = result_diff_visible_indices(s).len();
+                s.table
+                    .select(if n == 0 { None } else { Some(0) });
+            }
+        }
+        KeyCode::Up | KeyCode::Char('k') | KeyCode::Char('p') => step(app, -1),
+        KeyCode::Down | KeyCode::Char('j') | KeyCode::Char('n') => step(app, 1),
+        KeyCode::PageUp => step(app, -10),
+        KeyCode::PageDown => step(app, 10),
+        KeyCode::Home => {
+            if let Some(s) = app.result_diff.as_mut() {
+                if visible > 0 {
+                    s.table.select(Some(0));
+                }
+            }
+        }
+        KeyCode::End => {
+            if let Some(s) = app.result_diff.as_mut() {
+                if visible > 0 {
+                    s.table.select(Some(visible - 1));
+                }
+            }
+        }
+        KeyCode::Char('d') | KeyCode::Char('D')
+            if k.modifiers.contains(KeyModifiers::CONTROL)
+                && k.modifiers.contains(KeyModifiers::SHIFT) =>
+        {
+            open_result_diff(app);
+        }
+        KeyCode::Char('x') | KeyCode::Char('X')
+            if k.modifiers.contains(KeyModifiers::CONTROL)
+                && k.modifiers.contains(KeyModifiers::SHIFT) =>
+        {
+            clear_result_snapshot(app);
+        }
+        _ => {}
+    }
+}

@@ -290,6 +290,104 @@ pub(crate) struct RefRow {
     pub(crate) columns: Vec<String>,
 }
 
+// ─── R101: result-set snapshot diff ──────────────────────────────────────────
+
+/// R101: one in-memory snapshot of a result grid, keyed by connection id.
+/// Taken by `Ctrl-Shift-D` in the results pane and compared against the next
+/// result of the same query. Nothing here is persisted or re-queried.
+#[derive(Clone, Debug)]
+pub(crate) struct ResultSnapshot {
+    pub(crate) columns: Vec<String>,
+    pub(crate) rows: Vec<Vec<Val>>,
+    /// Primary-key column names used to match rows. Empty = whole-row match.
+    pub(crate) pk_cols: Vec<String>,
+    /// Local `HH:MM` when the snapshot was taken, shown in the status summary.
+    pub(crate) taken_at: String,
+}
+
+/// R101: how one row of a result-snapshot diff is classified.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum ResultDiffKind {
+    /// The key is only in the current result (`+`).
+    Added,
+    /// The key is only in the snapshot (`-`).
+    Removed,
+    /// The key is on both sides but at least one aligned cell differs (`~`).
+    Changed,
+    /// The row is identical on both sides (hidden unless `a` is on).
+    Unchanged,
+}
+
+impl ResultDiffKind {
+    /// R90-style marker: `+` / `-` / `~` / blank.
+    pub(crate) fn sign(self) -> &'static str {
+        match self {
+            ResultDiffKind::Added => "+",
+            ResultDiffKind::Removed => "-",
+            ResultDiffKind::Changed => "~",
+            ResultDiffKind::Unchanged => " ",
+        }
+    }
+    /// Marker colour, mirroring the R90 row marks (green add / red remove /
+    /// yellow change).
+    pub(crate) fn color(self) -> Color {
+        match self {
+            ResultDiffKind::Added => Color::Green,
+            ResultDiffKind::Removed => Color::Red,
+            ResultDiffKind::Changed => Color::Yellow,
+            ResultDiffKind::Unchanged => Color::DarkGray,
+        }
+    }
+    /// Sort rank so the diff groups `+` then `-` then `~` then unchanged.
+    pub(crate) fn rank(self) -> u8 {
+        match self {
+            ResultDiffKind::Added => 0,
+            ResultDiffKind::Removed => 1,
+            ResultDiffKind::Changed => 2,
+            ResultDiffKind::Unchanged => 3,
+        }
+    }
+}
+
+/// R101: one row of a result-snapshot diff, in aligned-column order.
+#[derive(Clone, Debug)]
+pub(crate) struct ResultDiffRow {
+    pub(crate) kind: ResultDiffKind,
+    /// Matching-key display (the PK values, or `#n` for a whole-row match).
+    pub(crate) key: String,
+    /// Values in aligned-column order (current side for add/change/unchanged,
+    /// snapshot side for a removed row).
+    pub(crate) vals: Vec<Val>,
+    /// Indices into the aligned columns whose values differ (changed rows only).
+    pub(crate) changed_cols: Vec<usize>,
+}
+
+/// R101: the open result-snapshot diff view.
+#[derive(Clone, Debug)]
+pub(crate) struct ResultDiffState {
+    /// Aligned column names (the intersection, in current-result order).
+    pub(crate) columns: Vec<String>,
+    pub(crate) rows: Vec<ResultDiffRow>,
+    pub(crate) added: usize,
+    pub(crate) removed: usize,
+    pub(crate) changed: usize,
+    pub(crate) unchanged: usize,
+    /// `a`: also list the unchanged rows (default off).
+    pub(crate) show_all: bool,
+    pub(crate) table: ratatui::widgets::TableState,
+    /// Snapshot time carried through to the status summary.
+    pub(crate) taken_at: String,
+    /// Columns present in the current result but absent from the snapshot.
+    pub(crate) extra_cols: Vec<String>,
+    /// Columns present in the snapshot but absent from the current result.
+    pub(crate) missing_cols: Vec<String>,
+    /// True when rows were matched by primary key (false = whole-row match).
+    pub(crate) matched_by_pk: bool,
+}
+
+/// R101: rows above this are not snapshotted (a deliberate memory guard).
+pub(crate) const RESULT_SNAPSHOT_MAX_ROWS: usize = 10_000;
+
 // ─── app state ───────────────────────────────────────────────────────────────
 
 /// SSH login method offered by the connection form. The string values match
@@ -2458,6 +2556,13 @@ pub(crate) struct App {
     pub(crate) data_progress: Option<(usize, usize)>,
     /// Cancellation flag shared with the running compare (Esc aborts).
     pub(crate) data_cancel: Arc<AtomicBool>,
+
+    // ── R101: result-set snapshot diff (Ctrl-Shift-D) ──
+    /// In-memory result snapshots, one per connection id (a new snapshot
+    /// overwrites the older one; connections are isolated). Never persisted.
+    pub(crate) result_snapshot: HashMap<String, ResultSnapshot>,
+    /// The open snapshot-diff view over the results pane.
+    pub(crate) result_diff: Option<Box<ResultDiffState>>,
 
     // ── SQL file execution (Alt-L) ──
     /// The modal file-path input.

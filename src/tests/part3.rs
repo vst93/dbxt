@@ -12233,3 +12233,310 @@ pub(crate) fn r100_help_documents_dictionary() {
         assert_ne!(t_lang(k, Lang::En), k, "missing English for {k:?}");
     }
 }
+
+// ── R101: result-set snapshot diff (Ctrl-Shift-D) ─────────────────────────────
+
+fn tv(s: &str) -> Val {
+    Val::Text(s.to_string())
+}
+
+fn snap_grid(cols: &[&str], rows: &[&[&str]]) -> Grid {
+    Grid {
+        columns: cols.iter().map(|c| c.to_string()).collect(),
+        types: Vec::new(),
+        rows: rows
+            .iter()
+            .map(|r| {
+                r.iter()
+                    .map(|v| {
+                        if *v == "<null>" {
+                            Val::Null
+                        } else {
+                            tv(v)
+                        }
+                    })
+                    .collect()
+            })
+            .collect(),
+        note: String::new(),
+    }
+}
+
+/// R101: a snapshot is stored per connection, a newer capture overwrites the
+/// older one, and another connection never sees it.
+#[test]
+pub(crate) fn result_snapshot_saves_overwrites_and_isolates_per_connection() {
+    let mut app = test_app();
+    app.selected = Some(test_conn("mysql"));
+    app.grid_kind = GridKind::Query;
+    app.set_grid(snap_grid(&["id", "name"], &[&["1", "a"]]));
+    save_result_snapshot(&mut app);
+    let a = app.selected.as_ref().unwrap().id.clone();
+    assert_eq!(app.result_snapshot.get(&a).unwrap().rows.len(), 1);
+    // A second capture on the same connection overwrites the first.
+    app.set_grid(snap_grid(
+        &["id", "name"],
+        &[&["1", "a"], &["2", "b"]],
+    ));
+    save_result_snapshot(&mut app);
+    assert_eq!(app.result_snapshot.get(&a).unwrap().rows.len(), 2);
+    // Another connection has no snapshot (isolation).
+    let b = test_conn("postgres").id;
+    assert!(!app.result_snapshot.contains_key(&b));
+    assert_eq!(app.result_snapshot.len(), 1);
+}
+
+/// R101: with a primary key the diff matches by key, classifies add / remove /
+/// change / unchanged, and locates the changed columns.
+#[test]
+pub(crate) fn result_snapshot_diff_pk_classifies_and_locates_changed_columns() {
+    let snap = ResultSnapshot {
+        columns: vec!["id".into(), "name".into(), "qty".into()],
+        rows: vec![
+            vec![tv("1"), tv("a"), tv("10")],
+            vec![tv("2"), tv("b"), tv("20")],
+            vec![tv("3"), tv("c"), tv("30")],
+        ],
+        pk_cols: vec!["id".into()],
+        taken_at: "10:32".into(),
+    };
+    let cols = vec!["id".to_string(), "name".to_string(), "qty".to_string()];
+    let rows = vec![
+        vec![tv("1"), tv("a"), tv("11")], // qty changed
+        vec![tv("2"), tv("b"), tv("20")], // unchanged
+        vec![tv("4"), tv("d"), tv("40")], // added
+    ];
+    let st = compute_result_diff(&snap, &cols, &rows, &["id".into()]);
+    assert!(st.matched_by_pk);
+    assert_eq!(
+        (st.added, st.removed, st.changed, st.unchanged),
+        (1, 1, 1, 1)
+    );
+    // Grouped order: `+`, `-`, `~`, unchanged.
+    assert_eq!(st.rows[0].kind, ResultDiffKind::Added);
+    let changed = st
+        .rows
+        .iter()
+        .find(|r| r.kind == ResultDiffKind::Changed)
+        .unwrap();
+    assert_eq!(changed.key, "1");
+    assert_eq!(changed.changed_cols, vec![2]);
+    let removed = st
+        .rows
+        .iter()
+        .find(|r| r.kind == ResultDiffKind::Removed)
+        .unwrap();
+    assert_eq!(removed.key, "3");
+    let summary = result_diff_summary(&st);
+    assert!(summary.contains("+1 -1 ~1"), "{summary}");
+    assert!(summary.contains("10:32"), "{summary}");
+}
+
+/// R101: without a primary key rows match whole-row, so a changed row shows as
+/// one removal plus one addition (no column-level `~`).
+#[test]
+pub(crate) fn result_snapshot_diff_without_pk_matches_whole_rows() {
+    let snap = ResultSnapshot {
+        columns: vec!["a".into(), "b".into()],
+        rows: vec![vec![tv("1"), tv("x")], vec![tv("2"), tv("y")]],
+        pk_cols: Vec::new(),
+        taken_at: "09:00".into(),
+    };
+    let cols = vec!["a".to_string(), "b".to_string()];
+    let rows = vec![
+        vec![tv("2"), tv("y")], // unchanged (multiset match)
+        vec![tv("1"), tv("z")], // changed content → removed + added
+    ];
+    let st = compute_result_diff(&snap, &cols, &rows, &[]);
+    assert!(!st.matched_by_pk);
+    assert_eq!(st.changed, 0);
+    assert_eq!((st.added, st.removed, st.unchanged), (1, 1, 1));
+    assert!(st.rows.iter().all(|r| r.changed_cols.is_empty()));
+}
+
+/// R101: a SQL column change aligns on the intersection and reports the extra /
+/// missing columns in the summary.
+#[test]
+pub(crate) fn result_snapshot_diff_aligns_columns_on_the_intersection() {
+    let snap = ResultSnapshot {
+        columns: vec!["id".into(), "old".into()],
+        rows: vec![vec![tv("1"), tv("x")]],
+        pk_cols: vec!["id".into()],
+        taken_at: "08:00".into(),
+    };
+    let cols = vec!["id".to_string(), "new".to_string()];
+    let rows = vec![vec![tv("1"), tv("y")]];
+    let st = compute_result_diff(&snap, &cols, &rows, &["id".into()]);
+    assert_eq!(st.columns, vec!["id".to_string()]);
+    assert_eq!(st.extra_cols, vec!["new".to_string()]);
+    assert_eq!(st.missing_cols, vec!["old".to_string()]);
+    // Only `id` is aligned, so the row is identical on the intersection.
+    assert_eq!(st.unchanged, 1);
+    let summary = result_diff_summary(&st);
+    assert!(summary.contains("列 +1 -1"), "{summary}");
+}
+
+/// R101: `a` toggles the unchanged rows in the visible set.
+#[test]
+pub(crate) fn result_diff_a_toggles_unchanged_rows() {
+    let snap = ResultSnapshot {
+        columns: vec!["id".into()],
+        rows: vec![vec![tv("1")], vec![tv("2")]],
+        pk_cols: vec!["id".into()],
+        taken_at: "07:00".into(),
+    };
+    let cols = vec!["id".to_string()];
+    let rows = vec![vec![tv("1")], vec![tv("2")], vec![tv("3")]];
+    let mut st = compute_result_diff(&snap, &cols, &rows, &["id".into()]);
+    assert_eq!(st.unchanged, 2);
+    // Default: unchanged rows are hidden.
+    assert_eq!(result_diff_visible_indices(&st).len(), 1);
+    st.show_all = true;
+    assert_eq!(result_diff_visible_indices(&st).len(), 3);
+}
+
+/// R101: the two-state `Ctrl-Shift-D` stores then compares, renders on a phone
+/// and a desktop terminal, and `Ctrl-Shift-X` clears the snapshot.
+#[test]
+pub(crate) fn result_snapshot_key_is_two_state_and_renders() {
+    let (tx, _rx) = tokio::sync::mpsc::unbounded_channel::<OpResult>();
+    let mut app = test_app();
+    app.selected = Some(test_conn("mysql"));
+    app.picker_open = false;
+    app.focus = Focus::Preview;
+    app.grid_kind = GridKind::Query;
+    app.set_grid(snap_grid(&["id", "name"], &[&["1", "a"], &["2", "b"]]));
+    let ctrl_shift_d = KeyEvent::new(
+        KeyCode::Char('D'),
+        KeyModifiers::CONTROL | KeyModifiers::SHIFT,
+    );
+    preview_key(&mut app, &tx, ctrl_shift_d);
+    assert!(app.result_diff.is_none(), "first press stores");
+    assert_eq!(app.result_snapshot.len(), 1);
+    // The footer advertises the compare key while a snapshot is live.
+    assert!(footer_hints(&app)
+        .iter()
+        .any(|(k, _)| *k == "Ctrl-⇧D"), "footer missing compare hint");
+    // Re-run: one new row.
+    app.set_grid(snap_grid(
+        &["id", "name"],
+        &[&["1", "a"], &["2", "b"], &["3", "c"]],
+    ));
+    preview_key(&mut app, &tx, ctrl_shift_d);
+    let st = app.result_diff.as_ref().expect("second press compares");
+    assert_eq!(st.added, 1);
+    let phone = draw(&mut app, 42, 22).join("\n").replace(' ', "");
+    assert!(phone.contains("快照对比"), "{phone}");
+    let wide = draw(&mut app, 110, 30).join("\n").replace(' ', "");
+    assert!(wide.contains("快照对比"), "{wide}");
+    // Ctrl-Shift-X clears both the snapshot and the view.
+    preview_key(
+        &mut app,
+        &tx,
+        KeyEvent::new(
+            KeyCode::Char('X'),
+            KeyModifiers::CONTROL | KeyModifiers::SHIFT,
+        ),
+    );
+    assert!(app.result_snapshot.is_empty());
+    assert!(app.result_diff.is_none());
+}
+
+/// R101: the invalidation chain — collapsing the results pane and a disconnect
+/// both drop the snapshot.
+#[test]
+pub(crate) fn result_snapshot_invalidation_chain() {
+    let (tx, _rx) = tokio::sync::mpsc::unbounded_channel::<OpResult>();
+    let mut app = test_app();
+    app.selected = Some(test_conn("mysql"));
+    app.picker_open = false;
+    app.grid_kind = GridKind::Query;
+    app.set_grid(snap_grid(&["id"], &[&["1"]]));
+    save_result_snapshot(&mut app);
+    let id = app.selected.as_ref().unwrap().id.clone();
+    assert!(app.result_snapshot.contains_key(&id));
+    // "Clear screen": Esc collapses the results pane.
+    app.focus = Focus::Preview;
+    preview_key(&mut app, &tx, KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+    assert!(app.focus == Focus::Sidebar);
+    assert!(!app.result_snapshot.contains_key(&id), "Esc should drop it");
+    // Disconnect drops it too.
+    app.selected = Some(test_conn("mysql"));
+    app.set_grid(snap_grid(&["id"], &[&["1"]]));
+    save_result_snapshot(&mut app);
+    invalidate_result_snapshot(&mut app, &id, false);
+    assert!(!app.result_snapshot.contains_key(&id));
+}
+
+/// R101: an oversized result is refused rather than copied into memory.
+#[test]
+pub(crate) fn result_snapshot_refuses_oversized_results() {
+    let mut app = test_app();
+    app.selected = Some(test_conn("mysql"));
+    app.grid_kind = GridKind::Query;
+    let rows: Vec<Vec<Val>> = (0..=RESULT_SNAPSHOT_MAX_ROWS)
+        .map(|i| vec![tv(&i.to_string())])
+        .collect();
+    app.set_grid(Grid {
+        columns: vec!["id".into()],
+        types: Vec::new(),
+        rows,
+        note: String::new(),
+    });
+    save_result_snapshot(&mut app);
+    assert!(app.result_snapshot.is_empty(), "oversized result must be refused");
+    assert!(app.status.contains("10000"), "{}", app.status);
+}
+
+/// R101: the full help carries the snapshot keys and every new string is
+/// translated.
+#[test]
+pub(crate) fn help_documents_the_result_snapshot_keys() {
+    assert!(HELP_ROWS
+        .iter()
+        .any(|(k, d)| *k == "Ctrl-Shift-D / Ctrl-Shift-X" && d.contains("快照")));
+    use ui_text::{t_lang, Lang};
+    for k in [
+        "快照已失效",
+        "快照已清除",
+        "没有可存快照的结果",
+        "快照对比仅支持 SQL 结果",
+        "对比快照",
+        "清快照",
+        "按主键",
+        "按整行",
+    ] {
+        assert_ne!(t_lang(k, Lang::En), k, "missing English for {k:?}");
+    }
+}
+
+/// R101: the diff keymap toggles the unchanged rows, moves the cursor and
+/// closes the view without dropping the snapshot.
+#[test]
+pub(crate) fn result_diff_key_toggles_a_moves_and_closes() {
+    let mut app = test_app();
+    app.selected = Some(test_conn("mysql"));
+    app.backend_kind = Backend::Sql;
+    let snap = ResultSnapshot {
+        columns: vec!["id".into()],
+        rows: vec![vec![tv("1")], vec![tv("2")]],
+        pk_cols: vec!["id".into()],
+        taken_at: "11:11".into(),
+    };
+    let cols = vec!["id".to_string()];
+    let rows = vec![vec![tv("1")], vec![tv("2")]];
+    app.result_snapshot.insert(
+        app.selected.as_ref().unwrap().id.clone(),
+        snap.clone(),
+    );
+    app.result_diff = Some(Box::new(compute_result_diff(&snap, &cols, &rows, &["id".into()])));
+    // `a` reveals the unchanged rows.
+    result_diff_key(&mut app, KeyEvent::new(KeyCode::Char('a'), KeyModifiers::NONE));
+    assert!(app.result_diff.as_ref().unwrap().show_all);
+    result_diff_key(&mut app, KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
+    assert_eq!(app.result_diff.as_ref().unwrap().table.selected(), Some(1));
+    // Esc closes the view; the snapshot survives for the next compare.
+    result_diff_key(&mut app, KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+    assert!(app.result_diff.is_none());
+    assert_eq!(app.result_snapshot.len(), 1);
+}

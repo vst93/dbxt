@@ -78,6 +78,8 @@ pub(crate) fn reset_overlays_for_backend_switch(app: &mut App) {
     app.diff_picker = None;
     app.diff = None;
     app.db_diff = None;
+    // R101: the result snapshot belongs to the SQL backend.
+    invalidate_current_snapshot(app, false);
     // Data transfer (a running copy is aborted; committed batches stay).
     if app.transfer.as_ref().is_some_and(|w| w.submitted) {
         app.transfer_cancel.store(true, Ordering::Relaxed);
@@ -319,6 +321,8 @@ pub(crate) fn confirm_key(app: &mut App, tx: &Tx, k: KeyEvent) {
                         app.connections.retain(|c| c.id != cc.id);
                         app.spawn(tx, Op::UnregisterTempConn(cc.id.clone()));
                         if app.selected.as_ref().map(|c| c.id.as_str()) == Some(cc.id.as_str()) {
+                            // R101: the temp connection is gone with its snapshot.
+                            invalidate_current_snapshot(app, false);
                             app.selected = None;
                             app.picker_open = true;
                         }
@@ -993,7 +997,10 @@ pub(crate) fn browse_key(app: &mut App, tx: &Tx, k: KeyEvent) {
         commit_batch(app);
         return;
     }
-    if k.modifiers.contains(KeyModifiers::CONTROL) && k.code == KeyCode::Char('x') {
+    if k.modifiers.contains(KeyModifiers::CONTROL)
+        && !k.modifiers.contains(KeyModifiers::SHIFT)
+        && k.code == KeyCode::Char('x')
+    {
         // R93: a live selection in the editor turns Ctrl-X into *cut* (feeding
         // the clipboard ring) instead of clearing the batch queue — cutting the
         // text you just highlighted is the obvious intent there. With no
@@ -1795,8 +1802,13 @@ pub(crate) fn sidebar_key(app: &mut App, tx: &Tx, k: KeyEvent) {
                 _ => {}
             }
         }
-        // Ctrl-D is the delete shortcut the results pane also uses.
-        if k.modifiers.contains(KeyModifiers::CONTROL) && k.code == KeyCode::Char('d') {
+        // Ctrl-D is the delete shortcut the results pane also uses. R101:
+        // `Ctrl-Shift-D` is the result snapshot, so a shifted lowercase `d` is
+        // never a batch delete.
+        if k.modifiers.contains(KeyModifiers::CONTROL)
+            && !k.modifiers.contains(KeyModifiers::SHIFT)
+            && k.code == KeyCode::Char('d')
+        {
             redis_batch_delete(app);
             return;
         }
@@ -2762,6 +2774,9 @@ pub(crate) fn jump_nonblank_row(app: &mut App, dir: i32) {
 
 pub(crate) fn reload_tables(app: &mut App, tx: &Tx) {
     if app.selected.is_some() {
+        // R101: switching database clears the result pane; the snapshot went
+        // with it.
+        invalidate_current_snapshot(app, false);
         // Remember the current table so a same-named table can be re-selected in
         // the new database.
         app.pending_table = app.selected_table().map(|t| t.name.clone());

@@ -1685,6 +1685,31 @@ pub static ALL_KEYS: &[&str] = &[
     " 导出数据字典 · Enter/Esc ",
     "E（连接树）",
     "导出数据字典：顺序读取当前库所有表的列 / 索引 / 外键，拼成一份 Markdown 数据字典（首节库概览：表数 / 引擎方言 / 生成时间），完成后输入文件名（默认 {db}-dictionary.md，留空则复制剪贴板）；>200 表先红色确认，生成中 Esc 软取消并丢弃未完成部分；只读连接可用（纯读，用户显式动作）",
+    // R101: result-set snapshot diff.
+    "未选择连接",
+    "没有可存快照的结果",
+    "结果 {} 行 > {}，快照未保存（防内存爆）",
+    "快照已存 {} · {} 行 · Ctrl-Shift-D 对比",
+    "快照已失效",
+    "快照对比仅支持 SQL 结果",
+    "快照已清除",
+    "当前没有快照",
+    "已关闭快照对比",
+    "+{} -{} ~{} · 快照 {}",
+    " · 列 +{} -{}",
+    "全部行",
+    "清快照",
+    "对比快照",
+    "按主键",
+    "按整行",
+    "a 显示全部",
+    "a 隐藏未变",
+    " 快照对比 · 快照 {} · +{} -{} ~{} · {} · {} · Esc 关 ",
+    "· 列 +{} -{} ",
+    "键",
+    "无新增 / 删除 / 变更（a 显示未变行）",
+    "结果与快照一致",
+    "结果集快照对比：无快照时存下当前结果，有快照时与它做行 diff（新增 + / 删除 - / 变更 ~，变更列高亮，摘要 +2 -1 ~3 · 快照 10:32）；a 显示未变行，Ctrl-Shift-X 清除快照；按主键匹配，无主键按整行匹配；列集不一致时按交集对齐并在摘要提示；纯客户端零查询，快照仅内存、换连接 / 收起结果 / 断开即失效",
 ];
 
 /// The Chinese → English table. Keys must match the source literals exactly.
@@ -4719,6 +4744,40 @@ fn en_of(zh: &'static str) -> Option<&'static str> {
         }
         " 导出数据字典 · Enter/Esc " => Some(" Export data dictionary · Enter/Esc "),
         "E（连接树）" => Some("E (connection tree)"),
+        // ── R101: result-set snapshot diff ──
+        "未选择连接" => Some("No connection selected"),
+        "没有可存快照的结果" => Some("No result to snapshot"),
+        "结果 {} 行 > {}，快照未保存（防内存爆）" => Some(
+            "Result has {} rows > {}; snapshot not saved (memory guard)",
+        ),
+        "快照已存 {} · {} 行 · Ctrl-Shift-D 对比" => {
+            Some("Snapshot saved {} · {} rows · Ctrl-Shift-D to compare")
+        }
+        "快照已失效" => Some("Snapshot is stale"),
+        "快照对比仅支持 SQL 结果" => Some("Snapshot compare supports SQL results only"),
+        "快照已清除" => Some("Snapshot cleared"),
+        "当前没有快照" => Some("No snapshot for this connection"),
+        "已关闭快照对比" => Some("Snapshot diff closed"),
+        "+{} -{} ~{} · 快照 {}" => Some("+{} -{} ~{} · snapshot {}"),
+        " · 列 +{} -{}" => Some(" · columns +{} -{}"),
+        "全部行" => Some("all rows"),
+        "清快照" => Some("clear snapshot"),
+        "对比快照" => Some("compare snapshot"),
+        "按主键" => Some("by primary key"),
+        "按整行" => Some("by whole row"),
+        "a 显示全部" => Some("a show all"),
+        "a 隐藏未变" => Some("a hide unchanged"),
+        " 快照对比 · 快照 {} · +{} -{} ~{} · {} · {} · Esc 关 " => Some(
+            " Snapshot diff · snapshot {} · +{} -{} ~{} · {} · {} · Esc close ",
+        ),
+        "· 列 +{} -{} " => Some("· columns +{} -{} "),
+        "无新增 / 删除 / 变更（a 显示未变行）" => {
+            Some("No additions / removals / changes (a shows unchanged rows)")
+        }
+        "结果与快照一致" => Some("Result matches the snapshot"),
+        "结果集快照对比：无快照时存下当前结果，有快照时与它做行 diff（新增 + / 删除 - / 变更 ~，变更列高亮，摘要 +2 -1 ~3 · 快照 10:32）；a 显示未变行，Ctrl-Shift-X 清除快照；按主键匹配，无主键按整行匹配；列集不一致时按交集对齐并在摘要提示；纯客户端零查询，快照仅内存、换连接 / 收起结果 / 断开即失效" => Some(
+            "Result-set snapshot diff: with no snapshot, freeze the current result; with one, diff the current result against it (added + / removed - / changed ~, changed cells highlighted, summary +2 -1 ~3 · snapshot 10:32). a shows the unchanged rows, Ctrl-Shift-X clears the snapshot. Rows match by primary key, or whole-row when there is none; a column-set mismatch aligns on the intersection and is noted in the summary. Purely client-side, zero queries; the snapshot is memory-only and is invalidated by a connection switch / collapsing the results / a disconnect.",
+        ),
         "导出数据字典：顺序读取当前库所有表的列 / 索引 / 外键，拼成一份 Markdown 数据字典（首节库概览：表数 / 引擎方言 / 生成时间），完成后输入文件名（默认 {db}-dictionary.md，留空则复制剪贴板）；>200 表先红色确认，生成中 Esc 软取消并丢弃未完成部分；只读连接可用（纯读，用户显式动作）" => {
             Some("Export the data dictionary: walk every table of the current database in order and build one Markdown document from its columns / indexes / foreign keys (the first section is the database overview: table count / dialect / generated-at). Then enter a filename (default {db}-dictionary.md; blank copies to the clipboard). More than 200 tables asks for the red confirmation first; Esc during generation soft-cancels and discards the unfinished part; read-only connections are welcome (pure read, an explicit action)")
         }

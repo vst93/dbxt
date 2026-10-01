@@ -28,6 +28,15 @@ pub(crate) fn preview_key(app: &mut App, tx: &Tx, k: KeyEvent) {
         mongo_docs_key(app, tx, k);
         return;
     }
+    // R101: the open snapshot diff owns the keyboard (Esc closes it); with no
+    // diff open, Ctrl-Shift-D stores / compares and Ctrl-Shift-X clears.
+    if app.result_diff.is_some() {
+        result_diff_key(app, k);
+        return;
+    }
+    if result_snapshot_key(app, k) {
+        return;
+    }
     // R57: row-select mode owns the keyboard until Esc / an action; a key the
     // mode does not use exits it and falls through to the normal grid keymap.
     if app.row_sel_anchor.is_some() && row_select_key(app, tx, k) {
@@ -248,7 +257,13 @@ pub(crate) fn preview_key(app: &mut App, tx: &Tx, k: KeyEvent) {
             }
             app.show_first_grid();
             app.focus = Focus::Sidebar;
-            app.flash(t("已回到侧栏").into());
+            // R101: collapsing the results pane is the "clear screen" event —
+            // the snapshot belonged to the grid that just left the screen.
+            if current_conn_id(app).is_some_and(|c| app.result_snapshot.contains_key(&c)) {
+                invalidate_current_snapshot(app, true);
+            } else {
+                app.flash(t("已回到侧栏").into());
+            }
         }
         KeyCode::Char('e') => edit_cell(app),
         KeyCode::Char('i') => quick_insert(app),

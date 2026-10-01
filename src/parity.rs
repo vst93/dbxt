@@ -1241,6 +1241,8 @@ impl App {
     /// field list is never filtered.
     pub(crate) fn set_grid(&mut self, grid: Grid) {
         self.grid_full = Some(grid);
+        // R101: a fresh result replaces whatever snapshot diff was on screen.
+        self.result_diff = None;
         self.rebuild_view();
     }
 
@@ -1257,6 +1259,8 @@ impl App {
     pub(crate) fn clear_grid(&mut self) {
         self.grid = None;
         self.grid_full = None;
+        // R101: the grid a snapshot diff described is gone.
+        self.result_diff = None;
         self.result_rows.clear();
         // R91: a reference row belongs to the result set it was pinned on.
         self.ref_row = None;

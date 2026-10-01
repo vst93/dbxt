@@ -3044,3 +3044,157 @@ pub(crate) fn render_result_filter(f: &mut Frame, area: Rect, app: &mut App) {
         t(" 搜索 · Enter 保留 "),
     );
 }
+
+/// R101: the result-snapshot diff view. It fills the results pane (the grid is
+/// untouched underneath) and reuses the R90 marker vocabulary — `+` green add,
+/// `-` red remove, `~` yellow change — with the changed cells highlighted in
+/// yellow. `a` reveals the unchanged rows.
+pub(crate) fn render_result_diff(f: &mut Frame, area: Rect, app: &mut App) {
+    let focused = app.focus == Focus::Preview;
+    let Some(state) = app.result_diff.as_mut() else {
+        return;
+    };
+    if area.width < 8 || area.height < 3 {
+        return;
+    }
+    let visible = result_diff_visible_indices(state);
+    let mode = if state.matched_by_pk {
+        t("按主键")
+    } else {
+        t("按整行")
+    };
+    let toggle = if state.show_all {
+        t("a 隐藏未变")
+    } else {
+        t("a 显示全部")
+    };
+    let mut title = tf(
+        " 快照对比 · 快照 {} · +{} -{} ~{} · {} · {} · Esc 关 ",
+        &[
+            &state.taken_at,
+            &state.added,
+            &state.removed,
+            &state.changed,
+            &mode,
+            &toggle,
+        ],
+    );
+    if !state.extra_cols.is_empty() || !state.missing_cols.is_empty() {
+        title.push_str(&tf(
+            "· 列 +{} -{} ",
+            &[&state.extra_cols.len(), &state.missing_cols.len()],
+        ));
+    }
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .title(title)
+        .border_set(border::ROUNDED)
+        .border_style(border_style(focused));
+    let inner = block.inner(area);
+    f.render_widget(block, area);
+    if inner.height < 2 || inner.width < 6 {
+        return;
+    }
+
+    // Column widths: the key, then each aligned column sized to its content.
+    let key_w = visible
+        .iter()
+        .map(|&i| disp_width(&state.rows[i].key))
+        .max()
+        .unwrap_or(3)
+        .clamp(3, 20);
+    let col_w: Vec<usize> = (0..state.columns.len())
+        .map(|ci| {
+            let hw = disp_width(&fix_double_encoding(&state.columns[ci]));
+            let cw = visible
+                .iter()
+                .map(|&ri| {
+                    state.rows[ri]
+                        .vals
+                        .get(ci)
+                        .map(|v| disp_width(&abbreviate_cell_text(&value_display(v).0)))
+                        .unwrap_or(0)
+                })
+                .max()
+                .unwrap_or(0);
+            hw.max(cw).clamp(3, 24)
+        })
+        .collect();
+
+    let mut header: Vec<Cell> = vec![Cell::from(""), Cell::from(t("键"))];
+    header.extend(state.columns.iter().map(|c| {
+        Cell::from(Span::styled(
+            fix_double_encoding(c),
+            Style::default()
+                .fg(Color::Cyan)
+                .add_modifier(Modifier::BOLD),
+        ))
+    }));
+
+    let changed_style = Style::default()
+        .fg(Color::Yellow)
+        .add_modifier(Modifier::BOLD);
+    let selected = state.table.selected();
+    let mut rows: Vec<Row> = Vec::with_capacity(visible.len());
+    for (pos, &ri) in visible.iter().enumerate() {
+        let row = &state.rows[ri];
+        let color = row.kind.color();
+        let mut cells: Vec<Cell> = vec![
+            Cell::from(Span::styled(
+                format!(" {} ", row.kind.sign()),
+                Style::default().fg(color).add_modifier(Modifier::BOLD),
+            )),
+            Cell::from(Span::styled(
+                truncate_disp(&row.key, key_w),
+                Style::default()
+                    .fg(Color::White)
+                    .add_modifier(Modifier::BOLD),
+            )),
+        ];
+        for (ci, w) in col_w.iter().enumerate() {
+            let v = row.vals.get(ci).cloned().unwrap_or(Val::Null);
+            let (text, base) = value_display(&v);
+            let style = if row.changed_cols.contains(&ci) {
+                changed_style
+            } else {
+                base
+            };
+            cells.push(Cell::from(Span::styled(
+                truncate_disp(&abbreviate_cell_text(&text), *w),
+                style,
+            )));
+        }
+        let mut r = Row::new(cells);
+        if selected == Some(pos) {
+            r = r.style(highlight_style());
+        }
+        rows.push(r);
+    }
+
+    let mut widths: Vec<Constraint> = vec![
+        Constraint::Length(2),
+        Constraint::Length(key_w as u16),
+    ];
+    widths.extend(col_w.iter().map(|w| Constraint::Length(*w as u16)));
+    let table = Table::new(rows, widths)
+        .header(Row::new(header))
+        .column_spacing(1);
+    f.render_stateful_widget(table, inner, &mut state.table);
+
+    if visible.is_empty() && inner.height >= 2 {
+        let msg = if state.unchanged > 0 && !state.show_all {
+            t("无新增 / 删除 / 变更（a 显示未变行）")
+        } else {
+            t("结果与快照一致")
+        };
+        f.render_widget(
+            Paragraph::new(msg).style(Style::default().fg(Color::Green)),
+            Rect {
+                x: inner.x,
+                y: inner.y + 1,
+                width: inner.width,
+                height: 1,
+            },
+        );
+    }
+}

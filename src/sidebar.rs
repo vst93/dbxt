@@ -312,6 +312,11 @@ pub(crate) fn activate_connection(
 ) {
     app.conn_gen = app.conn_gen.wrapping_add(1);
     let gen = app.conn_gen;
+    // R101: a result snapshot belongs to the connection it was taken on; a
+    // switch away invalidates it (the new connection starts clean).
+    if app.selected.as_ref().map(|c| c.id.as_str()) != Some(cfg.id.as_str()) {
+        invalidate_current_snapshot(app, false);
+    }
     // R98: any explicit activation supersedes an in-flight `--last` restore (its
     // own caller re-arms the flag right after this returns), and a fresh
     // activation has not opened a pool yet — only a successful answer re-arms
@@ -1097,6 +1102,9 @@ pub(crate) fn scroll(app: &mut App, tx: &Tx, delta: i32) {
             if app.struct_view == StructView::Ddl && app.ddl.is_some() {
                 let d = app.ddl_scroll as i32 + delta;
                 app.ddl_scroll = d.max(0) as u16;
+            } else if app.result_diff.is_some() {
+                // R101: the snapshot diff owns the pane, so the wheel scrolls it.
+                result_diff_move(app, delta);
             } else {
                 move_cursor(app, tx, delta);
             }
@@ -1454,6 +1462,11 @@ pub(crate) fn result_click(app: &mut App, x: u16, y: u16) {
 /// (query, table data, Redis value, Mongo documents) all share this path, so the
 /// value views behave exactly like the SQL side.
 pub(crate) fn result_tap(app: &mut App, x: u16, y: u16, double: bool) {
+    // R101: the snapshot diff is a read-only view; a tap must not select a grid
+    // row underneath or open its popup.
+    if app.result_diff.is_some() {
+        return;
+    }
     result_click(app, x, y);
     if double {
         open_row_popup(app);

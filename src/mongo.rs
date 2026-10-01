@@ -23,7 +23,9 @@ pub(crate) fn mongo_docs_key(app: &mut App, tx: &Tx, k: KeyEvent) {
             KeyCode::Char('e') => app.focus = Focus::Editor,
             KeyCode::Char('f') => page_turn(app, tx, true),
             KeyCode::Char('b') => page_turn(app, tx, false),
-            KeyCode::Char('d') => mongo_confirm_delete(app),
+            KeyCode::Char('d') if !k.modifiers.contains(KeyModifiers::SHIFT) => {
+                mongo_confirm_delete(app)
+            }
             // R82: cycle the client-side size ordering of the loaded page.
             KeyCode::Char('s') => cycle_mongo_size_sort(app),
             _ => {}

@@ -4965,6 +4965,8 @@ impl App {
             data_diff_gen: 0,
             data_progress: None,
             data_cancel: Arc::new(AtomicBool::new(false)),
+            result_snapshot: HashMap::new(),
+            result_diff: None,
             file_load_prompt: None,
             file_load_plan: None,
             sqlite_open: None,
@@ -5808,6 +5810,11 @@ fn apply_op_result(app: &mut App, res: OpResult, tx: &Tx) {
                 app.loading = false;
             }
             app.status = tf("已断开 {} · 展开该根可重连", &[&name]);
+            // R101: the pool is gone, so its result snapshot can never be
+            // compared again. Set after the status so the flash is visible.
+            if invalidate_result_snapshot(app, &id, false) && was_active {
+                app.flash(t("快照已失效").into());
+            }
             rebuild_side_rows(app);
             if was_active {
                 side_focus_nearest_root(app, &id);

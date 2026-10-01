@@ -1846,6 +1846,7 @@ name = "dbxt"
 version = "0.0.4"
 dependencies = [
  "anyhow",
+ "chrono",
  "crossterm",
  "dbx-core",
  "dbx-mcp",

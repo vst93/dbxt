@@ -1516,6 +1516,18 @@ pub(crate) fn footer_hints_ctx(ctx: FooterCtx) -> Vec<Hint> {
 pub(crate) fn footer_hints(app: &App) -> Vec<Hint> {
     let ctx = footer_ctx(app);
     let mut v = footer_hints_ctx(ctx);
+    // R101: in the results pane a live snapshot advertises the compare key; the
+    // open diff advertises its `a` toggle and the clear key.
+    if app.focus == Focus::Preview && app.backend_kind == Backend::Sql {
+        if app.result_diff.is_some() {
+            v.insert(0, ("a", t("全部行")));
+            v.insert(1, ("Ctrl-⇧X", t("清快照")));
+        } else if current_conn_id(app)
+            .is_some_and(|c| app.result_snapshot.contains_key(&c))
+        {
+            v.insert(0, ("Ctrl-⇧D", t("对比快照")));
+        }
+    }
     // R99: while the active connection's query runs, Esc soft-cancels it. Only
     // name the key on a pane-browsing surface (a modal overlay above owns Esc).
     if app.active_query_cancellable()
@@ -2495,6 +2507,12 @@ pub(crate) fn render_results_pane(f: &mut Frame, area: Rect, app: &mut App) {
             render_ddl(f, area, app, &ddl);
             return;
         }
+    }
+    // R101: the result-snapshot diff takes over the pane (the grid underneath is
+    // untouched; Esc returns to it).
+    if app.result_diff.is_some() {
+        render_result_diff(f, area, app);
+        return;
     }
     // R48: a pinned grid keeps an up-and-down comparison visible above the live
     // pane. Only on SQL data grids, and only when there is room for both.

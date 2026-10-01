@@ -674,7 +674,11 @@ pub(crate) fn redis_value_key(app: &mut App, tx: &Tx, k: KeyEvent) {
     if k.modifiers.contains(KeyModifiers::CONTROL) {
         match k.code {
             KeyCode::Char('e') => app.focus = Focus::Editor,
-            KeyCode::Char('d') => redis_confirm_delete(app),
+            // R101: leave `Ctrl-Shift-D` (result snapshot) alone — a shifted
+            // lowercase `d` must never be read as the delete shortcut.
+            KeyCode::Char('d') if !k.modifiers.contains(KeyModifiers::SHIFT) => {
+                redis_confirm_delete(app)
+            }
             _ => {}
         }
         return;
