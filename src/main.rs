@@ -270,7 +270,14 @@ enum Op {
     Ddl(Box<ConnectionConfig>, String, String, String),
     TableData(Box<TableDataReq>),
     TableColumns(Box<ConnectionConfig>, String, String, String),
-    Query(Box<ConnectionConfig>, String, String, usize, &'static str),
+    Query(
+        Box<ConnectionConfig>,
+        String,
+        String,
+        usize,
+        &'static str,
+        u64,
+    ),
     Redis(Box<ConnectionConfig>, u32, String),
     /// Paginated `SCAN` of the key browser.
     RedisScan {
@@ -664,8 +671,15 @@ enum OpResult {
         /// referenced row (best effort; empty when the backend cannot list).
         foreign_keys: Vec<ForeignKeyInfo>,
     },
-    Query(Box<dbx_core::db::QueryResult>, String, usize),
-    Script(Vec<StmtOutcome>),
+    Query(Box<dbx_core::db::QueryResult>, String, usize, QueryTag),
+    Script(Vec<StmtOutcome>, QueryTag),
+    /// R99: a query (or script) failed. Carries the [`QueryTag`] so a failure
+    /// belonging to a soft-cancelled run is dropped instead of surfacing a
+    /// stale error. A live failure flows through the generic error path.
+    QueryFailed {
+        tag: QueryTag,
+        msg: String,
+    },
     /// R84: one statement dbxt itself just sent to the server (success or
     /// failure), for the in-memory session run log the Alt-H panel shows at the
     /// top. Client-side bookkeeping only; never persisted and triggers no query.
@@ -1899,8 +1913,14 @@ async fn run_op(backend: &LocalBackend, op: Op, tx: &Tx) -> OpResult {
                 Err(e) => OpResult::Error(format!("table columns: {e}")),
             }
         }
-        Op::Query(cfg, db, sql, cap, origin) => {
+        Op::Query(cfg, db, sql, cap, origin, epoch) => {
             let cap = cap.max(1);
+            // R99: the reply carries this tag so a soft-cancelled run's late
+            // result can be identified and dropped.
+            let tag = QueryTag {
+                conn_id: cfg.id.clone(),
+                epoch,
+            };
             // R58: the connection's own limit drives the driver-side timeout, so
             // a form-set 30 s bounds the query instead of the old fixed 60 s.
             let timeout = cfg.effective_query_timeout_secs();
@@ -1973,7 +1993,7 @@ async fn run_op(backend: &LocalBackend, op: Op, tx: &Tx) -> OpResult {
                             let _ =
                                 tx.send(session_run_msg(&sql, total_ms, true, origin, &cfg.name));
                         }
-                        OpResult::Script(outcomes)
+                        OpResult::Script(outcomes, tag.clone())
                     }
                     Err(e) => {
                         if record {
@@ -1981,7 +2001,10 @@ async fn run_op(backend: &LocalBackend, op: Op, tx: &Tx) -> OpResult {
                                 .await;
                             let _ = tx.send(session_run_msg(&sql, 0, false, origin, &cfg.name));
                         }
-                        OpResult::Error(format!("script: {}", query_error_text(&e, timeout)))
+                        OpResult::QueryFailed {
+                            tag: tag.clone(),
+                            msg: format!("script: {}", query_error_text(&e, timeout)),
+                        }
                     }
                 }
             } else {
@@ -2009,7 +2032,7 @@ async fn run_op(backend: &LocalBackend, op: Op, tx: &Tx) -> OpResult {
                                 &cfg.name,
                             ));
                         }
-                        OpResult::Query(Box::new(r), sql, cap)
+                        OpResult::Query(Box::new(r), sql, cap, tag)
                     }
                     Err(e) => {
                         if record {
@@ -2017,7 +2040,10 @@ async fn run_op(backend: &LocalBackend, op: Op, tx: &Tx) -> OpResult {
                                 .await;
                             let _ = tx.send(session_run_msg(&sql, 0, false, origin, &cfg.name));
                         }
-                        OpResult::Error(format!("query: {}", query_error_text(&e, timeout)))
+                        OpResult::QueryFailed {
+                            tag,
+                            msg: format!("query: {}", query_error_text(&e, timeout)),
+                        }
                     }
                 }
             }
@@ -4383,15 +4409,30 @@ fn spawn_op(backend: &Arc<LocalBackend>, tx: &Tx, op: Op) {
     let backend = backend.clone();
     let tx = tx.clone();
     let limit = op.watchdog();
+    // R99: a query timeout must carry the query's tag so a soft-cancelled run's
+    // timeout is dropped like any other late reply instead of surfacing an error.
+    let query_tag = match &op {
+        Op::Query(cfg, _, _, _, _, epoch) => Some(QueryTag {
+            conn_id: cfg.id.clone(),
+            epoch: *epoch,
+        }),
+        _ => None,
+    };
     tokio::spawn(async move {
         // The watchdog is the last resort: a server that accepts the socket but
         // never answers must surface an error, not a spinner that never stops.
         let res = match tokio::time::timeout(limit, run_op(&backend, op, &tx)).await {
             Ok(r) => r,
-            Err(_) => OpResult::Error(tf(
-                "操作超时（{}s）· 服务器无响应或网络中断，请检查连接后用 d 重连",
-                &[&(limit.as_secs())],
-            )),
+            Err(_) => {
+                let msg = tf(
+                    "操作超时（{}s）· 服务器无响应或网络中断，请检查连接后用 d 重连",
+                    &[&(limit.as_secs())],
+                );
+                match query_tag {
+                    Some(tag) => OpResult::QueryFailed { tag, msg },
+                    None => OpResult::Error(msg),
+                }
+            }
         };
         let _ = tx.send(res);
     });
@@ -4886,6 +4927,10 @@ impl App {
             pending_ops: 1,
             loading_since: Some(Instant::now()),
             spinner: 0,
+            cancel_epoch: HashMap::new(),
+            queries_running: HashMap::new(),
+            query_slots_released: HashMap::new(),
+            cancel_announced: HashMap::new(),
             status: t("加载连接…").into(),
             flash_until: None,
             flash_text: String::new(),
@@ -5097,7 +5142,63 @@ async fn run_app(
     Ok(())
 }
 
+/// R99: the [`QueryTag`] carried by a query reply, if it is one. Used to drop a
+/// soft-cancelled / superseded run's late result before it renders.
+fn query_result_tag(res: &OpResult) -> Option<&QueryTag> {
+    match res {
+        OpResult::Query(_, _, _, tag) => Some(tag),
+        OpResult::Script(_, tag) => Some(tag),
+        OpResult::QueryFailed { tag, .. } => Some(tag),
+        _ => None,
+    }
+}
+
 fn apply_op_result(app: &mut App, res: OpResult, tx: &Tx) {
+    // R99: a query reply that belongs to a soft-cancelled or superseded run is
+    // dropped silently. Its op still counts as finished for the spinner, but the
+    // slot was already released at cancel time, so do not double-decrement.
+    if let Some(tag) = query_result_tag(&res) {
+        if app.query_reply_is_stale(tag) {
+            let had_release = app
+                .query_slots_released
+                .get(&tag.conn_id)
+                .copied()
+                .unwrap_or(0)
+                > 0;
+            if had_release {
+                let now_zero = if let Some(n) = app.query_slots_released.get_mut(&tag.conn_id) {
+                    *n -= 1;
+                    *n == 0
+                } else {
+                    false
+                };
+                if now_zero {
+                    app.query_slots_released.remove(&tag.conn_id);
+                }
+                // Only a reply whose slot a soft cancel released earns the
+                // "discarded" notice; a merely superseded run is dropped
+                // silently. The announce map keeps it once per generation.
+                let tag = tag.clone();
+                app.announce_discarded(&tag);
+            } else {
+                app.pending_ops = app.pending_ops.saturating_sub(1);
+                if app.pending_ops == 0 {
+                    app.loading = false;
+                    app.loading_since = None;
+                }
+            }
+            return;
+        }
+    }
+    // R99: a live query failure clears its in-flight marker, then flows through
+    // the generic error path (humanized, cleanup, popup).
+    let res = match res {
+        OpResult::QueryFailed { tag, msg } => {
+            app.queries_running.remove(&tag.conn_id);
+            OpResult::Error(msg)
+        }
+        other => other,
+    };
     // Intermediate / side-channel messages do not count as an op finishing, so
     // they are handled before the spinner accounting.
     if matches!(
@@ -5954,7 +6055,9 @@ fn apply_op_result(app: &mut App, res: OpResult, tx: &Tx) {
                 spawn_table_page(app, tx, 0);
             }
         }
-        OpResult::Query(r, sql, cap) => {
+        OpResult::Query(r, sql, cap, tag) => {
+            // R99: this run is the current one; clear its in-flight marker.
+            app.queries_running.remove(&tag.conn_id);
             // R47b: a query answered, so the pool is live.
             mark_active_live(app);
             // A `Ctrl-Enter` history direct run lands with a distinct status that
@@ -6042,7 +6145,9 @@ fn apply_op_result(app: &mut App, res: OpResult, tx: &Tx) {
             // A truncated result can be extended with Ctrl-N.
             app.query_more = if truncated { Some((sql, cap)) } else { None };
         }
-        OpResult::Script(outcomes) => {
+        OpResult::Script(outcomes, tag) => {
+            // R99: this run is the current one; clear its in-flight marker.
+            app.queries_running.remove(&tag.conn_id);
             app.count_cache.clear();
             // R47b: the script ran, so the pool is live.
             mark_active_live(app);
@@ -6965,6 +7070,10 @@ fn apply_op_result(app: &mut App, res: OpResult, tx: &Tx) {
             }
         }
         OpResult::TempConnUnregistered => {}
+        // R99: `QueryFailed` is rewritten to `Error` at the top of this
+        // function, so this arm is unreachable — it exists only so the match
+        // stays exhaustive.
+        OpResult::QueryFailed { .. } => {}
         OpResult::Error(e) => {
             // v0.6.27+ secret-store failures get a human hint (key missing /
             // migration pending); every other error passes through unchanged.

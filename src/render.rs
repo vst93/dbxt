@@ -1495,7 +1495,22 @@ pub(crate) fn footer_hints_ctx(ctx: FooterCtx) -> Vec<Hint> {
 
 /// Build the footer hint list for the current app state.
 pub(crate) fn footer_hints(app: &App) -> Vec<Hint> {
-    footer_hints_ctx(footer_ctx(app))
+    let ctx = footer_ctx(app);
+    let mut v = footer_hints_ctx(ctx);
+    // R99: while the active connection's query runs, Esc soft-cancels it. Only
+    // name the key on a pane-browsing surface (a modal overlay above owns Esc).
+    if app.active_query_cancellable()
+        && matches!(
+            ctx.view,
+            FooterView::Browse
+                | FooterView::RedisKeys
+                | FooterView::RedisValue
+                | FooterView::MongoDocs
+        )
+    {
+        v.insert(0, ("Esc", t("取消查询")));
+    }
+    v
 }
 
 pub(crate) fn hint_width(h: &Hint) -> usize {

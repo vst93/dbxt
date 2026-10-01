@@ -484,10 +484,45 @@ pub(crate) fn execute_sql(app: &mut App, tx: &Tx, sql: String, origin: &'static 
     app.direct_run = origin == "direct";
     app.status = t("执行中…").into();
     let db = app.current_db();
+    // R99: stamp the run with a fresh per-connection epoch so Esc can soft-cancel
+    // it and a later reply can be recognised as stale.
+    let epoch = app.register_query(&cfg, sql.clone());
     app.spawn(
         tx,
-        Op::Query(Box::new(cfg), db, sql, QUERY_MAX_ROWS, origin),
+        Op::Query(Box::new(cfg), db, sql, QUERY_MAX_ROWS, origin, epoch),
     );
+}
+
+/// R99: soft-cancel the active connection's in-flight query. Returns `true`
+/// when the Esc key was consumed — either because the run was soft-cancelled
+/// (UI control returns at once; the late reply is dropped) or because it was a
+/// write, which must never be soft-cancelled (double-write risk). Returns
+/// `false` when no query is in flight, so Esc keeps its normal meaning.
+pub(crate) fn soft_cancel_active_query(app: &mut App) -> bool {
+    let Some(cfg) = app.selected.clone() else {
+        return false;
+    };
+    let Some(run) = app.queries_running.get(&cfg.id).cloned() else {
+        return false;
+    };
+    // A write (INSERT / UPDATE / DELETE / DDL / an undetermined verb) is never
+    // soft-cancelled: the user must not mistake "still running" for "never ran"
+    // and re-send it. The classification was done once at launch.
+    if !run.cancellable {
+        app.status = t("写操作执行中，不可取消").into();
+        return true;
+    }
+    // Bump the connection's epoch so the in-flight reply is stale on arrival,
+    // release the UI at once, and free this op's spinner slot (the late reply
+    // must not decrement it a second time).
+    let _ = app.bump_cancel_epoch(&cfg.id);
+    app.queries_running.remove(&cfg.id);
+    *app.query_slots_released.entry(cfg.id.clone()).or_insert(0) += 1;
+    app.pending_ops = app.pending_ops.saturating_sub(1);
+    app.loading = false;
+    app.loading_since = None;
+    app.status = t("已取消，结果将在后台丢弃").into();
+    true
 }
 
 /// `Ctrl-N`: re-run the last query with a larger row cap when it was truncated.
@@ -514,7 +549,8 @@ pub(crate) fn load_more_rows(app: &mut App, tx: &Tx) {
     app.pending_scope = None;
     app.status = tf("加载更多… (上限 {} 行)", &[&(next)]);
     let db = app.current_db();
-    app.spawn(tx, Op::Query(Box::new(cfg), db, sql, next, "editor"));
+    let epoch = app.register_query(&cfg, sql.clone());
+    app.spawn(tx, Op::Query(Box::new(cfg), db, sql, next, "editor", epoch));
 }
 
 pub(crate) fn run_cmd_line(app: &mut App, tx: &Tx) {

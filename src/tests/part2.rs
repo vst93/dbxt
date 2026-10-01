@@ -3461,6 +3461,7 @@ pub(crate) fn watchdog_tiers_are_bounded() {
         "SELECT 1".into(),
         QUERY_MAX_ROWS,
         "editor",
+        0,
     );
     assert_eq!(q.watchdog(), OP_WATCHDOG_SQL);
     assert!(OP_WATCHDOG_FALLBACK < OP_WATCHDOG_SQL);

@@ -1647,9 +1647,10 @@ pub(crate) fn explain_current(app: &mut App, tx: &Tx) {
             app.pending_scope = None;
             app.status = format!("{} EXPLAIN…", cfg.db_type.as_str());
             let db = app.current_db();
+            let epoch = app.register_query(&cfg, explain.clone());
             app.spawn(
                 tx,
-                Op::Query(Box::new(cfg), db, explain, QUERY_MAX_ROWS, "editor"),
+                Op::Query(Box::new(cfg), db, explain, QUERY_MAX_ROWS, "editor", epoch),
             );
         }
         None => {

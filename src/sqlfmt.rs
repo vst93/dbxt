@@ -639,6 +639,15 @@ pub(crate) fn statement_is_read_only(statement: &str) -> bool {
     )
 }
 
+/// R99: true when `sql` contains any statement that is not a plain read. Used by
+/// the soft-cancel path: a write (INSERT / UPDATE / DELETE / DDL / an
+/// undetermined verb) must never be soft-cancelled, or a user could re-send it
+/// and double-write. Reuses the same classifier the read-only guard trusts.
+pub(crate) fn sql_has_write(db_type: DatabaseType, sql: &str) -> bool {
+    let statements = dbx_core::sql::split_sql_statements_for_database(sql, db_type);
+    statements.iter().any(|st| !statement_is_read_only(st))
+}
+
 /// The first write verb in `sql` for a read-only connection, or `None` when the
 /// whole batch is read-only. `?` marks a statement whose verb could not be
 /// determined (which still counts as a violation).

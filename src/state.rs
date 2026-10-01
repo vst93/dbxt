@@ -1344,6 +1344,24 @@ pub(crate) const SESSION_RUN_MAX: usize = 20;
 /// ago without turning the ring into a history you have to search.
 pub(crate) const EDITOR_CLIP_MAX: usize = 5;
 
+/// R99: identity stamped on a query when it is launched. The reply carries it
+/// back so a soft-cancelled (or superseded) run's late result can be dropped.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct QueryTag {
+    pub(crate) conn_id: String,
+    pub(crate) epoch: u64,
+}
+
+/// R99: the query currently in flight on one connection. Kept per connection so
+/// Esc can soft-cancel the active one without touching another connection's run.
+#[derive(Clone, Debug)]
+pub(crate) struct QueryRun {
+    /// Whether this run may be soft-cancelled. A write (INSERT / UPDATE /
+    /// DELETE / DDL / an undetermined verb) is not, so a re-send cannot double
+    /// write. Classified once at launch, never per render frame.
+    pub(crate) cancellable: bool,
+}
+
 impl SessionRun {
     /// Render one session run as the history row the panel draws: a synthetic
     /// `session:` id makes it recognisable without touching the store.
@@ -2597,6 +2615,20 @@ pub(crate) struct App {
     /// zero, so a fast secondary result (e.g. the history fetch) cannot make a
     /// slow primary one (the table list) look finished.
     pub(crate) pending_ops: usize,
+    /// R99: soft query cancel. Per-connection generation counter, bumped on every
+    /// query launch and every soft cancel. A reply whose epoch is behind the
+    /// connection's current epoch is stale (cancelled or superseded) and dropped.
+    pub(crate) cancel_epoch: HashMap<String, u64>,
+    /// R99: the latest in-flight query per connection, so Esc can soft-cancel the
+    /// active connection's run. Session-only, never persisted.
+    pub(crate) queries_running: HashMap<String, QueryRun>,
+    /// R99: per-connection count of cancelled query slots whose `pending_ops`
+    /// accounting was already released at cancel time. When the matching late
+    /// reply finally lands it must not decrement `pending_ops` a second time.
+    pub(crate) query_slots_released: HashMap<String, usize>,
+    /// R99: last cancel epoch announced as "discarded" per connection, so the
+    /// late-reply notice is shown once per generation, not once per reply.
+    pub(crate) cancel_announced: HashMap<String, u64>,
     /// When the oldest in-flight call started, shown as elapsed seconds so a slow
     /// query is visibly progressing rather than apparently hung.
     pub(crate) loading_since: Option<Instant>,
@@ -2746,6 +2778,62 @@ impl App {
         }
         self.loading = true;
         spawn_op(&self.backend, tx, op);
+    }
+
+    /// R99: advance a connection's cancel epoch, returning the new value.
+    pub(crate) fn bump_cancel_epoch(&mut self, conn_id: &str) -> u64 {
+        let e = self.cancel_epoch.entry(conn_id.to_string()).or_insert(0);
+        *e = e.wrapping_add(1);
+        *e
+    }
+
+    /// R99: stamp a fresh query with the next per-connection epoch and remember
+    /// it as the connection's in-flight run. The write / read classification is
+    /// done once here (reusing the read-only guard's classifier), so the Esc path
+    /// and the footer never re-split the SQL.
+    pub(crate) fn register_query(&mut self, cfg: &ConnectionConfig, sql: String) -> u64 {
+        let epoch = self.bump_cancel_epoch(&cfg.id);
+        let cancellable = !sql_has_write(cfg.db_type, &sql);
+        self.queries_running
+            .insert(cfg.id.clone(), QueryRun { cancellable });
+        epoch
+    }
+
+    /// R99: true when `tag` is behind the connection's current epoch, i.e. the
+    /// run was soft-cancelled or superseded by a newer one. Such a reply is
+    /// dropped without rendering.
+    pub(crate) fn query_reply_is_stale(&self, tag: &QueryTag) -> bool {
+        self.cancel_epoch.get(&tag.conn_id).copied().unwrap_or(0) > tag.epoch
+    }
+
+    /// R99: announce a dropped late reply once per cancelled generation. A
+    /// second stale reply from the same epoch leaves the status untouched.
+    pub(crate) fn announce_discarded(&mut self, tag: &QueryTag) {
+        if self.cancel_announced.get(&tag.conn_id).copied() == Some(tag.epoch) {
+            return;
+        }
+        self.cancel_announced.insert(tag.conn_id.clone(), tag.epoch);
+        self.status = t("已丢弃取消的查询结果").into();
+    }
+
+    /// R99: the in-flight query for the active connection, if any. The footer /
+    /// Esc hint keys off this so it never names a key that would do nothing.
+    pub(crate) fn active_query_running(&self) -> bool {
+        self.selected
+            .as_ref()
+            .is_some_and(|c| self.queries_running.contains_key(&c.id))
+    }
+
+    /// R99: true when the active connection has a soft-cancellable (read) query
+    /// in flight. The footer keys off this so it never advertises an Esc cancel
+    /// for a write run, which is deliberately refused.
+    pub(crate) fn active_query_cancellable(&self) -> bool {
+        let Some(cfg) = self.selected.as_ref() else {
+            return false;
+        };
+        self.queries_running
+            .get(&cfg.id)
+            .is_some_and(|r| r.cancellable)
     }
     pub(crate) fn current_db(&self) -> String {
         self.databases

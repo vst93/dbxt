@@ -7167,7 +7167,7 @@ pub(crate) fn script_status_names_total_elapsed() {
     };
     apply_op_result(
         &mut app,
-        OpResult::Script(vec![outcome(300), outcome(450)]),
+        OpResult::Script(vec![outcome(300), outcome(450)], test_query_tag()),
         &tx,
     );
     assert!(app.status.contains("750ms"), "{}", app.status);
@@ -7838,17 +7838,20 @@ pub(crate) fn script_errors_highlight_and_cycle_in_the_editor() {
     let (tx, _rx) = tokio::sync::mpsc::unbounded_channel::<OpResult>();
     apply_op_result(
         &mut app,
-        OpResult::Script(vec![
-            script_outcome(
-                "SELECT * FORM a",
-                Some("syntax error\nLINE 1: SELECT * FORM a"),
-            ),
-            script_outcome("SELECT 2", None),
-            script_outcome(
-                "SELECT * FORM b",
-                Some("syntax error near 'FORM' at line 1"),
-            ),
-        ]),
+        OpResult::Script(
+            vec![
+                script_outcome(
+                    "SELECT * FORM a",
+                    Some("syntax error\nLINE 1: SELECT * FORM a"),
+                ),
+                script_outcome("SELECT 2", None),
+                script_outcome(
+                    "SELECT * FORM b",
+                    Some("syntax error near 'FORM' at line 1"),
+                ),
+            ],
+            test_query_tag(),
+        ),
         &tx,
     );
 
@@ -11581,4 +11584,297 @@ pub(crate) fn r98_picker_with_last_session_renders_at_extreme_sizes() {
             assert!(text.contains('B'), "connection B missing at {w}x{h}");
         }
     });
+}
+
+// ── R99: soft query cancel (Esc during a run) ──
+
+/// Query → soft cancel → the late reply is dropped; a fresh query still renders.
+#[test]
+pub(crate) fn r99_soft_cancel_drops_late_result_and_next_query_renders() {
+    let tx = test_tx();
+    let mut app = test_app();
+    let cfg = conn("id-a", "A", "mysql");
+    app.selected = Some(cfg.clone());
+    app.backend_kind = Backend::Sql;
+    app.picker_open = false;
+    let sql = "SELECT SLEEP(10)";
+    let epoch = app.register_query(&cfg, sql.into());
+    app.pending_ops = 1;
+    app.loading = true;
+
+    // Esc soft-cancels: control returns at once.
+    assert!(soft_cancel_active_query(&mut app));
+    assert!(!app.loading);
+    assert_eq!(app.pending_ops, 0);
+    assert!(!app.active_query_running());
+    assert_eq!(app.status, t("已取消，结果将在后台丢弃"));
+
+    // The late reply is dropped without rendering and without a second decrement.
+    assert!(app.grid.is_none());
+    apply_op_result(
+        &mut app,
+        OpResult::Query(
+            Box::new(test_query_result(
+                &["late"],
+                vec![vec![serde_json::json!("x")]],
+            )),
+            sql.into(),
+            QUERY_MAX_ROWS,
+            QueryTag {
+                conn_id: cfg.id.clone(),
+                epoch,
+            },
+        ),
+        &tx,
+    );
+    assert!(app.grid.is_none(), "late result must not render");
+    assert_eq!(app.status, t("已丢弃取消的查询结果"));
+    assert_eq!(app.pending_ops, 0, "released slot is not double-counted");
+
+    // A new query on the same connection renders normally.
+    let epoch2 = app.register_query(&cfg, "SELECT 1".into());
+    apply_op_result(
+        &mut app,
+        OpResult::Query(
+            Box::new(test_query_result(
+                &["fresh"],
+                vec![vec![serde_json::json!(1)]],
+            )),
+            "SELECT 1".into(),
+            QUERY_MAX_ROWS,
+            QueryTag {
+                conn_id: cfg.id.clone(),
+                epoch: epoch2,
+            },
+        ),
+        &tx,
+    );
+    assert_eq!(
+        app.grid.as_ref().unwrap().columns,
+        vec!["fresh".to_string()]
+    );
+}
+
+/// Cancelling A leaves B's in-flight query alone: B renders, A's late reply is
+/// dropped.
+#[test]
+pub(crate) fn r99_soft_cancel_is_isolated_per_connection() {
+    let tx = test_tx();
+    let mut app = test_app();
+    let a = conn("id-a", "A", "mysql");
+    let b = conn("id-b", "B", "mysql");
+    app.selected = Some(a.clone());
+    app.backend_kind = Backend::Sql;
+    app.picker_open = false;
+    let ea = app.register_query(&a, "SELECT SLEEP(10)".into());
+    let eb = app.register_query(&b, "SELECT 1".into());
+    app.pending_ops = 2;
+    app.loading = true;
+
+    // Only the active connection (A) is cancelled.
+    assert!(soft_cancel_active_query(&mut app));
+    assert_eq!(app.cancel_epoch.get(&a.id), Some(&(ea + 1)));
+    assert_eq!(
+        app.cancel_epoch.get(&b.id),
+        Some(&eb),
+        "B's epoch untouched"
+    );
+    assert!(!app.active_query_running());
+
+    // B's current reply renders.
+    apply_op_result(
+        &mut app,
+        OpResult::Query(
+            Box::new(test_query_result(
+                &["b_col"],
+                vec![vec![serde_json::json!(1)]],
+            )),
+            "SELECT 1".into(),
+            QUERY_MAX_ROWS,
+            QueryTag {
+                conn_id: b.id.clone(),
+                epoch: eb,
+            },
+        ),
+        &tx,
+    );
+    assert_eq!(
+        app.grid.as_ref().unwrap().columns,
+        vec!["b_col".to_string()]
+    );
+
+    // A's late reply is dropped and leaves B's grid in place.
+    apply_op_result(
+        &mut app,
+        OpResult::Query(
+            Box::new(test_query_result(
+                &["a_col"],
+                vec![vec![serde_json::json!(2)]],
+            )),
+            "SELECT SLEEP(10)".into(),
+            QUERY_MAX_ROWS,
+            QueryTag {
+                conn_id: a.id.clone(),
+                epoch: ea,
+            },
+        ),
+        &tx,
+    );
+    assert_eq!(
+        app.grid.as_ref().unwrap().columns,
+        vec!["b_col".to_string()]
+    );
+    assert_eq!(app.status, t("已丢弃取消的查询结果"));
+    assert_eq!(app.pending_ops, 0);
+}
+
+/// A write run refuses soft cancel (double-write protection); a read is
+/// cancellable, including `EXPLAIN` of a write.
+#[test]
+pub(crate) fn r99_soft_cancel_refuses_write_statements() {
+    let mut app = test_app();
+    let cfg = conn("id-a", "A", "mysql");
+    app.selected = Some(cfg.clone());
+    app.backend_kind = Backend::Sql;
+    app.picker_open = false;
+
+    app.register_query(&cfg, "UPDATE t SET x = 1".into());
+    app.pending_ops = 1;
+    app.loading = true;
+    // The footer must not advertise a cancel that would be refused.
+    assert!(!footer_hints(&app)
+        .iter()
+        .any(|(k, d)| *k == "Esc" && *d == t("取消查询")));
+    assert!(soft_cancel_active_query(&mut app));
+    assert_eq!(app.status, t("写操作执行中，不可取消"));
+    assert!(app.active_query_running(), "the write stays in flight");
+    assert_eq!(app.pending_ops, 1, "the write slot is not released");
+    assert!(app.loading);
+
+    app.register_query(&cfg, "DROP TABLE t".into());
+    assert!(soft_cancel_active_query(&mut app));
+    assert_eq!(app.status, t("写操作执行中，不可取消"));
+
+    // EXPLAIN of a write is still classified as a write (fail closed), so it is
+    // refused too.
+    app.register_query(&cfg, "EXPLAIN DELETE FROM t".into());
+    assert!(soft_cancel_active_query(&mut app));
+    assert_eq!(app.status, t("写操作执行中，不可取消"));
+
+    // A plain read is cancellable.
+    app.register_query(&cfg, "SELECT 1".into());
+    assert!(soft_cancel_active_query(&mut app));
+    assert_eq!(app.status, t("已取消，结果将在后台丢弃"));
+}
+
+/// Two late replies from the same generation announce the discard only once.
+#[test]
+pub(crate) fn r99_late_results_announce_discard_once_per_generation() {
+    let tx = test_tx();
+    let mut app = test_app();
+    let cfg = conn("id-a", "A", "mysql");
+    app.selected = Some(cfg.clone());
+    app.backend_kind = Backend::Sql;
+    let epoch = app.register_query(&cfg, "SELECT SLEEP(10)".into());
+    app.pending_ops = 1;
+    assert!(soft_cancel_active_query(&mut app));
+
+    let tag = QueryTag {
+        conn_id: cfg.id.clone(),
+        epoch,
+    };
+    apply_op_result(
+        &mut app,
+        OpResult::Query(
+            Box::new(test_query_result(&["x"], vec![])),
+            "SELECT SLEEP(10)".into(),
+            QUERY_MAX_ROWS,
+            tag.clone(),
+        ),
+        &tx,
+    );
+    assert_eq!(app.status, t("已丢弃取消的查询结果"));
+
+    // A second late reply from the same generation must not overwrite a newer
+    // status with a repeat notice.
+    app.status = "keep-me".into();
+    apply_op_result(
+        &mut app,
+        OpResult::Query(
+            Box::new(test_query_result(&["x"], vec![])),
+            "SELECT SLEEP(10)".into(),
+            QUERY_MAX_ROWS,
+            tag,
+        ),
+        &tx,
+    );
+    assert_eq!(app.status, "keep-me");
+}
+
+/// The real Esc key route returns control and the footer advertises the gesture
+/// only while a cancellable run is live; rendering at both acceptance sizes is
+/// panic-free.
+#[test]
+pub(crate) fn r99_esc_key_returns_control_and_footer_names_it() {
+    let tx = test_tx();
+    let mut app = test_app();
+    let cfg = conn("id-a", "A", "mysql");
+    app.selected = Some(cfg.clone());
+    app.backend_kind = Backend::Sql;
+    app.picker_open = false;
+    app.focus = Focus::Editor;
+    app.register_query(&cfg, "SELECT SLEEP(10)".into());
+    app.pending_ops = 1;
+    app.loading = true;
+
+    assert!(
+        footer_hints(&app)
+            .iter()
+            .any(|(k, d)| *k == "Esc" && *d == t("取消查询")),
+        "footer must name Esc while a query runs"
+    );
+    for (w, h) in [(42u16, 22u16), (110, 30)] {
+        let rows = draw(&mut app, w, h);
+        assert_eq!(rows.len(), h as usize);
+    }
+
+    key(
+        &mut app,
+        &tx,
+        KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE),
+    );
+    assert!(!app.active_query_running());
+    assert_eq!(app.status, t("已取消，结果将在后台丢弃"));
+    assert!(
+        !footer_hints(&app)
+            .iter()
+            .any(|(k, d)| *k == "Esc" && *d == t("取消查询")),
+        "footer must drop the hint once the run is cancelled"
+    );
+}
+
+/// The full `?` sheet documents the gesture, and every new string translates.
+#[test]
+pub(crate) fn r99_help_documents_soft_cancel() {
+    assert!(
+        HELP_ROWS
+            .iter()
+            .any(|(k, d)| k.contains("Esc（执行中）") && d.contains("软取消")),
+        "full help missing the R99 soft-cancel row"
+    );
+    use ui_text::{t_lang, Lang};
+    assert_ne!(t_lang("Esc（执行中）", Lang::En), "Esc（执行中）");
+    assert_ne!(t_lang("取消查询", Lang::En), "取消查询");
+    assert_ne!(
+        t_lang("已取消，结果将在后台丢弃", Lang::En),
+        "已取消，结果将在后台丢弃"
+    );
+    assert_ne!(
+        t_lang("已丢弃取消的查询结果", Lang::En),
+        "已丢弃取消的查询结果"
+    );
+    assert_ne!(
+        t_lang("写操作执行中，不可取消", Lang::En),
+        "写操作执行中，不可取消"
+    );
 }

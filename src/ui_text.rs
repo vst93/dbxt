@@ -1643,6 +1643,13 @@ pub static ALL_KEYS: &[&str] = &[
     "上次会话的表 {} 已不存在 · 回到库 {}",
     "✓ 已恢复上次会话 · {}.{}",
     "✓ 已恢复上次会话 · {}",
+    // ── R99: soft query cancel (Esc during a run) ──
+    "取消查询",
+    "已取消，结果将在后台丢弃",
+    "已丢弃取消的查询结果",
+    "写操作执行中，不可取消",
+    "Esc（执行中）",
+    "执行中 Esc 软取消：立即归还操作权（后台查询不中断，迟到结果静默丢弃）；写语句（INSERT/UPDATE/DELETE/DDL）执行中不可取消，防重发双写",
 ];
 
 /// The Chinese → English table. Keys must match the source literals exactly.
@@ -4600,6 +4607,17 @@ fn en_of(zh: &'static str) -> Option<&'static str> {
         }
         "✓ 已恢复上次会话 · {}.{}" => Some("✓ Restored the last session · {}.{}"),
         "✓ 已恢复上次会话 · {}" => Some("✓ Restored the last session · {}"),
+        // ── R99: soft query cancel (Esc during a run) ──
+        "取消查询" => Some("cancel query"),
+        "已取消，结果将在后台丢弃" => {
+            Some("Cancelled; the result will be discarded in the background")
+        }
+        "已丢弃取消的查询结果" => Some("Discarded the cancelled query's result"),
+        "写操作执行中，不可取消" => Some("A write is running; it cannot be cancelled"),
+        "Esc（执行中）" => Some("Esc (while running)"),
+        "执行中 Esc 软取消：立即归还操作权（后台查询不中断，迟到结果静默丢弃）；写语句（INSERT/UPDATE/DELETE/DDL）执行中不可取消，防重发双写" => {
+            Some("Esc while running soft-cancels: control returns at once (the background query is not interrupted; a late result is dropped silently). A write (INSERT/UPDATE/DELETE/DDL) cannot be cancelled while running, preventing a double write on re-send")
+        }
         _ => None,
     }
 }

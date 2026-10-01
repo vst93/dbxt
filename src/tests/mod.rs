@@ -62,6 +62,39 @@ pub(crate) fn test_conn(db_type: &str) -> ConnectionConfig {
     .unwrap()
 }
 
+/// R99: a neutral query tag for tests. With no cancel epoch recorded it is
+/// never stale, so a reply built with it renders normally.
+pub(crate) fn test_query_tag() -> QueryTag {
+    QueryTag {
+        conn_id: "test-conn".into(),
+        epoch: 1,
+    }
+}
+
+/// R99: build a minimal query reply for the soft-cancel tests.
+pub(crate) fn test_query_result(
+    cols: &[&str],
+    rows: Vec<Vec<serde_json::Value>>,
+) -> dbx_core::db::QueryResult {
+    dbx_core::db::QueryResult {
+        columns: cols.iter().map(|c| c.to_string()).collect(),
+        column_types: cols.iter().map(|_| String::new()).collect(),
+        column_sortables: Vec::new(),
+        spatial_columns: Vec::new(),
+        spatial_values: Vec::new(),
+        rows,
+        affected_rows: 0,
+        execution_time_ms: 1,
+        server_execute_time_us: None,
+        query_timings_ms: None,
+        truncated: false,
+        session_id: None,
+        has_more: false,
+        elasticsearch_raw_body: None,
+        messages: Vec::new(),
+    }
+}
+
 /// Draw the whole UI into a headless buffer. Returns the rendered text rows
 /// so a test can assert what actually reached the screen.
 pub(crate) fn draw(app: &mut App, w: u16, h: u16) -> Vec<String> {

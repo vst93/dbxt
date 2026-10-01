@@ -818,6 +818,16 @@ pub(crate) fn browse_key(app: &mut App, tx: &Tx, k: KeyEvent) {
         }
     }
 
+    // R99: soft query cancel — Esc while a query is in flight returns control at
+    // once (the late result is dropped). A write run refuses cancellation so a
+    // re-send cannot double-write. Placed after every modal overlay so Esc still
+    // closes whatever popup owns the keyboard first.
+    if k.code == KeyCode::Esc && k.modifiers.is_empty() && app.active_query_running() {
+        if soft_cancel_active_query(app) {
+            return;
+        }
+    }
+
     // Help works from anywhere except the text inputs (where `?` is a character).
     // `F1` opens the very same cheat-sheet in *every* context, so the editor and
     // the command input — where `?` must stay a literal character — get a way in
