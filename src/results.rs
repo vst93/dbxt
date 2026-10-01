@@ -188,6 +188,15 @@ pub(crate) fn preview_key(app: &mut App, tx: &Tx, k: KeyEvent) {
             _ => app.pending_g = false,
         }
     }
+    // R102: `c` in the structure view edits the open table's comment. The bare
+    // key is otherwise the column picker, which is a no-op on the structure view
+    // (its grid has no hidden columns), so the gesture is reclaimed here; `g c`
+    // still opens the column popup above.
+    if k.code == KeyCode::Char('c') && k.modifiers.is_empty() && app.grid_kind == GridKind::Columns
+    {
+        open_table_comment_edit(app);
+        return;
+    }
     // Esc clears an active value locate, then an active column filter, then an
     // active result search, then an active cell find, before it does anything
     // else. This applies to the top-level grid and to a drilled script result;
@@ -2358,6 +2367,10 @@ pub(crate) fn cols_popup_key(app: &mut App, k: KeyEvent) {
             app.flash(t("已关闭列结构").into());
         }
         KeyCode::Char('/') => open_cols_popup_filter(app),
+        // R102: `n` edits the highlighted column's comment (the same confirm
+        // pipeline as the table comment). Read-only / unsupported engines report
+        // instead of opening the editor.
+        KeyCode::Char('n') => open_column_comment_edit(app),
         // R100: `y` copies the open table's structure as Markdown (the popup's
         // action row). Pure cache: no query is issued.
         KeyCode::Char('y') | KeyCode::Char('Y') => copy_table_structure_markdown(app),
@@ -2392,16 +2405,21 @@ pub(crate) fn col_index_by_name(columns: &[String], name: &str) -> Option<usize>
         })
 }
 
+/// R65: the highlighted column row of the `gc` popup, as an index into the
+/// *filtered* list. `None` when the filter matches nothing.
+pub(crate) fn cols_popup_selected(app: &App) -> Option<ColPopupRow> {
+    cols_popup_rows(app)
+        .into_iter()
+        .filter(|r| cols_popup_matches(r, &app.cols_popup_needle))
+        .nth(app.cols_popup_sel)
+}
+
 /// R65: Enter in the `gc` popup. The highlighted column is matched onto the
 /// *visible* grid by name and the cell cursor jumps there; the popup closes so
 /// the landing is visible. A column hidden by the column picker (or absent from
 /// a bare query result) reports instead of jumping somewhere wrong.
 pub(crate) fn cols_popup_jump(app: &mut App) {
-    let rows: Vec<ColPopupRow> = cols_popup_rows(app)
-        .into_iter()
-        .filter(|r| cols_popup_matches(r, &app.cols_popup_needle))
-        .collect();
-    let Some(row) = rows.get(app.cols_popup_sel).cloned() else {
+    let Some(row) = cols_popup_selected(app) else {
         app.status = t("没有可跳转的列").into();
         return;
     };

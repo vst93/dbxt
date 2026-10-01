@@ -4781,6 +4781,58 @@ fn en_of(zh: &'static str) -> Option<&'static str> {
         "导出数据字典：顺序读取当前库所有表的列 / 索引 / 外键，拼成一份 Markdown 数据字典（首节库概览：表数 / 引擎方言 / 生成时间），完成后输入文件名（默认 {db}-dictionary.md，留空则复制剪贴板）；>200 表先红色确认，生成中 Esc 软取消并丢弃未完成部分；只读连接可用（纯读，用户显式动作）" => {
             Some("Export the data dictionary: walk every table of the current database in order and build one Markdown document from its columns / indexes / foreign keys (the first section is the database overview: table count / dialect / generated-at). Then enter a filename (default {db}-dictionary.md; blank copies to the clipboard). More than 200 tables asks for the red confirmation first; Esc during generation soft-cancels and discards the unfinished part; read-only connections are welcome (pure read, an explicit action)")
         }
+        // ── R102: table / column comment view + edit ──
+        "留空 = 清除注释" => Some("blank = clear comment"),
+        "留空 = 清除（COMMENT = ''）" => Some("blank = clear (COMMENT = '')"),
+        "留空 = 清除（COMMENT … IS NULL）" => {
+            Some("blank = clear (COMMENT … IS NULL)")
+        }
+        "该引擎无注释，注释只读" => Some("This engine has no comments; read-only"),
+        "该引擎列注释暂不支持就地编辑" => {
+            Some("Column comments on this engine cannot be edited in place")
+        }
+        "表 {}" => Some("table {}"),
+        "列 {}.{}" => Some("column {}.{}"),
+        "编辑{}注释 · Enter 确认 · Esc 取消" => {
+            Some("Edit {} comment · Enter confirm · Esc cancel")
+        }
+        "没有可编辑注释的列" => Some("No column to edit a comment for"),
+        "查询结果无表元数据，无法编辑列注释" => {
+            Some("A query result has no table metadata; cannot edit a column comment")
+        }
+        "已取消编辑注释" => Some("Comment edit cancelled"),
+        "更新" => Some("update"),
+        "{}注释：{}" => Some("{} comment: {}"),
+        "注释确认 · Enter 执行 · Esc 取消" => {
+            Some("Comment confirmation · Enter run · Esc cancel")
+        }
+        " 表注释 · {} · Enter 确认 · Esc 取消 " => {
+            Some(" Table comment · {} · Enter confirm · Esc cancel ")
+        }
+        " 列注释 · {}.{} · Enter 确认 · Esc 取消 " => {
+            Some(" Column comment · {}.{} · Enter confirm · Esc cancel ")
+        }
+        "当前：{}" => Some("Current: {}"),
+        "当前：—" => Some("Current: —"),
+        " · c 编辑注释" => Some(" · c edit comment"),
+        " 表结构 · {} · 注释: {}{} · t 查看 DDL " => {
+            Some(" Structure · {} · comment: {}{} · t view DDL ")
+        }
+        " n 编辑列注释 · y 复制表结构 Markdown · Esc 关 " => {
+            Some(" n edit column comment · y copy table structure Markdown · Esc close ")
+        }
+        "只读连接，列注释只读" => Some("Read-only connection; column comments are read-only"),
+        "SQLite 无注释，列注释只读" => Some("SQLite has no comments; column comments are read-only"),
+        " y 复制表结构 Markdown · {} · Esc 关 " => {
+            Some(" y copy table structure Markdown · {} · Esc close ")
+        }
+        "c（表结构视图）" => Some("c (structure view)"),
+        "编辑当前表注释：预填当前注释的输入框，Enter 生成 COMMENT ON / ALTER TABLE … COMMENT 并进写确认管线（绝不静默执行）；留空清除（PG 为 IS NULL，MySQL 为 ''）；只读连接 / SQLite 隐藏该动作，表头显示当前注释（无则 —）" => {
+            Some("Edit the current table's comment: an input prefilled with the current comment; Enter generates COMMENT ON / ALTER TABLE … COMMENT and routes it through the write confirmation pipeline (never run silently). A blank value clears it (IS NULL on PostgreSQL, '' on MySQL). The action is hidden on a read-only connection / SQLite, and the header shows the current comment (— when none).")
+        }
+        "列结构弹层：列名 / 类型 / 键(PRI/UNI/MUL) / 默认值 / 可空 / 注释；右侧就地显示选中列的值分布（非空/空/去重，去重旁附 12 格分布 sparkline，数值列 min/max/avg；缓存元数据+已加载数据，不额外查库；窄屏 < 56 列隐藏 sparkline；/ 过滤列名；Enter 跳到该列；n 编辑选中列注释（PG/通用 COMMENT ON COLUMN，MySQL 列注释只读提示）；底部动作行 y 复制当前表结构 Markdown（列 / 索引 / 外键；无注释省略注释列）" => {
+            Some("Column-structure popup: name / type / key (PRI/UNI/MUL) / default / nullable / comment; the right pane shows the highlighted column's value distribution in place (non-null / null / distinct, with a 12-cell distribution sparkline next to the distinct count, and min/max/avg for numeric columns; cached metadata + loaded data, no extra query; a narrow screen under 56 columns hides the sparkline). / filters by column name; Enter jumps to the column; n edits the highlighted column's comment (COMMENT ON COLUMN on PostgreSQL / the generic form, a read-only note on MySQL columns); the bottom action row y copies the current table structure as Markdown (columns / indexes / foreign keys; the comment column is omitted when there are none).")
+        }
         _ => None,
     }
 }

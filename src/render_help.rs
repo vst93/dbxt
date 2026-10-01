@@ -1257,10 +1257,89 @@ pub(crate) fn render_filter_prompt(f: &mut Frame, area: Rect, app: &mut App) {
     }
 }
 
+/// R102: the table / column comment editor — a centered TextArea popup in the
+/// same style as the WHERE prompt, prefilled with the current comment. The title
+/// names the target and the hint line spells out the dialect's clear semantics.
+pub(crate) fn render_comment_prompt(f: &mut Frame, area: Rect, app: &mut App) {
+    let (title, hint, clear) = {
+        let Some(ce) = app.comment_edit.as_ref() else {
+            return;
+        };
+        let (title, hint) = match &ce.target {
+            CommentTarget::Table => (
+                tf(
+                    " 表注释 · {} · Enter 确认 · Esc 取消 ",
+                    &[&fix_double_encoding(&qualified_display(
+                        &ce.schema, &ce.table,
+                    ))],
+                ),
+                ce.original
+                    .as_deref()
+                    .filter(|c| !c.trim().is_empty())
+                    .map(|c| tf("当前：{}", &[&truncate_disp(c, 56)]))
+                    .unwrap_or_else(|| t("当前：—").to_string()),
+            ),
+            CommentTarget::Column(col) => (
+                tf(
+                    " 列注释 · {}.{} · Enter 确认 · Esc 取消 ",
+                    &[&fix_double_encoding(&ce.table), col],
+                ),
+                ce.original
+                    .as_deref()
+                    .filter(|c| !c.trim().is_empty())
+                    .map(|c| tf("当前：{}", &[&truncate_disp(c, 56)]))
+                    .unwrap_or_else(|| t("当前：—").to_string()),
+            ),
+        };
+        let clear = app
+            .selected
+            .as_ref()
+            .map(|c| comment_clear_hint(c.db_type, &ce.target))
+            .unwrap_or_else(|| t("留空 = 清除（COMMENT … IS NULL）"));
+        (title, hint, clear)
+    };
+    let w = overlay_width(area.width, 74, 24);
+    let h = 7.min(area.height);
+    let box_area = centered_overlay(area, w, h);
+    f.render_widget(Clear, box_area);
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .title(title)
+        .border_set(border::ROUNDED)
+        .border_style(Style::default().fg(Color::Yellow));
+    let inner = block.inner(box_area);
+    f.render_widget(block, box_area);
+    // Leave two lines at the bottom: the current value and the clear semantics.
+    let hint_h = 2u16.min(inner.height.saturating_sub(1));
+    let ta_h = inner.height.saturating_sub(hint_h).max(1);
+    let ta_area = Rect {
+        x: inner.x,
+        y: inner.y,
+        width: inner.width,
+        height: ta_h,
+    };
+    let hint_area = Rect {
+        x: inner.x,
+        y: inner.y + ta_h,
+        width: inner.width,
+        height: hint_h,
+    };
+    if let Some(ce) = app.comment_edit.as_mut() {
+        ce.input.set_block(Block::default());
+        f.render_widget(&ce.input, ta_area);
+    }
+    if hint_h > 0 {
+        let hints = vec![
+            Line::from(Span::styled(hint, Style::default().fg(Color::DarkGray))),
+            Line::from(Span::styled(clear, Style::default().fg(Color::DarkGray))),
+        ];
+        f.render_widget(Paragraph::new(hints), hint_area);
+    }
+}
+
 /// The `?` shortcut cheat-sheet, generated from the same list the README table
 /// mirrors.
-pub(crate) const HELP_ROWS: &[(&str, &str)] = &[
-    ("— 全局 —", ""),
+pub(crate) const HELP_ROWS: &[(&str, &str)] = &[    ("— 全局 —", ""),
     (
         "q / Ctrl-C",
         "退出（编辑器有未执行语句时两段确认：再按一次退出，Esc 留下）",
@@ -1691,7 +1770,11 @@ pub(crate) const HELP_ROWS: &[(&str, &str)] = &[
     ("g d / g t", "跳表结构视图 / 回表数据"),
     (
         "g c",
-        "列结构弹层：列名 / 类型 / 键(PRI/UNI/MUL) / 默认值 / 可空 / 注释；右侧就地显示选中列的值分布（非空/空/去重，去重旁附 12 格分布 sparkline，数值列 min/max/avg；缓存元数据+已加载数据，不额外查库；窄屏 < 56 列隐藏 sparkline；/ 过滤列名；Enter 跳到该列；底部动作行 y 复制当前表结构 Markdown（列 / 索引 / 外键；无注释省略注释列）",
+        "列结构弹层：列名 / 类型 / 键(PRI/UNI/MUL) / 默认值 / 可空 / 注释；右侧就地显示选中列的值分布（非空/空/去重，去重旁附 12 格分布 sparkline，数值列 min/max/avg；缓存元数据+已加载数据，不额外查库；窄屏 < 56 列隐藏 sparkline；/ 过滤列名；Enter 跳到该列；n 编辑选中列注释（PG/通用 COMMENT ON COLUMN，MySQL 列注释只读提示）；底部动作行 y 复制当前表结构 Markdown（列 / 索引 / 外键；无注释省略注释列）",
+    ),
+    (
+        "c（表结构视图）",
+        "编辑当前表注释：预填当前注释的输入框，Enter 生成 COMMENT ON / ALTER TABLE … COMMENT 并进写确认管线（绝不静默执行）；留空清除（PG 为 IS NULL，MySQL 为 ''）；只读连接 / SQLite 隐藏该动作，表头显示当前注释（无则 —）",
     ),
     (
         "g b",

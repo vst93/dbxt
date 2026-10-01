@@ -4,6 +4,7 @@
 
 mod ui_text;
 
+mod comments;
 mod csv_io;
 mod diffui;
 mod docgen;
@@ -269,6 +270,8 @@ enum Op {
     ListTables(Box<ConnectionConfig>, String, String, u64),
     Columns(Box<ConnectionConfig>, String, String, String),
     Ddl(Box<ConnectionConfig>, String, String, String),
+    /// R102: best-effort read of one table's comment for the structure view.
+    TableComment(Box<ConnectionConfig>, String, String, String),
     TableData(Box<TableDataReq>),
     TableColumns(Box<ConnectionConfig>, String, String, String),
     Query(
@@ -655,6 +658,12 @@ enum OpResult {
         table: String,
         schema: String,
         text: String,
+    },
+    /// R102: a table's comment (best-effort; `None` = none / read failed).
+    TableComment {
+        table: String,
+        schema: String,
+        comment: Option<String>,
     },
     TableData {
         grid: Box<Grid>,
@@ -1811,6 +1820,33 @@ async fn run_op(backend: &LocalBackend, op: Op, tx: &Tx) -> OpResult {
                     schema,
                     text: tf("-- 无法获取 DDL: {}", &[&(e)]),
                 },
+            }
+        }
+        Op::TableComment(cfg, db, schema, table) => {
+            // Best effort: a failed comment read (an engine without comments, a
+            // permission issue) simply reports no comment and never an error.
+            let effective = if schema.trim().is_empty() && is_postgres_family(cfg.db_type.as_str())
+            {
+                resolve_ddl_schema(backend, &cfg, &db, &table).await
+            } else {
+                schema.clone()
+            };
+            let comment = dbx_core::schema::get_table_comment_core(
+                backend.state().as_ref(),
+                &cfg.id,
+                &db,
+                &effective,
+                &table,
+            )
+            .await
+            .ok()
+            .flatten()
+            .map(|c| c.trim().to_string())
+            .filter(|c| !c.is_empty());
+            OpResult::TableComment {
+                table,
+                schema,
+                comment,
             }
         }
         Op::TableData(req) => {
@@ -4836,6 +4872,10 @@ impl App {
             ddl: None,
             struct_view: StructView::Fields,
             ddl_scroll: 0,
+            table_comment: None,
+            table_comment_loaded: false,
+            comment_edit: None,
+            comment_refresh: false,
             editor: TextArea::default(),
             history: Vec::new(),
             history_idx: None,
@@ -6041,6 +6081,19 @@ fn apply_op_result(app: &mut App, res: OpResult, tx: &Tx) {
                 app.ddl_scroll = 0;
             }
         }
+        OpResult::TableComment {
+            table,
+            schema,
+            comment,
+        } => {
+            // Only keep a comment that belongs to the table on screen.
+            if app.selected_table().map(|t| t.name.as_str()) == Some(table.as_str())
+                && app.schema == schema
+            {
+                app.table_comment = comment;
+                app.table_comment_loaded = true;
+            }
+        }
         OpResult::TableData {
             grid,
             total,
@@ -6217,6 +6270,14 @@ fn apply_op_result(app: &mut App, res: OpResult, tx: &Tx) {
                 app.pending_write = false;
                 let affected = r.affected_rows;
                 let note = format!("{}ms", r.execution_time_ms);
+                // R102: a comment write invalidates the cached comment; re-read
+                // the metadata so the structure view / `gc` popup show the new
+                // text (the page reload below already refreshes a data view).
+                let comment_refresh = std::mem::take(&mut app.comment_refresh);
+                if comment_refresh {
+                    app.table_comment = None;
+                    app.table_comment_loaded = false;
+                }
                 if app.page_state.is_some() && app.grid_kind == GridKind::TableData {
                     let sel = app.sel;
                     let ps = app.page_state.clone().unwrap();
@@ -6225,6 +6286,14 @@ fn apply_op_result(app: &mut App, res: OpResult, tx: &Tx) {
                     reload_table_view(app, tx, ps.filter.clone(), ps.order_by.clone(), ps.page);
                     app.pending_sel = Some(sel);
                     app.status = tf("{} · 已刷新当前页", &[&(msg)]);
+                    // R102: refresh the `gc` popup's cached column metadata too.
+                    if comment_refresh {
+                        refresh_after_comment_write(app, tx);
+                    }
+                } else if comment_refresh && app.grid_kind == GridKind::Columns {
+                    // The structure view is on screen: re-read its metadata (and
+                    // the table comment) in place.
+                    refresh_after_comment_write(app, tx);
                 } else {
                     app.status = tf("✓ 影响 {} 行 · {}", &[&(affected), &(note)]);
                 }
@@ -7245,6 +7314,8 @@ fn apply_op_result(app: &mut App, res: OpResult, tx: &Tx) {
             app.pending_focus = None;
             app.pending_write = false;
             app.pending_write_msg = None;
+            // R102: a failed comment write must not refresh on a later write.
+            app.comment_refresh = false;
             app.search_running = false;
             app.search_progress = None;
             // R100: a failed / timed-out dictionary walk must not leave its

@@ -12540,3 +12540,336 @@ pub(crate) fn result_diff_key_toggles_a_moves_and_closes() {
     assert!(app.result_diff.is_none());
     assert_eq!(app.result_snapshot.len(), 1);
 }
+
+// ── R102: table / column comment view + edit ─────────────────────────────────
+
+/// PG / the generic form: `COMMENT ON TABLE` / `COMMENT ON COLUMN`, with `''`
+/// escaping and `IS NULL` for the clear gesture.
+#[test]
+pub(crate) fn r102_comment_sql_pg_table_and_column() {
+    let pg = DatabaseType::Postgres;
+    assert_eq!(
+        comment_sql(
+            pg,
+            "public",
+            "orders",
+            &CommentTarget::Table,
+            Some("orders table")
+        )
+        .unwrap(),
+        "COMMENT ON TABLE \"public\".\"orders\" IS 'orders table';"
+    );
+    assert_eq!(
+        comment_sql(pg, "public", "orders", &CommentTarget::Table, Some("")).unwrap(),
+        "COMMENT ON TABLE \"public\".\"orders\" IS NULL;"
+    );
+    assert_eq!(
+        comment_sql(
+            pg,
+            "public",
+            "orders",
+            &CommentTarget::Column("id".into()),
+            Some("the id")
+        )
+        .unwrap(),
+        "COMMENT ON COLUMN \"public\".\"orders\".\"id\" IS 'the id';"
+    );
+    // A single quote is doubled (the `''` escape).
+    assert_eq!(
+        comment_sql(
+            pg,
+            "public",
+            "orders",
+            &CommentTarget::Column("id".into()),
+            Some("it's")
+        )
+        .unwrap(),
+        "COMMENT ON COLUMN \"public\".\"orders\".\"id\" IS 'it''s';"
+    );
+    // A blank / whitespace value clears.
+    assert_eq!(
+        comment_sql(
+            pg,
+            "public",
+            "orders",
+            &CommentTarget::Column("id".into()),
+            Some("   ")
+        )
+        .unwrap(),
+        "COMMENT ON COLUMN \"public\".\"orders\".\"id\" IS NULL;"
+    );
+    // No schema → unqualified.
+    assert_eq!(
+        comment_sql(pg, "", "orders", &CommentTarget::Table, Some("t")).unwrap(),
+        "COMMENT ON TABLE \"orders\" IS 't';"
+    );
+}
+
+/// MySQL: table comments are inline `ALTER TABLE … COMMENT`, column comments are
+/// read-only; SQLite has no comments at all.
+#[test]
+pub(crate) fn r102_mysql_and_sqlite_comments_degrade() {
+    let my = DatabaseType::Mysql;
+    assert_eq!(
+        comment_sql(my, "", "orders", &CommentTarget::Table, Some("hi")).unwrap(),
+        "ALTER TABLE `orders` COMMENT = 'hi';"
+    );
+    assert_eq!(
+        comment_sql(my, "", "orders", &CommentTarget::Table, Some("")).unwrap(),
+        "ALTER TABLE `orders` COMMENT = '';"
+    );
+    // MySQL column comments need the whole column definition → not editable here.
+    assert!(comment_sql(
+        my,
+        "",
+        "orders",
+        &CommentTarget::Column("id".into()),
+        Some("x")
+    )
+    .is_none());
+    assert!(!comment_target_editable(
+        my,
+        &CommentTarget::Column("id".into())
+    ));
+    assert!(comment_target_editable(my, &CommentTarget::Table));
+    assert_eq!(
+        comment_readonly_status(my),
+        t("该引擎列注释暂不支持就地编辑")
+    );
+
+    // SQLite: table and column comments are both read-only.
+    let sq = DatabaseType::Sqlite;
+    assert!(comment_sql(sq, "", "orders", &CommentTarget::Table, Some("x")).is_none());
+    assert!(comment_sql(
+        sq,
+        "",
+        "orders",
+        &CommentTarget::Column("id".into()),
+        Some("x")
+    )
+    .is_none());
+    assert!(!comment_target_editable(sq, &CommentTarget::Table));
+    assert_eq!(comment_readonly_status(sq), t("该引擎无注释，注释只读"));
+
+    // The `gc` popup action row surfaces the read-only note for both engines.
+    let mut app = test_app();
+    app.picker_open = false;
+    app.table_meta = Some(orders_meta(&[("id", "int")], &[]));
+    app.selected = Some(test_conn("sqlite"));
+    assert_eq!(
+        column_comment_hint(&app),
+        Some(t("SQLite 无注释，列注释只读"))
+    );
+    assert!(!column_comment_editable(&app));
+    app.selected = Some(test_conn("mysql"));
+    assert_eq!(
+        column_comment_hint(&app),
+        Some(t("该引擎列注释暂不支持就地编辑"))
+    );
+}
+
+/// The editor prefills the current comment; Enter routes a set / clear statement
+/// through the confirmation layer and never runs it directly.
+#[test]
+pub(crate) fn r102_comment_editor_prefills_and_empty_clears() {
+    let mut app = test_app();
+    app.picker_open = false;
+    app.selected = Some(test_conn("postgres"));
+    app.schema = "public".into();
+    app.tables = vec![table_info("orders", "TABLE")];
+    app.tables_all = app.tables.clone();
+    app.table_list.select(Some(0));
+    app.table_comment = Some("the orders".into());
+
+    open_table_comment_edit(&mut app);
+    let ce = app.comment_edit.as_ref().expect("editor opened");
+    assert_eq!(ce.target, CommentTarget::Table);
+    assert_eq!(ce.input.lines().join("\n"), "the orders");
+
+    // Enter → a red confirmation, not a run.
+    submit_comment_edit(&mut app);
+    assert!(app.comment_edit.is_none());
+    let c = app.confirm.as_ref().expect("confirm opened");
+    assert_eq!(
+        c.sql,
+        "COMMENT ON TABLE \"public\".\"orders\" IS 'the orders';"
+    );
+    assert!(
+        app.comment_refresh,
+        "a comment write must refresh the cache"
+    );
+    assert!(c.refresh);
+
+    // Blank the buffer → the clear gesture.
+    app.confirm = None;
+    open_table_comment_edit(&mut app);
+    app.comment_edit.as_mut().unwrap().input = TextArea::default();
+    submit_comment_edit(&mut app);
+    assert_eq!(
+        app.confirm.as_ref().unwrap().sql,
+        "COMMENT ON TABLE \"public\".\"orders\" IS NULL;"
+    );
+}
+
+/// The `gc` popup's `n` edits the highlighted column; MySQL columns and a bare
+/// query result both degrade with a status instead of opening the editor.
+#[test]
+pub(crate) fn r102_column_comment_edit_gates_on_metadata_and_engine() {
+    let mut app = test_app();
+    app.picker_open = false;
+    app.selected = Some(test_conn("postgres"));
+    app.grid_kind = GridKind::TableData;
+    app.set_grid(sample_grid());
+    let mut meta = orders_meta(&[("id", "int")], &[("name", "text")]);
+    meta.columns[1].comment = Some("the name".into());
+    app.table_meta = Some(meta);
+    open_cols_popup(&mut app);
+    app.cols_popup_sel = 1;
+    open_column_comment_edit(&mut app);
+    let ce = app.comment_edit.as_ref().expect("column editor opened");
+    assert_eq!(ce.target, CommentTarget::Column("name".into()));
+    assert_eq!(ce.input.lines().join("\n"), "the name");
+
+    // MySQL column: read-only, no editor.
+    app.comment_edit = None;
+    app.selected = Some(test_conn("mysql"));
+    app.table_meta = Some(orders_meta(&[("id", "int")], &[("name", "text")]));
+    open_column_comment_edit(&mut app);
+    assert!(app.comment_edit.is_none());
+    assert_eq!(app.status, comment_readonly_status(DatabaseType::Mysql));
+
+    // No cached table metadata: report rather than guess a table.
+    app.selected = Some(test_conn("postgres"));
+    app.table_meta = None;
+    open_column_comment_edit(&mut app);
+    assert!(app.comment_edit.is_none());
+    assert!(app.status.contains("无表元数据"), "{}", app.status);
+}
+
+/// A read-only connection hides the table comment action and refuses it if it is
+/// somehow reached.
+#[test]
+pub(crate) fn r102_readonly_connection_hides_comment_edit() {
+    let mut app = test_app();
+    app.picker_open = false;
+    let mut cfg = test_conn("postgres");
+    cfg.read_only = true;
+    app.selected = Some(cfg);
+    app.schema = "public".into();
+    app.tables = vec![table_info("orders", "TABLE")];
+    app.tables_all = app.tables.clone();
+    app.table_list.select(Some(0));
+    app.grid_kind = GridKind::Columns;
+    app.set_grid(sample_grid());
+    assert!(!table_comment_editable(&app));
+    let title = grid_title(&app);
+    assert!(!title.contains("编辑注释"), "{title}");
+    open_table_comment_edit(&mut app);
+    assert!(app.comment_edit.is_none());
+    assert!(app.status.contains("只读"), "{}", app.status);
+}
+
+/// A successful comment write invalidates the cached table comment so the
+/// structure view re-reads it.
+#[test]
+pub(crate) fn r102_comment_write_invalidates_the_cache() {
+    run_rt(|| {
+        let tx = test_tx();
+        let mut app = test_app();
+        app.picker_open = false;
+        app.selected = Some(test_conn("postgres"));
+        app.schema = "public".into();
+        app.tables = vec![table_info("orders", "TABLE")];
+        app.tables_all = app.tables.clone();
+        app.table_list.select(Some(0));
+        app.table_comment = Some("old".into());
+        app.table_comment_loaded = true;
+        refresh_after_comment_write(&mut app, &tx);
+        assert!(app.table_comment.is_none());
+        assert!(!app.table_comment_loaded);
+    });
+}
+
+/// The structure view header shows the comment (and `—` when none), and the
+/// edit hint disappears on an engine that cannot edit it.
+#[test]
+pub(crate) fn r102_struct_header_shows_the_table_comment() {
+    let mut app = test_app();
+    app.picker_open = false;
+    app.selected = Some(test_conn("postgres"));
+    app.schema = "public".into();
+    app.tables = vec![table_info("orders", "TABLE")];
+    app.tables_all = app.tables.clone();
+    app.table_list.select(Some(0));
+    app.grid_kind = GridKind::Columns;
+    app.set_grid(sample_grid());
+    app.table_comment = Some("the orders".into());
+    let title = grid_title(&app);
+    assert!(title.contains("注释: the orders"), "{title}");
+    assert!(title.contains("c 编辑注释"), "{title}");
+    // No comment → an em dash.
+    app.table_comment = None;
+    assert!(grid_title(&app).contains("注释: —"), "{}", grid_title(&app));
+    // SQLite hides the edit hint.
+    app.selected = Some(test_conn("sqlite"));
+    assert!(!grid_title(&app).contains("编辑注释"));
+}
+
+/// The full help carries the comment keys and every new string translates.
+#[test]
+pub(crate) fn r102_help_documents_comment_editing() {
+    assert!(HELP_ROWS
+        .iter()
+        .any(|(k, d)| *k == "c（表结构视图）" && d.contains("COMMENT ON")));
+    assert!(HELP_ROWS
+        .iter()
+        .any(|(k, d)| *k == "g c" && d.contains("编辑选中列注释")));
+    use ui_text::{t_lang, Lang};
+    for k in [
+        "c（表结构视图）",
+        "留空 = 清除注释",
+        "该引擎无注释，注释只读",
+        "该引擎列注释暂不支持就地编辑",
+        "注释确认 · Enter 执行 · Esc 取消",
+        " · c 编辑注释",
+        " n 编辑列注释 · y 复制表结构 Markdown · Esc 关 ",
+    ] {
+        assert_ne!(t_lang(k, Lang::En), k, "missing English for {k:?}");
+    }
+}
+
+/// The comment editor renders at the phone and desktop sizes without panicking.
+#[test]
+pub(crate) fn r102_comment_prompt_renders_at_both_sizes() {
+    let mut app = test_app();
+    app.picker_open = false;
+    app.selected = Some(test_conn("postgres"));
+    app.schema = "public".into();
+    app.tables = vec![table_info("orders", "TABLE")];
+    app.tables_all = app.tables.clone();
+    app.table_list.select(Some(0));
+    app.table_comment = Some("orders table".into());
+    open_table_comment_edit(&mut app);
+    assert!(app.comment_edit.is_some());
+    for (w, h) in [(42u16, 22u16), (110, 30)] {
+        let joined = draw(&mut app, w, h).join("\n").replace(' ', "");
+        assert!(
+            joined.contains("表注释"),
+            "table comment prompt missing at {w}x{h}: {joined}"
+        );
+    }
+    // The column variant renders too.
+    app.comment_edit = None;
+    app.table_meta = Some(orders_meta(&[("id", "int")], &[]));
+    app.grid_kind = GridKind::TableData;
+    app.set_grid(sample_grid());
+    open_cols_popup(&mut app);
+    app.cols_popup_sel = 0;
+    open_column_comment_edit(&mut app);
+    assert!(app.comment_edit.is_some());
+    let joined = draw(&mut app, 110, 30).join("\n").replace(' ', "");
+    assert!(
+        joined.contains("列注释"),
+        "column comment prompt missing: {joined}"
+    );
+}

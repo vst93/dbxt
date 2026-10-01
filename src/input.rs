@@ -147,6 +147,8 @@ pub(crate) fn reset_overlays_for_backend_switch(app: &mut App) {
     app.file_load_plan = None;
     app.sqlite_open = None;
     app.filter_prompt = None;
+    // R102: drop the comment editor with the rest of the overlays.
+    app.comment_edit = None;
     app.cell_popup = None;
     app.row_popup = None;
     app.error_popup = None;
@@ -392,6 +394,8 @@ pub(crate) fn confirm_key(app: &mut App, tx: &Tx, k: KeyEvent) {
         KeyCode::Esc | KeyCode::Char('n') | KeyCode::Char('N') => {
             app.confirm = None;
             app.pending_write = false;
+            // R102: a cancelled comment write must not refresh on a later write.
+            app.comment_refresh = false;
             // R88: a cancelled scoped run must not label a later result.
             app.pending_scope = None;
             app.flash(t("已取消").into());
@@ -534,6 +538,12 @@ pub(crate) fn browse_key(app: &mut App, tx: &Tx, k: KeyEvent) {
     }
     if app.conn_import_plan.is_some() {
         conn_import_plan_key(app, tx, k);
+        return;
+    }
+    // R102: the table / column comment editor (a modal TextArea) sits above the
+    // grid and the `gc` popup it was opened from, so it owns the keyboard first.
+    if app.comment_edit.is_some() {
+        comment_edit_key(app, k);
         return;
     }
     if app.filter_prompt.is_some() {
@@ -2229,6 +2239,11 @@ pub(crate) fn load_structure(app: &mut App, tx: &Tx) {
     app.status = tf("加载 {} 结构…", &[&(fix_double_encoding(&table))]);
     let db = app.current_db();
     let schema = app.schema.clone();
+    // R102: the structure view shows the table comment, so a fresh open clears
+    // the previous table's comment and reads this one best-effort alongside the
+    // columns / DDL.
+    app.table_comment = None;
+    app.table_comment_loaded = false;
     app.spawn(
         tx,
         Op::Columns(
@@ -2238,7 +2253,16 @@ pub(crate) fn load_structure(app: &mut App, tx: &Tx) {
             table.clone(),
         ),
     );
-    app.spawn(tx, Op::Ddl(Box::new(cfg), db, schema, table));
+    app.spawn(
+        tx,
+        Op::Ddl(
+            Box::new(cfg.clone()),
+            db.clone(),
+            schema.clone(),
+            table.clone(),
+        ),
+    );
+    app.spawn(tx, Op::TableComment(Box::new(cfg), db, schema, table));
 }
 
 pub(crate) fn open_table_data(app: &mut App, tx: &Tx) {
@@ -2284,6 +2308,10 @@ pub(crate) fn open_table_data(app: &mut App, tx: &Tx) {
     app.pending_focus = Some(Focus::Preview);
     app.page_pending = true;
     app.table_meta = None;
+    // R102: the table data view is not the structure view, so drop the cached
+    // comment with the rest of the structure metadata.
+    app.table_comment = None;
+    app.table_comment_loaded = false;
     app.deep_page_hint_shown = false;
     app.pending_deep_hint = false;
     app.result_needle.clear();

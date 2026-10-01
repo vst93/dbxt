@@ -155,6 +155,27 @@ pub(crate) enum StructView {
     Ddl,
 }
 
+/// R102: which comment a modal edit targets.
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub(crate) enum CommentTarget {
+    Table,
+    Column(String),
+}
+
+/// R102: the modal table / column comment editor. `input` is prefilled with the
+/// current comment; Enter routes the generated SQL through the write
+/// confirmation pipeline, Esc cancels. `schema` / `table` capture the scope at
+/// open time so a later navigation can never retarget the write.
+#[derive(Clone)]
+pub(crate) struct CommentEdit {
+    pub(crate) target: CommentTarget,
+    pub(crate) schema: String,
+    pub(crate) table: String,
+    /// The comment as last read (`None` = no comment), for the prefill / label.
+    pub(crate) original: Option<String>,
+    pub(crate) input: TextArea<'static>,
+}
+
 // ─── cell values ─────────────────────────────────────────────────────────────
 
 /// A result cell. NULL is kept distinct from the empty string so the grid can
@@ -2225,6 +2246,18 @@ pub(crate) struct App {
     pub(crate) ddl: Option<String>,
     pub(crate) struct_view: StructView,
     pub(crate) ddl_scroll: u16,
+    /// R102: the open table's comment, read best-effort when the structure view
+    /// loads. `None` renders as `—`; a read failure simply leaves it unset.
+    pub(crate) table_comment: Option<String>,
+    /// R102: true once the structure view has attempted the comment read, so
+    /// "no comment" is distinguishable from "not fetched yet".
+    pub(crate) table_comment_loaded: bool,
+    /// R102: the modal comment editor (`c` in the structure view / `n` in the
+    /// `gc` popup).
+    pub(crate) comment_edit: Option<CommentEdit>,
+    /// R102: a comment write is in flight; on success the metadata is re-read so
+    /// the structure view / `gc` popup refresh in place.
+    pub(crate) comment_refresh: bool,
 
     pub(crate) editor: TextArea<'static>,
     pub(crate) history: Vec<String>,

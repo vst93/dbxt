@@ -776,10 +776,15 @@ pub(crate) fn render_cols_popup(f: &mut Frame, area: Rect, app: &mut App) {
     // table metadata (a bare query result), says so instead of promising a copy
     // that cannot happen.
     if action_area.height > 0 {
-        let hint = if app.table_meta.is_some() {
-            t(" y 复制表结构 Markdown · Esc 关 ")
+        let hint: String = if app.table_meta.is_none() {
+            t(" 查询结果无表元数据，无法复制表结构 · Esc 关 ").to_string()
+        } else if column_comment_editable(app) {
+            t(" n 编辑列注释 · y 复制表结构 Markdown · Esc 关 ").to_string()
         } else {
-            t(" 查询结果无表元数据，无法复制表结构 · Esc 关 ")
+            match column_comment_hint(app) {
+                Some(note) => tf(" y 复制表结构 Markdown · {} · Esc 关 ", &[&note]),
+                None => t(" y 复制表结构 Markdown · Esc 关 ").to_string(),
+            }
         };
         f.render_widget(
             Paragraph::new(Line::from(Span::styled(

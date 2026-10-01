@@ -312,6 +312,11 @@ pub(crate) fn ui(f: &mut Frame, app: &mut App) {
     if app.filter_prompt.is_some() {
         render_filter_prompt(f, f.area(), app);
     }
+    // R102: the table / column comment editor, drawn above the `gc` popup it was
+    // opened from.
+    if app.comment_edit.is_some() {
+        render_comment_prompt(f, f.area(), app);
+    }
     if app.export_open {
         render_export(f, f.area(), app);
     }
@@ -2700,10 +2705,26 @@ pub(crate) fn grid_title(app: &App) -> String {
                 .selected_table()
                 .map(|t| fix_double_encoding(&qualified_display(&app.schema, &t.name)))
                 .unwrap_or_default();
+            // R102: show the table comment (best-effort read, `—` when none) and
+            // the `c` edit hint — hidden for a read-only connection or an engine
+            // that cannot edit comments.
+            let comment = app
+                .table_comment
+                .as_deref()
+                .filter(|c| !c.trim().is_empty())
+                .map(|c| truncate_disp(c, 48))
+                .unwrap_or_else(|| "—".to_string());
+            let hint = if table_comment_editable(app) {
+                t(" · c 编辑注释")
+            } else {
+                ""
+            };
             tf(
-                " 表结构 · {} · {} · t 查看 DDL ",
+                " 表结构 · {} · 注释: {}{} · t 查看 DDL ",
                 &[
                     &(table),
+                    &(comment),
+                    &(hint),
                     &(app
                         .grid
                         .as_ref()
