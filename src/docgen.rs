@@ -49,10 +49,14 @@ fn has_comment(c: &ColumnInfo) -> bool {
 /// R100: the `schema.table` heading of one table's structure section (schema
 /// omitted when the engine has none, e.g. MySQL).
 pub(crate) fn table_structure_title(meta: &TableMeta) -> String {
-    qualified_display(
+    // R106: the schema / table name is backend-controlled metadata, so it goes
+    // through the same cell escape as the body — a newline in an identifier
+    // would otherwise break the `## ` heading into a second line and a `|`
+    // would read as a table-cell separator. Ordinary names are unchanged.
+    md_cell(&qualified_display(
         &fix_double_encoding(&meta.schema),
         &fix_double_encoding(&meta.table),
-    )
+    ))
 }
 
 /// R100: one table's structure as Markdown — a column table plus an index list

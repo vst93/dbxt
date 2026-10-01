@@ -867,10 +867,12 @@ pub(crate) fn browse_key(app: &mut App, tx: &Tx, k: KeyEvent) {
     // once (the late result is dropped). A write run refuses cancellation so a
     // re-send cannot double-write. Placed after every modal overlay so Esc still
     // closes whatever popup owns the keyboard first.
-    if k.code == KeyCode::Esc && k.modifiers.is_empty() && app.active_query_running() {
-        if soft_cancel_active_query(app) {
-            return;
-        }
+    if k.code == KeyCode::Esc
+        && k.modifiers.is_empty()
+        && app.active_query_running()
+        && soft_cancel_active_query(app)
+    {
+        return;
     }
 
     // R100: Esc while a data-dictionary walk is in flight asks the worker to stop

@@ -12137,7 +12137,7 @@ pub(crate) fn r100_dict_prompt_writes_file_and_cancel_discards() {
     let path = std::env::temp_dir().join(format!("dbxt-dict-test-{}.md", std::process::id()));
     let _ = std::fs::remove_file(&path);
     let mut ta = TextArea::default();
-    ta.insert_str(&path.display().to_string());
+    ta.insert_str(path.display().to_string());
     app.dict_prompt = Some(ta);
     dict_prompt_key(&mut app, KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
     assert_eq!(std::fs::read_to_string(&path).unwrap(), "# doc\n");
@@ -13755,4 +13755,473 @@ pub(crate) fn r105_write_export_xlsx_file_pipeline() {
     let sheet = r105_read_xlsx_entry(&bytes, "xl/worksheets/sheet1.xml");
     assert!(sheet.contains(">column_0<"), "{sheet}");
     assert!(sheet.contains(">r0c0<"), "{sheet}");
+}
+
+// ── R106: hardening edge cases for R97-R105 ──────────────────────────────────
+//
+// Pure regression coverage for the boundaries the six rapid rounds left thin.
+// No new behaviour is exercised here beyond the one Markdown-heading escape fix
+// noted at `table_structure_title`; every case pins an existing contract.
+
+/// R97: the literal wrapping is driven by the *referencing* column's declared
+/// type, so an int-typed key pointing at a text column yields a bare numeric
+/// literal while a text-typed key always quotes. NULL still yields no predicate.
+#[test]
+pub(crate) fn r106_r97_fk_predicate_type_mismatch_wraps_by_referencing_column() {
+    let fk = fk_info("fk_tags_code", "code", Some("public"), "tags", "code");
+    // int-typed referencing column → bare literal (the constraint is what makes
+    // the two sides compatible; dbxt does not re-quote for the referenced side).
+    assert_eq!(
+        fk_predicate(&fk, &Val::Text("42".into()), Some("int")).unwrap(),
+        "code = 42"
+    );
+    // text-typed referencing column → quoted, even for a numeric-looking value.
+    assert_eq!(
+        fk_predicate(&fk, &Val::Text("42".into()), Some("text")).unwrap(),
+        "code = '42'"
+    );
+    // The type-mismatch path must not resurrect a NULL predicate.
+    assert!(fk_predicate(&fk, &Val::Null, Some("int")).is_none());
+    // And the jump builder offers nothing for a NULL cell regardless of type.
+    let app = fk_app(Val::Null);
+    assert!(fk_jump_for_cell(&app, "user_id", &Val::Null).is_none());
+}
+
+/// R98: a half-written line, a mid-save truncation and wrong field types all
+/// degrade to "no session" (or a default) without a panic.
+#[test]
+pub(crate) fn r106_r98_truncated_half_line_and_wrong_field_types_degrade() {
+    let dir = r98_tmp_dir("r106-truncated");
+    let path = dir.join("last-session.json");
+    // A crash mid-`write` leaves a half line: invalid JSON → no session.
+    std::fs::write(&path, "{\"conn_id\":\"id-a\",\"database\":\"sho").unwrap();
+    assert_eq!(LastSession::load(&path), None);
+    // A pretty-printed body cut off after a complete first field is also invalid.
+    std::fs::write(&path, "{\n  \"conn_id\": \"id-a\",\n  \"table\": \"ord").unwrap();
+    assert_eq!(LastSession::load(&path), None);
+    // Wrong type on the required field → no session (never a panic).
+    std::fs::write(&path, "{\"conn_id\":123}").unwrap();
+    assert_eq!(LastSession::load(&path), None);
+    // Wrong types on the optional fields default to empty / zero instead of
+    // failing the whole load, so a store written by a newer version still resumes
+    // the connection.
+    std::fs::write(
+        &path,
+        "{\"conn_id\":\"id-a\",\"database\":42,\"schema\":[],\"table\":{},\"saved_at\":\"soon\"}",
+    )
+    .unwrap();
+    let s = LastSession::load(&path).expect("valid conn_id keeps the record");
+    assert_eq!(s.conn_id, "id-a");
+    assert!(s.database.is_empty() && s.schema.is_empty() && s.table.is_empty());
+    assert_eq!(s.saved_at, 0);
+    // A numeric-but-negative timestamp is taken as-is (as_i64), not dropped.
+    std::fs::write(&path, "{\"conn_id\":\"id-a\",\"saved_at\":-5}").unwrap();
+    assert_eq!(LastSession::load(&path).unwrap().saved_at, -5);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// R98: a remembered connection that was deleted leaves no dangling cursor and
+/// `--last` reports the deletion rather than connecting to a same-named peer.
+#[test]
+pub(crate) fn r106_r98_deleted_conn_id_degrades_without_dangling_state() {
+    run_rt(|| {
+        let tx = test_tx();
+        let mut app = test_app();
+        app.connections = vec![conn("id-a", "A", "mysql"), conn("id-b", "B", "mysql")];
+        app.last_session = Some(LastSession {
+            conn_id: "id-gone".into(),
+            conn_name: "Gone".into(),
+            database: "shop".into(),
+            schema: "public".into(),
+            table: "orders".into(),
+            saved_at: 9,
+        });
+        app.want_last = true;
+        let cs = app.connections.clone();
+        apply_op_result(&mut app, OpResult::Connections(cs), &tx);
+        assert_eq!(app.conn_list.selected(), Some(0), "cursor falls back to row 0");
+        assert!(app.selected.is_none(), "nothing auto-connects");
+        assert!(!app.resume_last, "no resume chain is armed");
+        assert!(app.status.contains("已不存在"), "{}", app.status);
+    });
+}
+
+/// R99: pressing Esc twice on the same connection is idempotent — the second
+/// press is not consumed (it keeps its normal pane meaning) and never releases
+/// the spinner slot twice.
+#[test]
+pub(crate) fn r106_r99_double_esc_on_one_connection_is_idempotent() {
+    let mut app = test_app();
+    let cfg = conn("id-a", "A", "mysql");
+    app.selected = Some(cfg.clone());
+    app.backend_kind = Backend::Sql;
+    app.picker_open = false;
+    app.register_query(&cfg, "SELECT SLEEP(10)".into());
+    app.pending_ops = 1;
+    app.loading = true;
+
+    assert!(soft_cancel_active_query(&mut app));
+    assert_eq!(app.status, t("已取消，结果将在后台丢弃"));
+    assert_eq!(app.pending_ops, 0);
+    assert!(!app.active_query_running());
+
+    // Second Esc: there is no in-flight run any more, so it is not consumed.
+    assert!(!soft_cancel_active_query(&mut app));
+    assert_eq!(app.status, t("已取消，结果将在后台丢弃"));
+    assert_eq!(app.pending_ops, 0, "the slot is not double-released");
+}
+
+/// R99: the generation boundary — a reply from the just-cancelled epoch is
+/// stale, the very next epoch is not. Simulates the "reply lands 1 ms after the
+/// mark" race on a single thread.
+#[test]
+pub(crate) fn r106_r99_reply_one_tick_after_the_cancel_mark_is_stale() {
+    let tx = test_tx();
+    let mut app = test_app();
+    let cfg = conn("id-a", "A", "mysql");
+    app.selected = Some(cfg.clone());
+    app.backend_kind = Backend::Sql;
+    app.picker_open = false;
+    let epoch = app.register_query(&cfg, "SELECT SLEEP(10)".into());
+    app.pending_ops = 1;
+    app.loading = true;
+
+    // The cancel mark advances the epoch by exactly one.
+    assert!(soft_cancel_active_query(&mut app));
+    assert_eq!(app.cancel_epoch.get(&cfg.id), Some(&(epoch + 1)));
+    // `>` not `>=`: the cancelled epoch is stale, the next one is live.
+    assert!(app.query_reply_is_stale(&QueryTag {
+        conn_id: cfg.id.clone(),
+        epoch,
+    }));
+    assert!(!app.query_reply_is_stale(&QueryTag {
+        conn_id: cfg.id.clone(),
+        epoch: epoch + 1,
+    }));
+
+    // The late reply arrives on the same tick, before any new query.
+    apply_op_result(
+        &mut app,
+        OpResult::Query(
+            Box::new(test_query_result(&["late"], vec![])),
+            "SELECT SLEEP(10)".into(),
+            QUERY_MAX_ROWS,
+            QueryTag {
+                conn_id: cfg.id.clone(),
+                epoch,
+            },
+        ),
+        &tx,
+    );
+    assert!(app.grid.is_none(), "the cancelled generation never renders");
+    assert_eq!(app.pending_ops, 0, "the released slot is not double-counted");
+}
+
+/// R100: a database with no tables still produces a valid overview document
+/// with a zero count and no table sections.
+#[test]
+pub(crate) fn r106_r100_empty_database_dictionary_has_zero_tables() {
+    let md = database_dictionary_markdown("empty", "mysql", "2026-01-02T03:04:05Z", &[]);
+    assert!(md.starts_with("# empty 数据字典\n"), "{md}");
+    assert!(md.contains("- 数据库: empty"), "{md}");
+    assert!(md.contains("- 表数量: 0"), "{md}");
+    assert!(!md.contains("## "), "no table sections expected: {md}");
+    assert!(!md.contains("---"), "no separators expected: {md}");
+}
+
+/// R100: a table name carrying a quote, a pipe and a newline is escaped so the
+/// `## ` heading stays a single line and the pipe cannot split a row.
+#[test]
+pub(crate) fn r106_r100_table_name_with_quote_and_newline_is_escaped() {
+    let mut meta = orders_meta(&[("id", "int")], &[]);
+    meta.schema = "public".into();
+    meta.table = "we\"ird\nna|me".into();
+    let md = table_structure_markdown(&meta);
+    let heading = md.lines().next().expect("heading");
+    assert_eq!(heading, "## public.we\"ird na\\|me");
+    assert!(md.starts_with("## public.we\"ird na\\|me\n\n"), "{md}");
+    // The rest of the document is untouched (a normal column table follows).
+    assert!(md.contains("| id | int |"), "{md}");
+}
+
+/// R100: a comment over 1 KB is kept intact (only `|` escaped), never truncated,
+/// and does not break the single-line table row it lives in.
+#[test]
+pub(crate) fn r106_r100_long_comment_over_1kb_is_escaped_intact() {
+    let mut meta = orders_meta(&[("id", "int")], &[]);
+    let long = format!("{}|{}", "长".repeat(400), "x".repeat(200));
+    assert!(long.len() > 1024, "fixture must exceed 1 KB");
+    meta.columns[0].comment = Some(long.clone());
+    let md = table_structure_markdown(&meta);
+    assert!(md.contains("注释"), "the comment column must appear");
+    let escaped = long.replace('|', "\\|");
+    assert!(md.contains(&escaped), "the full comment must survive");
+    let row = md
+        .lines()
+        .find(|l| l.starts_with("| id "))
+        .expect("id row");
+    assert!(row.ends_with('|'), "row must stay a single line: {row}");
+    assert!(row.contains(&escaped), "escaped comment must be on the row");
+}
+
+/// R101: two identical results report a zero diff (`+0 -0 ~0`) with every row
+/// unchanged and nothing visible until `a` reveals the unchanged set.
+#[test]
+pub(crate) fn r106_r101_identical_results_report_zero_diff() {
+    let cols = vec!["id".to_string(), "name".to_string()];
+    let rows = vec![vec![tv("1"), tv("a")], vec![tv("2"), tv("b")]];
+    let snap = ResultSnapshot {
+        columns: cols.clone(),
+        rows: rows.clone(),
+        pk_cols: vec!["id".into()],
+        taken_at: "12:00".into(),
+    };
+    let st = compute_result_diff(&snap, &cols, &rows, &["id".into()]);
+    assert!(st.matched_by_pk);
+    assert_eq!((st.added, st.removed, st.changed, st.unchanged), (0, 0, 0, 2));
+    let summary = result_diff_summary(&st);
+    assert!(summary.contains("+0 -0 ~0"), "{summary}");
+    assert!(summary.contains("12:00"), "{summary}");
+    assert!(
+        result_diff_visible_indices(&st).is_empty(),
+        "unchanged rows are hidden by default"
+    );
+    assert_eq!(
+        st.rows
+            .iter()
+            .filter(|r| r.kind == ResultDiffKind::Unchanged)
+            .count(),
+        2
+    );
+}
+
+/// R101: rows in a different order but with identical content are all unchanged,
+/// both with a primary key and under the whole-row multiset match.
+#[test]
+pub(crate) fn r106_r101_pk_match_ignores_row_order() {
+    let cols = vec!["id".to_string(), "v".to_string()];
+    let snap = ResultSnapshot {
+        columns: cols.clone(),
+        rows: vec![
+            vec![tv("1"), tv("a")],
+            vec![tv("2"), tv("b")],
+            vec![tv("3"), tv("c")],
+        ],
+        pk_cols: vec!["id".into()],
+        taken_at: "12:01".into(),
+    };
+    let reversed = vec![
+        vec![tv("3"), tv("c")],
+        vec![tv("2"), tv("b")],
+        vec![tv("1"), tv("a")],
+    ];
+    let st = compute_result_diff(&snap, &cols, &reversed, &["id".into()]);
+    assert!(st.matched_by_pk);
+    assert_eq!((st.added, st.removed, st.changed, st.unchanged), (0, 0, 0, 3));
+    assert!(st.rows.iter().all(|r| r.kind == ResultDiffKind::Unchanged));
+    // Without any PK metadata the multiset match is order-independent too.
+    let snap_no_pk = ResultSnapshot {
+        pk_cols: Vec::new(),
+        ..snap
+    };
+    let st2 = compute_result_diff(&snap_no_pk, &cols, &reversed, &[]);
+    assert!(!st2.matched_by_pk);
+    assert_eq!(
+        (st2.added, st2.removed, st2.changed, st2.unchanged),
+        (0, 0, 0, 3)
+    );
+}
+
+/// R101: a single-column result set diffs cleanly — one aligned column, no
+/// column drift, and the key column itself can never be `~` (its value *is* the
+/// key).
+#[test]
+pub(crate) fn r106_r101_single_column_result_set_diffs() {
+    let cols = vec!["id".to_string()];
+    let snap = ResultSnapshot {
+        columns: cols.clone(),
+        rows: vec![vec![tv("1")], vec![tv("2")]],
+        pk_cols: vec!["id".into()],
+        taken_at: "12:02".into(),
+    };
+    let rows = vec![vec![tv("1")], vec![tv("3")]];
+    let st = compute_result_diff(&snap, &cols, &rows, &["id".into()]);
+    assert_eq!(st.columns, vec!["id".to_string()]);
+    assert!(st.extra_cols.is_empty() && st.missing_cols.is_empty());
+    assert_eq!((st.added, st.removed, st.changed, st.unchanged), (1, 1, 0, 1));
+    let summary = result_diff_summary(&st);
+    assert!(summary.contains("+1 -1 ~0"), "{summary}");
+    assert!(!summary.contains("列"), "no column drift on one column: {summary}");
+}
+
+/// R102: a comment carrying a single quote and a newline is escaped for SQL —
+/// the quote doubles, the newline stays a literal newline inside the literal —
+/// and the editor's multi-line input takes the same path.
+#[test]
+pub(crate) fn r106_r102_comment_with_quote_and_newline_is_escaped_in_sql() {
+    let pg = DatabaseType::Postgres;
+    assert_eq!(
+        comment_sql(
+            pg,
+            "public",
+            "orders",
+            &CommentTarget::Table,
+            Some("line1\nit's")
+        )
+        .unwrap(),
+        "COMMENT ON TABLE \"public\".\"orders\" IS 'line1\nit''s';"
+    );
+    // A backslash is doubled alongside the quote escape.
+    assert_eq!(
+        comment_sql(
+            pg,
+            "public",
+            "orders",
+            &CommentTarget::Column("id".into()),
+            Some("a\\b'c")
+        )
+        .unwrap(),
+        "COMMENT ON COLUMN \"public\".\"orders\".\"id\" IS 'a\\\\b''c';"
+    );
+
+    // The editor joins a two-line buffer with `\n` and routes it through the
+    // same escaping into the confirmation.
+    let mut app = test_app();
+    app.picker_open = false;
+    app.selected = Some(test_conn("postgres"));
+    app.schema = "public".into();
+    app.tables = vec![table_info("orders", "TABLE")];
+    app.tables_all = app.tables.clone();
+    app.table_list.select(Some(0));
+    open_table_comment_edit(&mut app);
+    app.comment_edit.as_mut().unwrap().input = TextArea::from(["a", "it's"]);
+    submit_comment_edit(&mut app);
+    assert_eq!(
+        app.confirm.as_ref().expect("confirm").sql,
+        "COMMENT ON TABLE \"public\".\"orders\" IS 'a\nit''s';"
+    );
+}
+
+/// R102: the empty-string clear gesture and the NULL clear are distinct from a
+/// literal quote comment, per dialect.
+#[test]
+pub(crate) fn r106_r102_empty_string_versus_null_semantics() {
+    let pg = DatabaseType::Postgres;
+    let my = DatabaseType::Mysql;
+    // `None`, an empty string and whitespace all mean "clear" on PostgreSQL.
+    for v in [None, Some(""), Some("   "), Some("\n\t")] {
+        assert_eq!(
+            comment_sql(pg, "public", "orders", &CommentTarget::Table, v).unwrap(),
+            "COMMENT ON TABLE \"public\".\"orders\" IS NULL;"
+        );
+    }
+    // MySQL cannot NULL a table comment, so its clear is the empty string.
+    for v in [None, Some("")] {
+        assert_eq!(
+            comment_sql(my, "", "orders", &CommentTarget::Table, v).unwrap(),
+            "ALTER TABLE `orders` COMMENT = '';"
+        );
+    }
+    // A literal two-quote comment is *not* the clear: it becomes a six-quote SQL
+    // literal, distinguishable from both `''` and `NULL`.
+    assert_eq!(
+        comment_sql(pg, "public", "orders", &CommentTarget::Table, Some("''")).unwrap(),
+        "COMMENT ON TABLE \"public\".\"orders\" IS '''''';"
+    );
+    // The editor hint names the dialect's exact clear form.
+    assert_eq!(
+        comment_clear_hint(pg, &CommentTarget::Table),
+        t("留空 = 清除（COMMENT … IS NULL）")
+    );
+    assert_eq!(
+        comment_clear_hint(my, &CommentTarget::Table),
+        t("留空 = 清除（COMMENT = ''）")
+    );
+}
+
+/// R103: the source SQL is used verbatim — a trailing `;` and a trailing `--`
+/// comment both survive into the CTAS.
+#[test]
+pub(crate) fn r106_r103_source_with_semicolon_and_trailing_comment_is_preserved() {
+    assert_eq!(
+        materialize_ctas_sql(DatabaseType::Mysql, "copy", "SELECT 1;").unwrap(),
+        "CREATE TABLE `copy` AS SELECT 1;"
+    );
+    assert_eq!(
+        materialize_ctas_sql(DatabaseType::Postgres, "copy", "SELECT 1 -- keep me").unwrap(),
+        "CREATE TABLE \"copy\" AS SELECT 1 -- keep me"
+    );
+    assert_eq!(
+        materialize_ctas_sql(DatabaseType::Mysql, "copy", "SELECT 1; -- done").unwrap(),
+        "CREATE TABLE `copy` AS SELECT 1; -- done"
+    );
+}
+
+/// R103: a browse page's ORDER BY is carried into the materialization source,
+/// after the WHERE filter.
+#[test]
+pub(crate) fn r106_r103_order_by_is_preserved_from_the_browse_page() {
+    let cfg = test_conn("mysql");
+    assert_eq!(
+        browse_equivalent_select(&cfg, "", "orders", "amount > 10", Some("`created_at` DESC")),
+        "SELECT * FROM `orders` WHERE (amount > 10) ORDER BY `created_at` DESC"
+    );
+    // The full path: `page_state`'s filter / order_by reach the CTAS source.
+    let mut app = orders_app(&[("id", "int")], 2);
+    app.page_state.as_mut().unwrap().filter = "id > 0".into();
+    app.page_state.as_mut().unwrap().order_by = Some("`id` DESC".into());
+    let src = materialize_source_sql(&app).expect("a browse page has a source");
+    assert_eq!(
+        src,
+        "SELECT * FROM `orders` WHERE (id > 0) ORDER BY `id` DESC"
+    );
+}
+
+/// R104: a module key's `(integer) 0` is a successful zero-byte sample (`· 0B`),
+/// while a `-ERR` / unsupported key is `· ?`; both render side by side.
+#[test]
+pub(crate) fn r106_r104_zero_byte_module_key_and_err_key_display() {
+    // 0 bytes is a real sample, not "unknown".
+    assert_eq!(parse_memory_usage(&serde_json::json!(0)), Some(0));
+    assert_eq!(redis_mem_size(0), "0B");
+    assert_eq!(redis_mem_tail(Some(&Some(0))).as_deref(), Some("· 0B"));
+    // A server error / unsupported reply is None → the unknown tail.
+    assert_eq!(redis_mem_tail(Some(&None)).as_deref(), Some("· ?"));
+
+    let mut app = test_app();
+    app.picker_open = false;
+    app.selected = Some(test_conn("redis"));
+    app.backend_kind = Backend::Redis;
+    app.redis_scan.keys = vec![rk("a", "module:key"), rk("b", "err:key")];
+    app.redis_scan.all = app.redis_scan.keys.clone();
+    app.redis_mem.insert("a".into(), Some(0));
+    app.redis_mem.insert("b".into(), None);
+    app.focus = Focus::Sidebar;
+    for (w, h) in [(42u16, 22u16), (110, 30)] {
+        let rows = draw(&mut app, w, h).join("\n");
+        assert!(rows.contains("module:key"), "missing module key at {w}x{h}");
+        assert!(rows.contains("· 0B"), "missing 0B tail at {w}x{h}");
+        assert!(rows.contains("· ?"), "missing unknown tail at {w}x{h}");
+    }
+}
+
+/// R105: the minimal workbook — one column, one all-NULL row — is a valid ZIP
+/// with a single empty data cell and no phantom rows.
+#[test]
+pub(crate) fn r106_r105_xlsx_minimal_single_column_all_null_single_row() {
+    let grid = Grid {
+        columns: vec!["only".into()],
+        types: vec!["text".into()],
+        rows: vec![vec![Val::Null]],
+        note: String::new(),
+    };
+    let bytes = grid_to_xlsx(&grid);
+    assert_eq!(&bytes[..4], b"PK\x03\x04", "not a ZIP container");
+    let sheet = r105_read_xlsx_entry(&bytes, "xl/worksheets/sheet1.xml");
+    assert!(sheet.contains(">only<"), "{sheet}");
+    // The single all-NULL cell is an empty cell at A2.
+    assert!(sheet.contains("<c r=\"A2\"/>"), "{sheet}");
+    assert!(sheet.contains("<row r=\"1\""), "{sheet}");
+    assert!(sheet.contains("<row r=\"2\""), "{sheet}");
+    assert!(!sheet.contains("<row r=\"3\""), "no phantom third row: {sheet}");
 }

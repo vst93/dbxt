@@ -7223,7 +7223,7 @@ fn apply_op_result(app: &mut App, res: OpResult, tx: &Tx) {
             // Prefill the `Ctrl-Y`-style destination prompt with the default
             // filename; clearing it copies to the clipboard instead.
             let mut ta = TextArea::default();
-            ta.insert_str(&dict_default_filename(&db));
+            ta.insert_str(dict_default_filename(&db));
             ta.set_placeholder_text(t("留空 = 复制到剪贴板 · 输入路径 = 写入文件"));
             app.dict_prompt = Some(ta);
             app.status = tf("数据字典已生成（{} 表）· Enter 写入 · Esc 取消", &[&tables]);
