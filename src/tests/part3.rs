@@ -14942,3 +14942,305 @@ pub(crate) fn r108_renders_at_both_sizes() {
     }
 }
 
+// ── R109: sidebar table column outline (`>` / `<`) ───────────────────────────
+
+/// A tree fixture with two tables and a cached column list for `orders`, already
+/// expanded. `id` is a primary key (`int(11)`), `email` is not (`varchar(255)`).
+pub(crate) fn r109_outline_app() -> App {
+    let mut app = tree_app();
+    app.focus = Focus::Sidebar;
+    app.picker_open = false;
+    let key = outline_key("id-mysql", "shop", "", "orders");
+    app.outline_cache.insert(
+        key.clone(),
+        vec![
+            ColumnInfo {
+                name: "id".into(),
+                data_type: "int(11)".into(),
+                is_primary_key: true,
+                ..Default::default()
+            },
+            ColumnInfo {
+                name: "email".into(),
+                data_type: "varchar(255)".into(),
+                ..Default::default()
+            },
+        ],
+    );
+    app.outline_open = Some(key);
+    rebuild_side_rows(&mut app);
+    app
+}
+
+/// The rendered text of one tree row (spans concatenated).
+pub(crate) fn r109_row_text(app: &App, row: &SideRow) -> String {
+    side_row_line(app, row, false, "", 90)
+        .spans
+        .iter()
+        .map(|s| s.content.as_ref())
+        .collect()
+}
+
+/// `>` renders the cached columns under the table: name, short type (the length
+/// stripped) and a `·PK` marker only on primary keys, indented one level deeper
+/// than the table row.
+#[test]
+pub(crate) fn r109_outline_renders_columns_with_type_and_pk() {
+    let app = r109_outline_app();
+    let table_pos = app
+        .side_rows
+        .iter()
+        .position(|r| matches!(r, SideRow::Table { table: 0, .. }))
+        .expect("orders row");
+    // Both column rows follow the table row, one level deeper (db at 1, table
+    // at 2, column at 3).
+    assert!(matches!(
+        &app.side_rows[table_pos + 1],
+        SideRow::Column {
+            table: 0,
+            col: 0,
+            depth: 3,
+            ..
+        }
+    ));
+    assert!(matches!(
+        &app.side_rows[table_pos + 2],
+        SideRow::Column {
+            table: 0,
+            col: 1,
+            depth: 3,
+            ..
+        }
+    ));
+
+    let pk_text = r109_row_text(&app, &app.side_rows[table_pos + 1]);
+    assert!(pk_text.contains("id"), "{pk_text}");
+    assert!(pk_text.contains("int"), "{pk_text}");
+    assert!(pk_text.contains("·PK"), "{pk_text}");
+    assert!(!pk_text.contains("11"), "the length is stripped: {pk_text}");
+
+    let plain_text = r109_row_text(&app, &app.side_rows[table_pos + 2]);
+    assert!(plain_text.contains("email"), "{plain_text}");
+    assert!(plain_text.contains("varchar"), "{plain_text}");
+    assert!(
+        !plain_text.contains("255"),
+        "the length is stripped: {plain_text}"
+    );
+    assert!(
+        !plain_text.contains("·PK"),
+        "not a primary key: {plain_text}"
+    );
+
+    assert_eq!(
+        column_type_short("character varying(64)"),
+        "character varying"
+    );
+    assert_eq!(column_type_short("BIGINT"), "bigint");
+}
+
+/// Only one table is expanded at a time: `>` on a second table collapses the
+/// first, and `<` collapses the current one.
+#[tokio::test(flavor = "multi_thread")]
+async fn r109_outline_single_expand_and_collapse() {
+    let (tx, _rx) = tokio::sync::mpsc::unbounded_channel::<OpResult>();
+    let mut app = r109_outline_app();
+    let key2 = outline_key("id-mysql", "shop", "", "users");
+    app.outline_cache.insert(
+        key2.clone(),
+        vec![ColumnInfo {
+            name: "uid".into(),
+            data_type: "bigint".into(),
+            is_primary_key: true,
+            ..Default::default()
+        }],
+    );
+    app.side_sel = app
+        .side_rows
+        .iter()
+        .position(|r| matches!(r, SideRow::Table { table: 1, .. }))
+        .unwrap();
+    side_outline_expand(&mut app, &tx);
+    assert_eq!(app.outline_open.as_deref(), Some(key2.as_str()));
+    assert!(
+        app.side_rows
+            .iter()
+            .all(|r| !matches!(r, SideRow::Column { table: 0, .. })),
+        "the first table's outline collapsed"
+    );
+    assert!(app
+        .side_rows
+        .iter()
+        .any(|r| matches!(r, SideRow::Column { table: 1, .. })));
+
+    // `<` collapses the open outline and hides every column row.
+    side_outline_collapse(&mut app);
+    assert!(app.outline_open.is_none());
+    assert!(
+        app.side_rows
+            .iter()
+            .all(|r| !matches!(r, SideRow::Column { .. })),
+        "no column rows survive a collapse"
+    );
+    // `<` with nothing open is a status hint, not a panic.
+    side_outline_collapse(&mut app);
+    assert!(app.status.contains("没有展开"));
+}
+
+/// A cached table expands without spawning a fetch; a miss spawns exactly one
+/// and marks the key pending.
+#[tokio::test(flavor = "multi_thread")]
+async fn r109_outline_cache_hit_does_not_refetch() {
+    let (tx, _rx) = tokio::sync::mpsc::unbounded_channel::<OpResult>();
+    let mut app = tree_app();
+    app.focus = Focus::Sidebar;
+    let key = outline_key("id-mysql", "shop", "", "orders");
+    app.outline_cache.insert(
+        key.clone(),
+        vec![ColumnInfo {
+            name: "id".into(),
+            data_type: "int".into(),
+            is_primary_key: true,
+            ..Default::default()
+        }],
+    );
+    rebuild_side_rows(&mut app);
+    app.side_sel = app
+        .side_rows
+        .iter()
+        .position(|r| matches!(r, SideRow::Table { table: 0, .. }))
+        .unwrap();
+    let before = app.pending_ops;
+    side_outline_expand(&mut app, &tx);
+    assert_eq!(
+        app.pending_ops, before,
+        "a cache hit must not spawn a fetch"
+    );
+    assert_eq!(app.outline_open.as_deref(), Some(key.as_str()));
+
+    // A miss (users) spawns exactly one op and marks the key pending.
+    app.outline_open = None;
+    app.side_sel = app
+        .side_rows
+        .iter()
+        .position(|r| matches!(r, SideRow::Table { table: 1, .. }))
+        .unwrap();
+    side_outline_expand(&mut app, &tx);
+    assert_eq!(app.pending_ops, before + 1, "a miss fetches once");
+    assert!(app.outline_pending.is_some());
+    assert_eq!(
+        app.outline_open.as_deref(),
+        Some(outline_key("id-mysql", "shop", "", "users").as_str())
+    );
+}
+
+/// A reloaded table list and a torn-down connection both drop the outline
+/// cache, so a stale column list can never be shown against a new tree.
+#[tokio::test(flavor = "multi_thread")]
+async fn r109_outline_cache_cleared_on_reload_and_disconnect() {
+    let (tx, _rx) = tokio::sync::mpsc::unbounded_channel::<OpResult>();
+    // `reload_tables` (the table-list refresh funnel) clears the cache.
+    let mut app = r109_outline_app();
+    assert!(!app.outline_cache.is_empty());
+    reload_tables(&mut app, &tx);
+    assert!(app.outline_cache.is_empty(), "reload clears the cache");
+    assert!(app.outline_open.is_none());
+    assert!(app.outline_pending.is_none());
+
+    // Disconnecting the active connection clears it through the result path.
+    let mut app = r109_outline_app();
+    let c1 = app.connections[0].id.clone();
+    app.conn_live.insert(c1.clone(), true);
+    rebuild_side_rows(&mut app);
+    apply_op_result(
+        &mut app,
+        OpResult::ConnDisconnected {
+            id: c1.clone(),
+            name: "test-mysql".into(),
+            error: None,
+        },
+        &tx,
+    );
+    assert!(app.outline_cache.is_empty(), "disconnect clears the cache");
+    assert!(app.outline_open.is_none());
+}
+
+/// `Enter` on a column row inserts the column name into the SQL editor at the
+/// caret and keeps the sidebar focused so several columns can be picked.
+#[tokio::test(flavor = "multi_thread")]
+async fn r109_outline_column_enter_inserts_name_into_editor() {
+    let (tx, _rx) = tokio::sync::mpsc::unbounded_channel::<OpResult>();
+    let mut app = r109_outline_app();
+    app.set_editor_text("SELECT ");
+    let pos = app
+        .side_rows
+        .iter()
+        .position(|r| matches!(r, SideRow::Column { col: 0, .. }))
+        .unwrap();
+    app.side_sel = pos;
+    side_activate(&mut app, &tx);
+    assert_eq!(app.editor_sql(), "SELECT id");
+    assert!(app.status.contains("已插入列"), "{}", app.status);
+    assert!(app.focus == Focus::Sidebar, "the tree keeps the keyboard");
+}
+
+/// `>` / `<` are documented in the footer, the full help and both README
+/// keymaps, and every new literal translates.
+#[test]
+pub(crate) fn r109_outline_is_documented_in_help_footer_and_readme() {
+    assert!(
+        HELP_ROWS
+            .iter()
+            .any(|(k, d)| k.contains("> / <") && d.contains("列清单")),
+        "full help missing the > / < row"
+    );
+    let hints = footer_hints_ctx(FooterCtx {
+        view: FooterView::Browse,
+        focus: Focus::Sidebar,
+        has_connection: true,
+    });
+    assert!(
+        hints.iter().any(|(k, _)| *k == ">/<"),
+        "sidebar footer missing >/<: {hints:?}"
+    );
+    assert!(include_str!("../../README.md").contains("`>`/`<`"));
+    assert!(include_str!("../../README.zh-CN.md").contains("`>`/`<`"));
+
+    for zh in [
+        "把光标移到表行上再按 > 展开列清单",
+        "列 {} 已展开 · < 收起",
+        "列 {} · {} 列 · < 收起",
+        "加载列 {}…",
+        "当前没有展开的列清单 · > 展开",
+        "已收起列清单",
+        "✗ 加载列 {} 失败：{}",
+        "已插入列 {}",
+        "展开列/收起",
+    ] {
+        let leaked: &'static str = Box::leak(zh.to_string().into_boxed_str());
+        assert_ne!(
+            ui_text::t_lang(leaked, ui_text::Lang::En),
+            zh,
+            "missing English for {zh:?}"
+        );
+    }
+}
+
+/// The expanded outline draws without panicking at phone and desktop sizes.
+#[test]
+pub(crate) fn r109_outline_renders_at_both_sizes() {
+    let mut app = r109_outline_app();
+    app.focus = Focus::Sidebar;
+    // A phone-sized terminal still draws the table (the second column may fall
+    // off the short sidebar panel; the smoke test is that nothing panics).
+    let narrow = draw(&mut app, 42, 22).join("\n");
+    assert!(
+        narrow.contains("orders") && narrow.contains("id"),
+        "outline missing at 42x22:\n{narrow}"
+    );
+    // The desktop size has room for both columns, the short type and `·PK`.
+    let wide = draw(&mut app, 110, 30).join("\n");
+    assert!(wide.contains("orders"), "table missing at 110x30:\n{wide}");
+    assert!(wide.contains("id"), "id missing at 110x30:\n{wide}");
+    assert!(wide.contains("email"), "email missing at 110x30:\n{wide}");
+    assert!(wide.contains("·PK"), "PK marker missing at 110x30:\n{wide}");
+}

@@ -2202,6 +2202,13 @@ pub(crate) fn sidebar_key(app: &mut App, tx: &Tx, k: KeyEvent) {
         // vim tree: `l`/`→` expands, `h`/`←` collapses (or steps to the parent).
         KeyCode::Left | KeyCode::Char('h') => side_collapse(app),
         KeyCode::Right | KeyCode::Char('l') => side_expand(app, tx),
+        // R109: `>` expands the table node under the cursor into its column
+        // outline (a deliberate one-off metadata read on a cache miss — never
+        // prefetched), `<` collapses it. Distinct from `h`/`l`, which fold the
+        // tree structure; the keys are free in this pane (the results grid owns
+        // `<`/`>` for column width, and only one pane holds the keyboard).
+        KeyCode::Char('>') => side_outline_expand(app, tx),
+        KeyCode::Char('<') => side_outline_collapse(app),
         // `[` / `]` keep the old fast database cycle now that `h`/`l` belong to
         // the tree; `d` is still the discoverable database list.
         KeyCode::Char('[') => cycle_db(app, tx, false),
@@ -2883,6 +2890,9 @@ pub(crate) fn reload_tables(app: &mut App, tx: &Tx) {
         app.row_popup = None;
         app.filter_prompt = None;
         app.table_meta = None;
+        // R109: the table list is being rebuilt, so a cached column outline no
+        // longer corresponds to what is on screen — drop it.
+        clear_outline_cache(app);
         app.pending_sel = None;
         app.pending_focus = None;
         app.page_pending = false;

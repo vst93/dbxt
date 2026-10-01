@@ -140,6 +140,17 @@ pub(crate) fn side_activate(app: &mut App, tx: &Tx) {
             }
         }
         SideRow::Table { .. } => open_table_data(app, tx),
+        // R109: Enter on a column outline row drops the column name into the
+        // SQL editor at the caret (the tree has no table-name insert pipeline of
+        // its own, so this is the light implementation the round asked for). The
+        // sidebar keeps the keyboard so several columns can be picked in a row.
+        SideRow::Column { table, col, .. } => {
+            let Some(name) = outline_column(app, table, col).map(|c| c.name.clone()) else {
+                return;
+            };
+            app.editor.insert_str(&name);
+            app.status = tf("已插入列 {}", &[&(fix_double_encoding(&name))]);
+        }
         SideRow::ConnError { idx, .. } => {
             // Retry the lazy fetch.
             if let Some(id) = side_root_cfg(app, idx).map(|c| c.id.clone()) {

@@ -393,6 +393,10 @@ pub(crate) fn activate_connection(
     app.redis_mem.clear();
     app.redis_mem_sort = false;
     app.redis_mem_probe = None;
+    // R109: the column outline cache is keyed by connection id, so a switch
+    // starts clean (the old entries could never render, but a reconnect would
+    // resurrect them).
+    clear_outline_cache(app);
     app.mongo_filter.clear();
     app.mongo_page = 0;
     app.set_placeholder();
@@ -1927,7 +1931,8 @@ pub(crate) fn side_row_depth(r: &SideRow) -> usize {
         | SideRow::ConnLoading { depth, .. }
         | SideRow::ConnError { depth, .. }
         | SideRow::Db { depth, .. }
-        | SideRow::Table { depth, .. } => *depth,
+        | SideRow::Table { depth, .. }
+        | SideRow::Column { depth, .. } => *depth,
     }
 }
 
@@ -2106,6 +2111,56 @@ pub(crate) fn build_group_rows(
     out
 }
 
+/// R109: append the active database's table rows at `depth`, each followed by
+/// its column outline when that table is the expanded one. `searching` filters
+/// table rows (a quick search is a result set); a non-empty `needle` additionally
+/// narrows the visible columns of the expanded table to those whose name matches,
+/// unless the table's own name matched (then every column stays visible). Pure
+/// over `app`.
+pub(crate) fn push_table_rows(
+    app: &App,
+    idx: usize,
+    depth: usize,
+    needle: &str,
+    searching: bool,
+    rows: &mut Vec<SideRow>,
+) {
+    for ti in 0..app.tables.len() {
+        if searching && !table_matches_needle(app, ti, needle) {
+            continue;
+        }
+        rows.push(SideRow::Table {
+            idx,
+            table: ti,
+            depth,
+        });
+        // R109: only the single expanded table draws its columns, and only once
+        // the explicit `>` fetch has landed (a pending fetch shows nothing but
+        // the status bar's `加载列 …` line).
+        let Some(key) = outline_key_for_table(app, ti) else {
+            continue;
+        };
+        if app.outline_open.as_deref() != Some(key.as_str()) {
+            continue;
+        }
+        let Some(cols) = app.outline_cache.get(&key) else {
+            continue;
+        };
+        let table_hit = needle.is_empty() || table_matches_needle(app, ti, needle);
+        for (ci, col) in cols.iter().enumerate() {
+            if !table_hit && !col.name.to_lowercase().contains(needle) {
+                continue;
+            }
+            rows.push(SideRow::Column {
+                idx,
+                table: ti,
+                col: ci,
+                depth: depth + 1,
+            });
+        }
+    }
+}
+
 /// Append one connection root and, when it is open, its databases / tables (or
 /// the lazy-loading placeholder). `grouped` connections are subject to the
 /// active filter; ungrouped roots stay as anchors, as they were before R48.
@@ -2135,16 +2190,7 @@ pub(crate) fn push_conn_subtree(
         if app.databases.is_empty() {
             // No database layer (SQLite / a test fixture): tables hang
             // directly under the connection.
-            for ti in 0..app.tables.len() {
-                if searching && !table_matches_needle(app, ti, needle) {
-                    continue;
-                }
-                rows.push(SideRow::Table {
-                    idx,
-                    table: ti,
-                    depth: depth + 1,
-                });
-            }
+            push_table_rows(app, idx, depth + 1, needle, searching, rows);
         } else {
             let cur_db = app.current_db();
             for db in &app.databases {
@@ -2164,16 +2210,7 @@ pub(crate) fn push_conn_subtree(
                     depth: depth + 1,
                 });
                 if is_cur_db && !app.tree_db_closed.contains(&db_node_key(&c.id, db)) {
-                    for ti in 0..app.tables.len() {
-                        if searching && !table_matches_needle(app, ti, needle) {
-                            continue;
-                        }
-                        rows.push(SideRow::Table {
-                            idx,
-                            table: ti,
-                            depth: depth + 2,
-                        });
-                    }
+                    push_table_rows(app, idx, depth + 2, needle, searching, rows);
                 }
             }
         }
@@ -2232,6 +2269,8 @@ pub(crate) fn side_row_matches_needle(app: &App, row: &SideRow, needle: &str) ->
         }
         SideRow::Db { db, .. } => fix_double_encoding(db).to_lowercase().contains(needle),
         SideRow::Table { table, .. } => table_matches_needle(app, *table, needle),
+        SideRow::Column { table, col, .. } => outline_column(app, *table, *col)
+            .is_some_and(|c| c.name.to_lowercase().contains(needle)),
         SideRow::ConnLoading { .. } | SideRow::ConnError { .. } => false,
     }
 }
@@ -2249,6 +2288,7 @@ pub(crate) fn side_row_hit(app: &App, row: &SideRow) -> Option<SideHit> {
             .tables
             .get(*table)
             .map(|t| SideHit::Table(t.name.clone())),
+        SideRow::Column { .. } => None,
         SideRow::ConnLoading { .. } | SideRow::ConnError { .. } => None,
     }
 }
@@ -2265,6 +2305,9 @@ pub(crate) fn side_row_label(app: &App, row: &SideRow) -> String {
             .tables
             .get(*table)
             .map(|t| qualified_display(&app.schema, &t.name))
+            .unwrap_or_default(),
+        SideRow::Column { table, col, .. } => outline_column(app, *table, *col)
+            .map(|c| c.name.clone())
             .unwrap_or_default(),
         SideRow::ConnLoading { .. } | SideRow::ConnError { .. } => String::new(),
     }
@@ -3296,6 +3339,133 @@ pub(crate) fn set_group_open(app: &mut App, id: &str, open: bool) {
         app.config.set_group_closed(id, !open);
         app.persist();
     }
+}
+
+// ── R109: sidebar table column outline (`>` / `<`) ──
+
+/// Cache key for one table's column outline: connection id, database, schema
+/// and table, joined with a separator no identifier can contain, so two
+/// same-named tables (different connections, databases or schemas) never share
+/// an entry.
+pub(crate) fn outline_key(conn: &str, db: &str, schema: &str, table: &str) -> String {
+    format!("{conn}\u{1}{db}\u{1}{schema}\u{1}{table}")
+}
+
+/// The outline cache key of the table drawn at `table` index, resolved against
+/// the active connection and its current database / schema. `None` when no
+/// connection is selected or the index is stale. Table rows only ever appear
+/// under the active connection, so this is unambiguous.
+pub(crate) fn outline_key_for_table(app: &App, table: usize) -> Option<String> {
+    let cfg = app.selected.as_ref()?;
+    let t = app.tables.get(table)?;
+    Some(outline_key(
+        &cfg.id,
+        &app.current_db(),
+        &app.schema,
+        &t.name,
+    ))
+}
+
+/// The cached column list of the expanded table at `table` index, or `None`
+/// when that table is not the expanded one / its columns are not cached yet.
+pub(crate) fn outline_columns(app: &App, table: usize) -> Option<&Vec<ColumnInfo>> {
+    let key = outline_key_for_table(app, table)?;
+    if app.outline_open.as_deref() != Some(key.as_str()) {
+        return None;
+    }
+    app.outline_cache.get(&key)
+}
+
+/// One column of the expanded table, by its row index.
+pub(crate) fn outline_column(app: &App, table: usize, col: usize) -> Option<&ColumnInfo> {
+    outline_columns(app, table).and_then(|cols| cols.get(col))
+}
+
+/// Drop the outline cache and close whatever is expanded. Called when the
+/// connection is torn down and when the table list is reloaded (a stale
+/// column list must never be shown against a new table set).
+pub(crate) fn clear_outline_cache(app: &mut App) {
+    app.outline_open = None;
+    app.outline_pending = None;
+    app.outline_cache.clear();
+}
+
+/// A short type label for a column outline row: the declared type with its
+/// parenthesised length / precision stripped, lowercased (`varchar(255)` →
+/// `varchar`, `character varying(64)` → `character varying`). The full type is
+/// still available in the `g c` popup.
+pub(crate) fn column_type_short(data_type: &str) -> String {
+    let base = data_type.split('(').next().unwrap_or(data_type).trim();
+    base.to_lowercase()
+}
+
+/// `>` on a table row: expand its column outline, fetching the columns once on
+/// a cache miss (an explicit gesture, so it is the one deliberate query behind
+/// this feature — nothing is prefetched). Only one table is expanded at a time;
+/// expanding another collapses the previous one. A fetch failure reports on the
+/// status bar and closes the outline instead of breaking the tree.
+pub(crate) fn side_outline_expand(app: &mut App, tx: &Tx) {
+    let Some(row) = app.side_rows.get(app.side_sel).cloned() else {
+        return;
+    };
+    let SideRow::Table { table, .. } = row else {
+        app.status = t("把光标移到表行上再按 > 展开列清单").into();
+        return;
+    };
+    let Some(cfg) = app.selected.clone() else {
+        return;
+    };
+    let Some(t) = app.tables.get(table).cloned() else {
+        return;
+    };
+    let db = app.current_db();
+    let schema = app.schema.clone();
+    let key = outline_key(&cfg.id, &db, &schema, &t.name);
+    let disp = fix_double_encoding(&t.name);
+    if app.outline_cache.contains_key(&key) {
+        if app.outline_open.as_deref() == Some(key.as_str()) {
+            app.status = tf("列 {} 已展开 · < 收起", &[&disp]);
+            return;
+        }
+        let n = app.outline_cache.get(&key).map(|c| c.len()).unwrap_or(0);
+        app.outline_open = Some(key);
+        rebuild_side_rows(app);
+        app.status = tf("列 {} · {} 列 · < 收起", &[&disp, &n]);
+        return;
+    }
+    // One outline at a time: the new table replaces the old expansion.
+    app.outline_open = Some(key.clone());
+    if app.outline_pending.as_deref() == Some(key.as_str()) {
+        rebuild_side_rows(app);
+        app.status = tf("加载列 {}…", &[&disp]);
+        return;
+    }
+    app.outline_pending = Some(key);
+    rebuild_side_rows(app);
+    app.status = tf("加载列 {}…", &[&disp]);
+    app.spawn(tx, Op::OutlineColumns(Box::new(cfg), db, schema, t.name));
+}
+
+/// `<` on the tree: collapse the expanded column outline. When the cursor sits
+/// on one of the outline's column rows it lands on the owning table row first,
+/// so the cursor never points at a row that is about to disappear.
+pub(crate) fn side_outline_collapse(app: &mut App) {
+    if app.outline_open.is_none() {
+        app.status = t("当前没有展开的列清单 · > 展开").into();
+        return;
+    }
+    if let Some(SideRow::Column { table, .. }) = app.side_rows.get(app.side_sel).cloned() {
+        if let Some(pos) = app
+            .side_rows
+            .iter()
+            .position(|r| matches!(r, SideRow::Table { table: t, .. } if *t == table))
+        {
+            app.side_sel = pos;
+        }
+    }
+    app.outline_open = None;
+    rebuild_side_rows(app);
+    app.status = t("已收起列清单").into();
 }
 
 /// `l` / `→`: expand the tree row under the cursor (a group unfolds, a

@@ -1472,6 +1472,8 @@ pub(crate) fn footer_hints_ctx(ctx: FooterCtx) -> Vec<Hint> {
             Focus::Sidebar => vec![
                 ("↑↓", t("树")),
                 ("h l", t("折叠/展开")),
+                // R109: `>` / `<` expand / collapse a table's column outline.
+                (">/<", t("展开列/收起")),
                 ("a-z", t("过滤")),
                 ("f", t("搜索")),
                 ("Enter", t("浏览")),
@@ -4308,6 +4310,49 @@ pub(crate) fn side_row_line(
                 spans.push(Span::styled(
                     "~".to_string(),
                     mk(Style::default().fg(Color::Blue)),
+                ));
+            }
+        }
+        // R109: one column of an expanded table node — a muted row indented one
+        // level deeper than its table, drawn as `· name type ·PK`. The muted
+        // grey reuses the tree's existing dim style; a primary key is flagged
+        // with `·PK` in the same yellow the tree uses for emphasis.
+        SideRow::Column { table, col, .. } => {
+            if let Some(c) = outline_column(app, *table, *col) {
+                let type_short = column_type_short(&c.data_type);
+                let type_w = disp_width(&type_short);
+                let pk_w = if c.is_primary_key { 3 } else { 0 };
+                let name_w = inner.saturating_sub(2 + 1 + type_w + pk_w).max(4);
+                let style = mk(Style::default().fg(Color::DarkGray));
+                let hit = style.add_modifier(Modifier::UNDERLINED);
+                spans.push(Span::styled(
+                    "· ".to_string(),
+                    mk(Style::default().fg(Color::DarkGray)),
+                ));
+                spans.extend(highlight_match_spans(
+                    &truncate_disp(&fix_double_encoding(&c.name), name_w),
+                    needle,
+                    style,
+                    hit,
+                ));
+                spans.push(Span::styled(
+                    format!(" {type_short}"),
+                    mk(Style::default().fg(Color::DarkGray)),
+                ));
+                if c.is_primary_key {
+                    spans.push(Span::styled(
+                        "·PK".to_string(),
+                        mk(Style::default()
+                            .fg(Color::Yellow)
+                            .add_modifier(Modifier::BOLD)),
+                    ));
+                }
+            } else {
+                // Stale index (the cache was cleared mid-frame): a muted
+                // placeholder so the row still draws instead of panicking.
+                spans.push(Span::styled(
+                    "· …".to_string(),
+                    mk(Style::default().fg(Color::DarkGray)),
                 ));
             }
         }

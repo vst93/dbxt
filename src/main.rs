@@ -272,6 +272,10 @@ enum Op {
     ListSchemas(Box<ConnectionConfig>, String),
     ListTables(Box<ConnectionConfig>, String, String, u64),
     Columns(Box<ConnectionConfig>, String, String, String),
+    /// R109: one explicit column fetch for the sidebar table outline (`>`).
+    /// Deliberate keystroke only — never prefetched; the reply lands in the
+    /// session outline cache instead of the structure view.
+    OutlineColumns(Box<ConnectionConfig>, String, String, String),
     Ddl(Box<ConnectionConfig>, String, String, String),
     /// R107: the explicit complete-DDL fetch behind `D` (dialect source
     /// statement, or the kernel's single-table DDL path).
@@ -723,6 +727,15 @@ enum OpResult {
         /// R97: cached foreign keys so the cell popup can offer a jump to the
         /// referenced row (best effort; empty when the backend cannot list).
         foreign_keys: Vec<ForeignKeyInfo>,
+    },
+    /// R109: the reply to one sidebar outline fetch. `key` is the outline cache
+    /// key; a failure is carried in-band so the outline can close with a red
+    /// status instead of tearing down unrelated state through the generic
+    /// error path.
+    OutlineColumns {
+        key: String,
+        table: String,
+        result: Result<Vec<ColumnInfo>, String>,
     },
     Query(Box<dbx_core::db::QueryResult>, String, usize, QueryTag),
     Script(Vec<StmtOutcome>, QueryTag),
@@ -1868,6 +1881,21 @@ async fn run_op(backend: &LocalBackend, op: Op, tx: &Tx) -> OpResult {
                     columns: c,
                 },
                 Err(e) => OpResult::Error(format!("columns: {e}")),
+            }
+        }
+        Op::OutlineColumns(cfg, db, schema, table) => {
+            let key = outline_key(&cfg.id, &db, &schema, &table);
+            match backend.get_columns(&cfg, &db, &schema, &table).await {
+                Ok(columns) => OpResult::OutlineColumns {
+                    key,
+                    table,
+                    result: Ok(columns),
+                },
+                Err(e) => OpResult::OutlineColumns {
+                    key,
+                    table,
+                    result: Err(e.to_string()),
+                },
             }
         }
         Op::Ddl(cfg, db, schema, table) => {
@@ -5290,6 +5318,9 @@ impl App {
             template_active: false,
             template_ph_start: None,
             table_meta: None,
+            outline_open: None,
+            outline_cache: HashMap::new(),
+            outline_pending: None,
             count_cache: HashMap::new(),
             pending_sel: None,
             pending_focus: None,
@@ -6066,6 +6097,9 @@ fn apply_op_result(app: &mut App, res: OpResult, tx: &Tx) {
             // A stale error row would be misleading once disconnected; the
             // cached database list is kept so the tree keeps its shape.
             app.tree_db_state.remove(&id);
+            // R109: the outline cache is keyed by connection id, so a torn-down
+            // connection's columns must not survive it.
+            clear_outline_cache(app);
             let was_active = app.selected.as_ref().is_some_and(|c| c.id == id);
             if was_active {
                 // Collapse the root and drop the browse state that belonged to
@@ -6482,6 +6516,40 @@ fn apply_op_result(app: &mut App, res: OpResult, tx: &Tx) {
                 app.pending_open_page = false;
                 spawn_table_page(app, tx, 0);
             }
+        }
+        // R109: one sidebar outline fetch landed. Cache it, then redraw the tree
+        // so the columns appear under the table (or report the failure and close
+        // the outline). A late reply for a table the user already collapsed is
+        // still cached for a later, free re-expand.
+        OpResult::OutlineColumns { key, table, result } => {
+            if app.outline_pending.as_deref() == Some(key.as_str()) {
+                app.outline_pending = None;
+            }
+            match result {
+                Ok(columns) => {
+                    let n = columns.len();
+                    app.outline_cache.insert(key.clone(), columns);
+                    if app.outline_open.as_deref() == Some(key.as_str()) {
+                        app.status = tf(
+                            "列 {} · {} 列 · < 收起",
+                            &[&(fix_double_encoding(&table)), &n],
+                        );
+                    }
+                }
+                Err(e) => {
+                    if app.outline_open.as_deref() == Some(key.as_str()) {
+                        app.outline_open = None;
+                    }
+                    app.status = tf(
+                        "✗ 加载列 {} 失败：{}",
+                        &[
+                            &(fix_double_encoding(&table)),
+                            &(humanize_backend_error(&e)),
+                        ],
+                    );
+                }
+            }
+            rebuild_side_rows(app);
         }
         OpResult::Query(r, sql, cap, tag) => {
             // R99: this run is the current one; clear its in-flight marker.

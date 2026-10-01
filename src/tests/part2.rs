@@ -600,6 +600,7 @@ pub(crate) fn sidebar_selected_rows_pad_to_the_full_inner_width() {
         SideRow::Conn { .. } => "Conn",
         SideRow::Db { .. } => "Db",
         SideRow::Table { .. } => "Table",
+        SideRow::Column { .. } => "Column",
         SideRow::ConnError { .. } => "ConnError",
         SideRow::ConnLoading { .. } => "ConnLoading",
     };

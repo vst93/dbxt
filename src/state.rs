@@ -1680,6 +1680,16 @@ pub(crate) enum SideRow {
         table: usize,
         depth: usize,
     },
+    /// R109: one column row of an expanded table node. `table` indexes
+    /// `App::tables`; `col` indexes the cached column list for that table
+    /// (`App::outline_cache`). Columns are leaves: no expander, no activation
+    /// beyond inserting the name into the editor.
+    Column {
+        idx: usize,
+        table: usize,
+        col: usize,
+        depth: usize,
+    },
 }
 
 /// R54: a stable identity for one tree node, so the quick search can find the
@@ -2788,6 +2798,18 @@ pub(crate) struct App {
 
     // column metadata for the table currently open in the data browser
     pub(crate) table_meta: Option<TableMeta>,
+    // R109: the sidebar table node whose column outline is expanded, keyed by
+    // `outline_key` (connection + db + schema + table). At most one table is
+    // expanded at a time, so a long tree cannot grow without bound; switching
+    // the `>` cursor to another table collapses the previous one.
+    pub(crate) outline_open: Option<String>,
+    // R109: session cache of table columns for the sidebar outline, keyed the
+    // same way. Filled only by an explicit `>` (never prefetched); cleared when
+    // the connection is torn down or the table list is reloaded.
+    pub(crate) outline_cache: HashMap<String, Vec<ColumnInfo>>,
+    // R109: the outline key whose columns are being fetched, so a second `>` on
+    // the same table reports `加载列 …` instead of spawning a duplicate fetch.
+    pub(crate) outline_pending: Option<String>,
     // session cache of row counts, keyed by db/table/filter; the bool marks a
     // lower bound (the row-count sample cap was hit).
     pub(crate) count_cache: HashMap<String, (u64, bool)>,

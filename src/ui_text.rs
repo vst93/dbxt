@@ -737,6 +737,7 @@ pub static ALL_KEYS: &[&str] = &[
     "树",
     "树 {}/{}",
     "折叠/展开",
+    "展开列/收起",
     "表名. 后只补该表列名；FROM/JOIN 后只补表名；WHERE/ON 后只补列名",
     "表结构尚未加载，稍后重试",
     "表结构视图不支持搜索",
@@ -1750,11 +1751,39 @@ pub static ALL_KEYS: &[&str] = &[
     " 物化结果集为表 · {} 行 · Enter 确认 · Esc 取消 ",
     " 物化 · Enter/Esc ",
     "物化当前结果为表（CTAS）：输入新表名（预填 result_HHMMSS），Enter 生成 CREATE TABLE … AS <来源 SQL> 并进红色确认层（显示完整 CTAS + 目标表名，绝不静默执行）；来源=查询结果对应语句（多语句跑批时=当前下钻 / 列表光标所在的那条）/ 浏览表当前过滤排序的等效 SELECT；成功后刷新侧栏表列表、状态栏显示 已物化 N 行、不跳转新表（保持上下文）；表名按方言转义，空名拒绝；只读连接 / Redis / Mongo / 结构视图隐藏",
+    // R109: sidebar table column outline (`>` / `<`).
+    "把光标移到表行上再按 > 展开列清单",
+    "列 {} 已展开 · < 收起",
+    "列 {} · {} 列 · < 收起",
+    "加载列 {}…",
+    "当前没有展开的列清单 · > 展开",
+    "已收起列清单",
+    "✗ 加载列 {} 失败：{}",
+    "已插入列 {}",
+    "> / <（表节点）",
+    "列清单：> 展开选中表的列（列名 + 类型短名 + ·PK；无缓存才拉一次元数据，命中直接展开），< 收起；同屏仅展开一个表，换表自动收起旧的；列行 Enter 把列名插入 SQL 编辑器光标处",
 ];
 
 /// The Chinese → English table. Keys must match the source literals exactly.
 fn en_of(zh: &'static str) -> Option<&'static str> {
     match zh {
+        // ── R109: sidebar table column outline (`>` / `<`) ──
+        "把光标移到表行上再按 > 展开列清单" => {
+            Some("Move the cursor onto a table row, then press > to expand its column outline")
+        }
+        "列 {} 已展开 · < 收起" => Some("Columns of {} already expanded · < to collapse"),
+        "列 {} · {} 列 · < 收起" => Some("Columns of {} · {} columns · < to collapse"),
+        "加载列 {}…" => Some("Loading columns of {}…"),
+        "当前没有展开的列清单 · > 展开" => {
+            Some("No column outline is expanded · > to expand")
+        }
+        "已收起列清单" => Some("Column outline collapsed"),
+        "✗ 加载列 {} 失败：{}" => Some("✗ Failed to load columns of {}: {}"),
+        "已插入列 {}" => Some("Inserted column {}"),
+        "> / <（表节点）" => Some("> / < (table node)"),
+        "列清单：> 展开选中表的列（列名 + 类型短名 + ·PK；无缓存才拉一次元数据，命中直接展开），< 收起；同屏仅展开一个表，换表自动收起旧的；列行 Enter 把列名插入 SQL 编辑器光标处" => Some(
+            "Column outline: > expands the selected table's columns (name + short type + ·PK; metadata is read once only on a cache miss, a hit expands instantly), < collapses it; only one table is expanded at a time, expanding another collapses the old one; Enter on a column row inserts its name into the SQL editor at the caret",
+        ),
         // ── R53: editor bracket highlight + cell copy ──
         "表结构视图没有可复制的单元格" => {
             Some("No cell to copy in the structure view")
@@ -3001,6 +3030,7 @@ fn en_of(zh: &'static str) -> Option<&'static str> {
         "树" => Some("tree"),
         "树 {}/{}" => Some("tree {}/{}"),
         "折叠/展开" => Some("collapse/expand"),
+        "展开列/收起" => Some("columns/collapse"),
         "表名. 后只补该表列名；FROM/JOIN 后只补表名；WHERE/ON 后只补列名" => Some("After table.: only that table's columns; after FROM/JOIN: only tables; after WHERE/ON: only columns"),
         "表结构尚未加载，稍后重试" => Some("Table structure not loaded yet, try again later"),
         "表结构视图不支持搜索" => Some("Structure view does not support search"),
