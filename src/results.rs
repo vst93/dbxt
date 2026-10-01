@@ -2343,6 +2343,9 @@ pub(crate) fn cols_popup_key(app: &mut App, k: KeyEvent) {
             app.flash(t("已关闭列结构").into());
         }
         KeyCode::Char('/') => open_cols_popup_filter(app),
+        // R100: `y` copies the open table's structure as Markdown (the popup's
+        // action row). Pure cache: no query is issued.
+        KeyCode::Char('y') | KeyCode::Char('Y') => copy_table_structure_markdown(app),
         // R65: Enter jumps the cell cursor to the highlighted column.
         KeyCode::Enter => cols_popup_jump(app),
         KeyCode::Up | KeyCode::Char('k') => {

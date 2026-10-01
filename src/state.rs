@@ -2417,6 +2417,25 @@ pub(crate) struct App {
     /// True when the hit list was capped at [`SEARCH_MAX_HITS`].
     pub(crate) search_truncated: bool,
 
+    // ── R100: full-database data-dictionary export ──
+    /// The filename prompt for a generated dictionary, prefilled with
+    /// [`dict_default_filename`]; blank copies to the clipboard like `Ctrl-Y`.
+    pub(crate) dict_prompt: Option<TextArea<'static>>,
+    /// The generated Markdown waiting for the destination step.
+    pub(crate) dict_content: Option<String>,
+    /// Database the pending content belongs to (status labels).
+    pub(crate) dict_db: String,
+    /// A `>200`-table export awaiting the red confirmation (never a query).
+    pub(crate) dict_confirm: Option<DictConfirm>,
+    /// A dictionary walk is in flight.
+    pub(crate) dict_running: bool,
+    /// `(done, total)` tables while a dictionary walk runs.
+    pub(crate) dict_progress: Option<(usize, usize)>,
+    /// Monotonic id of the latest walk; only the newest reply lands.
+    pub(crate) dict_gen: u64,
+    /// Cancellation flag shared with the running walk (Esc aborts).
+    pub(crate) dict_cancel: Arc<AtomicBool>,
+
     // ── schema diff (Alt-D / Shift+Alt-D) ──
     /// The `Alt-D` target picker (source is the focused table / current database).
     pub(crate) diff_picker: Option<DiffPicker>,

@@ -6,6 +6,7 @@ mod ui_text;
 
 mod csv_io;
 mod diffui;
+mod docgen;
 mod editor;
 mod filter;
 mod input;
@@ -442,6 +443,16 @@ enum Op {
         gen: u64,
         cancel: Arc<AtomicBool>,
     },
+    /// R100: walk every table of one database / schema and build its data
+    /// dictionary. Reports progress between tables; `cancel` lets the UI abort
+    /// (the partial document is discarded).
+    DataDictionary {
+        cfg: Box<ConnectionConfig>,
+        db: String,
+        schema: String,
+        gen: u64,
+        cancel: Arc<AtomicBool>,
+    },
     /// Fetch both tables' columns and indexes and diff them (source is the
     /// desired structure, the generated ALTER rewrites the target).
     DiffTable {
@@ -514,6 +525,7 @@ impl Op {
             Op::Import(_) => OP_WATCHDOG_IMPORT,
             Op::Export(_) => OP_WATCHDOG_EXPORT,
             Op::GlobalSearch { .. } => OP_WATCHDOG_SEARCH,
+            Op::DataDictionary { .. } => OP_WATCHDOG_SEARCH,
             Op::DataDiff { .. } => OP_WATCHDOG_DATA_DIFF,
             Op::DataTransfer(_) => OP_WATCHDOG_TRANSFER,
             Op::ProbeAll(_) => OP_WATCHDOG_PROBE_ALL,
@@ -818,6 +830,24 @@ enum OpResult {
     },
     /// A global search was aborted between tables (Esc).
     SearchCancelled {
+        gen: u64,
+    },
+    /// R100: intermediate data-dictionary progress (`done` tables of `total`).
+    /// A side-channel message, so it does not count as the op finishing.
+    DictProgress {
+        gen: u64,
+        done: usize,
+        total: usize,
+    },
+    /// R100: a data dictionary finished; `content` is the whole Markdown doc.
+    DictReady {
+        gen: u64,
+        db: String,
+        tables: usize,
+        content: String,
+    },
+    /// R100: a dictionary walk was aborted between tables (Esc).
+    DictCancelled {
         gen: u64,
     },
     /// A blocking SSH prompt (host-key TOFU / keyboard-interactive) the kernel
@@ -2965,6 +2995,13 @@ async fn run_op(backend: &LocalBackend, op: Op, tx: &Tx) -> OpResult {
             )
             .await
         }
+        Op::DataDictionary {
+            cfg,
+            db,
+            schema,
+            gen,
+            cancel,
+        } => run_data_dictionary(backend, &cfg, &db, &schema, gen, &cancel, tx).await,
         Op::DiffTable {
             src_cfg,
             src_db,
@@ -4405,6 +4442,75 @@ async fn run_global_search(
     }
 }
 
+/// R100: walk one database / schema and build its data dictionary. Views are
+/// included — a dictionary of the whole database should describe them too, and
+/// their column metadata is as cheap as a table's. Every table contributes its
+/// columns (required) plus its indexes and foreign keys (best effort); a table
+/// whose columns cannot be read is skipped rather than failing the whole walk.
+#[allow(clippy::too_many_arguments)]
+async fn run_data_dictionary(
+    backend: &LocalBackend,
+    cfg: &ConnectionConfig,
+    db: &str,
+    schema: &str,
+    gen: u64,
+    cancel: &AtomicBool,
+    tx: &Tx,
+) -> OpResult {
+    let tables = match backend.list_tables(cfg, db, schema).await {
+        Ok(t) => t,
+        Err(e) => return OpResult::Error(format!("data dictionary: list tables: {e}")),
+    };
+    let total = tables.len();
+    let _ = tx.send(OpResult::DictProgress {
+        gen,
+        done: 0,
+        total,
+    });
+    let mut metas: Vec<TableMeta> = Vec::with_capacity(total);
+    for (i, table) in tables.iter().enumerate() {
+        if cancel.load(Ordering::Relaxed) {
+            let _ = tx.send(OpResult::DictProgress {
+                gen,
+                done: i,
+                total,
+            });
+            return OpResult::DictCancelled { gen };
+        }
+        let _ = tx.send(OpResult::DictProgress {
+            gen,
+            done: i,
+            total,
+        });
+        let Ok(columns) = backend.get_columns(cfg, db, schema, &table.name).await else {
+            continue;
+        };
+        let indexes = list_indexes_best_effort(backend, cfg, db, schema, &table.name).await;
+        let foreign_keys =
+            list_foreign_keys_best_effort(backend, cfg, db, schema, &table.name).await;
+        metas.push(TableMeta {
+            table: table.name.clone(),
+            schema: schema.to_string(),
+            columns,
+            indexes,
+            foreign_keys,
+        });
+    }
+    let _ = tx.send(OpResult::DictProgress {
+        gen,
+        done: total,
+        total,
+    });
+    let dialect = cfg.db_type.as_str().to_string();
+    let content = database_dictionary_markdown(db, &dialect, &now_iso8601(), &metas);
+    OpResult::DictReady {
+        gen,
+        db: db.to_string(),
+        tables: total,
+        content,
+    }
+}
+
 fn spawn_op(backend: &Arc<LocalBackend>, tx: &Tx, op: Op) {
     let backend = backend.clone();
     let tx = tx.clone();
@@ -4842,6 +4948,14 @@ impl App {
             search_gen: 0,
             search_cancel: Arc::new(AtomicBool::new(false)),
             search_truncated: false,
+            dict_prompt: None,
+            dict_content: None,
+            dict_db: String::new(),
+            dict_confirm: None,
+            dict_running: false,
+            dict_progress: None,
+            dict_gen: 0,
+            dict_cancel: Arc::new(AtomicBool::new(false)),
             diff_picker: None,
             diff: None,
             db_diff: None,
@@ -5208,6 +5322,7 @@ fn apply_op_result(app: &mut App, res: OpResult, tx: &Tx) {
             | OpResult::SshPrompt(_)
             | OpResult::SshNotice(_)
             | OpResult::SearchProgress { .. }
+            | OpResult::DictProgress { .. }
             | OpResult::DataDiffProgress { .. }
             | OpResult::TransferProgress { .. }
             | OpResult::ConnStatus(_)
@@ -5255,6 +5370,12 @@ fn apply_op_result(app: &mut App, res: OpResult, tx: &Tx) {
                         "全库搜索「{}」· {}/{} 表…",
                         &[&(app.search_query), &(done), &(total)],
                     );
+                }
+            }
+            OpResult::DictProgress { gen, done, total } => {
+                if gen == app.dict_gen {
+                    app.dict_progress = Some((done, total));
+                    app.status = tf("字典生成中 {}/{}", &[&done, &total]);
                 }
             }
             OpResult::DataDiffProgress { gen, done, total } => {
@@ -6858,6 +6979,37 @@ fn apply_op_result(app: &mut App, res: OpResult, tx: &Tx) {
             app.search_progress = None;
             app.status = t("已中止全库搜索（保留已扫描的部分结果）").into();
         }
+        OpResult::DictReady {
+            gen,
+            db,
+            tables,
+            content,
+        } => {
+            // A reply for a superseded walk must not open a stale prompt.
+            if gen != app.dict_gen {
+                return;
+            }
+            app.dict_running = false;
+            app.dict_progress = None;
+            app.dict_db = db.clone();
+            app.dict_content = Some(content);
+            // Prefill the `Ctrl-Y`-style destination prompt with the default
+            // filename; clearing it copies to the clipboard instead.
+            let mut ta = TextArea::default();
+            ta.insert_str(&dict_default_filename(&db));
+            ta.set_placeholder_text(t("留空 = 复制到剪贴板 · 输入路径 = 写入文件"));
+            app.dict_prompt = Some(ta);
+            app.status = tf("数据字典已生成（{} 表）· Enter 写入 · Esc 取消", &[&tables]);
+        }
+        OpResult::DictCancelled { gen } => {
+            if gen != app.dict_gen {
+                return;
+            }
+            app.dict_running = false;
+            app.dict_progress = None;
+            app.dict_content = None;
+            app.status = t("已中止数据字典（未生成任何文件）").into();
+        }
         OpResult::DiffReady { gen, diff } => {
             // A reply for a superseded request must not replace the open overlay.
             if gen != app.diff_gen {
@@ -7061,6 +7213,7 @@ fn apply_op_result(app: &mut App, res: OpResult, tx: &Tx) {
         OpResult::SshPrompt(_)
         | OpResult::SshNotice(_)
         | OpResult::SearchProgress { .. }
+        | OpResult::DictProgress { .. }
         | OpResult::DataDiffProgress { .. } => {}
         // R83: the temporary connection is in the kernel cache now. Only the
         // initial quick-open activates it; a cache refresh leaves the UI alone.
@@ -7087,6 +7240,10 @@ fn apply_op_result(app: &mut App, res: OpResult, tx: &Tx) {
             app.pending_write_msg = None;
             app.search_running = false;
             app.search_progress = None;
+            // R100: a failed / timed-out dictionary walk must not leave its
+            // progress marker stuck with no job behind it.
+            app.dict_running = false;
+            app.dict_progress = None;
             app.data_progress = None;
             // A watchdog timeout or any unexpected failure of a transfer must not
             // leave its progress overlay stuck with no job behind it.

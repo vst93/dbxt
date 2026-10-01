@@ -3646,6 +3646,9 @@ pub(crate) fn help_has_no_bare_uppercase_shortcuts() {
     // gesture visually distinct from the `y`/`Y` copy pair. `S` (R94, the
     // status-bar numeric-summary toggle) joins: its lowercase `s` is the result
     // grid's sort, so the uppercase carries the deliberate, opt-in summary.
+    // `E` (R100, export the data dictionary from the connection tree) joins: the
+    // picker's lowercase `e` edits a connection, and `Alt-E` is the unrelated
+    // connection-bundle export, so the plain uppercase carries the new gesture.
     for (key, _) in HELP_ROWS {
         if key.starts_with('—') {
             continue;
@@ -3660,6 +3663,7 @@ pub(crate) fn help_has_no_bare_uppercase_shortcuts() {
                 || tok == "L"
                 || tok == "U"
                 || tok == "S"
+                || tok == "E"
             {
                 continue;
             }

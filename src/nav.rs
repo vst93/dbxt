@@ -746,4 +746,148 @@ pub(crate) fn search_key(app: &mut App, tx: &Tx, k: KeyEvent) {
     }
 }
 
+// ── R100: full-database data dictionary (`E` on the connection tree) ──
+
+/// R100: `E` on the connection list / tree — start a whole-database data
+/// dictionary export. A SQL-only, read-only, explicitly triggered walk; a
+/// database with more than [`DICT_CONFIRM_TABLES`] cached tables first asks
+/// through the red confirmation layer so a fat-finger cannot launch a huge scan.
+/// The table count is read from the sidebar's already-cached list (no query).
+pub(crate) fn open_data_dictionary(app: &mut App, tx: &Tx) {
+    if app.backend_kind != Backend::Sql {
+        app.status = t("数据字典仅支持 SQL 连接").into();
+        return;
+    }
+    let Some(cfg) = app.selected.clone() else {
+        app.status = t("先连接一个 SQL 连接再按 E 导出数据字典").into();
+        return;
+    };
+    let db = app.current_db();
+    if db.trim().is_empty() {
+        app.status = t("请先选择一个数据库").into();
+        return;
+    }
+    let schema = app.schema.clone();
+    let n = app.tables_all.len();
+    if n > DICT_CONFIRM_TABLES {
+        app.dict_confirm = Some(DictConfirm {
+            cfg: Box::new(cfg),
+            db,
+            schema,
+            tables: n,
+        });
+        app.status = tf("数据字典将遍历 {} 张表 · Enter 继续 · Esc 取消", &[&n]);
+        return;
+    }
+    start_data_dictionary(app, tx, cfg, db, schema);
+}
+
+/// Keys for the `>200`-table confirmation layer.
+pub(crate) fn dict_confirm_key(app: &mut App, tx: &Tx, k: KeyEvent) {
+    match k.code {
+        KeyCode::Enter | KeyCode::Char('y') | KeyCode::Char('Y') => {
+            let Some(c) = app.dict_confirm.take() else {
+                return;
+            };
+            start_data_dictionary(app, tx, *c.cfg, c.db, c.schema);
+        }
+        KeyCode::Esc | KeyCode::Char('n') | KeyCode::Char('N') => {
+            app.dict_confirm = None;
+            app.flash(t("已取消导出数据字典").into());
+        }
+        _ => {}
+    }
+}
+
+/// Kick off the background walk, cancelling any previous one. Progress lands on
+/// the status bar; Esc (handled in the global router) soft-cancels it.
+pub(crate) fn start_data_dictionary(
+    app: &mut App,
+    tx: &Tx,
+    cfg: ConnectionConfig,
+    db: String,
+    schema: String,
+) {
+    app.dict_cancel.store(true, Ordering::Relaxed);
+    app.dict_gen = app.dict_gen.wrapping_add(1);
+    let gen = app.dict_gen;
+    let cancel = Arc::new(AtomicBool::new(false));
+    app.dict_cancel = cancel.clone();
+    app.dict_running = true;
+    app.dict_progress = Some((0, 0));
+    app.dict_content = None;
+    app.dict_prompt = None;
+    app.dict_db = db.clone();
+    app.status = t("生成数据字典…正在枚举表").into();
+    app.loading = true;
+    app.spawn(
+        tx,
+        Op::DataDictionary {
+            cfg: Box::new(cfg),
+            db,
+            schema,
+            gen,
+            cancel,
+        },
+    );
+}
+
+/// Esc while a dictionary walk is in flight: ask the worker to stop between
+/// tables (the partial document is discarded). The state is reset by the
+/// worker's [`OpResult::DictCancelled`] reply, exactly like a search abort.
+pub(crate) fn soft_cancel_data_dictionary(app: &mut App) -> bool {
+    if !app.dict_running {
+        return false;
+    }
+    app.dict_cancel.store(true, Ordering::Relaxed);
+    app.status = t("正在中止数据字典…").into();
+    true
+}
+
+/// Destination prompt for a generated dictionary. Blank copies to the clipboard
+/// (the `Ctrl-Y` rule); a path writes the file.
+pub(crate) fn dict_prompt_key(app: &mut App, k: KeyEvent) {
+    let Some(mut ta) = app.dict_prompt.take() else {
+        return;
+    };
+    if k.code == KeyCode::Esc {
+        app.dict_content = None;
+        app.flash(t("已取消导出数据字典").into());
+        return;
+    }
+    if k.code != KeyCode::Enter {
+        ta.input(k);
+        app.dict_prompt = Some(ta);
+        return;
+    }
+    let Some(content) = app.dict_content.take() else {
+        return;
+    };
+    let input = ta.lines().join("\n");
+    let path = input.trim();
+    let n = content.chars().count();
+    if path.is_empty() {
+        match clipboard_copy(&content) {
+            Some(p) => {
+                app.status = tf(
+                    "✓ 数据字典已复制到剪贴板（{} 字符）· 兜底 {}",
+                    &[&n, &(p.display())],
+                )
+            }
+            None => app.status = tf("✓ 数据字典已复制到剪贴板（{} 字符）", &[&n]),
+        }
+        return;
+    }
+    let expanded = expand_home(path);
+    match std::fs::write(&expanded, content.as_bytes()) {
+        Ok(()) => {
+            app.status = tf(
+                "✓ 数据字典已写入 {}（{} 字符）",
+                &[&(expanded.display()), &n],
+            )
+        }
+        Err(e) => app.status = tf("✗ 数据字典写入失败：{}", &[&e]),
+    }
+}
+
 // ── schema diff (Alt-D / Shift+Alt-D) ──

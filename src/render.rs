@@ -318,6 +318,21 @@ pub(crate) fn ui(f: &mut Frame, app: &mut App) {
     if app.export_path.is_some() {
         render_export_path(f, f.area(), app);
     }
+    // R100: the generated data-dictionary destination prompt (default filename
+    // prefilled; blank copies to the clipboard like `Ctrl-Y`).
+    if app.dict_prompt.is_some() {
+        let title = tf(
+            " 导出数据字典 · {} · Enter 写入（留空复制） · Esc 取消 ",
+            &[&(app.dict_db)],
+        );
+        render_prompt_input(
+            f,
+            f.area(),
+            app.dict_prompt.as_mut(),
+            &title,
+            t(" 导出数据字典 · Enter/Esc "),
+        );
+    }
     if app.conn_export.is_some() {
         render_conn_export(f, f.area(), app);
     }
@@ -349,6 +364,10 @@ pub(crate) fn ui(f: &mut Frame, app: &mut App) {
         let (ok, cancel) = render_confirm(f, f.area(), &confirm);
         app.rects.confirm_ok = ok;
         app.rects.confirm_cancel = cancel;
+    }
+    // R100: the `>200`-table data-dictionary confirmation.
+    if app.dict_confirm.is_some() {
+        render_dict_confirm(f, f.area(), app);
     }
     if let Some(hc) = app.history_confirm.clone() {
         let (ok, cancel) = render_history_confirm(f, f.area(), &hc);

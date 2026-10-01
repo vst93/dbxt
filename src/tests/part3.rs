@@ -1302,6 +1302,7 @@ pub(crate) fn every_call_site_has_english() {
         include_str!("../results.rs"),
         include_str!("../nav.rs"),
         include_str!("../diffui.rs"),
+        include_str!("../docgen.rs"),
         include_str!("../filter.rs"),
         include_str!("../rowops.rs"),
         include_str!("../runner.rs"),
@@ -11877,4 +11878,358 @@ pub(crate) fn r99_help_documents_soft_cancel() {
         t_lang("写操作执行中，不可取消", Lang::En),
         "写操作执行中，不可取消"
     );
+}
+
+// ── R100: data dictionary export (table Markdown + full-db document) ──────────
+
+/// A full column table (key marks / nullability / default / comment) plus the
+/// index and foreign-key sections, with a schema-qualified heading.
+#[test]
+pub(crate) fn r100_table_structure_markdown_renders_every_section() {
+    let mut meta = orders_meta(
+        &[("id", "int")],
+        &[("user_id", "int"), ("name", "varchar(64)")],
+    );
+    meta.schema = "public".into();
+    meta.columns[0].comment = Some("主键".into());
+    meta.columns[1].comment = Some("引用用户".into());
+    meta.columns[2].is_nullable = true;
+    meta.columns[2].column_default = Some("'anon'".into());
+    meta.indexes = vec![idx_info("idx_name", &["name"], false, false)];
+    meta.foreign_keys = vec![fk_info("fk_user", "user_id", Some("public"), "users", "id")];
+    let md = table_structure_markdown(&meta);
+    assert!(md.starts_with("## public.orders\n\n"), "{md}");
+    assert!(
+        md.contains("| 列名 | 类型 | 键 | 可空 | 默认值 | 注释 |"),
+        "{md}"
+    );
+    assert!(md.contains("| id | int | PRI | 否 |  | 主键 |"), "{md}");
+    assert!(
+        md.contains("| user_id | int |  | 否 |  | 引用用户 |"),
+        "{md}"
+    );
+    // `name` is the first column of the non-unique `idx_name`, so it is `MUL`.
+    assert!(
+        md.contains("| name | varchar(64) | MUL | 是 | 'anon' |  |"),
+        "{md}"
+    );
+    assert!(md.contains("### 索引"), "{md}");
+    assert!(md.contains("| idx_name | name | 否 |"), "{md}");
+    assert!(md.contains("### 外键"), "{md}");
+    assert!(md.contains("| user_id | public.users.id |"), "{md}");
+}
+
+/// A comment-less table drops the `注释` column entirely; no indexes / foreign
+/// keys drops both sections.
+#[test]
+pub(crate) fn r100_table_structure_markdown_omits_empty_columns_and_sections() {
+    let meta = orders_meta(&[("id", "int")], &[("name", "text")]);
+    let md = table_structure_markdown(&meta);
+    assert!(!md.contains("注释"), "{md}");
+    assert!(md.contains("| 列名 | 类型 | 键 | 可空 | 默认值 |"), "{md}");
+    assert!(!md.contains("### 索引"), "{md}");
+    assert!(!md.contains("### 外键"), "{md}");
+    // Exactly five separator cells without the comment column.
+    assert!(md.contains("| --- | --- | --- | --- | --- |"), "{md}");
+}
+
+/// The schema prefix appears when the engine has one and is skipped otherwise.
+#[test]
+pub(crate) fn r100_table_structure_markdown_schema_prefix() {
+    let mut meta = orders_meta(&[("id", "int")], &[]);
+    assert!(table_structure_markdown(&meta).starts_with("## orders\n"));
+    meta.schema = "inv".into();
+    assert!(table_structure_markdown(&meta).starts_with("## inv.orders\n"));
+}
+
+/// A literal `|` in a cell is escaped so it cannot split the row.
+#[test]
+pub(crate) fn r100_table_structure_markdown_escapes_pipe() {
+    let mut meta = orders_meta(&[("id", "int")], &[]);
+    meta.columns[0].comment = Some("a | b".into());
+    meta.columns[0].data_type = "int | x".into();
+    let md = table_structure_markdown(&meta);
+    assert!(
+        md.contains("| id | int \\| x | PRI | 否 |  | a \\| b |"),
+        "{md}"
+    );
+}
+
+/// The full-database document opens with the overview (count / dialect / time)
+/// then one `##` section per table.
+#[test]
+pub(crate) fn r100_database_dictionary_has_overview_and_sections() {
+    let a = orders_meta(&[("id", "int")], &[]);
+    let mut b = orders_meta(&[("id", "int")], &[]);
+    b.table = "users".into();
+    let md = database_dictionary_markdown("shop", "mysql", "2026-01-02T03:04:05Z", &[a, b]);
+    assert!(md.starts_with("# shop 数据字典\n"), "{md}");
+    assert!(md.contains("- 数据库: shop"), "{md}");
+    assert!(md.contains("- 表数量: 2"), "{md}");
+    assert!(md.contains("- 引擎方言: mysql"), "{md}");
+    assert!(md.contains("- 生成时间: 2026-01-02T03:04:05Z"), "{md}");
+    assert!(md.contains("## orders"), "{md}");
+    assert!(md.contains("## users"), "{md}");
+    assert_eq!(md.matches("\n## ").count(), 2, "{md}");
+}
+
+/// The default filename is `{db}-dictionary.md`; path separators in the
+/// database name are neutralised so the default stays one filename.
+#[test]
+pub(crate) fn r100_dict_default_filename_sanitizes() {
+    assert_eq!(dict_default_filename("shop"), "shop-dictionary.md");
+    assert_eq!(dict_default_filename("a/b\\c:d"), "a_b_c_d-dictionary.md");
+    assert!(dict_default_filename("shop").ends_with(".md"));
+}
+
+/// A `>200`-table database goes through the red confirmation; nothing starts
+/// until it is accepted, and Esc dismisses it.
+#[test]
+pub(crate) fn r100_dict_confirm_gate_over_200() {
+    let mut app = test_app();
+    app.selected = Some(mysql_cfg());
+    app.databases = vec!["shop".into()];
+    app.db_index = 0;
+    app.tables_all = (0..DICT_CONFIRM_TABLES + 1)
+        .map(|i| TableInfo {
+            name: format!("t{i}"),
+            table_type: "TABLE".into(),
+            valid: None,
+            comment: None,
+            parent_schema: None,
+            parent_name: None,
+        })
+        .collect();
+    let (tx, _rx) = tokio::sync::mpsc::unbounded_channel::<OpResult>();
+    open_data_dictionary(&mut app, &tx);
+    let c = app.dict_confirm.as_ref().expect("confirmation shown");
+    assert_eq!(c.tables, DICT_CONFIRM_TABLES + 1);
+    assert!(
+        !app.dict_running,
+        "the walk must not start before confirmation"
+    );
+    dict_confirm_key(
+        &mut app,
+        &tx,
+        KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE),
+    );
+    assert!(app.dict_confirm.is_none());
+    assert!(!app.dict_running);
+}
+
+/// Enter on the confirmation starts the walk; a database under the gate starts
+/// it directly (no confirmation).
+#[test]
+pub(crate) fn r100_dict_confirm_enter_and_under_gate_start() {
+    run_rt(|| {
+        let mut app = test_app();
+        app.selected = Some(mysql_cfg());
+        app.databases = vec!["shop".into()];
+        app.db_index = 0;
+        app.tables_all = (0..DICT_CONFIRM_TABLES + 1)
+            .map(|i| TableInfo {
+                name: format!("t{i}"),
+                table_type: "TABLE".into(),
+                valid: None,
+                comment: None,
+                parent_schema: None,
+                parent_name: None,
+            })
+            .collect();
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel::<OpResult>();
+        open_data_dictionary(&mut app, &tx);
+        dict_confirm_key(
+            &mut app,
+            &tx,
+            KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+        );
+        assert!(app.dict_confirm.is_none());
+        assert!(app.dict_running);
+        assert_eq!(app.dict_progress, Some((0, 0)));
+        assert_eq!(app.dict_gen, 1);
+
+        // Under the gate: a fresh app starts directly, no confirmation.
+        let mut app2 = test_app();
+        app2.selected = Some(mysql_cfg());
+        app2.databases = vec!["shop".into()];
+        app2.db_index = 0;
+        let (tx2, _rx2) = tokio::sync::mpsc::unbounded_channel::<OpResult>();
+        open_data_dictionary(&mut app2, &tx2);
+        assert!(app2.dict_confirm.is_none());
+        assert!(app2.dict_running);
+        assert_eq!(app2.dict_gen, 1);
+    });
+}
+
+/// Progress updates the status; a stale generation is dropped; Ready opens the
+/// prefilled destination prompt; Cancelled discards the partial document.
+#[test]
+pub(crate) fn r100_dict_progress_ready_and_cancel_update_state() {
+    let mut app = test_app();
+    let (tx, _rx) = tokio::sync::mpsc::unbounded_channel::<OpResult>();
+    app.dict_gen = 7;
+    app.dict_running = true;
+    apply_op_result(
+        &mut app,
+        OpResult::DictProgress {
+            gen: 7,
+            done: 3,
+            total: 9,
+        },
+        &tx,
+    );
+    assert_eq!(app.dict_progress, Some((3, 9)));
+    assert!(app.status.contains("3/9"), "{}", app.status);
+    // A stale reply (an older generation) is ignored.
+    apply_op_result(
+        &mut app,
+        OpResult::DictProgress {
+            gen: 6,
+            done: 1,
+            total: 9,
+        },
+        &tx,
+    );
+    assert_eq!(app.dict_progress, Some((3, 9)));
+
+    apply_op_result(
+        &mut app,
+        OpResult::DictReady {
+            gen: 7,
+            db: "shop".into(),
+            tables: 9,
+            content: "# shop 数据字典\n".into(),
+        },
+        &tx,
+    );
+    assert!(!app.dict_running);
+    assert_eq!(app.dict_content.as_deref(), Some("# shop 数据字典\n"));
+    let ta = app.dict_prompt.as_ref().expect("destination prompt opened");
+    assert_eq!(ta.lines().join(""), "shop-dictionary.md");
+
+    app.dict_gen = 8;
+    app.dict_running = true;
+    app.dict_content = Some("partial".into());
+    apply_op_result(&mut app, OpResult::DictCancelled { gen: 8 }, &tx);
+    assert!(!app.dict_running);
+    assert!(app.dict_content.is_none());
+    assert!(app.dict_progress.is_none());
+}
+
+/// Esc's soft-cancel only reports while a walk is actually running.
+#[test]
+pub(crate) fn r100_soft_cancel_sets_flag_only_while_running() {
+    let mut app = test_app();
+    assert!(!soft_cancel_data_dictionary(&mut app));
+    app.dict_running = true;
+    assert!(soft_cancel_data_dictionary(&mut app));
+    assert!(app.dict_cancel.load(Ordering::Relaxed));
+    assert!(app.status.contains("中止"), "{}", app.status);
+}
+
+/// The destination prompt writes the file on Enter and discards on Esc.
+#[test]
+pub(crate) fn r100_dict_prompt_writes_file_and_cancel_discards() {
+    let mut app = test_app();
+    app.dict_db = "shop".into();
+    app.dict_content = Some("# doc\n".into());
+    let path = std::env::temp_dir().join(format!("dbxt-dict-test-{}.md", std::process::id()));
+    let _ = std::fs::remove_file(&path);
+    let mut ta = TextArea::default();
+    ta.insert_str(&path.display().to_string());
+    app.dict_prompt = Some(ta);
+    dict_prompt_key(&mut app, KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+    assert_eq!(std::fs::read_to_string(&path).unwrap(), "# doc\n");
+    let _ = std::fs::remove_file(&path);
+    assert!(app.dict_prompt.is_none());
+    assert!(app.dict_content.is_none());
+
+    app.dict_content = Some("x".into());
+    app.dict_prompt = Some(TextArea::default());
+    dict_prompt_key(&mut app, KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+    assert!(app.dict_content.is_none());
+    assert!(app.dict_prompt.is_none());
+}
+
+/// `y` inside the popup copies the cached structure (zero query) and reports.
+#[test]
+pub(crate) fn r100_popup_copy_table_structure_reports() {
+    let mut app = test_app();
+    app.picker_open = false;
+    app.selected = Some(test_conn("mysql"));
+    app.grid_kind = GridKind::TableData;
+    app.table_meta = Some(orders_meta(&[("id", "int")], &[("name", "text")]));
+    copy_table_structure_markdown(&mut app);
+    assert!(
+        app.status.contains("已复制表结构 Markdown"),
+        "{}",
+        app.status
+    );
+    // A bare query result has no metadata and must say so.
+    app.table_meta = None;
+    copy_table_structure_markdown(&mut app);
+    assert!(app.status.contains("没有表结构可复制"), "{}", app.status);
+}
+
+/// The popup's action row renders at both a phone and a wide size, and the
+/// no-metadata variant says why the copy is unavailable.
+#[test]
+pub(crate) fn r100_cols_popup_action_row_renders_at_both_sizes() {
+    let mut app = test_app();
+    app.picker_open = false;
+    app.selected = Some(test_conn("mysql"));
+    app.grid_kind = GridKind::TableData;
+    app.set_grid(sample_grid());
+    app.table_meta = Some(orders_meta(&[("id", "int")], &[("name", "text")]));
+    open_cols_popup(&mut app);
+    assert!(app.cols_popup_open);
+    for (w, h) in [(42u16, 22u16), (110, 30)] {
+        // Wide CJK cells leave a blank continuation cell, so drop the spaces
+        // before matching the phrase.
+        let joined = draw(&mut app, w, h).join("\n").replace(' ', "");
+        assert!(
+            joined.contains("复制表结构Markdown"),
+            "action row missing at {w}x{h}: {joined}"
+        );
+    }
+    // No metadata: the row explains instead of promising a copy.
+    app.cols_popup_open = false;
+    app.table_meta = None;
+    open_cols_popup(&mut app);
+    let joined = draw(&mut app, 110, 30).join("\n").replace(' ', "");
+    assert!(
+        joined.contains("无法复制表结构"),
+        "no-metadata hint missing: {joined}"
+    );
+}
+
+/// The full `?` sheet documents both new gestures and every new string translates.
+#[test]
+pub(crate) fn r100_help_documents_dictionary() {
+    assert!(
+        HELP_ROWS
+            .iter()
+            .any(|(k, d)| *k == "E（连接树）" && d.contains("数据字典")),
+        "full help missing the E connection-tree row"
+    );
+    assert!(
+        HELP_ROWS
+            .iter()
+            .any(|(k, d)| *k == "g c" && d.contains("复制当前表结构 Markdown")),
+        "full help's g c row missing the Markdown action"
+    );
+    use ui_text::{t_lang, Lang};
+    for k in [
+        "E（连接树）",
+        "列名",
+        "唯一",
+        "外键",
+        "引用",
+        "表数量",
+        "引擎方言",
+        "生成时间",
+        "{} 数据字典",
+    ] {
+        assert_ne!(t_lang(k, Lang::En), k, "missing English for {k:?}");
+    }
 }

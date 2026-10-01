@@ -1332,7 +1332,7 @@ pub static ALL_KEYS: &[&str] = &[
     "切换表",
     "列 {} 不在当前视图（可能已隐藏）",
     "切换同库其他表：输入即过滤的浮层（复用最近表样式，↑↓/j/k 选），Enter 打开该表数据",
-    "列结构弹层：列名 / 类型 / 键(PRI/UNI/MUL) / 默认值 / 可空 / 注释；右侧就地显示选中列的值分布（非空/空/去重，去重旁附 12 格分布 sparkline，数值列 min/max/avg；缓存元数据+已加载数据，不额外查库；窄屏 < 56 列隐藏 sparkline；/ 过滤列名；Enter 跳到该列）",
+    "列结构弹层：列名 / 类型 / 键(PRI/UNI/MUL) / 默认值 / 可空 / 注释；右侧就地显示选中列的值分布（非空/空/去重，去重旁附 12 格分布 sparkline，数值列 min/max/avg；缓存元数据+已加载数据，不额外查库；窄屏 < 56 列隐藏 sparkline；/ 过滤列名；Enter 跳到该列；底部动作行 y 复制当前表结构 Markdown（列 / 索引 / 外键；无注释省略注释列）",
     // R66: `gc` column value distribution (client-side, zero-query)
     "值分布",
     "值分布 · {}",
@@ -1650,6 +1650,41 @@ pub static ALL_KEYS: &[&str] = &[
     "写操作执行中，不可取消",
     "Esc（执行中）",
     "执行中 Esc 软取消：立即归还操作权（后台查询不中断，迟到结果静默丢弃）；写语句（INSERT/UPDATE/DELETE/DDL）执行中不可取消，防重发双写",
+    // ── R100: data dictionary export ──
+    "列名",
+    "唯一",
+    "外键",
+    "引用",
+    "{} 数据字典",
+    "表数量",
+    "引擎方言",
+    "生成时间",
+    "当前没有表结构可复制（查询结果无表元数据）",
+    "✓ 已复制表结构 Markdown（{} 字符）· 兜底 {}",
+    "✓ 已复制表结构 Markdown（{} 字符）",
+    "数据字典仅支持 SQL 连接",
+    "先连接一个 SQL 连接再按 E 导出数据字典",
+    "请先选择一个数据库",
+    "数据字典将遍历 {} 张表 · Enter 继续 · Esc 取消",
+    "已取消导出数据字典",
+    "生成数据字典…正在枚举表",
+    "正在中止数据字典…",
+    "✓ 数据字典已复制到剪贴板（{} 字符）· 兜底 {}",
+    "✓ 数据字典已复制到剪贴板（{} 字符）",
+    "✓ 数据字典已写入 {}（{} 字符）",
+    "✗ 数据字典写入失败：{}",
+    "字典生成中 {}/{}",
+    "数据字典已生成（{} 表）· Enter 写入 · Esc 取消",
+    "已中止数据字典（未生成任何文件）",
+    " y 复制表结构 Markdown · Esc 关 ",
+    " 查询结果无表元数据，无法复制表结构 · Esc 关 ",
+    "将为数据库 {} 生成数据字典，共 {} 张表，可能耗时",
+    "Enter/y 继续   Esc/n 取消",
+    " ⚠ 生成数据字典确认 ",
+    " 导出数据字典 · {} · Enter 写入（留空复制） · Esc 取消 ",
+    " 导出数据字典 · Enter/Esc ",
+    "E（连接树）",
+    "导出数据字典：顺序读取当前库所有表的列 / 索引 / 外键，拼成一份 Markdown 数据字典（首节库概览：表数 / 引擎方言 / 生成时间），完成后输入文件名（默认 {db}-dictionary.md，留空则复制剪贴板）；>200 表先红色确认，生成中 Esc 软取消并丢弃未完成部分；只读连接可用（纯读，用户显式动作）",
 ];
 
 /// The Chinese → English table. Keys must match the source literals exactly.
@@ -1820,8 +1855,8 @@ fn en_of(zh: &'static str) -> Option<&'static str> {
         "分组行无连接池：x 无动作（不会误进表过滤）" => Some(
             "A group row has no connection pool: x does nothing (it no longer leaks into the table filter)",
         ),
-        "列结构弹层：列名 / 类型 / 键(PRI/UNI/MUL) / 默认值 / 可空 / 注释；右侧就地显示选中列的值分布（非空/空/去重，去重旁附 12 格分布 sparkline，数值列 min/max/avg；缓存元数据+已加载数据，不额外查库；窄屏 < 56 列隐藏 sparkline；/ 过滤列名；Enter 跳到该列）" => Some(
-            "Column-structure popup: name / type / key (PRI/UNI/MUL) / default / nullable / comment; the selected column's value distribution is shown in place (non-null/null/distinct; a 12-cell distribution sparkline beside the distinct count; min/max/avg for a numeric column; cached metadata + loaded rows, no extra query; the sparkline hides below 56 columns; / filters by name; Enter jumps to that column)",
+        "列结构弹层：列名 / 类型 / 键(PRI/UNI/MUL) / 默认值 / 可空 / 注释；右侧就地显示选中列的值分布（非空/空/去重，去重旁附 12 格分布 sparkline，数值列 min/max/avg；缓存元数据+已加载数据，不额外查库；窄屏 < 56 列隐藏 sparkline；/ 过滤列名；Enter 跳到该列；底部动作行 y 复制当前表结构 Markdown（列 / 索引 / 外键；无注释省略注释列）" => Some(
+            "Column-structure popup: name / type / key (PRI/UNI/MUL) / default / nullable / comment; the selected column's value distribution is shown in place (non-null/null/distinct; a 12-cell distribution sparkline beside the distinct count; min/max/avg for a numeric column; cached metadata + loaded rows, no extra query; the sparkline hides below 56 columns; / filters by name; Enter jumps to that column; the bottom action row's y copies the table structure as Markdown (columns / indexes / foreign keys; the comment column is omitted when empty))",
         ),
         // ── R66: `gc` column value distribution (client-side, zero-query) ──
         "值分布" => Some("Value distribution"),
@@ -4617,6 +4652,75 @@ fn en_of(zh: &'static str) -> Option<&'static str> {
         "Esc（执行中）" => Some("Esc (while running)"),
         "执行中 Esc 软取消：立即归还操作权（后台查询不中断，迟到结果静默丢弃）；写语句（INSERT/UPDATE/DELETE/DDL）执行中不可取消，防重发双写" => {
             Some("Esc while running soft-cancels: control returns at once (the background query is not interrupted; a late result is dropped silently). A write (INSERT/UPDATE/DELETE/DDL) cannot be cancelled while running, preventing a double write on re-send")
+        }
+        // ── R100: data dictionary export (table Markdown + full-db doc) ──
+        "列名" => Some("column"),
+        "唯一" => Some("unique"),
+        "外键" => Some("foreign key"),
+        "引用" => Some("references"),
+        "{} 数据字典" => Some("{} data dictionary"),
+        "表数量" => Some("tables"),
+        "引擎方言" => Some("dialect"),
+        "生成时间" => Some("generated at"),
+        "当前没有表结构可复制（查询结果无表元数据）" => {
+            Some("No table structure to copy (a query result has no table metadata)")
+        }
+        "✓ 已复制表结构 Markdown（{} 字符）· 兜底 {}" => {
+            Some("✓ Copied table structure Markdown ({} chars) · fallback {}")
+        }
+        "✓ 已复制表结构 Markdown（{} 字符）" => {
+            Some("✓ Copied table structure Markdown ({} chars)")
+        }
+        "数据字典仅支持 SQL 连接" => Some("The data dictionary supports SQL connections only"),
+        "先连接一个 SQL 连接再按 E 导出数据字典" => {
+            Some("Connect a SQL connection first, then press E to export the data dictionary")
+        }
+        "请先选择一个数据库" => Some("Select a database first"),
+        "数据字典将遍历 {} 张表 · Enter 继续 · Esc 取消" => {
+            Some("The data dictionary will walk {} tables · Enter continue · Esc cancel")
+        }
+        "已取消导出数据字典" => Some("Data-dictionary export cancelled"),
+        "生成数据字典…正在枚举表" => {
+            Some("Generating the data dictionary… enumerating tables")
+        }
+        "正在中止数据字典…" => Some("Aborting the data dictionary…"),
+        "✓ 数据字典已复制到剪贴板（{} 字符）· 兜底 {}" => {
+            Some("✓ Data dictionary copied to the clipboard ({} chars) · fallback {}")
+        }
+        "✓ 数据字典已复制到剪贴板（{} 字符）" => {
+            Some("✓ Data dictionary copied to the clipboard ({} chars)")
+        }
+        "✓ 数据字典已写入 {}（{} 字符）" => {
+            Some("✓ Data dictionary written to {} ({} chars)")
+        }
+        "✗ 数据字典写入失败：{}" => {
+            Some("✗ Failed to write the data dictionary: {}")
+        }
+        "字典生成中 {}/{}" => Some("Building dictionary {}/{}"),
+        "数据字典已生成（{} 表）· Enter 写入 · Esc 取消" => {
+            Some("Data dictionary ready ({} tables) · Enter write · Esc cancel")
+        }
+        "已中止数据字典（未生成任何文件）" => {
+            Some("Data dictionary aborted (no file was written)")
+        }
+        " y 复制表结构 Markdown · Esc 关 " => {
+            Some(" y copy table structure Markdown · Esc close ")
+        }
+        " 查询结果无表元数据，无法复制表结构 · Esc 关 " => {
+            Some(" A query result has no table metadata; cannot copy the structure · Esc close ")
+        }
+        "将为数据库 {} 生成数据字典，共 {} 张表，可能耗时" => {
+            Some("Generate the data dictionary for database {} — {} tables, this may take a while")
+        }
+        "Enter/y 继续   Esc/n 取消" => Some("Enter/y continue   Esc/n cancel"),
+        " ⚠ 生成数据字典确认 " => Some(" ⚠ Confirm data-dictionary generation "),
+        " 导出数据字典 · {} · Enter 写入（留空复制） · Esc 取消 " => {
+            Some(" Export data dictionary · {} · Enter write (blank copies) · Esc cancel ")
+        }
+        " 导出数据字典 · Enter/Esc " => Some(" Export data dictionary · Enter/Esc "),
+        "E（连接树）" => Some("E (connection tree)"),
+        "导出数据字典：顺序读取当前库所有表的列 / 索引 / 外键，拼成一份 Markdown 数据字典（首节库概览：表数 / 引擎方言 / 生成时间），完成后输入文件名（默认 {db}-dictionary.md，留空则复制剪贴板）；>200 表先红色确认，生成中 Esc 软取消并丢弃未完成部分；只读连接可用（纯读，用户显式动作）" => {
+            Some("Export the data dictionary: walk every table of the current database in order and build one Markdown document from its columns / indexes / foreign keys (the first section is the database overview: table count / dialect / generated-at). Then enter a filename (default {db}-dictionary.md; blank copies to the clipboard). More than 200 tables asks for the red confirmation first; Esc during generation soft-cancels and discards the unfinished part; read-only connections are welcome (pure read, an explicit action)")
         }
         _ => None,
     }

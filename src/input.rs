@@ -58,6 +58,15 @@ pub(crate) fn reset_overlays_for_backend_switch(app: &mut App) {
     app.search_input = None;
     app.search_running = false;
     app.search_progress = None;
+    // R100: a data-dictionary walk / prompt / confirmation belongs to the
+    // outgoing backend too.
+    app.dict_cancel.store(true, Ordering::Relaxed);
+    app.dict_gen = app.dict_gen.wrapping_add(1);
+    app.dict_confirm = None;
+    app.dict_prompt = None;
+    app.dict_content = None;
+    app.dict_running = false;
+    app.dict_progress = None;
     // Data compare.
     app.data_cancel.store(true, Ordering::Relaxed);
     app.data_diff_gen = app.data_diff_gen.wrapping_add(1);
@@ -493,6 +502,15 @@ pub(crate) fn browse_key(app: &mut App, tx: &Tx, k: KeyEvent) {
         file_load_plan_key(app, tx, k);
         return;
     }
+    // R100: the data-dictionary confirmation and destination prompt are modal.
+    if app.dict_confirm.is_some() {
+        dict_confirm_key(app, tx, k);
+        return;
+    }
+    if app.dict_prompt.is_some() {
+        dict_prompt_key(app, k);
+        return;
+    }
     if app.export_path.is_some() {
         export_path_key(app, tx, k);
         return;
@@ -826,6 +844,13 @@ pub(crate) fn browse_key(app: &mut App, tx: &Tx, k: KeyEvent) {
         if soft_cancel_active_query(app) {
             return;
         }
+    }
+
+    // R100: Esc while a data-dictionary walk is in flight asks the worker to stop
+    // between tables (the partial document is discarded), the same soft-cancel
+    // contract as a query / global search.
+    if k.code == KeyCode::Esc && k.modifiers.is_empty() && soft_cancel_data_dictionary(app) {
+        return;
     }
 
     // Help works from anywhere except the text inputs (where `?` is a character).
@@ -1686,6 +1711,15 @@ pub(crate) fn sidebar_key(app: &mut App, tx: &Tx, k: KeyEvent) {
             KeyCode::Char('T') => {
                 cycle_tip(app);
             }
+            // R100: `E` (the uppercase twin of the picker's `e` edit) exports the
+            // data dictionary. Nothing is connected yet, so the handler reports
+            // the next step instead of silently doing nothing.
+            KeyCode::Char('E')
+                if !k.modifiers.contains(KeyModifiers::CONTROL)
+                    && !k.modifiers.contains(KeyModifiers::ALT) =>
+            {
+                open_data_dictionary(app, tx);
+            }
             KeyCode::Tab => {
                 app.focus = Focus::Editor;
             }
@@ -1985,6 +2019,17 @@ pub(crate) fn sidebar_key(app: &mut App, tx: &Tx, k: KeyEvent) {
         // effect before a probe). Lowercase `o` stays "back to the picker", so
         // the ordering takes the free uppercase sibling.
         KeyCode::Char('O') => toggle_latency_sort(app),
+        // R100: `E` exports the current database's data dictionary (the free
+        // uppercase twin of the picker's `e`; `Alt-E` is the connection-bundle
+        // export, a different gesture). Read-only connections are welcome — the
+        // walk only reads metadata. Falls through to the type-to-filter below
+        // for a lowercase `e`, which stays an ordinary filter character.
+        KeyCode::Char('E')
+            if !k.modifiers.contains(KeyModifiers::CONTROL)
+                && !k.modifiers.contains(KeyModifiers::ALT) =>
+        {
+            open_data_dictionary(app, tx);
+        }
         // R55: `r` on a connection root / group row renames it in place (Enter
         // saves, Esc cancels). On every other row the long-standing meaning —
         // open the selected table's structure — is unchanged.

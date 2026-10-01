@@ -57,6 +57,7 @@ pub(crate) use uuid::Uuid;
 
 pub(crate) use crate::csv_io::*;
 pub(crate) use crate::diffui::*;
+pub(crate) use crate::docgen::*;
 pub(crate) use crate::editor::*;
 pub(crate) use crate::filter::*;
 pub(crate) use crate::input::*;

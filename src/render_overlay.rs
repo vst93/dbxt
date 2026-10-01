@@ -513,6 +513,49 @@ pub(crate) fn render_snippet_confirm(f: &mut Frame, area: Rect) {
     f.render_widget(Paragraph::new(lines).block(block), box_area);
 }
 
+/// R100: the `>200`-table data-dictionary confirmation (red layer). It is a
+/// dedicated state, not the SQL `Confirm`, so accepting can never run a
+/// statement — it only starts the metadata walk.
+pub(crate) fn render_dict_confirm(f: &mut Frame, area: Rect, app: &mut App) {
+    let Some(c) = app.dict_confirm.as_ref() else {
+        return;
+    };
+    let w = area.width.saturating_sub(4).clamp(30, 72);
+    let inner_w = w.saturating_sub(2) as usize;
+    let mut lines: Vec<Line> = wrap_text(
+        &tf(
+            "将为数据库 {} 生成数据字典，共 {} 张表，可能耗时",
+            &[&c.db, &c.tables],
+        ),
+        inner_w.max(1),
+    )
+    .into_iter()
+    .map(|l| {
+        Line::from(Span::styled(
+            l,
+            Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
+        ))
+    })
+    .collect();
+    lines.push(Line::from(""));
+    lines.push(Line::from(Span::styled(
+        t("Enter/y 继续   Esc/n 取消"),
+        Style::default().fg(Color::DarkGray),
+    )));
+    let h = (lines.len() as u16 + 2).min(area.height.max(3));
+    let box_area = centered_overlay(area, w, h);
+    f.render_widget(Clear, box_area);
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .title(Span::styled(
+            t(" ⚠ 生成数据字典确认 "),
+            Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
+        ))
+        .border_set(border::THICK)
+        .border_style(Style::default().fg(Color::Red));
+    f.render_widget(Paragraph::new(lines).block(block), box_area);
+}
+
 /// Ctrl-Shift-H column-visibility overlay: space toggles the highlighted column,
 /// `a` shows all, `x` keeps only the first. Changes apply live behind the popup.
 /// R48 `gc`: the column-structure mini popup. A compact, scrollable list of the
@@ -571,12 +614,14 @@ pub(crate) fn render_cols_popup(f: &mut Frame, area: Rect, app: &mut App) {
             show_spark,
         )
     };
+    // R100: one extra line at the bottom for the action row (`y` copy table
+    // structure Markdown), always visible so the gesture is self-documenting.
     let total_lines = if stats_lines.is_empty() {
-        rows.len().max(1)
+        rows.len().max(1) + 1
     } else if side_by_side {
-        rows.len().max(1).max(stats_lines.len())
+        rows.len().max(1).max(stats_lines.len()) + 1
     } else {
-        rows.len().max(1) + stats_lines.len() + 1
+        rows.len().max(1) + stats_lines.len() + 2
     };
     let (y, h) = overlay_list_box(total_lines, area);
     let x = area.x + (area.width.saturating_sub(w)) / 2;
@@ -609,8 +654,21 @@ pub(crate) fn render_cols_popup(f: &mut Frame, area: Rect, app: &mut App) {
         .title(fit_title(&full, t(" 列结构 · j/k · Esc "), box_area.width))
         .border_set(border::ROUNDED)
         .border_style(Style::default().fg(Color::Cyan));
-    let inner = block.inner(box_area);
+    let full_inner = block.inner(box_area);
     f.render_widget(block, box_area);
+    // R100: reserve the bottom interior line for the action row, then split the
+    // rest exactly as before (side by side / stacked).
+    let action_h = full_inner.height.min(1);
+    let inner = Rect {
+        height: full_inner.height.saturating_sub(action_h),
+        ..full_inner
+    };
+    let action_area = Rect {
+        x: full_inner.x,
+        y: full_inner.y + inner.height,
+        width: full_inner.width,
+        height: action_h,
+    };
     // Split the interior. Side by side keeps the list and the stats visible at
     // once; stacked reserves the bottom for the stats and lets the list scroll.
     let (list_area, stats_area) = if stats_lines.is_empty() {
@@ -713,6 +771,23 @@ pub(crate) fn render_cols_popup(f: &mut Frame, area: Rect, app: &mut App) {
     );
     if let Some(sa) = stats_area {
         f.render_widget(Paragraph::new(stats_lines), sa);
+    }
+    // R100: the action row. It names the key and, when the open grid has no
+    // table metadata (a bare query result), says so instead of promising a copy
+    // that cannot happen.
+    if action_area.height > 0 {
+        let hint = if app.table_meta.is_some() {
+            t(" y 复制表结构 Markdown · Esc 关 ")
+        } else {
+            t(" 查询结果无表元数据，无法复制表结构 · Esc 关 ")
+        };
+        f.render_widget(
+            Paragraph::new(Line::from(Span::styled(
+                hint,
+                Style::default().fg(Color::DarkGray),
+            ))),
+            action_area,
+        );
     }
 }
 
