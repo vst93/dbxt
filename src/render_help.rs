@@ -1767,10 +1767,14 @@ pub(crate) const HELP_ROWS: &[(&str, &str)] = &[    ("— 全局 —", ""),
     ),
     ("Alt-R", "最近表直达浮层"),
     ("t", "字段 ↔ DDL（表结构）"),
+    (
+        "D",
+        "导出当前表完整 DDL：按方言取源（MySQL SHOW CREATE TABLE / SQLite sqlite_master，PG / SQL Server / Oracle 走内核单表 DDL），弹层显示完整可执行脚本；y 复制、Ctrl-Y 存为 <表名>.sql、Esc 关；仅显式按键才发这一条源语句（g c 弹层内 D 同入口）",
+    ),
     ("g d / g t", "跳表结构视图 / 回表数据"),
     (
         "g c",
-        "列结构弹层：列名 / 类型 / 键(PRI/UNI/MUL) / 默认值 / 可空 / 注释；右侧就地显示选中列的值分布（非空/空/去重，去重旁附 12 格分布 sparkline，数值列 min/max/avg；缓存元数据+已加载数据，不额外查库；窄屏 < 56 列隐藏 sparkline；/ 过滤列名；Enter 跳到该列；n 编辑选中列注释（PG/通用 COMMENT ON COLUMN，MySQL 列注释只读提示）；底部动作行 y 复制当前表结构 Markdown（列 / 索引 / 外键；无注释省略注释列）",
+        "列结构弹层：列名 / 类型 / 键(PRI/UNI/MUL) / 默认值 / 可空 / 注释；右侧就地显示选中列的值分布（非空/空/去重，去重旁附 12 格分布 sparkline，数值列 min/max/avg；缓存元数据+已加载数据，不额外查库；窄屏 < 56 列隐藏 sparkline；/ 过滤列名；Enter 跳到该列；n 编辑选中列注释（PG/通用 COMMENT ON COLUMN，MySQL 列注释只读提示）；底部动作行 y 复制当前表结构 Markdown、D 导出完整 DDL（列 / 索引 / 外键；无注释省略注释列）",
     ),
     (
         "c（表结构视图）",

@@ -777,15 +777,89 @@ pub(crate) fn render_cols_popup(f: &mut Frame, area: Rect, app: &mut App) {
     // that cannot happen.
     if action_area.height > 0 {
         let hint: String = if app.table_meta.is_none() {
-            t(" 查询结果无表元数据，无法复制表结构 · Esc 关 ").to_string()
+            t(" 查询结果无表元数据 · D 完整DDL · Esc 关 ").to_string()
         } else if column_comment_editable(app) {
-            t(" n 编辑列注释 · y 复制表结构 Markdown · Esc 关 ").to_string()
+            t(" n 编辑列注释 · y 复制表结构 Markdown · D 完整DDL · Esc 关 ").to_string()
         } else {
             match column_comment_hint(app) {
-                Some(note) => tf(" y 复制表结构 Markdown · {} · Esc 关 ", &[&note]),
-                None => t(" y 复制表结构 Markdown · Esc 关 ").to_string(),
+                Some(note) => tf(" y 复制表结构 Markdown · D 完整DDL · {} · Esc 关 ", &[&note]),
+                None => t(" y 复制表结构 Markdown · D 完整DDL · Esc 关 ").to_string(),
             }
         };
+        f.render_widget(
+            Paragraph::new(Line::from(Span::styled(
+                hint,
+                Style::default().fg(Color::DarkGray),
+            ))),
+            action_area,
+        );
+    }
+}
+
+/// R107: the modal complete-DDL popup (`D`). The body is the DDL exactly as the
+/// dialect source statement returned it, wrapped to the box width; the bottom
+/// action row names the copy / save keys, and the title carries the table and
+/// line count. Same rounded cyan style as the other overlays.
+pub(crate) fn render_ddl_popup(f: &mut Frame, area: Rect, app: &mut App) {
+    let Some(popup) = app.ddl_popup.as_ref() else {
+        return;
+    };
+    let w = if area.width < 48 {
+        area.width
+    } else {
+        area.width.min(110)
+    };
+    let inner_w = w.saturating_sub(2).max(1) as usize;
+    let lines = wrap_text(&popup.text, inner_w);
+    let total = lines.len();
+    // Leave a one-line margin top / bottom when the screen allows it.
+    let max_h = area.height.saturating_sub(2).max(3);
+    let want = (total as u16).saturating_add(3).max(5);
+    let h = want.min(max_h).min(area.height);
+    let box_area = centered_overlay(area, w, h);
+    f.render_widget(Clear, box_area);
+    let table = fix_double_encoding(&popup.table);
+    let label = qualified_display(&popup.schema, &table);
+    let full = tf(
+        " 完整 DDL · {} · {} 行 · y 复制 · Ctrl-Y 存文件 · Esc 关 ",
+        &[&label, &total],
+    );
+    let short = t(" 完整 DDL · Esc 关 ");
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .title(fit_title(&full, short, box_area.width))
+        .border_set(border::ROUNDED)
+        .border_style(Style::default().fg(Color::Cyan));
+    let inner = block.inner(box_area);
+    f.render_widget(block, box_area);
+    // The bottom interior line is the action row (mirrors the `g c` popup).
+    let action_h = inner.height.min(1);
+    let body_h = inner.height.saturating_sub(action_h);
+    let body_area = Rect {
+        height: body_h,
+        ..inner
+    };
+    let action_area = Rect {
+        y: inner.y + body_h,
+        height: action_h,
+        ..inner
+    };
+    let max_scroll = total
+        .saturating_sub(body_h as usize)
+        .min(u16::MAX as usize) as u16;
+    let scroll = app
+        .ddl_popup
+        .as_ref()
+        .map(|p| p.scroll)
+        .unwrap_or(0)
+        .min(max_scroll);
+    if let Some(p) = app.ddl_popup.as_mut() {
+        p.scroll = scroll;
+    }
+    let body: Vec<Line> = lines.into_iter().map(Line::raw).collect();
+    f.render_widget(Paragraph::new(body).scroll((scroll, 0)), body_area);
+    if action_area.height > 0 {
+        let hint = tf(" y 复制 · Ctrl-Y 存为 {}.sql · Esc 关 ", &[&label]);
         f.render_widget(
             Paragraph::new(Line::from(Span::styled(
                 hint,

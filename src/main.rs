@@ -6,6 +6,7 @@ mod ui_text;
 
 mod comments;
 mod csv_io;
+mod ddl_export;
 mod diffui;
 mod docgen;
 mod editor;
@@ -271,6 +272,9 @@ enum Op {
     ListTables(Box<ConnectionConfig>, String, String, u64),
     Columns(Box<ConnectionConfig>, String, String, String),
     Ddl(Box<ConnectionConfig>, String, String, String),
+    /// R107: the explicit complete-DDL fetch behind `D` (dialect source
+    /// statement, or the kernel's single-table DDL path).
+    TableDdl(Box<ConnectionConfig>, String, String, String),
     /// R102: best-effort read of one table's comment for the structure view.
     TableComment(Box<ConnectionConfig>, String, String, String),
     TableData(Box<TableDataReq>),
@@ -671,6 +675,16 @@ enum OpResult {
         table: String,
         schema: String,
         text: String,
+    },
+    /// R107: the complete-DDL reply behind `D`. `text` is `Some` on success;
+    /// `error` is `Some` (and `text` `None`) when the fetch failed, so a
+    /// permission / unsupported-object failure is never rendered as a half
+    /// statement.
+    TableDdl {
+        table: String,
+        schema: String,
+        text: Option<String>,
+        error: Option<String>,
     },
     /// R102: a table's comment (best-effort; `None` = none / read failed).
     TableComment {
@@ -1873,6 +1887,50 @@ async fn run_op(backend: &LocalBackend, op: Op, tx: &Tx) -> OpResult {
                     schema,
                     text: tf("-- 无法获取 DDL: {}", &[&(e)]),
                 },
+            }
+        }
+        Op::TableDdl(cfg, db, schema, table) => {
+            // R107: the explicit `D` fetch. MySQL / SQLite issue their plain
+            // source statement and take the DDL cell; every other dialect goes
+            // through the kernel's single-table DDL path. The result is a
+            // `Result`, so a failure is reported instead of rendered.
+            let effective = if schema.trim().is_empty() && is_postgres_family(cfg.db_type.as_str())
+            {
+                resolve_ddl_schema(backend, &cfg, &db, &table).await
+            } else {
+                schema.clone()
+            };
+            let outcome: std::result::Result<String, String> =
+                match table_source_sql(cfg.db_type, &db, &effective, &table) {
+                    Some(sql) => match backend
+                        .execute_query(&cfg, &db, &sql, Some(1), Some(30))
+                        .await
+                    {
+                        Ok(r) => ddl_from_rows(cfg.db_type, &r.rows),
+                        Err(e) => Err(e),
+                    },
+                    None => {
+                        dbx_core::schema::get_table_ddl_core(
+                            backend.state().as_ref(),
+                            &cfg.id,
+                            &db,
+                            &effective,
+                            &table,
+                            None,
+                        )
+                        .await
+                    }
+                };
+            let (text, error) = match outcome {
+                Ok(ddl) if !ddl.trim().is_empty() => (Some(ddl), None),
+                Ok(_) => (None, Some(t("DDL 结果为空").to_string())),
+                Err(e) => (None, Some(e)),
+            };
+            OpResult::TableDdl {
+                table,
+                schema,
+                text,
+                error,
             }
         }
         Op::TableComment(cfg, db, schema, table) => {
@@ -4969,6 +5027,8 @@ impl App {
             ddl: None,
             struct_view: StructView::Fields,
             ddl_scroll: 0,
+            ddl_popup: None,
+            ddl_popup_pending: None,
             table_comment: None,
             table_comment_loaded: false,
             comment_edit: None,
@@ -6186,6 +6246,12 @@ fn apply_op_result(app: &mut App, res: OpResult, tx: &Tx) {
                 app.ddl_scroll = 0;
             }
         }
+        OpResult::TableDdl {
+            table,
+            schema,
+            text,
+            error,
+        } => apply_ddl_popup_result(app, table, schema, text, error),
         OpResult::TableComment {
             table,
             schema,

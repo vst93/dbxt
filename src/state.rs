@@ -206,6 +206,25 @@ pub(crate) struct MaterializePlan {
     pub(crate) ctas_sql: String,
 }
 
+/// R107: the modal complete-DDL popup (`D` in the structure view / the `g c`
+/// popup). `text` is the DDL exactly as the dialect source statement returned
+/// it; `scroll` is the first visible wrapped line.
+#[derive(Clone)]
+pub(crate) struct DdlPopup {
+    pub(crate) table: String,
+    pub(crate) schema: String,
+    pub(crate) text: String,
+    pub(crate) scroll: u16,
+}
+
+/// R107: the in-flight `D` fetch. Kept as the guard so a late reply for a table
+/// the user has navigated away from is dropped instead of shown.
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub(crate) struct DdlRequest {
+    pub(crate) table: String,
+    pub(crate) schema: String,
+}
+
 // ─── cell values ─────────────────────────────────────────────────────────────
 
 /// A result cell. NULL is kept distinct from the empty string so the grid can
@@ -2286,6 +2305,10 @@ pub(crate) struct App {
     pub(crate) ddl: Option<String>,
     pub(crate) struct_view: StructView,
     pub(crate) ddl_scroll: u16,
+    /// R107: the modal complete-DDL popup (`D`), and the in-flight fetch it is
+    /// waiting on (both cleared when the popup closes).
+    pub(crate) ddl_popup: Option<DdlPopup>,
+    pub(crate) ddl_popup_pending: Option<DdlRequest>,
     /// R102: the open table's comment, read best-effort when the structure view
     /// loads. `None` renders as `—`; a read failure simply leaves it unset.
     pub(crate) table_comment: Option<String>,

@@ -1287,6 +1287,7 @@ pub(crate) fn every_call_site_has_english() {
         include_str!("../transfer.rs"),
         include_str!("../textutil.rs"),
         include_str!("../csv_io.rs"),
+        include_str!("../ddl_export.rs"),
         include_str!("../sqlite_open.rs"),
         include_str!("../redis.rs"),
         include_str!("../tui_config.rs"),
@@ -12199,7 +12200,7 @@ pub(crate) fn r100_cols_popup_action_row_renders_at_both_sizes() {
     open_cols_popup(&mut app);
     let joined = draw(&mut app, 110, 30).join("\n").replace(' ', "");
     assert!(
-        joined.contains("无法复制表结构"),
+        joined.contains("无表元数据"),
         "no-metadata hint missing: {joined}"
     );
 }
@@ -12833,7 +12834,7 @@ pub(crate) fn r102_help_documents_comment_editing() {
         "该引擎列注释暂不支持就地编辑",
         "注释确认 · Enter 执行 · Esc 取消",
         " · c 编辑注释",
-        " n 编辑列注释 · y 复制表结构 Markdown · Esc 关 ",
+        " n 编辑列注释 · y 复制表结构 Markdown · D 完整DDL · Esc 关 ",
     ] {
         assert_ne!(t_lang(k, Lang::En), k, "missing English for {k:?}");
     }
@@ -14224,4 +14225,331 @@ pub(crate) fn r106_r105_xlsx_minimal_single_column_all_null_single_row() {
     assert!(sheet.contains("<row r=\"1\""), "{sheet}");
     assert!(sheet.contains("<row r=\"2\""), "{sheet}");
     assert!(!sheet.contains("<row r=\"3\""), "no phantom third row: {sheet}");
+}
+
+// ── R107: complete single-table DDL export (SHOW CREATE family) ──────────────
+
+/// R107: the source statement is dialect-specific — MySQL qualifies with the
+/// database (backticks), SQLite reads `sqlite_master` (single-quoted name);
+/// PostgreSQL / SQL Server / Oracle have catalog-driven source SQL, so they
+/// delegate to the kernel and produce no one-liner here.
+#[test]
+pub(crate) fn r107_table_source_sql_is_dialect_specific() {
+    assert_eq!(
+        table_source_sql(DatabaseType::Mysql, "shop", "", "orders").unwrap(),
+        "SHOW CREATE TABLE `shop`.`orders`"
+    );
+    // A schema layer wins over the database for the qualifier.
+    assert_eq!(
+        table_source_sql(DatabaseType::Mysql, "shop", "sales", "orders").unwrap(),
+        "SHOW CREATE TABLE `sales`.`orders`"
+    );
+    // Identifiers are escaped, never interpolated raw.
+    assert_eq!(
+        table_source_sql(DatabaseType::Mysql, "shop", "", "order`s").unwrap(),
+        "SHOW CREATE TABLE `shop`.`order``s`"
+    );
+
+    assert_eq!(
+        table_source_sql(DatabaseType::Sqlite, "", "", "orders").unwrap(),
+        "SELECT sql FROM \"main\".sqlite_master WHERE type = 'table' AND name = 'orders'"
+    );
+    let named = table_source_sql(DatabaseType::Sqlite, "", "att", "o'rder").unwrap();
+    assert!(named.contains("\"att\".sqlite_master"), "{named}");
+    assert!(named.contains("name = 'o''rder'"), "{named}");
+
+    for db in [
+        DatabaseType::Postgres,
+        DatabaseType::SqlServer,
+        DatabaseType::Oracle,
+    ] {
+        assert!(
+            table_source_sql(db, "db", "public", "orders").is_none(),
+            "{db:?} should delegate to the kernel"
+        );
+    }
+}
+
+/// R107: the kernel's source-SQL family is directly queryable — the same
+/// builders the kernel uses for its object DDL. This pins the contract the
+/// export relies on without a live server.
+#[test]
+pub(crate) fn r107_kernel_source_sql_family_is_directly_queryable() {
+    use dbx_core::types::ObjectSourceKind;
+    let view = ObjectSourceKind::View;
+    assert_eq!(
+        dbx_core::schema::mysql_object_source_sql("shop", "v_orders", &view),
+        "SHOW CREATE VIEW `shop`.`v_orders`"
+    );
+    assert!(
+        dbx_core::schema::sqlite_object_source_sql("main", "v_orders", &view)
+            .contains("sqlite_master"),
+        "sqlite source SQL should read sqlite_master"
+    );
+    assert!(
+        dbx_core::schema::postgres_object_source_sql("public", "v_orders", &view, None)
+            .contains("pg_get_viewdef"),
+        "postgres source SQL should read pg_get_viewdef"
+    );
+    assert!(
+        dbx_core::schema::sqlserver_object_source_sql("dbo", "v_orders", &view)
+            .contains("sys.sql_modules"),
+        "sqlserver source SQL should read sys.sql_modules"
+    );
+    assert!(
+        dbx_core::schema::oracle_object_source_sql("HR", "V_ORDERS", &view)
+            .contains("DBMS_METADATA.GET_DDL"),
+        "oracle source SQL should read DBMS_METADATA.GET_DDL"
+    );
+}
+
+/// R107: MySQL's `SHOW CREATE TABLE` returns `(Table, Create Table)` so the DDL
+/// is the second column; SQLite's single-column query takes the first.
+#[test]
+pub(crate) fn r107_ddl_from_rows_picks_the_ddl_column() {
+    use serde_json::json;
+    let mysql = vec![vec![json!("orders"), json!("CREATE TABLE `orders` (`id` int)")]];
+    assert_eq!(
+        ddl_from_rows(DatabaseType::Mysql, &mysql).unwrap(),
+        "CREATE TABLE `orders` (`id` int)"
+    );
+    let sqlite = vec![vec![json!("CREATE TABLE orders (`id` int)")]];
+    assert_eq!(
+        ddl_from_rows(DatabaseType::Sqlite, &sqlite).unwrap(),
+        "CREATE TABLE orders (`id` int)"
+    );
+}
+
+/// R107: empty / missing-column / blank replies are errors (never a half
+/// statement); extra rows are tolerated and the first wins.
+#[test]
+pub(crate) fn r107_ddl_from_rows_tolerates_empty_missing_and_extra_rows() {
+    use serde_json::json;
+    assert!(ddl_from_rows(DatabaseType::Mysql, &[]).is_err(), "empty reply");
+    assert!(
+        ddl_from_rows(DatabaseType::Mysql, &[vec![json!("orders")]]).is_err(),
+        "missing the DDL column"
+    );
+    assert!(
+        ddl_from_rows(DatabaseType::Sqlite, &[vec![json!("   ")]]).is_err(),
+        "blank DDL"
+    );
+    let rows = vec![
+        vec![json!("CREATE TABLE a (x int)")],
+        vec![json!("CREATE TABLE b (y int)")],
+    ];
+    assert_eq!(
+        ddl_from_rows(DatabaseType::Sqlite, &rows).unwrap(),
+        "CREATE TABLE a (x int)"
+    );
+}
+
+/// R107: the popup renders the wrapped DDL at a phone (42x22) and a desktop
+/// (110x30) size without clipping through the title or panicking.
+#[test]
+pub(crate) fn r107_ddl_popup_renders_at_both_sizes() {
+    let ddl = "CREATE TABLE `orders` (\n  `id` int NOT NULL,\n  `total` decimal(10,2) DEFAULT NULL,\n  PRIMARY KEY (`id`)\n) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4";
+    for (w, h) in [(42u16, 22u16), (110, 30)] {
+        let mut app = test_app();
+        app.ddl_popup = Some(DdlPopup {
+            table: "orders".into(),
+            schema: "shop".into(),
+            text: ddl.into(),
+            scroll: 0,
+        });
+        let screen: String = draw(&mut app, w, h)
+            .join("\n")
+            .chars()
+            .filter(|c| !c.is_whitespace())
+            .collect();
+        assert!(screen.contains("orders"), "table missing at {w}x{h}");
+        assert!(screen.contains("CREATETABLE"), "DDL missing at {w}x{h}");
+        assert!(screen.contains("完整DDL"), "title missing at {w}x{h}");
+    }
+}
+
+/// R107: `y` copies the DDL exactly as fetched (no re-formatting), and the
+/// `Ctrl-Y` default filename is the sanitised table name + `.sql`.
+#[test]
+pub(crate) fn r107_ddl_popup_copy_text_is_the_original_ddl() {
+    let ddl = "CREATE TABLE `orders` (\n  `id` int NOT NULL\n)";
+    let mut app = test_app();
+    app.ddl_popup = Some(DdlPopup {
+        table: "orders".into(),
+        schema: String::new(),
+        text: ddl.into(),
+        scroll: 0,
+    });
+    assert_eq!(ddl_popup_copy_text(&app).as_deref(), Some(ddl));
+    assert_eq!(ddl_default_filename("orders"), "orders.sql");
+    assert_eq!(ddl_default_filename("a b/c"), "a_b_c.sql");
+    assert_eq!(ddl_default_filename(""), "table.sql");
+}
+
+/// R107: the popup keymap scrolls and closes; the async reply opens the popup,
+/// reports a failure, and drops a reply for a table the user left.
+#[test]
+pub(crate) fn r107_ddl_popup_keys_and_reply_routing() {
+    let mut app = test_app();
+    app.ddl_popup = Some(DdlPopup {
+        table: "orders".into(),
+        schema: String::new(),
+        text: "a\nb\nc".into(),
+        scroll: 0,
+    });
+    ddl_popup_key(&mut app, KeyEvent::new(KeyCode::Char('j'), KeyModifiers::NONE));
+    assert_eq!(app.ddl_popup.as_ref().unwrap().scroll, 1);
+    ddl_popup_key(
+        &mut app,
+        KeyEvent::new(KeyCode::PageDown, KeyModifiers::NONE),
+    );
+    assert_eq!(app.ddl_popup.as_ref().unwrap().scroll, 11);
+    ddl_popup_key(&mut app, KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+    assert!(app.ddl_popup.is_none());
+
+    // Success opens the popup and clears the pending guard.
+    app.ddl_popup_pending = Some(DdlRequest {
+        table: "orders".into(),
+        schema: "shop".into(),
+    });
+    apply_ddl_popup_result(
+        &mut app,
+        "orders".into(),
+        "shop".into(),
+        Some("CREATE TABLE orders (id int)".into()),
+        None,
+    );
+    assert!(app.ddl_popup.is_some());
+    assert!(app.ddl_popup_pending.is_none());
+
+    // A failure reports instead of opening a half statement.
+    app.ddl_popup = None;
+    app.ddl_popup_pending = Some(DdlRequest {
+        table: "orders".into(),
+        schema: "shop".into(),
+    });
+    apply_ddl_popup_result(
+        &mut app,
+        "orders".into(),
+        "shop".into(),
+        None,
+        Some("permission denied".into()),
+    );
+    assert!(app.ddl_popup.is_none());
+    assert!(app.status.contains("无法获取完整 DDL"), "{}", app.status);
+
+    // A reply for a table the user navigated away from is dropped.
+    app.ddl_popup_pending = Some(DdlRequest {
+        table: "users".into(),
+        schema: "shop".into(),
+    });
+    apply_ddl_popup_result(
+        &mut app,
+        "orders".into(),
+        "shop".into(),
+        Some("CREATE TABLE orders (id int)".into()),
+        None,
+    );
+    assert!(app.ddl_popup.is_none());
+}
+
+/// R107: `D` inside the `g c` popup closes it and opens the same complete-DDL
+/// entry (the pending fetch), so the two surfaces share one action.
+#[test]
+pub(crate) fn r107_gc_popup_d_opens_the_ddl_entry() {
+    run_rt(|| {
+        let tx = test_tx();
+        let mut app = test_app();
+        app.picker_open = false;
+        app.selected = Some(test_conn("mysql"));
+        app.backend_kind = Backend::Sql;
+        app.grid_kind = GridKind::TableData;
+        app.set_grid(sample_grid());
+        app.tables = vec![table_info("orders", "TABLE")];
+        app.tables_all = app.tables.clone();
+        app.table_list.select(Some(0));
+        app.table_meta = Some(TableMeta {
+            table: "orders".into(),
+            schema: String::new(),
+            columns: vec![col_info("id", "int")],
+            indexes: Vec::new(),
+            foreign_keys: Vec::new(),
+        });
+        open_cols_popup(&mut app);
+        assert!(app.cols_popup_open);
+        cols_popup_key(
+            &mut app,
+            &tx,
+            KeyEvent::new(KeyCode::Char('D'), KeyModifiers::NONE),
+        );
+        assert!(!app.cols_popup_open, "D closes the column popup");
+        assert!(
+            app.ddl_popup_pending.is_some(),
+            "D starts the complete-DDL fetch"
+        );
+    });
+}
+
+/// R107: the help surfaces stay in sync — a full-help row, the `g c` row's
+/// mention, the results footer, the popup footer, and both README keymaps.
+#[test]
+pub(crate) fn r107_ddl_export_is_documented_in_help_and_footer() {
+    assert!(
+        HELP_ROWS
+            .iter()
+            .any(|(k, d)| *k == "D" && d.contains("完整 DDL")),
+        "full help missing the D row"
+    );
+    assert!(
+        HELP_ROWS
+            .iter()
+            .any(|(k, d)| *k == "g c" && d.contains("D 导出完整 DDL")),
+        "the g c row should advertise the D entry"
+    );
+
+    let preview = footer_hints_ctx(FooterCtx {
+        view: FooterView::Browse,
+        focus: Focus::Preview,
+        has_connection: true,
+    });
+    assert!(
+        preview.iter().any(|(k, _)| *k == "D"),
+        "results footer missing D: {preview:?}"
+    );
+    let popup = footer_hints_ctx(FooterCtx {
+        view: FooterView::DdlPopup,
+        focus: Focus::Preview,
+        has_connection: true,
+    });
+    let keys: Vec<&str> = popup.iter().map(|(k, _)| *k).collect();
+    for k in ["y", "Ctrl-Y", "Esc"] {
+        assert!(keys.contains(&k), "DDL popup footer missing {k:?}: {keys:?}");
+    }
+
+    // Every new literal translates.
+    for zh in [
+        "完整DDL",
+        "存文件",
+        "复制 DDL",
+        " 完整 DDL · Esc 关 ",
+        "已关闭完整 DDL",
+        "DDL 结果为空",
+    ] {
+        let leaked: &'static str = Box::leak(zh.to_string().into_boxed_str());
+        assert_ne!(
+            ui_text::t_lang(leaked, ui_text::Lang::En),
+            zh,
+            "missing English for {zh:?}"
+        );
+    }
+
+    // Both READMEs document the key in their keymap.
+    assert!(
+        include_str!("../../README.md").contains("`D`"),
+        "English README missing the D key"
+    );
+    assert!(
+        include_str!("../../README.zh-CN.md").contains("`D`"),
+        "Chinese README missing the D key"
+    );
 }

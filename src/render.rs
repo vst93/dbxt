@@ -68,6 +68,11 @@ pub(crate) fn ui(f: &mut Frame, app: &mut App) {
     if app.cols_popup_open {
         render_cols_popup(f, f.area(), app);
     }
+    // R107: the complete-DDL popup (`D`) draws above the `g c` popup it can be
+    // opened from; the two never coexist (opening it closes the column popup).
+    if app.ddl_popup.is_some() {
+        render_ddl_popup(f, f.area(), app);
+    }
     // R75: the sidebar table-node info card (`i`) draws over the grid but under
     // the taller overlays below, matching its dispatch order.
     if app.table_info_open {
@@ -927,6 +932,8 @@ pub(crate) enum FooterView {
     ColPicker,
     /// R75: the sidebar table-node info card (`i`).
     TableInfo,
+    /// R107: the modal complete-DDL popup (`D`).
+    DdlPopup,
     ConnPicker,
     NewConn,
     RedisKeys,
@@ -1088,6 +1095,8 @@ pub(crate) fn footer_ctx_inner(app: &App, include_help: bool) -> FooterCtx {
         FooterView::TableJump
     } else if app.col_picker_open {
         FooterView::ColPicker
+    } else if app.ddl_popup.is_some() {
+        FooterView::DdlPopup
     } else if app.table_info_open {
         FooterView::TableInfo
     } else if app.page == Page::NewConn {
@@ -1269,6 +1278,13 @@ pub(crate) fn footer_hints_ctx(ctx: FooterCtx) -> Vec<Hint> {
             ("Esc", t("关闭")),
         ],
         FooterView::TableInfo => vec![("↑↓", t("滚动")), ("Esc", t("关闭"))],
+        // R107: the modal complete-DDL popup.
+        FooterView::DdlPopup => vec![
+            ("↑↓", t("滚动")),
+            ("y", t("复制 DDL")),
+            ("Ctrl-Y", t("存文件")),
+            ("Esc", t("关闭")),
+        ],
         FooterView::Completion => vec![
             ("↑↓", t("选择")),
             ("Tab/Enter", t("上屏")),
@@ -1528,6 +1544,8 @@ pub(crate) fn footer_hints_ctx(ctx: FooterCtx) -> Vec<Hint> {
                 ("gW", t("全列适配")),
                 // R103: materialize the result set as a table (CTAS).
                 ("gm", t("物化成表")),
+                // R107: the complete-DDL popup for the open table.
+                ("D", t("完整DDL")),
                 ("[ ]", t("切标签")),
                 ("Alt-W", t("关标签")),
                 ("Alt-O", t("语句耗时")),

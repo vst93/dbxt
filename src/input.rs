@@ -771,7 +771,13 @@ pub(crate) fn browse_key(app: &mut App, tx: &Tx, k: KeyEvent) {
 
     // R48: the `gc` column-structure popup is modal too.
     if app.cols_popup_open {
-        cols_popup_key(app, k);
+        cols_popup_key(app, tx, k);
+        return;
+    }
+
+    // R107: the complete-DDL popup (`D`) is modal on top of everything else.
+    if app.ddl_popup.is_some() {
+        ddl_popup_key(app, k);
         return;
     }
 

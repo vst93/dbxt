@@ -1682,8 +1682,8 @@ pub static ALL_KEYS: &[&str] = &[
     "字典生成中 {}/{}",
     "数据字典已生成（{} 表）· Enter 写入 · Esc 取消",
     "已中止数据字典（未生成任何文件）",
-    " y 复制表结构 Markdown · Esc 关 ",
-    " 查询结果无表元数据，无法复制表结构 · Esc 关 ",
+    " y 复制表结构 Markdown · D 完整DDL · Esc 关 ",
+    " 查询结果无表元数据 · D 完整DDL · Esc 关 ",
     "将为数据库 {} 生成数据字典，共 {} 张表，可能耗时",
     "Enter/y 继续   Esc/n 取消",
     " ⚠ 生成数据字典确认 ",
@@ -4797,11 +4797,11 @@ fn en_of(zh: &'static str) -> Option<&'static str> {
         "已中止数据字典（未生成任何文件）" => {
             Some("Data dictionary aborted (no file was written)")
         }
-        " y 复制表结构 Markdown · Esc 关 " => {
-            Some(" y copy table structure Markdown · Esc close ")
+        " y 复制表结构 Markdown · D 完整DDL · Esc 关 " => {
+            Some(" y copy table structure Markdown · D full DDL · Esc close ")
         }
-        " 查询结果无表元数据，无法复制表结构 · Esc 关 " => {
-            Some(" A query result has no table metadata; cannot copy the structure · Esc close ")
+        " 查询结果无表元数据 · D 完整DDL · Esc 关 " => {
+            Some(" A query result has no table metadata · D full DDL · Esc close ")
         }
         "将为数据库 {} 生成数据字典，共 {} 张表，可能耗时" => {
             Some("Generate the data dictionary for database {} — {} tables, this may take a while")
@@ -4887,20 +4887,20 @@ fn en_of(zh: &'static str) -> Option<&'static str> {
         " 表结构 · {} · 注释: {}{} · t 查看 DDL " => {
             Some(" Structure · {} · comment: {}{} · t view DDL ")
         }
-        " n 编辑列注释 · y 复制表结构 Markdown · Esc 关 " => {
-            Some(" n edit column comment · y copy table structure Markdown · Esc close ")
+        " n 编辑列注释 · y 复制表结构 Markdown · D 完整DDL · Esc 关 " => {
+            Some(" n edit column comment · y copy table structure Markdown · D full DDL · Esc close ")
         }
         "只读连接，列注释只读" => Some("Read-only connection; column comments are read-only"),
         "SQLite 无注释，列注释只读" => Some("SQLite has no comments; column comments are read-only"),
-        " y 复制表结构 Markdown · {} · Esc 关 " => {
-            Some(" y copy table structure Markdown · {} · Esc close ")
+        " y 复制表结构 Markdown · D 完整DDL · {} · Esc 关 " => {
+            Some(" y copy table structure Markdown · D full DDL · {} · Esc close ")
         }
         "c（表结构视图）" => Some("c (structure view)"),
         "编辑当前表注释：预填当前注释的输入框，Enter 生成 COMMENT ON / ALTER TABLE … COMMENT 并进写确认管线（绝不静默执行）；留空清除（PG 为 IS NULL，MySQL 为 ''）；只读连接 / SQLite 隐藏该动作，表头显示当前注释（无则 —）" => {
             Some("Edit the current table's comment: an input prefilled with the current comment; Enter generates COMMENT ON / ALTER TABLE … COMMENT and routes it through the write confirmation pipeline (never run silently). A blank value clears it (IS NULL on PostgreSQL, '' on MySQL). The action is hidden on a read-only connection / SQLite, and the header shows the current comment (— when none).")
         }
-        "列结构弹层：列名 / 类型 / 键(PRI/UNI/MUL) / 默认值 / 可空 / 注释；右侧就地显示选中列的值分布（非空/空/去重，去重旁附 12 格分布 sparkline，数值列 min/max/avg；缓存元数据+已加载数据，不额外查库；窄屏 < 56 列隐藏 sparkline；/ 过滤列名；Enter 跳到该列；n 编辑选中列注释（PG/通用 COMMENT ON COLUMN，MySQL 列注释只读提示）；底部动作行 y 复制当前表结构 Markdown（列 / 索引 / 外键；无注释省略注释列）" => {
-            Some("Column-structure popup: name / type / key (PRI/UNI/MUL) / default / nullable / comment; the right pane shows the highlighted column's value distribution in place (non-null / null / distinct, with a 12-cell distribution sparkline next to the distinct count, and min/max/avg for numeric columns; cached metadata + loaded data, no extra query; a narrow screen under 56 columns hides the sparkline). / filters by column name; Enter jumps to the column; n edits the highlighted column's comment (COMMENT ON COLUMN on PostgreSQL / the generic form, a read-only note on MySQL columns); the bottom action row y copies the current table structure as Markdown (columns / indexes / foreign keys; the comment column is omitted when there are none).")
+        "列结构弹层：列名 / 类型 / 键(PRI/UNI/MUL) / 默认值 / 可空 / 注释；右侧就地显示选中列的值分布（非空/空/去重，去重旁附 12 格分布 sparkline，数值列 min/max/avg；缓存元数据+已加载数据，不额外查库；窄屏 < 56 列隐藏 sparkline；/ 过滤列名；Enter 跳到该列；n 编辑选中列注释（PG/通用 COMMENT ON COLUMN，MySQL 列注释只读提示）；底部动作行 y 复制当前表结构 Markdown、D 导出完整 DDL（列 / 索引 / 外键；无注释省略注释列）" => {
+            Some("Column-structure popup: name / type / key (PRI/UNI/MUL) / default / nullable / comment; the right pane shows the highlighted column's value distribution in place (non-null / null / distinct, with a 12-cell distribution sparkline next to the distinct count, and min/max/avg for numeric columns; cached metadata + loaded data, no extra query; a narrow screen under 56 columns hides the sparkline). / filters by column name; Enter jumps to the column; n edits the highlighted column's comment (COMMENT ON COLUMN on PostgreSQL / the generic form, a read-only note on MySQL columns); the bottom action row y copies the current table structure as Markdown and D exports the complete DDL (columns / indexes / foreign keys; the comment column is omitted when there are none).")
         }
         // ── R103: materialize the result set as a table (CTAS) ──
         "新表名" => Some("new table name"),
@@ -4931,6 +4931,38 @@ fn en_of(zh: &'static str) -> Option<&'static str> {
         "物化当前结果为表（CTAS）：输入新表名（预填 result_HHMMSS），Enter 生成 CREATE TABLE … AS <来源 SQL> 并进红色确认层（显示完整 CTAS + 目标表名，绝不静默执行）；来源=查询结果对应语句（多语句跑批时=当前下钻 / 列表光标所在的那条）/ 浏览表当前过滤排序的等效 SELECT；成功后刷新侧栏表列表、状态栏显示 已物化 N 行、不跳转新表（保持上下文）；表名按方言转义，空名拒绝；只读连接 / Redis / Mongo / 结构视图隐藏" => {
             Some("Materialize the current result as a table (CTAS): type a new table name (prefilled result_HHMMSS); Enter builds CREATE TABLE … AS <source SQL> and routes it through the red confirmation layer (the full CTAS plus the target table name are shown; it is never run silently). The source is the statement behind a query result (after a multi-statement run, the drilled statement or the focused row of the statement list) or the equivalent SELECT of a browsed table's current WHERE / ORDER BY. On success the sidebar table list refreshes, the status shows `materialized N rows`, and the app does not jump to the new table (the context is kept). The name is quoted / escaped per dialect and a blank name is refused; the action is hidden on a read-only connection / Redis / MongoDB / the structure view.")
         }
+        "导出当前表完整 DDL：按方言取源（MySQL SHOW CREATE TABLE / SQLite sqlite_master，PG / SQL Server / Oracle 走内核单表 DDL），弹层显示完整可执行脚本；y 复制、Ctrl-Y 存为 <表名>.sql、Esc 关；仅显式按键才发这一条源语句（g c 弹层内 D 同入口）" => {
+            Some("Export the current table's complete DDL: the dialect source statement (MySQL SHOW CREATE TABLE / SQLite sqlite_master; PostgreSQL / SQL Server / Oracle use the kernel's single-table DDL path) opens in a popup as a complete, runnable script. y copies, Ctrl-Y saves <table>.sql, Esc closes; the single source statement is only issued on this explicit key (the same entry is D inside the g c popup).")
+        }
+        // ── R107: complete table DDL export ──
+        "源语句没有返回 DDL" => Some("The source statement returned no DDL"),
+        "DDL 结果缺少目标列" => Some("The DDL result is missing its target column"),
+        "DDL 结果为空" => Some("The DDL result is empty"),
+        "完整 DDL 仅支持 SQL 引擎" => Some("Complete DDL is only available for SQL engines"),
+        "加载 {} 完整 DDL…" => Some("Loading complete DDL for {}…"),
+        "✓ 完整 DDL 已复制（{} 字符）· 兜底 {}" => {
+            Some("✓ Complete DDL copied ({} chars) · fallback {}")
+        }
+        "✓ 完整 DDL 已复制（{} 字符）" => Some("✓ Complete DDL copied ({} chars)"),
+        "✓ 完整 DDL 已写入 {}（{} 字符）" => {
+            Some("✓ Complete DDL written to {} ({} chars)")
+        }
+        "✗ DDL 写入失败：{}" => Some("✗ Failed to write DDL: {}"),
+        "已关闭完整 DDL" => Some("Closed complete DDL"),
+        "完整 DDL · y 复制 · Ctrl-Y 存文件 · Esc 关" => {
+            Some("Complete DDL · y copy · Ctrl-Y save file · Esc close")
+        }
+        "✗ 无法获取完整 DDL：{}" => Some("✗ Could not fetch the complete DDL: {}"),
+        " 完整 DDL · {} · {} 行 · y 复制 · Ctrl-Y 存文件 · Esc 关 " => Some(
+            " Complete DDL · {} · {} lines · y copy · Ctrl-Y save file · Esc close ",
+        ),
+        " 完整 DDL · Esc 关 " => Some(" Complete DDL · Esc close "),
+        " y 复制 · Ctrl-Y 存为 {}.sql · Esc 关 " => {
+            Some(" y copy · Ctrl-Y save as {}.sql · Esc close ")
+        }
+        "完整DDL" => Some("full DDL"),
+        "复制 DDL" => Some("copy DDL"),
+        "存文件" => Some("save file"),
         _ => None,
     }
 }

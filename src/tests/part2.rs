@@ -1231,7 +1231,7 @@ pub(crate) fn cols_popup_lists_cached_metadata() {
     let rows = draw(&mut app, 42, 22);
     assert!(rows.join("\n").contains("column_0"));
     // Esc closes it.
-    cols_popup_key(&mut app, KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+    cols_popup_key(&mut app, &test_tx(), KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
     assert!(!app.cols_popup_open);
     // With neither metadata nor a grid there is nothing to open.
     app.cols_popup_open = false;
@@ -1439,6 +1439,7 @@ pub(crate) fn cols_popup_filter_state_machine() {
     // `/` opens the prompt; typing filters as you go.
     cols_popup_key(
         &mut app,
+        &test_tx(),
         KeyEvent::new(KeyCode::Char('/'), KeyModifiers::NONE),
     );
     assert!(app.cols_popup_filter.is_some());
@@ -1460,6 +1461,7 @@ pub(crate) fn cols_popup_filter_state_machine() {
     // Re-opening prefills the needle; Esc clears it.
     cols_popup_key(
         &mut app,
+        &test_tx(),
         KeyEvent::new(KeyCode::Char('/'), KeyModifiers::NONE),
     );
     assert_eq!(
@@ -1481,7 +1483,7 @@ pub(crate) fn cols_popup_filter_state_machine() {
         .filter(|c| !c.is_whitespace())
         .collect();
     assert!(screen.contains("没有匹配的列"), "{screen}");
-    cols_popup_key(&mut app, KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+    cols_popup_key(&mut app, &test_tx(), KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
     assert!(!app.cols_popup_open);
     assert!(app.cols_popup_needle.is_empty());
 }
@@ -1516,10 +1518,11 @@ pub(crate) fn gc_enter_jumps_to_the_highlighted_column() {
     // `j` moves the cursor (the scroll window follows it), not the offset.
     cols_popup_key(
         &mut app,
+        &test_tx(),
         KeyEvent::new(KeyCode::Char('j'), KeyModifiers::NONE),
     );
     assert_eq!(app.cols_popup_sel, 1);
-    cols_popup_key(&mut app, KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+    cols_popup_key(&mut app, &test_tx(), KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
     assert!(!app.cols_popup_open, "Enter closes the popup");
     assert_eq!(app.col_cursor, 5, "cursor lands on column_5");
     assert!(app.status.contains("column_5"), "{}", app.status);
@@ -1528,7 +1531,7 @@ pub(crate) fn gc_enter_jumps_to_the_highlighted_column() {
     app.col_hidden.insert("column_3".into());
     app.reapply_col_filter();
     open_cols_popup(&mut app);
-    cols_popup_key(&mut app, KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+    cols_popup_key(&mut app, &test_tx(), KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
     assert!(app.cols_popup_open, "a missing column keeps the popup open");
     assert!(app.status.contains("不在当前视图"), "{}", app.status);
 }
@@ -1798,6 +1801,7 @@ pub(crate) fn cols_popup_renders_value_stats() {
     // into a non-numeric note.
     cols_popup_key(
         &mut app,
+        &test_tx(),
         KeyEvent::new(KeyCode::Char('j'), KeyModifiers::NONE),
     );
     let wide2 = compact(draw(&mut app, 110, 30));
@@ -3667,6 +3671,10 @@ pub(crate) fn help_has_no_bare_uppercase_shortcuts() {
                 || tok == "S"
                 || tok == "E"
                 || tok == "M"
+                // `D` (R107, the complete-DDL export) joins: its lowercase `d`
+                // is the results pane's delete-row / generate-DELETE, so the
+                // uppercase carries the deliberate export gesture.
+                || tok == "D"
             {
                 continue;
             }

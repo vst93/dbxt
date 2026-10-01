@@ -297,6 +297,10 @@ pub(crate) fn preview_key(app: &mut App, tx: &Tx, k: KeyEvent) {
                 app.ddl_scroll = 0;
             }
         }
+        // R107: `D` fetches the current table's complete DDL and opens the
+        // modal popup (`y` copy · `Ctrl-Y` save `{table}.sql`). An explicit
+        // action: exactly one dialect source statement is issued here.
+        KeyCode::Char('D') if k.modifiers.is_empty() => open_ddl_popup(app, tx),
         // `g` starts the `gd` (goto structure) / `gt` (goto data) / `gb`
         // (switch table) / `gw` (fit width) chord.
         KeyCode::Char('g') => {
@@ -2356,7 +2360,7 @@ pub(crate) fn open_cols_popup_filter(app: &mut App) {
     app.cols_popup_filter = Some(ta);
 }
 
-pub(crate) fn cols_popup_key(app: &mut App, k: KeyEvent) {
+pub(crate) fn cols_popup_key(app: &mut App, tx: &Tx, k: KeyEvent) {
     // The filter prompt is modal on top of the popup and owns the keyboard first.
     if app.cols_popup_filter.is_some() {
         cols_popup_filter_key(app, k);
@@ -2374,6 +2378,15 @@ pub(crate) fn cols_popup_key(app: &mut App, k: KeyEvent) {
             app.flash(t("已关闭列结构").into());
         }
         KeyCode::Char('/') => open_cols_popup_filter(app),
+        // R107: `D` is the same complete-DDL entry as the results pane's `D`,
+        // acting on the current table. The column popup closes so the DDL popup
+        // is the only modal surface.
+        KeyCode::Char('D') if k.modifiers.is_empty() => {
+            app.cols_popup_open = false;
+            app.cols_popup_needle.clear();
+            app.cols_popup_filter = None;
+            open_ddl_popup(app, tx);
+        }
         // R102: `n` edits the highlighted column's comment (the same confirm
         // pipeline as the table comment). Read-only / unsupported engines report
         // instead of opening the editor.
