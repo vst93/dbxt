@@ -1665,7 +1665,7 @@ pub(crate) const HELP_ROWS: &[(&str, &str)] = &[    ("— 全局 —", ""),
     ),
     (
         "Ctrl-Y",
-        "导出当前结果（CSV / JSON / NDJSON / Markdown / INSERT）",
+        "导出当前结果（CSV / Excel (.xlsx) / JSON / NDJSON / Markdown / INSERT）",
     ),
     ("y", "复制当前行为 INSERT 语句（OSC52 + 文件兜底）"),
     ("Y", "复制当前单元格值（状态栏显示列名与字符数）"),
@@ -3484,11 +3484,13 @@ pub(crate) fn render_export_path(f: &mut Frame, area: Rect, app: &mut App) {
         f.render_widget(&*ta, ta_area);
     }
     if hint_h > 0 {
+        let first = if fmt.file_only() {
+            t("Excel 仅支持写入文件（不支持剪贴板）· 输入路径支持 ~")
+        } else {
+            t("留空 = 复制到剪贴板（OSC52）· 输入路径 = 写入文件（支持 ~）")
+        };
         let hints = vec![
-            Line::from(Span::styled(
-                t("留空 = 复制到剪贴板（OSC52）· 输入路径 = 写入文件（支持 ~）"),
-                Style::default().fg(Color::DarkGray),
-            )),
+            Line::from(Span::styled(first, Style::default().fg(Color::DarkGray))),
             Line::from(Span::styled(
                 t("Enter 确认 · Esc 取消"),
                 Style::default().fg(Color::DarkGray),

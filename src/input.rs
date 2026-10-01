@@ -3420,6 +3420,16 @@ pub(crate) fn active_grid(app: &App) -> Option<Grid> {
     app.grid.clone()
 }
 
+/// Row count of the focused grid without deep-cloning it (the export guard runs
+/// on possibly huge grids, so it must not copy every row just to count).
+pub(crate) fn active_grid_rows(app: &App) -> usize {
+    if app.script.as_ref().is_some_and(|s| s.drilled.is_some()) {
+        // Drilled script results are bounded; the filtered count is exact.
+        return active_grid(app).map(|g| g.rows.len()).unwrap_or(0);
+    }
+    app.grid.as_ref().map(|g| g.rows.len()).unwrap_or(0)
+}
+
 /// The grid as it was fetched, before the session column filter. Used by the row
 /// detail popup, which must show every column even the hidden ones.
 pub(crate) fn full_grid(app: &App) -> Option<Grid> {

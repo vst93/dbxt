@@ -687,6 +687,8 @@ pub(crate) fn render_export_content(
 ) -> String {
     match format {
         ExportFormat::Csv => grid_to_csv(grid),
+        // XLSX is binary and file-only; there is no string form to copy.
+        ExportFormat::Xlsx => String::new(),
         ExportFormat::JsonArray => grid_to_json_array(grid),
         ExportFormat::JsonNdjson => grid_to_json_ndjson(grid),
         ExportFormat::Markdown => grid_to_markdown(grid),
@@ -715,7 +717,7 @@ pub(crate) fn render_export_content(
 
 /// Stream `format` into `w`. Identical bytes to [`render_export_content`], but
 /// no intermediate document.
-pub(crate) fn write_export<W: Write>(
+pub(crate) fn write_export<W: Write + Seek>(
     w: &mut W,
     cfg: Option<&ConnectionConfig>,
     schema: &str,
@@ -726,6 +728,7 @@ pub(crate) fn write_export<W: Write>(
 ) -> std::io::Result<()> {
     match format {
         ExportFormat::Csv => write_csv(w, grid),
+        ExportFormat::Xlsx => write_xlsx(w, grid),
         ExportFormat::JsonArray => write_json_array(w, grid),
         ExportFormat::JsonNdjson => write_json_ndjson(w, grid),
         ExportFormat::Markdown => write_markdown(w, grid),
@@ -740,6 +743,69 @@ pub(crate) fn write_export<W: Write>(
             None => Ok(()),
         },
     }
+}
+
+/// Stream `grid` as a single-sheet XLSX workbook through the kernel streaming
+/// XLSX writer. The header is the grid's column names (comments are never
+/// looked up — zero queries). A NULL becomes an empty cell, and every other
+/// value is passed through verbatim as its raw text; the kernel turns a numeric
+/// column's text into a numeric cell (with its scale preserved) and leaves the
+/// rest as inline strings.
+pub(crate) fn write_xlsx<W: Write + Seek>(w: &mut W, grid: &Grid) -> std::io::Result<()> {
+    let columns = grid.columns.clone();
+    let column_types = grid.types.clone();
+    let column_comments: Vec<Option<String>> = vec![None; columns.len()];
+    let mut writer = start_streaming_xlsx_workbook_with_options(
+        w,
+        Some("Result"),
+        &columns,
+        &column_types,
+        &column_comments,
+        &[],
+        None,
+        false,
+        false,
+    )
+    .map_err(std::io::Error::other)?;
+    let mut values: Vec<serde_json::Value> = Vec::with_capacity(columns.len());
+    for row in &grid.rows {
+        values.clear();
+        for ci in 0..columns.len() {
+            values.push(match row.get(ci) {
+                Some(Val::Text(s)) => serde_json::Value::String(s.clone()),
+                _ => serde_json::Value::Null,
+            });
+        }
+        writer.write_row(&values).map_err(std::io::Error::other)?;
+    }
+    writer.finish().map_err(std::io::Error::other)?;
+    Ok(())
+}
+
+/// Build the whole XLSX workbook in memory. Only for bounded payloads (tests
+/// and the small-result helper); the file pipeline streams via [`write_xlsx`].
+#[allow(dead_code)]
+pub(crate) fn grid_to_xlsx(grid: &Grid) -> Vec<u8> {
+    let mut cursor = Cursor::new(Vec::new());
+    write_xlsx(&mut cursor, grid).expect("in-memory XLSX write cannot fail");
+    cursor.into_inner()
+}
+
+/// The default destination filename for an XLSX export: `{base}.xlsx`, with any
+/// path separator neutralised so the default stays one filename in the working
+/// directory.
+pub(crate) fn xlsx_default_filename(base: &str) -> String {
+    let safe: String = base
+        .chars()
+        .map(|c| {
+            if matches!(c, '/' | '\\' | ':' | '\0') {
+                '_'
+            } else {
+                c
+            }
+        })
+        .collect();
+    format!("{safe}.{}", ExportFormat::Xlsx.extension())
 }
 
 pub(crate) fn write_csv<W: Write>(w: &mut W, grid: &Grid) -> std::io::Result<()> {
@@ -1723,7 +1789,7 @@ pub(crate) fn export_key(app: &mut App, k: KeyEvent) {
             let idx = app.export_list.selected().unwrap_or(0).min(n - 1);
             choose_export_format(app, EXPORT_FORMATS[idx]);
         }
-        KeyCode::Char(c @ '1'..='6') => {
+        KeyCode::Char(c @ '1'..='7') => {
             let idx = (c as usize) - ('1' as usize);
             if idx < n {
                 choose_export_format(app, EXPORT_FORMATS[idx]);
@@ -1735,6 +1801,19 @@ pub(crate) fn export_key(app: &mut App, k: KeyEvent) {
 
 /// Pick a format and move on to the destination prompt.
 pub(crate) fn choose_export_format(app: &mut App, format: ExportFormat) {
+    // Excel is built entirely in memory, so a huge result would exhaust RAM.
+    // Refuse before anything is generated and point at the streaming CSV path.
+    if format == ExportFormat::Xlsx {
+        let rows = active_grid_rows(app);
+        if rows > EXPORT_XLSX_MAX_ROWS {
+            app.status = tf(
+                "结果 {} 行超过 Excel 导出上限（{} 行），请改用 CSV",
+                &[&rows, &EXPORT_XLSX_MAX_ROWS],
+            );
+            app.export_open = false;
+            return;
+        }
+    }
     let table = if matches!(format, ExportFormat::Insert | ExportFormat::InsertBatch) {
         match export_insert_table(app) {
             Some(t) => Some(t),
@@ -1749,7 +1828,17 @@ pub(crate) fn choose_export_format(app: &mut App, format: ExportFormat) {
         None
     };
     let mut ta = TextArea::default();
-    ta.set_placeholder_text(t("留空 = 复制到剪贴板 · 输入路径 = 写入文件"));
+    if format.file_only() {
+        // The clipboard cannot carry a binary workbook, so the default
+        // filename is prefilled and Enter writes it straight away.
+        let base = export_insert_table(app)
+            .map(|(_, t)| t)
+            .unwrap_or_else(|| "query".to_string());
+        ta.insert_str(xlsx_default_filename(&base));
+        ta.set_placeholder_text(t("Excel 仅支持写入文件 · 请输入文件名"));
+    } else {
+        ta.set_placeholder_text(t("留空 = 复制到剪贴板 · 输入路径 = 写入文件"));
+    }
     app.export_pending = Some(ExportPending { format, table });
     app.export_path = Some(ta);
     app.export_open = false;
@@ -1781,6 +1870,14 @@ pub(crate) fn export_path_key(app: &mut App, tx: &Tx, k: KeyEvent) {
     let path = input.trim();
     let label = pending.format.label();
     if path.is_empty() {
+        // A binary workbook has no OSC 52 form: keep the prompt open and ask
+        // for a filename instead of silently exporting nothing.
+        if pending.format.file_only() {
+            app.export_pending = Some(pending);
+            app.export_path = Some(ta);
+            app.status = t("Excel 导出仅支持写入文件，请输入文件名").into();
+            return;
+        }
         // Clipboard export stays synchronous: the payload is bounded by what a
         // terminal can carry and the OSC 52 write must run on the UI thread.
         let content = render_export_content(app, &grid, pending.format, pending.table.as_ref());

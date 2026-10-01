@@ -9,7 +9,7 @@
 pub(crate) use crate::ui_text::{t, tf};
 
 pub(crate) use std::collections::{HashMap, HashSet, VecDeque};
-pub(crate) use std::io::{BufWriter, IsTerminal, Write};
+pub(crate) use std::io::{BufWriter, Cursor, IsTerminal, Seek, Write};
 pub(crate) use std::path::PathBuf;
 pub(crate) use std::sync::atomic::{AtomicBool, Ordering};
 pub(crate) use std::sync::Arc;
@@ -38,6 +38,7 @@ pub(crate) use dbx_core::sql_dialect::{
     TableDataSelectSqlOptions, TablePaginationStrategy,
 };
 pub(crate) use dbx_core::types::{ColumnInfo, ForeignKeyInfo, IndexInfo, TableInfo};
+pub(crate) use dbx_core::xlsx_export::start_streaming_xlsx_workbook_with_options;
 pub(crate) use dbx_mcp::backend::{
     new_connection_config, parse_database_type, BatchStatementResult, DbxBackend, LocalBackend,
 };

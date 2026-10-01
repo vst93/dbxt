@@ -145,6 +145,7 @@ pub(crate) struct ImportJob {
 #[derive(Clone, Copy, PartialEq, Debug)]
 pub(crate) enum ExportFormat {
     Csv,
+    Xlsx,
     JsonArray,
     JsonNdjson,
     Markdown,
@@ -156,6 +157,7 @@ impl ExportFormat {
     pub(crate) fn label(self) -> &'static str {
         match self {
             ExportFormat::Csv => "CSV",
+            ExportFormat::Xlsx => "Excel",
             ExportFormat::JsonArray => "JSON",
             ExportFormat::JsonNdjson => "NDJSON",
             ExportFormat::Markdown => "Markdown",
@@ -166,6 +168,7 @@ impl ExportFormat {
     pub(crate) fn description(self) -> &'static str {
         match self {
             ExportFormat::Csv => t("逗号分隔，NULL 为空字段"),
+            ExportFormat::Xlsx => t("Excel 工作簿（.xlsx，仅文件）"),
             ExportFormat::JsonArray => t("JSON 数组，每个对象一行记录"),
             ExportFormat::JsonNdjson => t("每行一个 JSON 对象（NDJSON）"),
             ExportFormat::Markdown => t("Markdown 表格（| 转义）"),
@@ -173,11 +176,33 @@ impl ExportFormat {
             ExportFormat::InsertBatch => t("多行 VALUES 合并为一条 INSERT"),
         }
     }
+    /// File extension (no dot) used for the default filename / destination.
+    pub(crate) fn extension(self) -> &'static str {
+        match self {
+            ExportFormat::Csv => "csv",
+            ExportFormat::Xlsx => "xlsx",
+            ExportFormat::JsonArray => "json",
+            ExportFormat::JsonNdjson => "ndjson",
+            ExportFormat::Markdown => "md",
+            ExportFormat::Insert | ExportFormat::InsertBatch => "sql",
+        }
+    }
+    /// True for formats that can only be written to a file — the OSC 52
+    /// clipboard path is a text channel, so a binary workbook cannot use it.
+    pub(crate) fn file_only(self) -> bool {
+        matches!(self, ExportFormat::Xlsx)
+    }
 }
+
+/// The in-memory XLSX writer buffers the whole workbook before it hits disk, so
+/// a very large result would exhaust memory. Past this row count the picker
+/// refuses Excel and points at CSV (the streaming text format).
+pub(crate) const EXPORT_XLSX_MAX_ROWS: usize = 100_000;
 
 /// All formats in overlay order.
 pub(crate) const EXPORT_FORMATS: &[ExportFormat] = &[
     ExportFormat::Csv,
+    ExportFormat::Xlsx,
     ExportFormat::JsonArray,
     ExportFormat::JsonNdjson,
     ExportFormat::Markdown,

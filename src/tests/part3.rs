@@ -13546,3 +13546,213 @@ pub(crate) fn r104_redis_mem_renders_at_both_sizes() {
         assert!(rows.contains("· ?"), "missing failed tail at {w}x{h}");
     }
 }
+
+// ── R105: XLSX export via the kernel StreamingXlsxWriter ─────────────────────
+
+/// Read and decompress one entry from an in-memory XLSX (ZIP) buffer.
+fn r105_read_xlsx_entry(bytes: &[u8], path: &str) -> String {
+    use std::io::Read;
+    let mut archive =
+        zip::ZipArchive::new(Cursor::new(bytes.to_vec())).expect("open xlsx as zip archive");
+    let mut entry = archive
+        .by_name(path)
+        .unwrap_or_else(|_| panic!("missing zip entry: {path}"));
+    let mut content = String::new();
+    entry.read_to_string(&mut content).expect("read zip entry");
+    content
+}
+
+/// A numeric column becomes a numeric cell (raw text preserved, scale intact),
+/// NULL becomes an empty cell, and text keeps Unicode / escaped XML verbatim.
+#[test]
+pub(crate) fn r105_grid_to_xlsx_types_cells() {
+    let grid = Grid {
+        columns: vec!["amount".into(), "note".into(), "cn".into(), "quote".into()],
+        types: vec![
+            "decimal(10,2)".into(),
+            "text".into(),
+            "text".into(),
+            "text".into(),
+        ],
+        rows: vec![vec![
+            Val::Text("1.50".into()),
+            Val::Null,
+            Val::Text("中文".into()),
+            Val::Text("a\"b<c>&d".into()),
+        ]],
+        note: String::new(),
+    };
+    let bytes = grid_to_xlsx(&grid);
+    let sheet = r105_read_xlsx_entry(&bytes, "xl/worksheets/sheet1.xml");
+    // Header row = column names, comments never looked up.
+    assert!(sheet.contains(">amount<"), "{sheet}");
+    // Numeric column: the raw text lands in a numeric `<v>` cell.
+    assert!(sheet.contains("<v>1.50</v>"), "{sheet}");
+    // NULL: an empty cell.
+    assert!(sheet.contains("<c r=\"B2\"/>"), "{sheet}");
+    // Unicode survives verbatim.
+    assert!(sheet.contains("中文"), "{sheet}");
+    // XML metacharacters are escaped by the kernel writer.
+    assert!(sheet.contains("a&quot;b&lt;c&gt;&amp;d"), "{sheet}");
+}
+
+/// The streamed bytes are a real ZIP: PK magic, with the workbook skeleton
+/// discoverable in the central directory (no full parse).
+#[test]
+pub(crate) fn r105_grid_to_xlsx_has_zip_magic() {
+    let bytes = grid_to_xlsx(&sample_grid());
+    assert_eq!(&bytes[..4], b"PK\x03\x04", "not a ZIP container");
+    let text = String::from_utf8_lossy(&bytes);
+    assert!(
+        text.contains("xl/worksheets/sheet1.xml"),
+        "missing sheet1 entry"
+    );
+    assert!(
+        text.contains("[Content_Types].xml"),
+        "missing content types"
+    );
+}
+
+/// Label / extension / file-only flag and the CSV-then-Excel picker order.
+#[test]
+pub(crate) fn r105_xlsx_label_extension_and_default_filename() {
+    assert_eq!(ExportFormat::Xlsx.label(), "Excel");
+    assert_eq!(ExportFormat::Xlsx.extension(), "xlsx");
+    assert!(ExportFormat::Xlsx.file_only());
+    assert!(!ExportFormat::Csv.file_only());
+    assert_eq!(EXPORT_FORMATS[0], ExportFormat::Csv);
+    assert_eq!(EXPORT_FORMATS[1], ExportFormat::Xlsx);
+    assert_eq!(ExportFormat::JsonArray.extension(), "json");
+    assert_eq!(ExportFormat::InsertBatch.extension(), "sql");
+    assert_eq!(xlsx_default_filename("orders"), "orders.xlsx");
+    assert_eq!(xlsx_default_filename("a/b:c\\d"), "a_b_c_d.xlsx");
+}
+
+/// Over the in-memory cap the picker refuses Excel and points at CSV; exactly at
+/// the cap it proceeds and prefills the default filename.
+#[test]
+pub(crate) fn r105_xlsx_row_limit_rejects() {
+    let mut app = test_app();
+    app.picker_open = false;
+    let big: Vec<Vec<Val>> = (0..=EXPORT_XLSX_MAX_ROWS)
+        .map(|i| vec![Val::Text(i.to_string())])
+        .collect();
+    app.set_grid(Grid {
+        columns: vec!["id".into()],
+        types: vec!["int".into()],
+        rows: big,
+        note: String::new(),
+    });
+    choose_export_format(&mut app, ExportFormat::Xlsx);
+    assert!(
+        app.export_pending.is_none(),
+        "over-limit export must not start"
+    );
+    assert!(!app.export_open);
+    assert!(app.status.contains("Excel 导出上限"), "{}", app.status);
+    assert!(app.status.contains("CSV"), "{}", app.status);
+
+    // Exactly at the cap: proceed, with a default `{base}.xlsx` destination.
+    let at_cap: Vec<Vec<Val>> = (0..EXPORT_XLSX_MAX_ROWS)
+        .map(|i| vec![Val::Text(i.to_string())])
+        .collect();
+    app.set_grid(Grid {
+        columns: vec!["id".into()],
+        types: vec!["int".into()],
+        rows: at_cap,
+        note: String::new(),
+    });
+    choose_export_format(&mut app, ExportFormat::Xlsx);
+    assert!(app.export_pending.is_some());
+    assert_eq!(
+        app.export_path.as_ref().unwrap().lines().join(""),
+        "query.xlsx"
+    );
+}
+
+/// Excel is file-only: blank input keeps the prompt open instead of copying a
+/// (nonexistent) binary payload to the clipboard.
+#[test]
+pub(crate) fn r105_xlsx_file_only_refuses_clipboard() {
+    let mut app = test_app();
+    app.picker_open = false;
+    app.set_grid(sample_grid());
+    choose_export_format(&mut app, ExportFormat::Xlsx);
+    assert_eq!(
+        app.export_path.as_ref().unwrap().lines().join(""),
+        "query.xlsx"
+    );
+    app.export_path = Some(TextArea::default());
+    let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+    export_path_key(
+        &mut app,
+        &tx,
+        KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+    );
+    assert!(app.export_path.is_some(), "prompt must stay open");
+    assert!(app.export_pending.is_some());
+    assert!(app.status.contains("仅支持写入文件"), "{}", app.status);
+}
+
+/// The picker and the destination prompt render at the phone and desktop sizes.
+#[test]
+pub(crate) fn r105_xlsx_renders_at_both_sizes() {
+    let mut app = test_app();
+    app.picker_open = false;
+    app.selected = Some(test_conn("mysql"));
+    app.grid_kind = GridKind::TableData;
+    app.set_grid(sample_grid());
+    app.export_open = true;
+    for (w, h) in [(42u16, 22u16), (110, 30)] {
+        let joined = draw(&mut app, w, h).join("\n");
+        assert!(joined.contains("Excel"), "picker missing Excel at {w}x{h}");
+    }
+    choose_export_format(&mut app, ExportFormat::Xlsx);
+    for (w, h) in [(42u16, 22u16), (110, 30)] {
+        let joined = draw(&mut app, w, h).join("\n").replace(' ', "");
+        assert!(joined.contains("Excel"), "prompt missing at {w}x{h}");
+    }
+}
+
+/// The full `?` sheet lists Excel and every new string has an English form.
+#[test]
+pub(crate) fn r105_help_documents_xlsx() {
+    assert!(
+        HELP_ROWS
+            .iter()
+            .any(|(k, d)| *k == "Ctrl-Y" && d.contains("Excel")),
+        "full help Ctrl-Y row missing Excel"
+    );
+    use ui_text::{t_lang, Lang};
+    for s in [
+        "Excel 工作簿（.xlsx，仅文件）",
+        "Excel 仅支持写入文件 · 请输入文件名",
+        "Excel 仅支持写入文件（不支持剪贴板）· 输入路径支持 ~",
+        "Excel 导出仅支持写入文件，请输入文件名",
+        "结果 {} 行超过 Excel 导出上限（{} 行），请改用 CSV",
+    ] {
+        assert_ne!(t_lang(s, Lang::En), s, "missing English for {s:?}");
+    }
+}
+
+/// The exact file pipeline `Op::Export` uses — `write_export` into a
+/// `BufWriter<File>` — produces a readable workbook.
+#[test]
+pub(crate) fn r105_write_export_xlsx_file_pipeline() {
+    let app = test_app();
+    let grid = sample_grid();
+    let types = grid_column_types(&app, "", "", &grid);
+    let path = std::env::temp_dir().join(format!("dbxt-r105-{}.xlsx", std::process::id()));
+    {
+        let file = std::fs::File::create(&path).unwrap();
+        let mut w = BufWriter::new(file);
+        write_export(&mut w, None, "", "", &types, &grid, ExportFormat::Xlsx).unwrap();
+        w.flush().unwrap();
+    }
+    let bytes = std::fs::read(&path).unwrap();
+    let _ = std::fs::remove_file(&path);
+    assert_eq!(&bytes[..4], b"PK\x03\x04", "not a ZIP container");
+    let sheet = r105_read_xlsx_entry(&bytes, "xl/worksheets/sheet1.xml");
+    assert!(sheet.contains(">column_0<"), "{sheet}");
+    assert!(sheet.contains(">r0c0<"), "{sheet}");
+}

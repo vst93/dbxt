@@ -1039,6 +1039,12 @@ pub static ALL_KEYS: &[&str] = &[
     // ── R22: export formats ──
     "INSERT (批量)",
     "逗号分隔，NULL 为空字段",
+    // ── R105: XLSX export ──
+    "Excel 工作簿（.xlsx，仅文件）",
+    "Excel 仅支持写入文件 · 请输入文件名",
+    "Excel 仅支持写入文件（不支持剪贴板）· 输入路径支持 ~",
+    "Excel 导出仅支持写入文件，请输入文件名",
+    "结果 {} 行超过 Excel 导出上限（{} 行），请改用 CSV",
     "JSON 数组，每个对象一行记录",
     "每行一个 JSON 对象（NDJSON）",
     "Markdown 表格（| 转义）",
@@ -1067,7 +1073,7 @@ pub static ALL_KEYS: &[&str] = &[
     "插入文档到 {}…",
     "更新文档 {}…",
     "导入 CSV 到当前表（预览 + 追加/覆盖确认）",
-    "导出当前结果（CSV / JSON / NDJSON / Markdown / INSERT）",
+    "导出当前结果（CSV / Excel (.xlsx) / JSON / NDJSON / Markdown / INSERT）",
     "预览",
     "导入",
     "追加/覆盖",
@@ -3282,6 +3288,16 @@ fn en_of(zh: &'static str) -> Option<&'static str> {
         // ── R22: export formats ──
         "INSERT (批量)" => Some("INSERT (batch)"),
         "逗号分隔，NULL 为空字段" => Some("comma-separated, NULL is an empty field"),
+        // ── R105: XLSX export ──
+        "Excel 工作簿（.xlsx，仅文件）" => Some("Excel workbook (.xlsx, file only)"),
+        "Excel 仅支持写入文件 · 请输入文件名" => Some("Excel can only be written to a file · enter a filename"),
+        "Excel 仅支持写入文件（不支持剪贴板）· 输入路径支持 ~" => Some(
+            "Excel can only be written to a file (no clipboard) · paths support ~",
+        ),
+        "Excel 导出仅支持写入文件，请输入文件名" => Some("Excel export is file-only; enter a filename"),
+        "结果 {} 行超过 Excel 导出上限（{} 行），请改用 CSV" => Some(
+            "{} rows exceed the Excel export limit ({} rows); use CSV instead",
+        ),
         "JSON 数组，每个对象一行记录" => Some("JSON array, one object per row"),
         "每行一个 JSON 对象（NDJSON）" => Some("one JSON object per line (NDJSON)"),
         "Markdown 表格（| 转义）" => Some("Markdown table (| escaped)"),
@@ -3311,7 +3327,9 @@ fn en_of(zh: &'static str) -> Option<&'static str> {
         "插入文档到 {}…" => Some("Inserting document into {}…"),
         "更新文档 {}…" => Some("Updating document {}…"),
         "导入 CSV 到当前表（预览 + 追加/覆盖确认）" => Some("Import CSV into the current table (preview + append/overwrite confirmation)"),
-        "导出当前结果（CSV / JSON / NDJSON / Markdown / INSERT）" => Some("Export the current result (CSV / JSON / NDJSON / Markdown / INSERT)"),
+        "导出当前结果（CSV / Excel (.xlsx) / JSON / NDJSON / Markdown / INSERT）" => Some(
+            "Export the current result (CSV / Excel (.xlsx) / JSON / NDJSON / Markdown / INSERT)",
+        ),
         "预览" => Some("preview"),
         "导入" => Some("import"),
         "追加/覆盖" => Some("append/overwrite"),

@@ -124,7 +124,7 @@ The biggest jump since the first preview — the sidebar became a real tree, and
 - `Alt-G` opens **global search**: it scans the `char` / `varchar` / `text` columns of every table on the current database (and PostgreSQL schema) for a term, case-insensitively, and lists each hit as `table.column → value` with the match highlighted. One bounded `SELECT … LIMIT` runs per table (`DBXT_SEARCH_SCAN_LIMIT`, default 1000), and a table estimated above `DBXT_SEARCH_MAX_ROWS` (default 1,000,000) is skipped and reported. `↑`/`↓` move, `Enter` jumps to the table and lands on the matching row, `y` copies the matched value, `r` re-runs, and `Esc` aborts a running scan (keeping partial results). MySQL / PostgreSQL only.
 - `Alt-L` loads and runs a **`.sql` file**: type a path (a leading `~` expands), then confirm a preview showing the file size, statement count and target connection/database, with the script wrapped below. A file over 2 MB warns, and one containing `DROP`, `TRUNCATE`, or an `UPDATE`/`DELETE` without `WHERE` routes through the same red confirmation layer before anything runs. The whole file is one history entry, and the result is the usual per-statement script summary with error messages inline; `e` loads the file into the editor instead.
 - Every run keeps its own result tab (`[` / `]`); execution time and affected rows are shown. A **tab strip** sits above the results grid, labelling each tab `number:first 12 chars of the statement` with the active tab highlighted; on a narrow terminal the middle tabs fold to `…` while the active one stays visible. `Alt-W` closes the active result tab (the last one is kept; a tab with an unconfirmed edit is left alone; client-side only, never queries).
-- `Ctrl-P` runs `EXPLAIN`, `Ctrl-Y` exports the result set (CSV / JSON / NDJSON / Markdown / INSERT), `Ctrl-N` loads more when a result hit the row cap.
+- `Ctrl-P` runs `EXPLAIN`, `Ctrl-Y` exports the result set (CSV / Excel / JSON / NDJSON / Markdown / INSERT), `Ctrl-N` loads more when a result hit the row cap.
 - `Ctrl-O` inserts a DBX saved snippet; `s` saves the editor's SQL back into that shared store, `Alt-S` does the same in one step from the editor, `/` filters the list by name / SQL text, `d` deletes a favourite behind a red confirmation, and the list caps at **100** per connection (a save past it is refused with a hint to delete first).
 - Multi-statement scripts (`a; b; c;`) run as a batch, one row per statement; while it runs the status bar counts statements (`3/7`) and the summary names the total elapsed time; `Enter` drills into one.
 
@@ -156,7 +156,7 @@ The biggest jump since the first preview — the sidebar became a real tree, and
 - CSV headers match table columns by name (case-insensitive); a table column absent from the CSV keeps its default (usually `NULL`), and an extra CSV column blocks the import with a clear message.
 - `m` toggles append / overwrite (overwrite clears the table first and turns the preview border red), `s` toggles stop-on-error (default, reports the failing row) / skip-and-continue (reports every skipped row). Rows are written in transactional batches of 500 with per-batch progress.
 - Encoding is auto-detected — UTF-8, otherwise GB18030/GBK (the common Chinese encoding) — and the delimiter is sniffed from the header (`,` / `;` / TAB). Excel `.xlsx` is deliberately not supported.
-- `Ctrl-Y` exports the focused result set as CSV, JSON (array), NDJSON, Markdown, `INSERT` (one statement per row) or batched `INSERT` (multi-row `VALUES`). Pick a format, then a destination: blank copies via OSC 52, a path writes a file. Results over 10,000 rows warn that generation may take a moment.
+- `Ctrl-Y` exports the focused result set as CSV, Excel (`.xlsx`, via the kernel `StreamingXlsxWriter`), JSON (array), NDJSON, Markdown, `INSERT` (one statement per row) or batched `INSERT` (multi-row `VALUES`). Pick a format, then a destination: blank copies via OSC 52, a path writes a file. Excel is **file-only** (the default `{table|query}.xlsx` filename is prefilled) and refuses results over 100,000 rows — the workbook is built in memory, so it points you at CSV instead. Results over 10,000 rows warn that generation may take a moment.
 
 **Redis**
 - Connecting to Redis opens a paginated `SCAN` key browser (never `KEYS *`) with type + TTL badges, a server-side `MATCH` pattern (`/`) and logical-DB switching.
@@ -301,7 +301,8 @@ Early but usable. Verified end-to-end against real MySQL 8.4, PostgreSQL 16, Red
 - [x] SSH tunnels (password / key / agent, `~/.ssh/config` aliases and `ProxyJump`) with in-TUI create/edit
 - [x] Prebuilt archives for seven targets — only the Linux x86_64 build has been exercised locally, the others are untested
 - [x] In-TUI connection deletion (red confirmation; config only, never database data)
-- [ ] Result export to XLSX, and search across pages
+- [x] Result export to XLSX (via the kernel `StreamingXlsxWriter`)
+- [ ] Search across pages
 - [ ] Excel (`.xlsx`) import
 - [ ] A dedicated Android/Termux build
 
@@ -311,7 +312,7 @@ An honest list of what is **not** there yet, so it is not discovered after a rel
 
 - **Table size metadata is MySQL / PostgreSQL only.** Pressing `s` on a database row reports *this engine does not support size query* on SQLite, DuckDB and any other engine — the sidebar size column stays empty there.
 - **Global search (`Alt-G`) is MySQL / PostgreSQL only** — it scans the `char` / `varchar` / `text` columns of every table and is not wired to other engines.
-- **No `.xlsx` import and no XLSX export** — deliberately out of scope; use CSV.
+- **No `.xlsx` import** — deliberately out of scope; use CSV. (Export *to* XLSX is supported via `Ctrl-Y`.)
 - **Search is page-local** — `/` searches the visible rows, not the whole result set; cross-page result search is not implemented.
 - **A large export is capped by a warning, not stopped** — result sets over 10,000 rows warn before `Ctrl-Y` proceeds.
 - **Read-only detection fails closed** — a statement with an unrecognised verb counts as a write, so a rare ambiguous-but-read statement is refused by design.

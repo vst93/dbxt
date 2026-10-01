@@ -28,6 +28,11 @@ uuid = { version = "1", features = ["v4"] }
 # dbx-core, so this adds no new crate to the build).
 chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
 
+[dev-dependencies]
+# R105: read the streamed XLSX back in tests (already in the lock via dbx-core,
+# so no new crate is compiled).
+zip = { version = "4", default-features = false, features = ["deflate"] }
+
 [patch.crates-io]
 tokio-postgres = { git = "https://github.com/t8y2/tokio-postgres-gaussdb.git", rev = "ac8ad476de59093d33ab9f294531c956e0c6a724" }
 postgres-types = { git = "https://github.com/t8y2/tokio-postgres-gaussdb.git", rev = "ac8ad476de59093d33ab9f294531c956e0c6a724" }

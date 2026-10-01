@@ -1744,6 +1744,10 @@ pub(crate) fn export_handles_huge_and_binary_cells_in_every_format() {
         types: Vec::new(),
     };
     for format in EXPORT_FORMATS {
+        // R105: XLSX is a binary workbook, not a string payload.
+        if *format == ExportFormat::Xlsx {
+            continue;
+        }
         let out = render_export_content(
             &app,
             &grid,
@@ -1814,11 +1818,16 @@ pub(crate) fn assert_stream_matches(app: &App, grid: &Grid, schema: &str, table:
     let types = grid_column_types(app, schema, table, grid);
     let table_ref = Some((schema.to_string(), table.to_string()));
     for fmt in EXPORT_FORMATS {
+        // R105: XLSX is a binary workbook with no string builder to compare
+        // against; its bytes are pinned by the dedicated R105 tests.
+        if *fmt == ExportFormat::Xlsx {
+            continue;
+        }
         let reference = render_export_content(app, grid, *fmt, table_ref.as_ref());
-        let mut buf: Vec<u8> = Vec::new();
+        let mut buf = Cursor::new(Vec::new());
         write_export(&mut buf, Some(cfg), schema, table, &types, grid, *fmt).unwrap();
         assert_eq!(
-            String::from_utf8(buf).unwrap(),
+            String::from_utf8(buf.into_inner()).unwrap(),
             reference,
             "streaming {:?} diverged from the string builder",
             fmt
