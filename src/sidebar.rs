@@ -312,6 +312,13 @@ pub(crate) fn activate_connection(
 ) {
     app.conn_gen = app.conn_gen.wrapping_add(1);
     let gen = app.conn_gen;
+    // R98: any explicit activation supersedes an in-flight `--last` restore (its
+    // own caller re-arms the flag right after this returns), and a fresh
+    // activation has not opened a pool yet — only a successful answer re-arms
+    // the exit write, so a switch to a failing connection leaves no session.
+    app.resume_last = false;
+    app.resume_note = None;
+    app.session_opened = false;
     app.selected = Some(cfg.clone());
     // R87: record this connection as the most recent one (LRU, session-only).
     // Every activation — picker connect, `Alt-<n>`, `Alt-``, a recent-list jump
@@ -1855,6 +1862,8 @@ pub(crate) fn mark_active_live(app: &mut App) {
         let id = c.id.clone();
         app.conn_connecting.remove(&id);
         app.conn_live.insert(id, true);
+        // R98: a live pool means this run may remember its session on exit.
+        app.session_opened = true;
     }
 }
 

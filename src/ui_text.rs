@@ -1633,6 +1633,16 @@ pub static ALL_KEYS: &[&str] = &[
     "没有 .db / .sqlite / .sqlite3 文件 · 输入完整路径或 Tab 补全",
     "跳到第 {} 行 · 第 {} 页…",
     "正在加载，稍后再试",
+    // ── R98: last-session restore ──
+    "  --last         启动即恢复上次会话的连接与库表（失败逐级降级）",
+    "启动即恢复上次会话的连接与 库.schema.表（逐级降级：表→库→连接→连接列表）",
+    "没有可恢复的上次会话 · 回到连接列表",
+    "上次会话的连接已不存在 · 回到连接列表",
+    "✓ 已恢复上次会话",
+    "上次会话的库 {} 已不存在 · 回到连接首屏",
+    "上次会话的表 {} 已不存在 · 回到库 {}",
+    "✓ 已恢复上次会话 · {}.{}",
+    "✓ 已恢复上次会话 · {}",
 ];
 
 /// The Chinese → English table. Keys must match the source literals exactly.
@@ -4568,6 +4578,28 @@ fn en_of(zh: &'static str) -> Option<&'static str> {
         "粘贴环：在最近 5 次编辑器内复制 / 剪切内容间循环，替换当前选区或在光标处插入并保持选中，连按可继续翻到下一条；仅会话内存、不落盘，也不读写系统剪贴板（Y / OSC52 通道不受影响）。需要终端能区分 Shift（kitty / wezterm / foot 等扩展键盘协议）" => {
             Some("Paste ring: cycle through the last 5 editor copy / cut payloads, replacing the current selection (or inserting at the caret) and keeping it selected so a repeat advances; session-only, never written to disk, and it never reads or writes the system clipboard (the Y / OSC52 channel is untouched). Needs a terminal that reports Shift distinctly (kitty / wezterm / foot and other extended-keyboard-protocol terminals)")
         }
+        // ── R98: last-session restore ──
+        "  --last         启动即恢复上次会话的连接与库表（失败逐级降级）" => {
+            Some("  --last         reconnect the last session's connection and table at startup (degrades one level at a time)")
+        }
+        "启动即恢复上次会话的连接与 库.schema.表（逐级降级：表→库→连接→连接列表）" => {
+            Some("Reconnect the last session's connection and database.schema.table at startup (degrades one level at a time: table → database → connection → list)")
+        }
+        "没有可恢复的上次会话 · 回到连接列表" => {
+            Some("No last session to restore · back to the connection list")
+        }
+        "上次会话的连接已不存在 · 回到连接列表" => {
+            Some("The last session's connection no longer exists · back to the connection list")
+        }
+        "✓ 已恢复上次会话" => Some("✓ Restored the last session"),
+        "上次会话的库 {} 已不存在 · 回到连接首屏" => {
+            Some("The last session's database {} no longer exists · back to the connection's first screen")
+        }
+        "上次会话的表 {} 已不存在 · 回到库 {}" => {
+            Some("The last session's table {} no longer exists · back to database {}")
+        }
+        "✓ 已恢复上次会话 · {}.{}" => Some("✓ Restored the last session · {}.{}"),
+        "✓ 已恢复上次会话 · {}" => Some("✓ Restored the last session · {}"),
         _ => None,
     }
 }

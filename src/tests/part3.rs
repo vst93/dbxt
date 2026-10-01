@@ -1294,6 +1294,7 @@ pub(crate) fn every_call_site_has_english() {
         include_str!("../search.rs"),
         include_str!("../input.rs"),
         include_str!("../jsonview.rs"),
+        include_str!("../last_session.rs"),
         include_str!("../sidebar.rs"),
         include_str!("../editor.rs"),
         include_str!("../mongo.rs"),
@@ -1448,12 +1449,13 @@ pub(crate) fn help_text_matches_the_real_cli() {
     assert!(help.contains("DBX_STORE"));
     assert!(help.contains("-h, --help"));
     assert!(help.contains("-V, --version"));
+    assert!(help.contains("--last"));
     assert!(help.contains("https://github.com/vst93/dbxt"));
     assert!(help.ends_with('\n'));
-    // Exactly the two long options the parser actually accepts.
+    // The usage line plus exactly the three long options the parser accepts.
     assert_eq!(
         help.matches("--").count(),
-        2,
+        4,
         "unexpected --help drift: {help:?}"
     );
 }
@@ -11225,4 +11227,358 @@ pub(crate) fn r97_fk_jump_is_documented_in_full_help() {
         ui_text::t_lang("该单元格没有外键可跳转", ui_text::Lang::En),
         "该单元格没有外键可跳转"
     );
+}
+
+// ── R98: last-session restore ───────────────────────────────────────────────
+
+/// A fresh temp directory for the last-session tests.
+pub(crate) fn r98_tmp_dir(tag: &str) -> PathBuf {
+    let dir = std::env::temp_dir().join(format!("dbxt-r98-{tag}-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    let _ = std::fs::create_dir_all(&dir);
+    dir
+}
+
+/// R98: a stored session survives a round-trip, and every kind of corruption —
+/// invalid JSON, a non-object root, a missing / blank `conn_id`, a missing file
+/// — is "no session" without ever panicking.
+#[test]
+pub(crate) fn r98_last_session_round_trips_and_tolerates_corruption() {
+    let dir = r98_tmp_dir("roundtrip");
+    let path = dir.join("last-session.json");
+    let s = LastSession {
+        conn_id: "id-a".into(),
+        conn_name: "A".into(),
+        database: "shop".into(),
+        schema: "public".into(),
+        table: "orders".into(),
+        saved_at: 123,
+    };
+    s.save(&path);
+    assert_eq!(LastSession::load(&path), Some(s.clone()));
+    // The on-disk shape is the documented one.
+    let raw: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+    assert_eq!(raw["conn_id"], "id-a");
+    assert_eq!(raw["database"], "shop");
+    assert_eq!(raw["saved_at"], 123);
+
+    // Invalid JSON / non-object root / missing or blank conn_id → no session.
+    for body in [
+        "{ not json",
+        "[1,2,3]",
+        "{\"database\":\"shop\"}",
+        "{\"conn_id\":\"  \"}",
+        "null",
+    ] {
+        std::fs::write(&path, body).unwrap();
+        assert_eq!(LastSession::load(&path), None, "body {body:?}");
+    }
+    // A minimal record keeps the optional fields empty instead of failing.
+    std::fs::write(&path, "{\"conn_id\":\"id-a\"}").unwrap();
+    let partial = LastSession::load(&path).unwrap();
+    assert_eq!(partial.conn_id, "id-a");
+    assert!(partial.database.is_empty() && partial.table.is_empty());
+    assert_eq!(partial.saved_at, 0);
+    // A missing file is simply no session.
+    assert_eq!(LastSession::load(&dir.join("nope.json")), None);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// R98: the picker's initial cursor lands on the last session's connection —
+/// with a file, without one, and when that connection was deleted.
+#[test]
+pub(crate) fn r98_startup_highlights_last_connection() {
+    run_rt(|| {
+        let tx = test_tx();
+        // With a file naming the second connection → cursor on it, no connect.
+        let mut app = test_app();
+        app.connections = vec![conn("id-a", "A", "mysql"), conn("id-b", "B", "mysql")];
+        app.last_session = Some(LastSession {
+            conn_id: "id-b".into(),
+            ..Default::default()
+        });
+        let cs = app.connections.clone();
+        apply_op_result(&mut app, OpResult::Connections(cs), &tx);
+        assert_eq!(app.conn_list.selected(), Some(1));
+        assert!(app.selected.is_none(), "highlight only, nothing connects");
+
+        // Without a file → the first row.
+        let mut app = test_app();
+        app.connections = vec![conn("id-a", "A", "mysql"), conn("id-b", "B", "mysql")];
+        let cs = app.connections.clone();
+        apply_op_result(&mut app, OpResult::Connections(cs), &tx);
+        assert_eq!(app.conn_list.selected(), Some(0));
+
+        // A deleted connection → the first row (no dangling highlight).
+        let mut app = test_app();
+        app.connections = vec![conn("id-a", "A", "mysql")];
+        app.last_session = Some(LastSession {
+            conn_id: "id-gone".into(),
+            ..Default::default()
+        });
+        let cs = app.connections.clone();
+        apply_op_result(&mut app, OpResult::Connections(cs), &tx);
+        assert_eq!(app.conn_list.selected(), Some(0));
+    });
+}
+
+/// R98: `--last` reconnects and reopens the remembered table end to end.
+#[test]
+pub(crate) fn r98_last_flag_auto_resumes_the_table() {
+    run_rt(|| {
+        let tx = test_tx();
+        let mut app = test_app();
+        app.connections = vec![conn("id-a", "A", "mysql")];
+        app.last_session = Some(LastSession {
+            conn_id: "id-a".into(),
+            conn_name: "A".into(),
+            database: "shop".into(),
+            schema: String::new(),
+            table: "orders".into(),
+            saved_at: 1,
+        });
+        app.want_last = true;
+        let cs = app.connections.clone();
+        apply_op_result(&mut app, OpResult::Connections(cs), &tx);
+        assert!(app.selected.is_some(), "auto-connected");
+        assert!(app.resume_last, "resume chain in flight");
+        let gen = app.conn_gen;
+        apply_op_result(
+            &mut app,
+            OpResult::Databases {
+                databases: vec!["shop".into()],
+                warning: None,
+                gen,
+            },
+            &tx,
+        );
+        assert_eq!(app.current_db(), "shop");
+        let tgen = app.tables_gen;
+        apply_op_result(
+            &mut app,
+            OpResult::TablesFor {
+                tables: vec![table_info("orders", "TABLE"), table_info("users", "TABLE")],
+                gen: tgen,
+            },
+            &tx,
+        );
+        assert_eq!(
+            app.page_state.as_ref().map(|p| p.table.as_str()),
+            Some("orders")
+        );
+        assert!(!app.resume_last, "chain resolved");
+        assert!(app.status.contains("已恢复上次会话"), "{}", app.status);
+    });
+}
+
+/// R98: the degradation chain — a missing table falls back to the database's
+/// first screen, a missing database to the connection's first screen, and a
+/// missing connection to the connection list.
+#[test]
+pub(crate) fn r98_last_flag_degrades_table_database_connection() {
+    run_rt(|| {
+        let tx = test_tx();
+        // Table gone → database first screen.
+        let mut app = test_app();
+        app.connections = vec![conn("id-a", "A", "mysql")];
+        app.last_session = Some(LastSession {
+            conn_id: "id-a".into(),
+            database: "shop".into(),
+            table: "orders".into(),
+            ..Default::default()
+        });
+        app.want_last = true;
+        let cs = app.connections.clone();
+        apply_op_result(&mut app, OpResult::Connections(cs), &tx);
+        let gen = app.conn_gen;
+        apply_op_result(
+            &mut app,
+            OpResult::Databases {
+                databases: vec!["shop".into()],
+                warning: None,
+                gen,
+            },
+            &tx,
+        );
+        let tgen = app.tables_gen;
+        apply_op_result(
+            &mut app,
+            OpResult::TablesFor {
+                tables: vec![table_info("users", "TABLE")],
+                gen: tgen,
+            },
+            &tx,
+        );
+        assert!(app.page_state.is_none(), "no table opened");
+        assert!(!app.resume_last);
+        assert!(app.status.contains("上次会话的表"), "{}", app.status);
+        assert!(app.status.contains("orders"), "{}", app.status);
+
+        // Database gone → connection first screen, never a same-named table in
+        // some other database.
+        let mut app = test_app();
+        app.connections = vec![conn("id-a", "A", "mysql")];
+        app.last_session = Some(LastSession {
+            conn_id: "id-a".into(),
+            database: "shop".into(),
+            table: "orders".into(),
+            ..Default::default()
+        });
+        app.want_last = true;
+        let cs = app.connections.clone();
+        apply_op_result(&mut app, OpResult::Connections(cs), &tx);
+        let gen = app.conn_gen;
+        apply_op_result(
+            &mut app,
+            OpResult::Databases {
+                databases: vec!["other".into()],
+                warning: None,
+                gen,
+            },
+            &tx,
+        );
+        assert!(!app.resume_last);
+        assert!(app.status.contains("上次会话的库"), "{}", app.status);
+        let tgen = app.tables_gen;
+        apply_op_result(
+            &mut app,
+            OpResult::TablesFor {
+                tables: vec![table_info("orders", "TABLE")],
+                gen: tgen,
+            },
+            &tx,
+        );
+        assert!(
+            app.page_state.is_none(),
+            "a same-named table in another db must not open"
+        );
+        assert!(app.status.contains("上次会话的库"), "{}", app.status);
+
+        // Connection gone → connection list.
+        let mut app = test_app();
+        app.connections = vec![conn("id-a", "A", "mysql")];
+        app.last_session = Some(LastSession {
+            conn_id: "id-gone".into(),
+            ..Default::default()
+        });
+        app.want_last = true;
+        let cs = app.connections.clone();
+        apply_op_result(&mut app, OpResult::Connections(cs), &tx);
+        assert!(app.selected.is_none());
+        assert!(!app.resume_last);
+        assert!(
+            app.status.contains("上次会话的连接已不存在"),
+            "{}",
+            app.status
+        );
+
+        // No file at all → connection list with its own message.
+        let mut app = test_app();
+        app.connections = vec![conn("id-a", "A", "mysql")];
+        app.want_last = true;
+        let cs = app.connections.clone();
+        apply_op_result(&mut app, OpResult::Connections(cs), &tx);
+        assert!(app.selected.is_none());
+        assert!(
+            app.status.contains("没有可恢复的上次会话"),
+            "{}",
+            app.status
+        );
+    });
+}
+
+/// R98: a run that never actually opened a connection writes no file; one that
+/// did records the connection / database / table it was on.
+#[test]
+pub(crate) fn r98_failed_connection_writes_no_session() {
+    let dir = r98_tmp_dir("nowrite");
+    let path = dir.join("last-session.json");
+    let mut app = test_app();
+    app.selected = Some(conn("id-a", "A", "mysql"));
+    app.databases = vec!["shop".into()];
+    app.db_index = 0;
+    app.page_state = Some(page_of("orders"));
+    // Never opened → nothing is written.
+    app.session_opened = false;
+    save_last_session(&app, &path);
+    assert!(!path.exists(), "a failed connection writes nothing");
+    // The pool answered → the session is recorded.
+    app.session_opened = true;
+    save_last_session(&app, &path);
+    let back = LastSession::load(&path).unwrap();
+    assert_eq!(back.conn_id, "id-a");
+    assert_eq!(back.conn_name, "A");
+    assert_eq!(back.database, "shop");
+    assert_eq!(back.table, "orders");
+    assert!(back.saved_at > 0);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// R98: the flag is documented in `--help` and the full `?` sheet, and the
+/// degradation messages carry an English translation (R86 reconciliation).
+#[test]
+pub(crate) fn r98_last_flag_is_documented_in_help() {
+    assert!(
+        HELP_ROWS
+            .iter()
+            .any(|(k, d)| k.contains("--last") && d.contains("降级")),
+        "full help missing the --last row"
+    );
+    let help = help_text();
+    assert!(help.contains("--last"));
+    assert!(help.contains("[DBX_STORE] [--last]"));
+    assert_eq!(
+        parse_cli_args(&["--last".into(), "/tmp/dbx.db".into()]).unwrap(),
+        CliArgs {
+            store: Some("/tmp/dbx.db".into()),
+            want_last: true,
+        }
+    );
+    assert!(parse_cli_args(&["--nope".into()]).is_err());
+    use ui_text::{t_lang, tf_lang, Lang};
+    assert_ne!(
+        tf_lang(
+            "上次会话的表 {} 已不存在 · 回到库 {}",
+            &[&"orders", &"shop"],
+            Lang::En
+        ),
+        "上次会话的表 {} 已不存在 · 回到库 {}"
+    );
+    assert_ne!(
+        t_lang("上次会话的连接已不存在 · 回到连接列表", Lang::En),
+        "上次会话的连接已不存在 · 回到连接列表"
+    );
+    assert_ne!(
+        t_lang("没有可恢复的上次会话 · 回到连接列表", Lang::En),
+        "没有可恢复的上次会话 · 回到连接列表"
+    );
+}
+
+/// R98: the connection picker with a last-session highlight renders at the
+/// phone and desktop sizes without panicking.
+#[test]
+pub(crate) fn r98_picker_with_last_session_renders_at_extreme_sizes() {
+    run_rt(|| {
+        let tx = test_tx();
+        let mut app = test_app();
+        app.connections = vec![conn("id-a", "A", "mysql"), conn("id-b", "B", "mysql")];
+        app.last_session = Some(LastSession {
+            conn_id: "id-b".into(),
+            conn_name: "B".into(),
+            database: "shop".into(),
+            schema: String::new(),
+            table: "orders".into(),
+            saved_at: 1,
+        });
+        let cs = app.connections.clone();
+        apply_op_result(&mut app, OpResult::Connections(cs), &tx);
+        assert_eq!(app.conn_list.selected(), Some(1));
+        for (w, h) in [(42u16, 22u16), (110, 30)] {
+            let rows = draw(&mut app, w, h);
+            assert_eq!(rows.len(), h as usize);
+            let text = rows.join("\n");
+            assert!(text.contains('B'), "connection B missing at {w}x{h}");
+        }
+    });
 }

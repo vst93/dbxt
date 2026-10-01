@@ -10,6 +10,7 @@ mod editor;
 mod filter;
 mod input;
 mod jsonview;
+mod last_session;
 mod mongo;
 mod nav;
 mod numfmt;
@@ -4443,7 +4444,7 @@ fn version_line() -> String {
 /// [`write_stdout`], which tolerates a closed pipe.
 fn help_text() -> String {
     format!(
-        "dbxt {} — {}\n\n{}: dbxt [DBX_STORE]\n\n{}:\n{}\n\n{}:\n{}\n{}\n\n{}: https://github.com/vst93/dbxt\n",
+        "dbxt {} — {}\n\n{}: dbxt [DBX_STORE] [--last]\n\n{}:\n{}\n\n{}:\n{}\n{}\n{}\n\n{}: https://github.com/vst93/dbxt\n",
         dbxt_version(),
         t("DBX 的终端界面"),
         t("用法"),
@@ -4452,8 +4453,33 @@ fn help_text() -> String {
         t("选项"),
         t("  -h, --help     显示本帮助"),
         t("  -V, --version  显示版本"),
+        t("  --last         启动即恢复上次会话的连接与库表（失败逐级降级）"),
         t("文档"),
     )
+}
+
+/// R98: the parsed command line (after `--help` / `--version` are answered).
+#[derive(Default, PartialEq, Debug)]
+pub(crate) struct CliArgs {
+    pub(crate) store: Option<String>,
+    pub(crate) want_last: bool,
+}
+
+/// R98: parse the arguments (excluding `argv[0]`). `-h` / `--help` / `-V` /
+/// `--version` are recognised but answered by the caller; an unknown option is
+/// a usage error (`Err`). `--last` sets the auto-resume flag; any other bare
+/// word is the store path (the last one wins).
+pub(crate) fn parse_cli_args(args: &[String]) -> std::result::Result<CliArgs, String> {
+    let mut out = CliArgs::default();
+    for a in args {
+        match a.as_str() {
+            "-h" | "--help" | "-V" | "--version" => {}
+            "--last" => out.want_last = true,
+            s if s.len() > 1 && s.starts_with('-') => return Err(s.to_string()),
+            s => out.store = Some(s.to_string()),
+        }
+    }
+    Ok(out)
 }
 
 /// Write a block of text to stdout, exiting quietly when the reader has gone
@@ -4502,30 +4528,29 @@ async fn run_async() -> Result<()> {
     ui_text::set_lang(ui_text::detect_lang());
     // `--version` / `--help` answer before the TUI is initialised, so they work
     // over a pipe (the install scripts query `--version`) and without a terminal.
-    if let Some(arg) = std::env::args().nth(1) {
-        match arg.as_str() {
-            "-V" | "--version" => {
-                write_stdout(&format!("{}\n", version_line()))?;
-                return Ok(());
-            }
-            "-h" | "--help" => {
-                write_stdout(&help_text())?;
-                return Ok(());
-            }
+    let args: Vec<String> = std::env::args().skip(1).collect();
+    if args.iter().any(|a| a == "-h" || a == "--help") {
+        write_stdout(&help_text())?;
+        return Ok(());
+    }
+    if args.iter().any(|a| a == "-V" || a == "--version") {
+        write_stdout(&format!("{}\n", version_line()))?;
+        return Ok(());
+    }
+    let CliArgs { store, want_last } = match parse_cli_args(&args) {
+        Ok(c) => c,
+        Err(s) => {
             // An unknown option is a usage error (exit 2, like cmd/install.sh):
             // previously `dbxt --foo` was taken as a store path, created a file
             // literally named `--foo`, and then failed inside the TUI.
-            s if s.len() > 1 && s.starts_with('-') => {
-                write_stderr(&format!(
-                    "{}\n{}: dbxt [DBX_STORE]  (-h/--help)\n",
-                    tf("未知选项: {}", &[&s]),
-                    t("用法"),
-                ));
-                std::process::exit(2);
-            }
-            _ => {}
+            write_stderr(&format!(
+                "{}\n{}: dbxt [DBX_STORE] [--last]  (-h/--help)\n",
+                tf("未知选项: {}", &[&s]),
+                t("用法"),
+            ));
+            std::process::exit(2);
         }
-    }
+    };
     // The TUI needs a real terminal on stdout; without one ratatui's init()
     // panics (exit 101). Report it cleanly *before* touching the store, so a
     // non-interactive caller gets a sensible non-zero exit code and no side
@@ -4540,7 +4565,7 @@ async fn run_async() -> Result<()> {
     // The positional argument is the `dbx.db` file itself. A directory is also
     // accepted (and joined with `dbx.db`) so the historical documented usage
     // keeps working.
-    let mut db_path: PathBuf = match std::env::args().nth(1) {
+    let mut db_path: PathBuf = match store {
         Some(p) => PathBuf::from(p),
         None => storage_db_path().map_err(|e| anyhow::anyhow!(e))?,
     };
@@ -4564,7 +4589,7 @@ async fn run_async() -> Result<()> {
     // SGR encoding (1006), so press, release, `Drag` and bare `Moved` all reach us —
     // the drag path a phone's horizontal swipe needs is therefore live.
     let _ = execute!(std::io::stdout(), EnableMouseCapture);
-    let res = run_app(terminal, backend).await;
+    let res = run_app(terminal, backend, want_last).await;
     let _ = execute!(std::io::stdout(), DisableMouseCapture);
     ratatui::restore();
     res
@@ -4608,6 +4633,11 @@ impl App {
             conn_pointers: HashMap::new(),
             pending_restore: None,
             switch_notice: None,
+            last_session: None,
+            want_last: false,
+            resume_last: false,
+            resume_note: None,
+            session_opened: false,
             selected: None,
             databases: Vec::new(),
             db_index: 0,
@@ -4917,7 +4947,11 @@ impl App {
     }
 }
 
-async fn run_app(mut terminal: ratatui::DefaultTerminal, backend: Arc<LocalBackend>) -> Result<()> {
+async fn run_app(
+    mut terminal: ratatui::DefaultTerminal,
+    backend: Arc<LocalBackend>,
+    want_last: bool,
+) -> Result<()> {
     let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<OpResult>();
 
     // Bridge the kernel's process-global SSH prompt / notice gateways into the
@@ -4975,6 +5009,12 @@ async fn run_app(mut terminal: ratatui::DefaultTerminal, backend: Arc<LocalBacke
         trace_path,
         DragPan::from_env(),
     );
+    // R98: load the last session (best-effort) and seed the startup highlight /
+    // `--last` auto-resume request.
+    if let Some(path) = last_session_path() {
+        app.last_session = LastSession::load(&path);
+    }
+    app.want_last = want_last;
 
     // Pre-counted by `pending_ops: 1` in the initializer above.
     spawn_op(&backend, &tx, Op::ListConnections);
@@ -5048,6 +5088,11 @@ async fn run_app(mut terminal: ratatui::DefaultTerminal, backend: Arc<LocalBacke
                 expire_flash(&mut app);
             }
         }
+    }
+    // R98: remember where this run left off on a graceful exit. A run that never
+    // opened a connection writes nothing (`save_last_session` gates on it).
+    if let Some(path) = last_session_path() {
+        save_last_session(&app, &path);
     }
     Ok(())
 }
@@ -5216,6 +5261,16 @@ fn apply_op_result(app: &mut App, res: OpResult, tx: &Tx) {
             sort_connection_list(&mut app.connections, app.conn_sort);
             let sel = keep
                 .and_then(|id| app.connections.iter().position(|c| c.id == id))
+                .or_else(|| {
+                    // R98: on the initial picker load, drop the cursor on the last
+                    // session's connection. Highlight only — nothing connects
+                    // until the user presses Enter.
+                    if app.selected.is_none() {
+                        last_session_conn_index(app)
+                    } else {
+                        None
+                    }
+                })
                 .or_else(|| (!app.connections.is_empty()).then_some(0));
             app.conn_list.select(sel);
             app.picker_open = app.selected.is_none();
@@ -5223,6 +5278,12 @@ fn apply_op_result(app: &mut App, res: OpResult, tx: &Tx) {
             // R47b: seed the tree's liveness cache from the kernel now that the
             // connection list is known.
             refresh_conn_status(app, tx);
+            // R98: `--last` — auto-resume the previous session's connection (and
+            // its database / schema / table) once the list is known.
+            if app.want_last && app.selected.is_none() {
+                app.want_last = false;
+                resume_last_session(app, tx);
+            }
         }
         OpResult::SidebarLayout { layout, raw } => {
             // R48: groups come from DBX Desktop's own store. Rebuilding the tree
@@ -5378,6 +5439,8 @@ fn apply_op_result(app: &mut App, res: OpResult, tx: &Tx) {
                 // other connections' state with a background registry read.
                 app.conn_connecting.remove(&cfg.id);
                 app.conn_live.insert(cfg.id, true);
+                // R98: the pool answered, so this run may remember its session.
+                app.session_opened = true;
                 refresh_conn_status(app, tx);
             }
             app.db_index = configured
@@ -5386,12 +5449,34 @@ fn apply_op_result(app: &mut App, res: OpResult, tx: &Tx) {
                 .unwrap_or(0);
             // R41 smart restore: prefer the database the switch wanted to return
             // to, but only when this connection actually exposes it.
+            let mut resume_db_missing = false;
             if let Some(p) = &app.pending_restore {
                 if !p.db.is_empty() {
-                    if let Some(i) = app.databases.iter().position(|d| d == &p.db) {
-                        app.db_index = i;
+                    match app.databases.iter().position(|d| d == &p.db) {
+                        Some(i) => app.db_index = i,
+                        // R98: a `--last` restore whose database is gone degrades
+                        // to the connection's first screen rather than opening a
+                        // same-named table in some other database.
+                        None if app.resume_last => resume_db_missing = true,
+                        None => {}
                     }
                 }
+            }
+            if resume_db_missing {
+                let db = app
+                    .pending_restore
+                    .as_ref()
+                    .map(|p| p.db.clone())
+                    .unwrap_or_default();
+                if let Some(p) = app.pending_restore.as_mut() {
+                    p.table = None;
+                    p.schema.clear();
+                }
+                app.resume_last = false;
+                app.resume_note = Some(tf(
+                    "上次会话的库 {} 已不存在 · 回到连接首屏",
+                    &[&(fix_double_encoding(&db))],
+                ));
             }
             // A fresh database list invalidates the cached schema list.
             app.schemas.clear();
@@ -5432,6 +5517,11 @@ fn apply_op_result(app: &mut App, res: OpResult, tx: &Tx) {
             // still used) but it must not be swallowed either.
             if let Some(w) = warning {
                 app.status = format!("⚠ {w}");
+            }
+            // R98: surface a database-level degradation now; the table landing
+            // re-applies the note after its own list arrives.
+            if let Some(note) = app.resume_note.clone() {
+                app.status = note;
             }
         }
         OpResult::TreeDatabases {
@@ -5602,9 +5692,32 @@ fn apply_op_result(app: &mut App, res: OpResult, tx: &Tx) {
                         app.nav_landing =
                             Some(tf("→ {}.{}", &[&db, &(fix_double_encoding(&name))]));
                         open_table_data(app, tx);
+                        // R98: a `--last` resume that found its table names the
+                        // restored target; the first page lands right after.
+                        if app.resume_last {
+                            app.resume_last = false;
+                            app.status = tf(
+                                "✓ 已恢复上次会话 · {}.{}",
+                                &[&db, &(fix_double_encoding(&name))],
+                            );
+                        }
                         if let Some(nt) = notice {
                             app.status = format!("{} · ⚠ {nt}", app.status);
                         }
+                        return;
+                    }
+                    // R98: the remembered table is gone — degrade to the
+                    // database's first screen (table → database).
+                    if app.resume_last {
+                        app.resume_last = false;
+                        app.nav_landing = Some(tf(
+                            "→ {} 首屏（无 {}）",
+                            &[&db, &(fix_double_encoding(&name))],
+                        ));
+                        app.status = tf(
+                            "上次会话的表 {} 已不存在 · 回到库 {}",
+                            &[&(fix_double_encoding(&name)), &db],
+                        );
                         return;
                     }
                     app.nav_landing = Some(tf(
@@ -5612,6 +5725,14 @@ fn apply_op_result(app: &mut App, res: OpResult, tx: &Tx) {
                         &[&db, &(fix_double_encoding(&name))],
                     ));
                 } else {
+                    // R98: the last session had no table open — landing on the
+                    // restored database is the successful end of the chain.
+                    if app.resume_last {
+                        app.resume_last = false;
+                        app.nav_landing = Some(tf("→ {}", &[&db]));
+                        app.status = tf("✓ 已恢复上次会话 · {}", &[&db]);
+                        return;
+                    }
                     app.nav_landing = Some(tf("→ {}", &[&db]));
                 }
             }
@@ -5642,6 +5763,11 @@ fn apply_op_result(app: &mut App, res: OpResult, tx: &Tx) {
             };
             if let Some(nt) = notice.take() {
                 status = format!("{status} · ⚠ {nt}");
+            }
+            // R98: a missing remembered database left its degradation note for
+            // this landing (the table list is what finally replaces the status).
+            if let Some(note) = app.resume_note.take() {
+                status = note;
             }
             app.status = status;
         }

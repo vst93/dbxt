@@ -1964,6 +1964,22 @@ pub(crate) struct App {
     /// One-shot notice appended to the landing status after a switch (e.g. the
     /// editor still holds uncommitted text).
     pub(crate) switch_notice: Option<String>,
+    /// R98: the last session read from `last-session.json` at startup. Drives
+    /// the picker's initial highlight and, with `--last`, the auto-resume. A
+    /// missing / corrupt file simply leaves this `None`.
+    pub(crate) last_session: Option<LastSession>,
+    /// R98: `--last` was passed on the command line; consumed once the
+    /// connection list arrives.
+    pub(crate) want_last: bool,
+    /// R98: a `--last` resume is in flight; the database / table handlers use it
+    /// to emit the per-level degradation message instead of the generic landing.
+    pub(crate) resume_last: bool,
+    /// R98: a degradation message to apply to the next table-list landing (a
+    /// missing database resolves before the table list arrives).
+    pub(crate) resume_note: Option<String>,
+    /// R98: a connection actually opened this run, so a graceful exit may write
+    /// `last-session.json`. A failed / never-attempted connection never sets it.
+    pub(crate) session_opened: bool,
 
     pub(crate) selected: Option<ConnectionConfig>,
     pub(crate) databases: Vec<String>,

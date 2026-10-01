@@ -61,6 +61,7 @@ pub(crate) use crate::editor::*;
 pub(crate) use crate::filter::*;
 pub(crate) use crate::input::*;
 pub(crate) use crate::jsonview::*;
+pub(crate) use crate::last_session::*;
 pub(crate) use crate::mongo::*;
 pub(crate) use crate::nav::*;
 pub(crate) use crate::numfmt::*;

@@ -225,7 +225,7 @@ cargo install --git https://github.com/vst93/dbxt
 # or: git clone https://github.com/vst93/dbxt && cd dbxt && cargo build --release
 ```
 
-Releases are cut from GitHub Actions: `gh workflow run release.yml` (optionally `-f version=0.2.0`) bumps the patch of the latest tag, tags, creates the release and builds all seven archives. `dbxt --version` and `dbxt --help` answer without opening the TUI.
+Releases are cut from GitHub Actions: `gh workflow run release.yml` (optionally `-f version=0.2.0`) bumps the patch of the latest tag, tags, creates the release and builds all seven archives. `dbxt --version` and `dbxt --help` answer without opening the TUI. `dbxt [DBX_STORE] --last` reconnects the last session's connection and reopens its `database.schema.table` at startup (degrading one level at a time: table → database → connection → list).
 
 ## Quick start
 
@@ -261,7 +261,7 @@ The TUI's `?` overlay and `dbxt --help` carry the complete list; this is the sho
 
 ## Persistence & configuration
 
-Per-table choices (compact widths, hidden columns, sort) and remembered column widths (`<`/`>` in the results pane) are written to `~/.config/dbxt/tui.json`, keyed by `database.table` (a column width also carries the connection and column name, capped at 200 entries with LRU eviction); `DBXT_CONFIG` overrides the path and `DBXT_NO_PERSIST=1` disables it. `DBXT_LANG=en|zh` selects the UI language (the locale decides when unset), `DBX_DATA_DIR` points dbxt at a different DBX store, and `DBXT_INSTALL_DIR` is the install script's target directory.
+Per-table choices (compact widths, hidden columns, sort) and remembered column widths (`<`/`>` in the results pane) are written to `~/.config/dbxt/tui.json`, keyed by `database.table` (a column width also carries the connection and column name, capped at 200 entries with LRU eviction); the connection / database / table the last run left off on is written to `~/.config/dbxt/last-session.json` (only after a connection actually opened) and reloaded at startup to highlight that connection, or to auto-resume it with `--last`; `DBXT_CONFIG` overrides the directory for both, `DBXT_LAST_SESSION` overrides just the session file, and `DBXT_NO_PERSIST=1` disables them. `DBXT_LANG=en|zh` selects the UI language (the locale decides when unset), `DBX_DATA_DIR` points dbxt at a different DBX store, and `DBXT_INSTALL_DIR` is the install script's target directory.
 
 The SSH-tunnel unit tests (serialization shape, form mapping, auth/error classification, host-key prompt) run with the normal `cargo test`. Two extra end-to-end tests drive a real tunnel (dbxt → local `sshd` → MySQL) and are skipped unless `DBXT_SSH_TEST=1`; they read `DBXT_SSH_TEST_USER` / `_PASSWORD` / `_KEY`, `DBXT_SSH_TEST_MYSQL_PORT` (default 13306) and `DBXT_SSH_TEST_MYSQL_USER` / `_PASSWORD`. `tests/secret_store.rs` also runs with `cargo test`: it generates a throwaway `DBX_SECRET_KEY_FILE`, saves an encrypted connection and reads its password back (the key is never committed).
 

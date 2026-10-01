@@ -225,7 +225,7 @@ cargo install --git https://github.com/vst93/dbxt
 # 或：git clone https://github.com/vst93/dbxt && cd dbxt && cargo build --release
 ```
 
-发版由 GitHub Actions 完成：`gh workflow run release.yml`（可加 `-f version=0.2.0`）把最新 tag 的 patch 加一、打 tag、创建 Release 并构建全部七个压缩包。`dbxt --version` 与 `dbxt --help` 不启动 TUI 即可输出。
+发版由 GitHub Actions 完成：`gh workflow run release.yml`（可加 `-f version=0.2.0`）把最新 tag 的 patch 加一、打 tag、创建 Release 并构建全部七个压缩包。`dbxt --version` 与 `dbxt --help` 不启动 TUI 即可输出。`dbxt [DBX_STORE] --last` 启动即重连上次会话的连接并重新打开其 `库.schema.表`（失败逐级降级：表 → 库 → 连接 → 连接列表）。
 
 ## 快速上手
 
@@ -261,7 +261,7 @@ cargo install --git https://github.com/vst93/dbxt
 
 ## 持久化与配置
 
-按表偏好（列宽压缩、隐藏列、排序）与记住的列宽（结果区 `<`/`>`）写入 `~/.config/dbxt/tui.json`，以 `库.表` 为键（列宽另带连接与列名，上限 200 条、LRU 淘汰）；`DBXT_CONFIG` 可覆盖路径，`DBXT_NO_PERSIST=1` 可关闭。`DBXT_LANG=en|zh` 选择界面语言（未设置时由 locale 决定），`DBX_DATA_DIR` 指定其他 DBX 存储，`DBXT_INSTALL_DIR` 是安装脚本的目标目录。
+按表偏好（列宽压缩、隐藏列、排序）与记住的列宽（结果区 `<`/`>`）写入 `~/.config/dbxt/tui.json`，以 `库.表` 为键（列宽另带连接与列名，上限 200 条、LRU 淘汰）；上次退出时所在的连接 / 库 / 表写入 `~/.config/dbxt/last-session.json`（仅在确实连上连接后写），启动时读取以高亮该连接，`--last` 则自动恢复；`DBXT_CONFIG` 可覆盖两者所在目录，`DBXT_LAST_SESSION` 单独覆盖会话文件，`DBXT_NO_PERSIST=1` 可关闭。`DBXT_LANG=en|zh` 选择界面语言（未设置时由 locale 决定），`DBX_DATA_DIR` 指定其他 DBX 存储，`DBXT_INSTALL_DIR` 是安装脚本的目标目录。
 
 SSH 隧道的单测（序列化形状、表单映射、认证/错误分类、主机密钥提示）随 `cargo test` 运行。另有两个端到端测试会驱动真实隧道（dbxt → 本机 `sshd` → MySQL），默认跳过，需 `DBXT_SSH_TEST=1` 开启；它们读取 `DBXT_SSH_TEST_USER` / `_PASSWORD` / `_KEY`、`DBXT_SSH_TEST_MYSQL_PORT`（默认 13306）与 `DBXT_SSH_TEST_MYSQL_USER` / `_PASSWORD`。`tests/secret_store.rs` 也随 `cargo test` 运行：它临时生成一个 `DBX_SECRET_KEY_FILE`，写入加密连接再读回密码（密钥不提交）。
 
