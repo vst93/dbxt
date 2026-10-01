@@ -149,6 +149,10 @@ pub(crate) fn reset_overlays_for_backend_switch(app: &mut App) {
     app.filter_prompt = None;
     // R102: drop the comment editor with the rest of the overlays.
     app.comment_edit = None;
+    // R103: drop the materialize prompt / pending write too.
+    app.materialize_prompt = None;
+    app.materialize_write = None;
+    app.pending_materialize_msg = None;
     app.cell_popup = None;
     app.row_popup = None;
     app.error_popup = None;
@@ -396,6 +400,8 @@ pub(crate) fn confirm_key(app: &mut App, tx: &Tx, k: KeyEvent) {
             app.pending_write = false;
             // R102: a cancelled comment write must not refresh on a later write.
             app.comment_refresh = false;
+            // R103: a cancelled materialization must not label / refresh a later write.
+            app.materialize_write = None;
             // R88: a cancelled scoped run must not label a later result.
             app.pending_scope = None;
             app.flash(t("已取消").into());
@@ -544,6 +550,11 @@ pub(crate) fn browse_key(app: &mut App, tx: &Tx, k: KeyEvent) {
     // grid and the `gc` popup it was opened from, so it owns the keyboard first.
     if app.comment_edit.is_some() {
         comment_edit_key(app, k);
+        return;
+    }
+    // R103: the `g m` table-name prompt is modal while it is open.
+    if app.materialize_prompt.is_some() {
+        materialize_prompt_key(app, k);
         return;
     }
     if app.filter_prompt.is_some() {
@@ -827,6 +838,8 @@ pub(crate) fn browse_key(app: &mut App, tx: &Tx, k: KeyEvent) {
             | KeyCode::Char('s')
             // R85: `g w` fits the focused column to its content.
             | KeyCode::Char('w')
+            // R103: `g m` materializes the result set as a table (CTAS).
+            | KeyCode::Char('m')
                 if k.modifiers.is_empty() =>
             {
                 preview_key(app, tx, k);

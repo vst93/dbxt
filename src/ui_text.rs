@@ -1300,7 +1300,7 @@ pub static ALL_KEYS: &[&str] = &[
     "无可钉住的结果（先打开一张表或执行查询）",
     "无可钉住的结果",
     "📌 已钉住结果区 · 切换表/库仍显示 · Alt-F 解除",
-    "g… d=表结构 t=表数据 v=定位值 c=列结构 b=切换表 w=适配列宽 W=全列适配",
+    "g… d=表结构 t=表数据 v=定位值 c=列结构 b=切换表 f=冻结列 s=钉行 w=适配列宽 W=全列适配 m=物化成表",
     // R85: content auto-fit column widths (`g w` / `g W`)
     "没有可适配列宽的结果",
     "没有可适配的列",
@@ -1710,6 +1710,23 @@ pub static ALL_KEYS: &[&str] = &[
     "无新增 / 删除 / 变更（a 显示未变行）",
     "结果与快照一致",
     "结果集快照对比：无快照时存下当前结果，有快照时与它做行 diff（新增 + / 删除 - / 变更 ~，变更列高亮，摘要 +2 -1 ~3 · 快照 10:32）；a 显示未变行，Ctrl-Shift-X 清除快照；按主键匹配，无主键按整行匹配；列集不一致时按交集对齐并在摘要提示；纯客户端零查询，快照仅内存、换连接 / 收起结果 / 断开即失效",
+    // R103: materialize the result set as a table (CTAS).
+    "新表名",
+    "物化成表",
+    "物化结果集为表 · 输入表名 · Enter 确认 · Esc 取消（预填 {}）",
+    "物化确认 · Enter 执行 · Esc 取消",
+    "物化结果集 → 表 {}",
+    "已物化 {} · {} 行",
+    "已取消物化",
+    "✗ 表名不能为空",
+    "✗ 物化仅支持 SQL 结果",
+    "✗ 只读连接不能物化",
+    "✗ 物化仅支持结果网格（结构视图不可用）",
+    "当前没有可物化的结果",
+    "当前结果没有可物化的来源 SQL",
+    " 物化结果集为表 · {} 行 · Enter 确认 · Esc 取消 ",
+    " 物化 · Enter/Esc ",
+    "物化当前结果为表（CTAS）：输入新表名（预填 result_HHMMSS），Enter 生成 CREATE TABLE … AS <来源 SQL> 并进红色确认层（显示完整 CTAS + 目标表名，绝不静默执行）；来源=查询结果对应语句（多语句跑批时=当前下钻 / 列表光标所在的那条）/ 浏览表当前过滤排序的等效 SELECT；成功后刷新侧栏表列表、状态栏显示 已物化 N 行、不跳转新表（保持上下文）；表名按方言转义，空名拒绝；只读连接 / Redis / Mongo / 结构视图隐藏",
 ];
 
 /// The Chinese → English table. Keys must match the source literals exactly.
@@ -4605,6 +4622,9 @@ fn en_of(zh: &'static str) -> Option<&'static str> {
         "g… d=表结构 t=表数据 v=定位值 c=列结构 b=切换表 f=冻结列 s=钉行 w=适配列宽 W=全列适配" => {
             Some("g… d=structure t=data v=locate c=columns b=switch table f=freeze column s=pin row w=fit width W=fit all")
         }
+        "g… d=表结构 t=表数据 v=定位值 c=列结构 b=切换表 f=冻结列 s=钉行 w=适配列宽 W=全列适配 m=物化成表" => {
+            Some("g… d=structure t=data v=locate c=columns b=switch table f=freeze column s=pin row w=fit width W=fit all m=materialize")
+        }
         "g… f=字段跳转 s=钉行" => Some("g… f=field jump s=pin row"),
         "g… f=冻结列 s=钉行" => Some("g… f=freeze column s=pin row"),
         "冻结列" => Some("freeze col"),
@@ -4832,6 +4852,35 @@ fn en_of(zh: &'static str) -> Option<&'static str> {
         }
         "列结构弹层：列名 / 类型 / 键(PRI/UNI/MUL) / 默认值 / 可空 / 注释；右侧就地显示选中列的值分布（非空/空/去重，去重旁附 12 格分布 sparkline，数值列 min/max/avg；缓存元数据+已加载数据，不额外查库；窄屏 < 56 列隐藏 sparkline；/ 过滤列名；Enter 跳到该列；n 编辑选中列注释（PG/通用 COMMENT ON COLUMN，MySQL 列注释只读提示）；底部动作行 y 复制当前表结构 Markdown（列 / 索引 / 外键；无注释省略注释列）" => {
             Some("Column-structure popup: name / type / key (PRI/UNI/MUL) / default / nullable / comment; the right pane shows the highlighted column's value distribution in place (non-null / null / distinct, with a 12-cell distribution sparkline next to the distinct count, and min/max/avg for numeric columns; cached metadata + loaded data, no extra query; a narrow screen under 56 columns hides the sparkline). / filters by column name; Enter jumps to the column; n edits the highlighted column's comment (COMMENT ON COLUMN on PostgreSQL / the generic form, a read-only note on MySQL columns); the bottom action row y copies the current table structure as Markdown (columns / indexes / foreign keys; the comment column is omitted when there are none).")
+        }
+        // ── R103: materialize the result set as a table (CTAS) ──
+        "新表名" => Some("new table name"),
+        "物化成表" => Some("materialize"),
+        "物化结果集为表 · 输入表名 · Enter 确认 · Esc 取消（预填 {}）" => Some(
+            "Materialize result as table · enter a name · Enter confirm · Esc cancel (prefilled {})",
+        ),
+        "物化确认 · Enter 执行 · Esc 取消" => {
+            Some("Materialize confirmation · Enter run · Esc cancel")
+        }
+        "物化结果集 → 表 {}" => Some("Materialize result set → table {}"),
+        "已物化 {} · {} 行" => Some("Materialized {} · {} rows"),
+        "已取消物化" => Some("Materialization cancelled"),
+        "✗ 表名不能为空" => Some("✗ The table name cannot be empty"),
+        "✗ 物化仅支持 SQL 结果" => Some("✗ Materialize is only available for SQL results"),
+        "✗ 只读连接不能物化" => Some("✗ A read-only connection cannot materialize"),
+        "✗ 物化仅支持结果网格（结构视图不可用）" => {
+            Some("✗ Materialize is only available for a result grid (not the structure view)")
+        }
+        "当前没有可物化的结果" => Some("No result to materialize"),
+        "当前结果没有可物化的来源 SQL" => {
+            Some("The current result has no source SQL to materialize")
+        }
+        " 物化结果集为表 · {} 行 · Enter 确认 · Esc 取消 " => {
+            Some(" Materialize result as table · {} rows · Enter confirm · Esc cancel ")
+        }
+        " 物化 · Enter/Esc " => Some(" Materialize · Enter/Esc "),
+        "物化当前结果为表（CTAS）：输入新表名（预填 result_HHMMSS），Enter 生成 CREATE TABLE … AS <来源 SQL> 并进红色确认层（显示完整 CTAS + 目标表名，绝不静默执行）；来源=查询结果对应语句（多语句跑批时=当前下钻 / 列表光标所在的那条）/ 浏览表当前过滤排序的等效 SELECT；成功后刷新侧栏表列表、状态栏显示 已物化 N 行、不跳转新表（保持上下文）；表名按方言转义，空名拒绝；只读连接 / Redis / Mongo / 结构视图隐藏" => {
+            Some("Materialize the current result as a table (CTAS): type a new table name (prefilled result_HHMMSS); Enter builds CREATE TABLE … AS <source SQL> and routes it through the red confirmation layer (the full CTAS plus the target table name are shown; it is never run silently). The source is the statement behind a query result (after a multi-statement run, the drilled statement or the focused row of the statement list) or the equivalent SELECT of a browsed table's current WHERE / ORDER BY. On success the sidebar table list refreshes, the status shows `materialized N rows`, and the app does not jump to the new table (the context is kept). The name is quoted / escaped per dialect and a blank name is refused; the action is hidden on a read-only connection / Redis / MongoDB / the structure view.")
         }
         _ => None,
     }

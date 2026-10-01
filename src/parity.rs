@@ -1431,6 +1431,9 @@ impl App {
         let Some(tab) = self.result_tabs.get(self.result_tab).cloned() else {
             return;
         };
+        // R103: `g m` materializes the tab actually on screen, so the active
+        // statement follows the tab flip (a script list clears it).
+        self.last_sql = tab.sql.clone();
         self.grid_full = tab.grid_full.clone();
         self.script = tab.script;
         self.grid_kind = tab.kind;
@@ -1473,6 +1476,7 @@ pub(crate) fn push_result_tab(
     app.save_result_tab();
     app.result_tabs.push(ResultTab {
         title,
+        sql: None,
         grid: grid.as_ref().map(|g| {
             if kind == GridKind::Columns {
                 g.clone()
@@ -1521,8 +1525,11 @@ pub(crate) fn replace_result_tab(
         return;
     }
     let idx = app.result_tab.min(app.result_tabs.len() - 1);
+    // R103: a load-more replaces the same result, so its source SQL carries over.
+    let keep_sql = app.result_tabs[idx].sql.clone();
     app.result_tabs[idx] = ResultTab {
         title,
+        sql: keep_sql,
         grid: grid.as_ref().map(|g| {
             if kind == GridKind::Columns {
                 g.clone()

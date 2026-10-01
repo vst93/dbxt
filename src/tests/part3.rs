@@ -1295,6 +1295,7 @@ pub(crate) fn every_call_site_has_english() {
         include_str!("../input.rs"),
         include_str!("../jsonview.rs"),
         include_str!("../last_session.rs"),
+        include_str!("../materialize.rs"),
         include_str!("../sidebar.rs"),
         include_str!("../editor.rs"),
         include_str!("../mongo.rs"),
@@ -12872,4 +12873,309 @@ pub(crate) fn r102_comment_prompt_renders_at_both_sizes() {
         joined.contains("列注释"),
         "column comment prompt missing: {joined}"
     );
+}
+
+// ── R103: materialize the result set as a table (CTAS) ───────────────────────
+
+/// A single-statement query result materializes its own statement, quoted per
+/// dialect; a blank name is refused.
+#[test]
+pub(crate) fn r103_ctas_plain_select_and_blank_name() {
+    assert_eq!(
+        materialize_ctas_sql(DatabaseType::Mysql, "result_120000", "SELECT * FROM orders"),
+        Some("CREATE TABLE `result_120000` AS SELECT * FROM orders".to_string())
+    );
+    assert_eq!(
+        materialize_ctas_sql(
+            DatabaseType::Postgres,
+            "result_120000",
+            "SELECT * FROM orders"
+        ),
+        Some("CREATE TABLE \"result_120000\" AS SELECT * FROM orders".to_string())
+    );
+    // Blank / whitespace-only names are refused.
+    assert_eq!(
+        materialize_ctas_sql(DatabaseType::Mysql, "   ", "SELECT 1"),
+        None
+    );
+}
+
+/// The identifier is escaped per dialect, so an embedded quote cannot break out
+/// of the name.
+#[test]
+pub(crate) fn r103_ctas_escapes_quotes_in_the_name() {
+    assert_eq!(
+        materialize_ctas_sql(DatabaseType::Postgres, "a\"b", "SELECT 1"),
+        Some("CREATE TABLE \"a\"\"b\" AS SELECT 1".to_string())
+    );
+    assert_eq!(
+        materialize_ctas_sql(DatabaseType::Mysql, "a`b", "SELECT 1"),
+        Some("CREATE TABLE `a``b` AS SELECT 1".to_string())
+    );
+}
+
+/// The prefilled name is `result_<HHMMSS>`.
+#[test]
+pub(crate) fn r103_default_name_is_result_hhmmss() {
+    let name = default_materialize_name();
+    let suffix = name.strip_prefix("result_").expect("result_ prefix");
+    assert_eq!(suffix.len(), 6, "{name}");
+    assert!(suffix.chars().all(|c| c.is_ascii_digit()), "{name}");
+}
+
+/// A browsed table's filter / sort materializes as the equivalent unbounded
+/// SELECT (the same view the export INSERT reads).
+#[test]
+pub(crate) fn r103_browse_equivalent_select_carries_filter_and_sort() {
+    let cfg = test_conn("mysql");
+    let sql = browse_equivalent_select(
+        &cfg,
+        "",
+        "orders",
+        "amount > 10",
+        Some("`created_at` DESC"),
+    );
+    assert_eq!(
+        sql,
+        "SELECT * FROM `orders` WHERE (amount > 10) ORDER BY `created_at` DESC"
+    );
+    // No filter / sort → a plain `SELECT *`.
+    assert_eq!(
+        browse_equivalent_select(&cfg, "", "orders", "", None),
+        "SELECT * FROM `orders`"
+    );
+    // A leading WHERE in the stored filter is stripped, then re-wrapped.
+    assert_eq!(
+        browse_equivalent_select(&cfg, "", "orders", "WHERE id = 1", None),
+        "SELECT * FROM `orders` WHERE (id = 1)"
+    );
+}
+
+/// After a multi-statement run, the drilled statement's own SQL is the source
+/// (the ordinal is the script outcome index).
+#[test]
+pub(crate) fn r103_source_sql_uses_the_drilled_script_outcome() {
+    let mut app = test_app();
+    app.picker_open = false;
+    app.selected = Some(test_conn("mysql"));
+    app.backend_kind = Backend::Sql;
+    let mk = |sql: &str| StmtOutcome {
+        sql: sql.to_string(),
+        grid: sample_grid(),
+        error: None,
+        affected: 0,
+        ms: 1,
+    };
+    app.script = Some(ScriptView {
+        outcomes: vec![mk("SELECT 1"), mk("SELECT * FROM orders WHERE id = 7")],
+        sel: 0,
+        drilled: Some(1),
+    });
+    app.grid_kind = GridKind::Query;
+    app.last_sql = Some("SELECT stale".into());
+    assert_eq!(
+        materialize_source_sql(&app).as_deref(),
+        Some("SELECT * FROM orders WHERE id = 7")
+    );
+}
+
+/// In the statement list (not drilled), the focused statement's own result is
+/// the source — the `光标` / ordinal case.
+#[test]
+pub(crate) fn r103_source_sql_uses_the_focused_script_outcome() {
+    let mut app = test_app();
+    app.picker_open = false;
+    app.selected = Some(test_conn("mysql"));
+    app.backend_kind = Backend::Sql;
+    let mk = |sql: &str| StmtOutcome {
+        sql: sql.to_string(),
+        grid: sample_grid(),
+        error: None,
+        affected: 0,
+        ms: 1,
+    };
+    app.script = Some(ScriptView {
+        outcomes: vec![mk("SELECT 1"), mk("SELECT * FROM orders WHERE id = 7")],
+        sel: 1,
+        drilled: None,
+    });
+    app.grid_kind = GridKind::Query;
+    assert_eq!(
+        materialize_source_sql(&app).as_deref(),
+        Some("SELECT * FROM orders WHERE id = 7")
+    );
+    assert_eq!(materialize_grid_rows(&app), Some(sample_grid().rows.len()));
+    assert!(materialize_available(&app));
+    // A write outcome (no result columns) is not materializable.
+    let write = StmtOutcome {
+        sql: "INSERT INTO orders VALUES (1)".into(),
+        grid: Grid::default(),
+        error: None,
+        affected: 1,
+        ms: 1,
+    };
+    app.script.as_mut().unwrap().outcomes.push(write);
+    app.script.as_mut().unwrap().sel = 2;
+    assert_eq!(materialize_source_sql(&app), None);
+    assert!(!materialize_available(&app));
+}
+
+/// The active result tab's own statement wins over a stale `last_sql`, and a
+/// tab flip updates it.
+#[test]
+pub(crate) fn r103_source_sql_follows_the_active_result_tab() {
+    let mut app = test_app();
+    app.picker_open = false;
+    app.selected = Some(test_conn("mysql"));
+    app.backend_kind = Backend::Sql;
+    app.grid_kind = GridKind::Query;
+    app.set_grid(sample_grid());
+    push_result_tab(
+        &mut app,
+        "first".into(),
+        Some(sample_grid()),
+        None,
+        GridKind::Query,
+    );
+    app.result_tabs[app.result_tab].sql = Some("SELECT fresh".into());
+    app.last_sql = Some("SELECT stale".into());
+    assert_eq!(
+        materialize_source_sql(&app).as_deref(),
+        Some("SELECT fresh")
+    );
+    // Restoring the tab re-syncs `last_sql` to the tab's statement.
+    app.last_sql = Some("SELECT other".into());
+    app.restore_result_tab();
+    assert_eq!(app.last_sql.as_deref(), Some("SELECT fresh"));
+}
+
+/// `g m` is hidden (reported unavailable) on a read-only connection and for the
+/// Redis / MongoDB / structure-view grids.
+#[test]
+pub(crate) fn r103_action_hidden_on_readonly_and_non_sql_grids() {
+    let mut app = test_app();
+    app.picker_open = false;
+    app.backend_kind = Backend::Sql;
+    let mut cfg = test_conn("mysql");
+    cfg.read_only = true;
+    app.selected = Some(cfg);
+    app.grid_kind = GridKind::Query;
+    app.set_grid(sample_grid());
+    app.last_sql = Some("SELECT 1".into());
+    assert!(!materialize_available(&app));
+    open_materialize_prompt(&mut app);
+    assert!(app.materialize_prompt.is_none());
+    assert!(app.status.contains("只读"), "{}", app.status);
+
+    // Redis / MongoDB backends are never SQL.
+    app.backend_kind = Backend::Redis;
+    app.selected = Some(test_conn("mysql"));
+    app.grid_kind = GridKind::RedisValue;
+    assert!(!materialize_available(&app));
+    app.backend_kind = Backend::Mongo;
+    app.grid_kind = GridKind::MongoDocs;
+    assert!(!materialize_available(&app));
+
+    // The structure view has no data grid.
+    app.backend_kind = Backend::Sql;
+    app.grid_kind = GridKind::Columns;
+    assert!(!materialize_available(&app));
+}
+
+/// Opening the prompt prefills `result_HHMMSS`; Enter builds the CTAS and hands
+/// it to the red confirmation layer (never runs it directly).
+#[test]
+pub(crate) fn r103_prompt_prefills_and_submit_routes_to_confirm() {
+    let mut app = test_app();
+    app.picker_open = false;
+    app.selected = Some(test_conn("mysql"));
+    app.backend_kind = Backend::Sql;
+    app.grid_kind = GridKind::Query;
+    app.set_grid(sample_grid());
+    app.last_sql = Some("SELECT * FROM orders".into());
+    open_materialize_prompt(&mut app);
+    let mp = app.materialize_prompt.as_ref().expect("prompt open");
+    assert_eq!(mp.rows, sample_grid().rows.len());
+    let prefilled = mp.input.lines().join("");
+    assert!(prefilled.starts_with("result_"), "{prefilled}");
+    // Rename and submit.
+    app.materialize_prompt.as_mut().unwrap().input = TextArea::from(["orders_copy"]);
+    submit_materialize(&mut app);
+    assert!(app.materialize_prompt.is_none());
+    let confirm = app.confirm.as_ref().expect("confirm open");
+    assert_eq!(
+        confirm.sql,
+        "CREATE TABLE `orders_copy` AS SELECT * FROM orders"
+    );
+    assert!(confirm.reasons.iter().any(|r| r.contains("orders_copy")));
+    assert_eq!(
+        app.materialize_write.as_ref().map(|p| p.name.as_str()),
+        Some("orders_copy")
+    );
+    // Cancelling clears the pending materialization.
+    confirm_key(&mut app, &test_tx(), KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+    assert!(app.confirm.is_none());
+    assert!(app.materialize_write.is_none());
+}
+
+/// A blank name keeps the prompt open and reports instead of building SQL.
+#[test]
+pub(crate) fn r103_blank_name_keeps_the_prompt_open() {
+    let mut app = test_app();
+    app.picker_open = false;
+    app.selected = Some(test_conn("mysql"));
+    app.backend_kind = Backend::Sql;
+    app.grid_kind = GridKind::Query;
+    app.set_grid(sample_grid());
+    app.last_sql = Some("SELECT 1".into());
+    open_materialize_prompt(&mut app);
+    app.materialize_prompt.as_mut().unwrap().input = TextArea::from(["   "]);
+    submit_materialize(&mut app);
+    assert!(app.confirm.is_none());
+    assert!(app.materialize_prompt.is_some());
+    assert!(app.status.contains("空"), "{}", app.status);
+}
+
+/// The full help carries `g m` and every new string translates.
+#[test]
+pub(crate) fn r103_help_documents_materialize() {
+    assert!(HELP_ROWS
+        .iter()
+        .any(|(k, d)| *k == "g m" && d.contains("CTAS")));
+    use ui_text::{t_lang, Lang};
+    for k in [
+        "物化成表",
+        "物化结果集为表 · 输入表名 · Enter 确认 · Esc 取消（预填 {}）",
+        "物化确认 · Enter 执行 · Esc 取消",
+        "物化结果集 → 表 {}",
+        "已物化 {} · {} 行",
+        "已取消物化",
+        "✗ 表名不能为空",
+        "✗ 只读连接不能物化",
+        " 物化结果集为表 · {} 行 · Enter 确认 · Esc 取消 ",
+        " 物化 · Enter/Esc ",
+    ] {
+        assert_ne!(t_lang(k, Lang::En), k, "missing English for {k:?}");
+    }
+}
+
+/// The prompt renders at the phone and desktop sizes without panicking.
+#[test]
+pub(crate) fn r103_prompt_renders_at_both_sizes() {
+    let mut app = test_app();
+    app.picker_open = false;
+    app.selected = Some(test_conn("mysql"));
+    app.backend_kind = Backend::Sql;
+    app.grid_kind = GridKind::Query;
+    app.set_grid(sample_grid());
+    app.last_sql = Some("SELECT * FROM orders".into());
+    open_materialize_prompt(&mut app);
+    assert!(app.materialize_prompt.is_some());
+    for (w, h) in [(42u16, 22u16), (110, 30)] {
+        let joined = draw(&mut app, w, h).join("\n").replace(' ', "");
+        assert!(
+            joined.contains("物化") && joined.contains("result_"),
+            "materialize prompt missing at {w}x{h}: {joined}"
+        );
+    }
 }

@@ -13,6 +13,7 @@ mod filter;
 mod input;
 mod jsonview;
 mod last_session;
+mod materialize;
 mod mongo;
 mod nav;
 mod numfmt;
@@ -4876,6 +4877,9 @@ impl App {
             table_comment_loaded: false,
             comment_edit: None,
             comment_refresh: false,
+            materialize_prompt: None,
+            materialize_write: None,
+            pending_materialize_msg: None,
             editor: TextArea::default(),
             history: Vec::new(),
             history_idx: None,
@@ -6038,6 +6042,11 @@ fn apply_op_result(app: &mut App, res: OpResult, tx: &Tx) {
             if let Some(note) = app.resume_note.take() {
                 status = note;
             }
+            // R103: a materialize's `已物化 …` status must survive the sidebar
+            // table-list refresh that ran right after the CTAS.
+            if let Some(msg) = app.pending_materialize_msg.take() {
+                status = msg;
+            }
             app.status = status;
         }
         OpResult::Columns {
@@ -6264,6 +6273,18 @@ fn apply_op_result(app: &mut App, res: OpResult, tx: &Tx) {
             if is_write {
                 app.count_cache.clear();
             }
+            // R103: a confirmed CTAS landed. Keep the source grid on screen (no
+            // auto-jump), name the new table and refresh the sidebar list. Match
+            // on the exact statement so an unrelated in-flight run (an F5 during
+            // the CTAS) is never mistaken for it.
+            if app
+                .materialize_write
+                .as_ref()
+                .is_some_and(|p| p.ctas_sql == sql)
+            {
+                apply_materialize_success(app, tx, r.affected_rows);
+                return;
+            }
             // A write launched from the edit dialog refreshes the current page
             // instead of replacing the grid with the DML result.
             if app.pending_write && is_write {
@@ -6335,6 +6356,11 @@ fn apply_op_result(app: &mut App, res: OpResult, tx: &Tx) {
                 replace_result_tab(app, title, Some(grid), None, GridKind::Query);
             } else {
                 push_result_tab(app, title, Some(grid), None, GridKind::Query);
+            }
+            // R103: remember the statement behind this tab so `g m` materializes
+            // the result the user is actually looking at (including after `[`).
+            if let Some(tab) = app.result_tabs.get_mut(app.result_tab) {
+                tab.sql = Some(sql.clone());
             }
             app.ddl = None;
             app.struct_view = StructView::Fields;
@@ -7316,6 +7342,9 @@ fn apply_op_result(app: &mut App, res: OpResult, tx: &Tx) {
             app.pending_write_msg = None;
             // R102: a failed comment write must not refresh on a later write.
             app.comment_refresh = false;
+            // R103: a failed CTAS must not label / refresh a later write.
+            app.materialize_write = None;
+            app.pending_materialize_msg = None;
             app.search_running = false;
             app.search_progress = None;
             // R100: a failed / timed-out dictionary walk must not leave its

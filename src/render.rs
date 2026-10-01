@@ -317,6 +317,26 @@ pub(crate) fn ui(f: &mut Frame, app: &mut App) {
     if app.comment_edit.is_some() {
         render_comment_prompt(f, f.area(), app);
     }
+    // R103: the `g m` table-name prompt (prefilled `result_HHMMSS`).
+    if app.materialize_prompt.is_some() {
+        let title = app
+            .materialize_prompt
+            .as_ref()
+            .map(|mp| {
+                tf(
+                    " 物化结果集为表 · {} 行 · Enter 确认 · Esc 取消 ",
+                    &[&mp.rows],
+                )
+            })
+            .unwrap_or_default();
+        render_prompt_input(
+            f,
+            f.area(),
+            app.materialize_prompt.as_mut().map(|mp| &mut mp.input),
+            &title,
+            t(" 物化 · Enter/Esc "),
+        );
+    }
     if app.export_open {
         render_export(f, f.area(), app);
     }
@@ -1504,6 +1524,8 @@ pub(crate) fn footer_hints_ctx(ctx: FooterCtx) -> Vec<Hint> {
                 // R85: content auto-fit column widths.
                 ("gw", t("适配列宽")),
                 ("gW", t("全列适配")),
+                // R103: materialize the result set as a table (CTAS).
+                ("gm", t("物化成表")),
                 ("[ ]", t("切标签")),
                 ("Alt-W", t("关标签")),
                 ("Alt-O", t("语句耗时")),

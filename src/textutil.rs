@@ -826,6 +826,10 @@ pub(crate) struct PinnedResult {
 pub(crate) struct ResultTab {
     /// Short label (the first line of the SQL, trimmed).
     pub(crate) title: String,
+    /// R103: the statement that produced this tab's grid (a single-statement
+    /// query run), so `g m` materializes the tab actually on screen after a
+    /// `[` / `]` flip. `None` for a script list / a table browse.
+    pub(crate) sql: Option<String>,
     pub(crate) grid: Option<Grid>,
     /// Unfiltered grid, so the column-visibility filter can be re-applied.
     pub(crate) grid_full: Option<Grid>,

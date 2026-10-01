@@ -181,6 +181,13 @@ pub(crate) fn preview_key(app: &mut App, tx: &Tx, k: KeyEvent) {
                 toggle_ref_row(app);
                 return;
             }
+            // R103: `g m` materializes the current result set as a new table
+            // (CTAS) through the red confirmation layer.
+            KeyCode::Char('m') if k.modifiers.is_empty() => {
+                app.pending_g = false;
+                open_materialize_prompt(app);
+                return;
+            }
             KeyCode::Esc => {
                 app.pending_g = false;
                 return;
@@ -295,7 +302,7 @@ pub(crate) fn preview_key(app: &mut App, tx: &Tx, k: KeyEvent) {
         KeyCode::Char('g') => {
             app.pending_g = true;
             app.status =
-                t("g… d=表结构 t=表数据 v=定位值 c=列结构 b=切换表 f=冻结列 s=钉行 w=适配列宽 W=全列适配").into();
+                t("g… d=表结构 t=表数据 v=定位值 c=列结构 b=切换表 f=冻结列 s=钉行 w=适配列宽 W=全列适配 m=物化成表").into();
         }
         KeyCode::Char('s') => sort_column(app, tx, false),
         // R94: `S` toggles the status-bar numeric summary (min / max / avg of the

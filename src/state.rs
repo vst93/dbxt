@@ -176,6 +176,36 @@ pub(crate) struct CommentEdit {
     pub(crate) input: TextArea<'static>,
 }
 
+/// R103: the modal table-name prompt for `g m` (materialize the result set as a
+/// new table via CTAS). `source_sql` and `rows` capture the result set at open
+/// time, so a later navigation can never retarget the materialization.
+#[derive(Clone)]
+pub(crate) struct MaterializePrompt {
+    pub(crate) input: TextArea<'static>,
+    /// The SELECT whose result set is being materialized (a query statement, a
+    /// drilled script outcome, or the browse view's equivalent SELECT).
+    pub(crate) source_sql: String,
+    /// Rows in the source result set, used for the status when the engine does
+    /// not report an affected-row count for CTAS.
+    pub(crate) rows: usize,
+    pub(crate) db_type: DatabaseType,
+}
+
+/// R103: a confirmed materialization awaiting its write result. Kept on the app
+/// (not inside [`Confirm`]) so the many existing confirm construction sites stay
+/// untouched; the red layer is modal, so it can never be confused with another
+/// write.
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub(crate) struct MaterializePlan {
+    /// The new table name as typed (unquoted), for the status / label.
+    pub(crate) name: String,
+    /// Rows in the source result set, as a fallback row count.
+    pub(crate) rows: usize,
+    /// The exact CTAS statement sent, so a query result that arrives while this
+    /// one is still in flight (e.g. an F5 run) can never be mistaken for it.
+    pub(crate) ctas_sql: String,
+}
+
 // ─── cell values ─────────────────────────────────────────────────────────────
 
 /// A result cell. NULL is kept distinct from the empty string so the grid can
@@ -2258,6 +2288,14 @@ pub(crate) struct App {
     /// R102: a comment write is in flight; on success the metadata is re-read so
     /// the structure view / `gc` popup refresh in place.
     pub(crate) comment_refresh: bool,
+    /// R103: the modal table-name prompt for `g m`.
+    pub(crate) materialize_prompt: Option<MaterializePrompt>,
+    /// R103: a confirmed CTAS awaiting its write result. Taken on success so the
+    /// sidebar can refresh and the status can name the new table.
+    pub(crate) materialize_write: Option<MaterializePlan>,
+    /// R103: the `已物化 …` status, held across the sidebar table-list refresh
+    /// that would otherwise overwrite it with `N 个表/视图`.
+    pub(crate) pending_materialize_msg: Option<String>,
 
     pub(crate) editor: TextArea<'static>,
     pub(crate) history: Vec<String>,
