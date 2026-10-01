@@ -662,6 +662,19 @@ pub(crate) fn context_info(app: &App) -> String {
     if let Some(s) = num_summary_text(app) {
         parts.push(s);
     }
+    // R112: a persistent freeze marker, so the pinned first column (and why the
+    // row identity stays put while scrolling) is never a mystery. Placed with
+    // the other explicit, user-toggled markers ahead of the identity fields so
+    // it survives the status bar's tail truncation on a narrow terminal. Only
+    // shown while the grid actually clips columns: a fully fitting grid looks
+    // the same frozen or not, so the marker would be pure noise there.
+    if app.freeze_first && app.grid_kind != GridKind::Columns && app.grid_frozen > 0 {
+        if let Some(grid) = &app.grid {
+            if grid.columns.len() > app.grid_frozen + app.vis_cols.max(1) {
+                parts.push(t("冻结首列").into());
+            }
+        }
+    }
     // R65: where the open data view lives (`db.table`, table alone when narrow).
     // The connection name leads the left block, so only the location is added
     // here. Sits ahead of the other persistent fields so the identity survives
@@ -1555,6 +1568,9 @@ pub(crate) fn footer_hints_ctx(ctx: FooterCtx) -> Vec<Hint> {
                 // the mini cheat-sheet reaches them on a small screen).
                 ("gf", t("冻结列")),
                 ("gs", t("钉行")),
+                // R112: freeze the first column so the row identity survives a
+                // sideways scroll (Ctrl-F was already page-forward here).
+                ("gF", t("冻结首列")),
                 // R80 additions: the R51–R79 keys that were missing here.
                 // `v` already leads this group; the epoch preview it shows is
                 // passive (no key), so it stays documented in the full help.
@@ -3174,6 +3190,26 @@ pub(crate) fn render_grid(
             .header(Row::new(rheader))
             .column_spacing(1);
             f.render_widget(rtable, right_area);
+        }
+    }
+
+    // ── frozen-rail separator (R112) ──
+    // When the first column is pinned and the grid still scrolls sideways, a
+    // muted hairline marks the boundary between the fixed rail and the moving
+    // window. A grid that fits entirely gets no line: freezing changes nothing
+    // there, so the separator would be pure noise.
+    let frozen_scroll_total = ncols.saturating_sub(pinned.len());
+    if !pinned.is_empty()
+        && frozen_scroll_total > visible
+        && visible > 0
+        && (inner.width as usize) > left_w + GAP
+    {
+        let sep_x = inner.x + left_w as u16;
+        if sep_x < inner.x + inner.width {
+            let style = Style::default().fg(Color::DarkGray);
+            for y in inner.y..inner.y + inner.height {
+                f.buffer_mut().set_stringn(sep_x, y, "│", 1, style);
+            }
         }
     }
 

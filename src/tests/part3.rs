@@ -10047,6 +10047,9 @@ pub(crate) fn g_f_freezes_the_focused_column_up_to_two() {
     // Freezing needs a grid wide enough to still scroll; use the 8-column
     // fixture (`z` pins column 0, so `g f` is exercised on later columns).
     app.set_grid(sample_grid());
+    // R112: the first-column freeze is off by default now, so turn it on to
+    // keep exercising the two-column cap below.
+    app.freeze_first = true;
     // `z` already pins column 0, so one `g f` reaches the two-column cap.
     app.col_cursor = 2;
     press_g(&mut app, &tx, 'f');
@@ -14772,6 +14775,7 @@ fn r108_tab(title: &str, sql: &str, cols: &[&str], rows: Vec<Vec<Val>>) -> Resul
         sel: 0,
         col_offset: 0,
         col_cursor: 0,
+        freeze_first: false,
     }
 }
 
@@ -14907,6 +14911,7 @@ pub(crate) fn r108_collect_skips_tabs_without_a_grid() {
             sel: 0,
             col_offset: 0,
             col_cursor: 0,
+            freeze_first: false,
         },
         r108_tab("empty", "SELECT 1", &[], vec![]),
     ];
@@ -15650,5 +15655,163 @@ pub(crate) fn r111_text_write_export_file_pipeline() {
     assert!(
         widths.windows(2).all(|w| w[0] == w[1]),
         "ragged table:\n{text}"
+    );
+}
+
+// ─── R112: freeze the first column in the results grid (`g F`) ──────────────
+
+/// `g F` toggles the first-column freeze, which is off by default; `z` stays an
+/// alias for the same flag.
+#[test]
+pub(crate) fn r112_g_f_toggles_the_first_column_freeze() {
+    let (tx, _rx) = tokio::sync::mpsc::unbounded_channel::<OpResult>();
+    let mut app = test_app();
+    app.picker_open = false;
+    app.focus = Focus::Preview;
+    app.set_grid(sample_grid());
+    assert!(!app.freeze_first, "the freeze is off by default");
+    press_g(&mut app, &tx, 'F');
+    assert!(app.freeze_first, "g F freezes the first column");
+    press_g(&mut app, &tx, 'F');
+    assert!(!app.freeze_first, "g F again unfreezes it");
+}
+
+/// A frozen first column never enters the scroll window, so panning to the far
+/// right cannot make the row identity disappear.
+#[test]
+pub(crate) fn r112_frozen_first_column_stays_out_of_the_scroll_window() {
+    let widths = vec![10usize; 8];
+    let pinned = vec![0usize];
+    for off in 0..8 {
+        for cursor in 0..8 {
+            let (next_off, vis) = window_for_cursor_pinned(&widths, cursor, off, 21, &pinned);
+            assert!(!pinned.contains(&next_off), "off {off} cursor {cursor}");
+            let win = scroll_window_cols(8, next_off, vis, &pinned);
+            assert!(
+                !win.contains(&0),
+                "off {off} cursor {cursor}: frozen col 0 leaked into {win:?}"
+            );
+        }
+    }
+    // The pinned column keeps its own width when the focused column is fitted.
+    assert_eq!(effective_frozen_widths(true, 8, &widths, 2, 40), 1);
+}
+
+/// On a narrow screen the frozen first column is always drawn and a muted rail
+/// separates it from the scroll window; with the freeze off the render is the
+/// exact unfrozen baseline (no extra separator). 42×22 and 110×30 smoke.
+#[test]
+pub(crate) fn r112_narrow_render_pins_the_first_column_and_separates_it() {
+    let (tx, _rx) = tokio::sync::mpsc::unbounded_channel::<OpResult>();
+    let rails = |rows: &[String]| rows.iter().map(|r| r.matches('│').count()).sum::<usize>();
+    let mut app = test_app();
+    app.picker_open = false;
+    app.term_w = 42;
+    app.grid_kind = GridKind::Query;
+    app.focus = Focus::Preview;
+    app.set_grid(sample_grid());
+    app.status.clear();
+    let base = draw(&mut app, 42, 22);
+    let base_rails = rails(&base);
+
+    press_g(&mut app, &tx, 'F');
+    assert!(app.freeze_first);
+    app.status.clear();
+    let frozen = draw(&mut app, 42, 22);
+    assert_eq!(app.grid_frozen, 1, "the first column is the frozen rail");
+    assert_eq!(app.grid_frozen_cols, vec![0]);
+    assert!(
+        frozen.iter().any(|r| r.contains("r0c0")),
+        "frozen first column value is on screen: {frozen:?}"
+    );
+    assert!(
+        rails(&frozen) > base_rails,
+        "a separator rail is drawn when frozen: {} vs {base_rails}",
+        rails(&frozen)
+    );
+    assert!(
+        context_info(&app).contains("冻结首列"),
+        "status line names the freeze: {}",
+        context_info(&app)
+    );
+
+    // The wide acceptance size renders too (no panic, first column still there).
+    app.status.clear();
+    let wide = draw(&mut app, 110, 30);
+    assert!(wide.iter().any(|r| r.contains("r0c0")), "{wide:?}");
+
+    // Unfreezing returns the narrow render byte-for-byte to the baseline.
+    press_g(&mut app, &tx, 'F');
+    assert!(!app.freeze_first);
+    app.status.clear();
+    let after = draw(&mut app, 42, 22);
+    assert_eq!(after, base, "the freeze is visually inert when off");
+}
+
+/// The freeze is per result tab: freezing one tab leaves the other unfrozen,
+/// and flipping back restores the tab's own state.
+#[test]
+pub(crate) fn r112_freeze_state_is_isolated_per_result_tab() {
+    let (tx, _rx) = tokio::sync::mpsc::unbounded_channel::<OpResult>();
+    let mut app = test_app();
+    app.picker_open = false;
+    app.focus = Focus::Preview;
+    push_result_tab(
+        &mut app,
+        "select a".into(),
+        Some(sample_grid()),
+        None,
+        GridKind::Query,
+    );
+    push_result_tab(
+        &mut app,
+        "select b".into(),
+        Some(sample_grid()),
+        None,
+        GridKind::Query,
+    );
+    assert_eq!(app.result_tabs.len(), 2);
+    assert_eq!(app.result_tab, 1, "tab B is on screen");
+    assert!(!app.freeze_first, "a new tab starts unfrozen");
+
+    // Freeze B.
+    press_g(&mut app, &tx, 'F');
+    assert!(app.freeze_first);
+
+    // Flip to A: unfrozen; flip back to B: still frozen.
+    switch_result_tab(&mut app, -1);
+    assert_eq!(app.result_tab, 0);
+    assert!(!app.freeze_first, "tab A is not frozen");
+    switch_result_tab(&mut app, 1);
+    assert_eq!(app.result_tab, 1);
+    assert!(app.freeze_first, "tab B kept its freeze");
+}
+
+/// `g F` is documented in the results footer / mini sheet and the full F1 help,
+/// and its status marker is translated.
+#[test]
+pub(crate) fn r112_freeze_key_is_in_footer_and_full_help() {
+    assert!(
+        HELP_ROWS.iter().any(|(k, _)| *k == "g F"),
+        "full help is missing g F"
+    );
+    let hints = footer_hints_ctx(FooterCtx {
+        view: FooterView::Browse,
+        focus: Focus::Preview,
+        has_connection: true,
+    });
+    assert!(
+        hints.iter().any(|h| h.0 == "gF" && h.1 == t("冻结首列")),
+        "result footer names gF: {hints:?}"
+    );
+    let mini: Vec<&str> = hints
+        .iter()
+        .filter(|h| h.0 != "?" && h.0 != "F1")
+        .map(|h| h.0)
+        .collect();
+    assert!(mini.contains(&"gF"), "mini help: {mini:?}");
+    assert_eq!(
+        ui_text::t_lang("冻结首列", ui_text::Lang::En),
+        "first col frozen"
     );
 }

@@ -838,6 +838,10 @@ pub(crate) struct ResultTab {
     pub(crate) sel: usize,
     pub(crate) col_offset: usize,
     pub(crate) col_cursor: usize,
+    /// R112: the first-column freeze toggle (`g F`) is per-tab and session-only,
+    /// so flipping to another result keeps its own frozen rail (new tabs start
+    /// off). Purely a render-time layout choice, never persisted.
+    pub(crate) freeze_first: bool,
 }
 
 #[derive(Clone)]

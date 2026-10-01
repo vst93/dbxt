@@ -174,6 +174,18 @@ pub(crate) fn preview_key(app: &mut App, tx: &Tx, k: KeyEvent) {
                 toggle_freeze_col(app);
                 return;
             }
+            // R112: `g F` freezes / unfreezes the first (logical) column so a
+            // wide grid keeps its row identity while scrolling sideways. The
+            // spec's first choice `Ctrl-F` is taken here by page-forward, so the
+            // free `g F` chord is used. Shift is allowed (uppercase F).
+            KeyCode::Char('F')
+                if !k.modifiers.contains(KeyModifiers::CONTROL)
+                    && !k.modifiers.contains(KeyModifiers::ALT) =>
+            {
+                app.pending_g = false;
+                toggle_freeze_first(app);
+                return;
+            }
             // R91: `gs` pins / unpins the focused row as the *reference* row, so
             // a wide grid can be read against a fixed baseline (status bar `Δ`).
             KeyCode::Char('s') if k.modifiers.is_empty() => {

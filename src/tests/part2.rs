@@ -3681,6 +3681,10 @@ pub(crate) fn help_has_no_bare_uppercase_shortcuts() {
                 // lowercase `a` is unused there, so the uppercase labels the
                 // deliberate all-tabs gesture next to `S` (the SQL-zip one).
                 || tok == "A"
+                // `F` (R112, freeze the first column) joins: it only ever
+                // appears as the `g F` chord (Ctrl-F is page-forward), and its
+                // lowercase `g f` freezes the focused column.
+                || tok == "F"
             {
                 continue;
             }

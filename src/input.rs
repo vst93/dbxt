@@ -866,7 +866,8 @@ pub(crate) fn browse_key(app: &mut App, tx: &Tx, k: KeyEvent) {
             // R85: `g W` (the uppercase twin) fits every visible column. A
             // terminal reports SHIFT for an uppercase char, so the `is_empty`
             // guard above cannot apply here — only Ctrl / Alt would collide.
-            KeyCode::Char('W')
+            // R112: `g F` (freeze the first column) rides the same rule.
+            KeyCode::Char('W') | KeyCode::Char('F')
                 if !k.modifiers.contains(KeyModifiers::CONTROL)
                     && !k.modifiers.contains(KeyModifiers::ALT) =>
             {

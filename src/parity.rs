@@ -1635,6 +1635,8 @@ impl App {
             tab.sel = self.sel;
             tab.col_offset = self.col_offset;
             tab.col_cursor = self.col_cursor;
+            // R112: the freeze toggle rides with the tab.
+            tab.freeze_first = self.freeze_first;
         }
     }
 
@@ -1668,6 +1670,8 @@ impl App {
         );
         self.col_offset = tab.col_offset;
         self.col_cursor = tab.col_cursor;
+        // R112: each tab keeps its own first-column freeze state.
+        self.freeze_first = tab.freeze_first;
         // R91: the reference row belongs to the result that was on screen; a
         // tab flip shows a different grid.
         self.ref_row = None;
@@ -1702,6 +1706,8 @@ pub(crate) fn push_result_tab(
         sel: 0,
         col_offset: 0,
         col_cursor: 0,
+        // R112: a fresh tab starts with the first column unfrozen.
+        freeze_first: false,
     });
     app.result_tab = app.result_tabs.len() - 1;
     // Cap the history so a long session cannot grow without bound.
@@ -1719,6 +1725,8 @@ pub(crate) fn push_result_tab(
     app.sel = 0;
     app.col_offset = 0;
     app.col_cursor = 0;
+    // R112: a new tab is born unfrozen.
+    app.freeze_first = false;
     app.page_state = None;
     app.cell_popup = None;
     app.row_popup = None;
@@ -1739,6 +1747,8 @@ pub(crate) fn replace_result_tab(
     let idx = app.result_tab.min(app.result_tabs.len() - 1);
     // R103: a load-more replaces the same result, so its source SQL carries over.
     let keep_sql = app.result_tabs[idx].sql.clone();
+    // R112: a load-more is the same result, so its freeze state carries over too.
+    let keep_freeze = app.result_tabs[idx].freeze_first;
     app.result_tabs[idx] = ResultTab {
         title,
         sql: keep_sql,
@@ -1755,6 +1765,7 @@ pub(crate) fn replace_result_tab(
         sel: 0,
         col_offset: 0,
         col_cursor: 0,
+        freeze_first: keep_freeze,
     };
     app.result_tab = idx;
     app.grid_kind = kind;
@@ -1767,6 +1778,8 @@ pub(crate) fn replace_result_tab(
     app.sel = 0;
     app.col_offset = 0;
     app.col_cursor = 0;
+    // R112: the load-more keeps the tab's freeze state.
+    app.freeze_first = keep_freeze;
     app.page_state = None;
     app.cell_popup = None;
     app.row_popup = None;

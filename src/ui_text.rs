@@ -4791,8 +4791,13 @@ fn en_of(zh: &'static str) -> Option<&'static str> {
         "g… f=冻结列 s=钉行" => Some("g… f=freeze column s=pin row"),
         "冻结列" => Some("freeze col"),
         "钉行" => Some("pin row"),
+        // R112: freeze the first column (the row identity rail).
+        "冻结首列" => Some("first col frozen"),
         "冻结 / 解冻当前列：冻结后钉在左缘，横向滚动时始终可见（最多 2 列，再按解冻），冻结列列宽仍可用 < / > 调" => {
             Some("Freeze / unfreeze the focused column: it pins to the left edge and stays visible while panning (at most 2 columns, press again to unfreeze); a frozen column's width still adjusts with < / >")
+        }
+        "冻结 / 解冻首列：把第 1 列钉在左缘，横向滚动时行标识不丢（默认关；与 g f 的当前列冻结合计最多 2 列；列宽仍可用 < / > 调）" => {
+            Some("Freeze / unfreeze the first column: it pins to the left edge so the row identity is never lost while panning (off by default; counts toward the same 2-column cap as g f; its width still adjusts with < / >)")
         }
         "钉住 / 取消参照行：被钉行行尾显 ❮，状态栏显当前行相对它的 Δ 偏移与首个差异列名；换表 / 重新查询自动清除" => {
             Some("Pin / unpin the reference row: the pinned row shows ❮ at its end and the status bar shows the current row's Δ offset plus the first differing column; switching tables / re-running clears it")
