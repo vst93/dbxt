@@ -270,6 +270,19 @@ pub fn tip_start_index() -> usize {
 /// [`en_of`] (a test asserts each entry resolves to a distinct English string).
 #[allow(dead_code)]
 pub static ALL_KEYS: &[&str] = &[
+    // R110: About dialog.
+    "关于 dbxt",
+    " 关于 ",
+    "已关闭关于",
+    "版本",
+    "构建",
+    "统计",
+    "会话",
+    "链接",
+    "（未注入）",
+    "{} 个键位 · {} 轮迭代",
+    "启动 {} · 已运行 {}",
+    "关于 dbxt：版本 / 构建 commit 与日期 / 键位与迭代统计 / 本次会话启动时刻与已运行时长 / 项目链接（帮助浮层内按 V 同开；Esc / q 关闭）",
     "今日 Tip",
     "T 换一条",
     "换一条",
@@ -1767,6 +1780,21 @@ pub static ALL_KEYS: &[&str] = &[
 /// The Chinese → English table. Keys must match the source literals exactly.
 fn en_of(zh: &'static str) -> Option<&'static str> {
     match zh {
+        // ── R110: About dialog (version / build introspection) ──
+        "关于 dbxt" => Some("About dbxt"),
+        " 关于 " => Some(" About "),
+        "已关闭关于" => Some("closed About"),
+        "版本" => Some("Version"),
+        "构建" => Some("Build"),
+        "统计" => Some("Stats"),
+        "会话" => Some("Session"),
+        "链接" => Some("Link"),
+        "（未注入）" => Some("(not injected)"),
+        "{} 个键位 · {} 轮迭代" => Some("{} keybindings · {} rounds"),
+        "启动 {} · 已运行 {}" => Some("started {} · uptime {}"),
+        "关于 dbxt：版本 / 构建 commit 与日期 / 键位与迭代统计 / 本次会话启动时刻与已运行时长 / 项目链接（帮助浮层内按 V 同开；Esc / q 关闭）" => {
+            Some("About dbxt: version / build commit and date / keybinding and round counts / this session's start time and uptime / project link (also opens with V inside the help overlay; Esc / q closes)")
+        }
         // ── R109: sidebar table column outline (`>` / `<`) ──
         "把光标移到表行上再按 > 展开列清单" => {
             Some("Move the cursor onto a table row, then press > to expand its column outline")

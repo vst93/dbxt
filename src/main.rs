@@ -4868,9 +4868,47 @@ fn dbxt_version() -> &'static str {
     pick_version(option_env!("DBXT_VERSION"), env!("CARGO_PKG_VERSION"))
 }
 
+/// R110: the current iteration number, surfaced by the About dialog. Bumped by
+/// hand each round; the about dialog's `{n} keybindings · R{m} rounds` line and
+/// its test read this one constant.
+pub(crate) const DBXT_ROUND: u32 = 110;
+
+/// R110: the git commit this binary was built from, injected by `build.rs`
+/// (short SHA) or a release environment. `None` for a tarball / crates.io
+/// build with no `.git`, so the field is safely omitted.
+pub(crate) fn build_sha() -> Option<&'static str> {
+    option_env!("DBXT_GIT_SHA").filter(|s| !s.is_empty())
+}
+
+/// R110: the build date (the commit's own date) injected by `build.rs`. Same
+/// safe-omission contract as [`build_sha`].
+pub(crate) fn build_date() -> Option<&'static str> {
+    option_env!("DBXT_BUILD_DATE").filter(|s| !s.is_empty())
+}
+
+/// R110: format the `--version` line from its parts, so the enrichment is
+/// unit-tested without the compile-time environment. `dbxt 0.0.4` stays the
+/// bare line; when a commit and/or date is known it is appended in parentheses.
+/// The leading `dbxt x.y.z` is preserved, so `cmd/install.sh`'s semver grep
+/// keeps working.
+fn version_line_with(version: &str, sha: Option<&str>, date: Option<&str>) -> String {
+    let mut extra: Vec<String> = Vec::new();
+    if let Some(s) = sha.filter(|s| !s.is_empty()) {
+        extra.push(format!("commit {s}"));
+    }
+    if let Some(d) = date.filter(|d| !d.is_empty()) {
+        extra.push(format!("built {d}"));
+    }
+    if extra.is_empty() {
+        format!("dbxt {version}")
+    } else {
+        format!("dbxt {version} ({})", extra.join(", "))
+    }
+}
+
 /// The exact `--version` line. Kept in one place so the format is tested once.
 fn version_line() -> String {
-    format!("dbxt {}", dbxt_version())
+    version_line_with(dbxt_version(), build_sha(), build_date())
 }
 
 /// `dbxt --help`: a short usage summary. The full manual lives in the README.
@@ -5284,6 +5322,9 @@ impl App {
             help_scroll: 0,
             help_needle: String::new(),
             help_filter: None,
+            about: None,
+            session_start: Instant::now(),
+            session_started_wall: chrono::Local::now().format("%H:%M:%S").to_string(),
             pan_mode: false,
             drag_pan,
             gesture: PanGesture::default(),

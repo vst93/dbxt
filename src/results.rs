@@ -728,6 +728,27 @@ pub(crate) fn open_help(app: &mut App) {
     app.help_filter = None;
 }
 
+/// R110: open the About dialog. The uptime is computed exactly once, here, and
+/// frozen into the snapshot — the render path never reads a clock, so there is
+/// no refresh and no polling. Opening it leaves any help layer untouched, so
+/// `Esc` closes About and reveals the help underneath.
+pub(crate) fn open_about(app: &mut App) {
+    let uptime = format_uptime(uptime_between(app.session_start, Instant::now()));
+    app.about = Some(AboutInfo::capture(&app.session_started_wall, uptime));
+}
+
+/// R110: the About overlay's key handler — `Esc` / `q` closes it (and flashes
+/// the same transient status every other overlay uses).
+pub(crate) fn about_key(app: &mut App, k: KeyEvent) {
+    match k.code {
+        KeyCode::Esc | KeyCode::Char('q') => {
+            app.about = None;
+            app.flash(t("已关闭关于").into());
+        }
+        _ => {}
+    }
+}
+
 pub(crate) fn help_key(app: &mut App, k: KeyEvent) {
     // While the `/` filter input owns the keyboard, every key is text (or the
     // two ways out: Enter keeps the filter, Esc clears it).
@@ -746,6 +767,9 @@ pub(crate) fn help_key(app: &mut App, k: KeyEvent) {
         KeyCode::Char('/') => {
             app.help_filter = Some(TextArea::from([app.help_needle.clone()]));
         }
+        // R110: `V` inside the full cheat-sheet opens About (F10 is the global
+        // key; some terminals eat F10, so this is the documented fallback).
+        KeyCode::Char('V') => open_about(app),
         KeyCode::Up | KeyCode::Char('k') => app.help_scroll = app.help_scroll.saturating_sub(1),
         KeyCode::Down | KeyCode::Char('j') => app.help_scroll = app.help_scroll.saturating_add(1),
         KeyCode::PageUp => app.help_scroll = app.help_scroll.saturating_sub(8),
@@ -794,6 +818,8 @@ pub(crate) fn help_mini_key(app: &mut App, k: KeyEvent) {
             app.help_needle.clear();
             app.help_filter = None;
         }
+        // R110: F10 opens About even from the mini cheat-sheet.
+        KeyCode::F(10) => open_about(app),
         KeyCode::Esc | KeyCode::Char('q') => {
             app.help_mini = false;
             app.flash(t("已关闭帮助").into());

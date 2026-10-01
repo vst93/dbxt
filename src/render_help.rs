@@ -1409,6 +1409,10 @@ pub(crate) const HELP_ROWS: &[(&str, &str)] = &[    ("— 全局 —", ""),
         "打开本帮助（编辑器 / 命令输入里 ? 是字面字符，改用 F1）",
     ),
     (
+        "F10",
+        "关于 dbxt：版本 / 构建 commit 与日期 / 键位与迭代统计 / 本次会话启动时刻与已运行时长 / 项目链接（帮助浮层内按 V 同开；Esc / q 关闭）",
+    ),
+    (
         "DBXT_MOUSE_DEBUG=1",
         "启动时显示鼠标事件浮层（滑动无效时排查终端编码）",
     ),
@@ -2169,6 +2173,141 @@ pub(crate) const HELP_ROWS: &[(&str, &str)] = &[    ("— 全局 —", ""),
         "纵向滚行；Shift/Alt/Ctrl+滚轮 或左右滑动 = 横滚列",
     ),
 ];
+
+/// R110: number of documented keybindings — every [`HELP_ROWS`] entry that is
+/// not a section header. The About dialog and its reconciliation test both read
+/// this one source, so the count can never drift from the help.
+pub(crate) fn help_binding_count() -> usize {
+    HELP_ROWS.iter().filter(|(_, d)| !d.is_empty()).count()
+}
+
+/// R110: the About dialog's frozen snapshot. Everything is captured when the
+/// overlay opens (see [`open_about`]); the dialog itself never reads a clock, so
+/// the uptime is a static string rather than a ticking one.
+#[derive(Clone, PartialEq, Debug)]
+pub(crate) struct AboutInfo {
+    pub(crate) version: String,
+    pub(crate) commit: Option<&'static str>,
+    pub(crate) build_date: Option<&'static str>,
+    pub(crate) bindings: usize,
+    pub(crate) rounds: u32,
+    pub(crate) started: String,
+    pub(crate) uptime: String,
+}
+
+impl AboutInfo {
+    /// Capture the compile-time identity plus the caller-supplied session
+    /// timestamps. Kept free of `Instant::now()` so the formatting is testable.
+    pub(crate) fn capture(started: &str, uptime: String) -> Self {
+        Self {
+            version: crate::dbxt_version().to_string(),
+            commit: crate::build_sha(),
+            build_date: crate::build_date(),
+            bindings: help_binding_count(),
+            rounds: crate::DBXT_ROUND,
+            started: started.to_string(),
+            uptime,
+        }
+    }
+}
+
+/// R110: pure uptime formatting, split out so it is tested with injected
+/// durations instead of a real clock. `3661s` → `1h 01m 01s`.
+pub(crate) fn format_uptime(d: Duration) -> String {
+    let secs = d.as_secs();
+    let (h, m, s) = (secs / 3600, (secs % 3600) / 60, secs % 60);
+    if h > 0 {
+        format!("{h}h {m:02}m {s:02}s")
+    } else if m > 0 {
+        format!("{m}m {s:02}s")
+    } else {
+        format!("{s}s")
+    }
+}
+
+/// R110: elapsed time between two instants. A separate function so a test can
+/// inject both ends (`let now = start + Duration::…`).
+pub(crate) fn uptime_between(start: Instant, now: Instant) -> Duration {
+    now.saturating_duration_since(start)
+}
+
+/// R110: the `commit · date` build summary, omitting whichever part is missing.
+/// Both missing reads as an explicit `(not injected)` rather than an empty gap.
+pub(crate) fn build_summary(commit: Option<&str>, date: Option<&str>) -> String {
+    match (
+        commit.filter(|s| !s.is_empty()),
+        date.filter(|s| !s.is_empty()),
+    ) {
+        (Some(c), Some(d)) => format!("{c} · {d}"),
+        (Some(c), None) => c.to_string(),
+        (None, Some(d)) => d.to_string(),
+        (None, None) => t("（未注入）").to_string(),
+    }
+}
+
+/// R110: the About dialog's content. A pure function of [`AboutInfo`] so the
+/// render smoke tests and the field assertions share one source.
+pub(crate) fn about_lines(info: &AboutInfo) -> Vec<Line<'static>> {
+    let label = Style::default()
+        .fg(Color::Yellow)
+        .add_modifier(Modifier::BOLD);
+    let row = |name: &'static str, value: String| {
+        Line::from(vec![
+            Span::styled(format!("{}  ", t(name)), label),
+            Span::raw(value),
+        ])
+    };
+    vec![
+        row("版本", format!("dbxt {}", info.version)),
+        row("构建", build_summary(info.commit, info.build_date)),
+        row(
+            "统计",
+            tf(
+                "{} 个键位 · {} 轮迭代",
+                &[&info.bindings, &format!("R{}", info.rounds)],
+            ),
+        ),
+        row(
+            "会话",
+            tf("启动 {} · 已运行 {}", &[&info.started, &info.uptime]),
+        ),
+        Line::from(""),
+        row("链接", "github.com/vst93/dbxt".to_string()),
+    ]
+}
+
+/// R110: the About overlay. Reuses the help overlay's frame (centered, thick
+/// cyan border, `Esc` / `q` closes) and draws on top of whatever help layer is
+/// open. Purely static — it never issues a query, never polls the clock.
+pub(crate) fn render_about(f: &mut Frame, area: Rect, app: &App) {
+    let Some(info) = app.about.as_ref() else {
+        return;
+    };
+    let lines = about_lines(info);
+    let content_w = lines.iter().map(|l| l.width()).max().unwrap_or(0) as u16;
+    let w = overlay_width(area.width, 64, 30)
+        .max(content_w + 2)
+        .min(area.width);
+    let h = (lines.len() as u16 + 2).min(area.height);
+    let box_area = centered_overlay(area, w, h);
+    f.render_widget(Clear, box_area);
+    let title = fit_title(
+        &format!(" {} · Esc ", t("关于 dbxt")),
+        t(" 关于 "),
+        box_area.width,
+    );
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .title(title)
+        .border_set(border::THICK)
+        .border_style(Style::default().fg(Color::Cyan));
+    let inner = block.inner(box_area);
+    f.render_widget(block, box_area);
+    if inner.width == 0 || inner.height == 0 {
+        return;
+    }
+    f.render_widget(Paragraph::new(lines), inner);
+}
 
 /// Width of the `?` help overlay. The cheat-sheet has grown a lot (R15–R33),
 /// so on a wide terminal it takes almost the whole screen — capped at 96

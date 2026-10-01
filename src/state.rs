@@ -2717,6 +2717,14 @@ pub(crate) struct App {
     /// The modal input while `/` is being typed inside the help overlay.
     pub(crate) help_filter: Option<TextArea<'static>>,
 
+    /// R110: the About dialog's frozen snapshot (`None` = closed). Captured when
+    /// the overlay opens, so the uptime never ticks and no clock is polled.
+    pub(crate) about: Option<AboutInfo>,
+    /// R110: session monotonic clock, the baseline for the About uptime.
+    pub(crate) session_start: Instant,
+    /// R110: session start wall-clock (`HH:MM:SS`), shown once in the dialog.
+    pub(crate) session_started_wall: String,
+
     // touch / terminal fallbacks
     //   pan_mode: vertical wheel pans columns instead of rows (for phone terminals
     //   that never emit a horizontal wheel for a left/right swipe).

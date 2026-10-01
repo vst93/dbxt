@@ -1428,6 +1428,9 @@ pub(crate) fn version_output_is_a_parseable_semver_line() {
     let ver = line
         .strip_prefix("dbxt ")
         .unwrap_or_else(|| panic!("unexpected --version format: {line:?}"));
+    // R110: the line may be enriched with ` (commit …, built …)`; the leading
+    // version is still the first whitespace / parenthesis-delimited token.
+    let ver = ver.split([' ', '(']).next().unwrap();
     let core = ver.split(['-', '+']).next().unwrap();
     let parts: Vec<&str> = core.split('.').collect();
     assert_eq!(parts.len(), 3, "not x.y.z: {ver:?}");
@@ -1440,6 +1443,200 @@ pub(crate) fn version_output_is_a_parseable_semver_line() {
     // The reported value is the one actually compiled in.
     assert_eq!(ver, dbxt_version());
     assert!(!dbxt_version().is_empty());
+}
+
+/// R110: `--version` gains a commit / build-date suffix when the build injected
+/// one, and stays the bare `dbxt x.y.z` line when nothing is known — a missing
+/// `option_env!` must never break the output.
+#[test]
+pub(crate) fn version_line_appends_commit_and_date_only_when_present() {
+    assert_eq!(version_line_with("0.0.4", None, None), "dbxt 0.0.4");
+    assert_eq!(version_line_with("0.0.4", Some(""), Some("")), "dbxt 0.0.4");
+    assert_eq!(
+        version_line_with("0.0.4", Some("abc1234"), None),
+        "dbxt 0.0.4 (commit abc1234)"
+    );
+    assert_eq!(
+        version_line_with("0.0.4", None, Some("2026-01-02")),
+        "dbxt 0.0.4 (built 2026-01-02)"
+    );
+    let both = version_line_with("0.0.4", Some("abc1234"), Some("2026-01-02"));
+    assert!(both.starts_with("dbxt 0.0.4 ("), "{both}");
+    assert!(both.contains("commit abc1234") && both.contains("built 2026-01-02"));
+}
+
+/// R110: the About dialog's build summary omits whichever half is missing and
+/// names the absence explicitly when neither was injected.
+#[test]
+pub(crate) fn about_build_summary_handles_missing_parts() {
+    assert_eq!(
+        build_summary(Some("abc"), Some("2026-01-02")),
+        "abc · 2026-01-02"
+    );
+    assert_eq!(build_summary(Some("abc"), None), "abc");
+    assert_eq!(build_summary(None, Some("2026-01-02")), "2026-01-02");
+    assert_eq!(build_summary(Some(""), Some("")), t("（未注入）"));
+    assert_eq!(build_summary(None, None), t("（未注入）"));
+}
+
+/// R110: the uptime formatter and the elapsed-time helper, exercised with
+/// injected instants so no real clock is involved.
+#[test]
+pub(crate) fn about_uptime_is_computed_from_injected_instants() {
+    assert_eq!(format_uptime(Duration::from_secs(0)), "0s");
+    assert_eq!(format_uptime(Duration::from_secs(59)), "59s");
+    assert_eq!(format_uptime(Duration::from_secs(60)), "1m 00s");
+    assert_eq!(format_uptime(Duration::from_secs(3599)), "59m 59s");
+    assert_eq!(format_uptime(Duration::from_secs(3600)), "1h 00m 00s");
+    assert_eq!(format_uptime(Duration::from_secs(3661)), "1h 01m 01s");
+    let start = Instant::now();
+    let now = start + Duration::from_secs(3661);
+    assert_eq!(uptime_between(start, now), Duration::from_secs(3661));
+    // A `now` before `start` saturates rather than panicking.
+    assert_eq!(uptime_between(now, start), Duration::ZERO);
+}
+
+/// R110: the About content names the version, the injected build identity, the
+/// help reconciliation count, the hard-coded round, the session clock and the
+/// project link.
+#[test]
+pub(crate) fn about_lines_render_version_stats_and_session() {
+    let info = AboutInfo {
+        version: "9.9.9".into(),
+        commit: Some("abc1234"),
+        build_date: Some("2026-01-02"),
+        bindings: help_binding_count(),
+        rounds: DBXT_ROUND,
+        started: "10:32:01".into(),
+        uptime: "1h 01m 01s".into(),
+    };
+    let text: String = about_lines(&info)
+        .iter()
+        .map(|l| {
+            l.spans
+                .iter()
+                .map(|s| s.content.as_ref())
+                .collect::<String>()
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(text.contains("dbxt 9.9.9"), "{text}");
+    assert!(
+        text.contains("abc1234") && text.contains("2026-01-02"),
+        "{text}"
+    );
+    assert!(
+        text.contains(&help_binding_count().to_string()),
+        "binding count missing: {text}"
+    );
+    assert!(text.contains(&format!("R{DBXT_ROUND}")), "{text}");
+    assert!(
+        text.contains("10:32:01") && text.contains("1h 01m 01s"),
+        "{text}"
+    );
+    assert!(text.contains("github.com/vst93/dbxt"), "{text}");
+    // The compiled-in version is what the real capture reports, and it reaches
+    // the rendered version row.
+    let live = AboutInfo::capture("00:00:00", "0s".into());
+    assert_eq!(live.version, dbxt_version());
+    let live_text: String = about_lines(&live)
+        .iter()
+        .map(|l| {
+            l.spans
+                .iter()
+                .map(|s| s.content.as_ref())
+                .collect::<String>()
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(
+        live_text.contains(env!("CARGO_PKG_VERSION")),
+        "version row missing CARGO_PKG_VERSION: {live_text}"
+    );
+}
+
+/// R110: the About dialog's keybinding count is the same source the help
+/// reconciliation test reads, so the two can never drift.
+#[test]
+pub(crate) fn help_binding_count_matches_the_help_rows() {
+    let from_rows = HELP_ROWS.iter().filter(|(_, d)| !d.is_empty()).count();
+    assert_eq!(help_binding_count(), from_rows);
+    // The F10 / About row is documented in the global section.
+    assert!(
+        HELP_ROWS.iter().any(|(k, _)| *k == "F10"),
+        "the help is missing the F10 / About row"
+    );
+    // And the section-header rows are excluded from the count.
+    let headers = HELP_ROWS.iter().filter(|(_, d)| d.is_empty()).count();
+    assert!(headers > 5 && from_rows > headers);
+}
+
+/// R110: F10 opens About from anywhere, `V` inside the full cheat-sheet opens
+/// it too, and `Esc` / `q` closes it (revealing the help layer underneath).
+#[test]
+pub(crate) fn f10_and_help_v_open_and_esc_closes_the_about_dialog() {
+    let (tx, _rx) = tokio::sync::mpsc::unbounded_channel::<OpResult>();
+    let mut app = test_app();
+    key(
+        &mut app,
+        &tx,
+        KeyEvent::new(KeyCode::F(10), KeyModifiers::NONE),
+    );
+    assert!(app.about.is_some(), "F10 should open About");
+    // Esc closes it and flashes the standard status.
+    key(
+        &mut app,
+        &tx,
+        KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE),
+    );
+    assert!(app.about.is_none(), "Esc should close About");
+
+    // `q` closes it too.
+    key(
+        &mut app,
+        &tx,
+        KeyEvent::new(KeyCode::F(10), KeyModifiers::NONE),
+    );
+    key(
+        &mut app,
+        &tx,
+        KeyEvent::new(KeyCode::Char('q'), KeyModifiers::NONE),
+    );
+    assert!(app.about.is_none(), "q should close About");
+
+    // Inside the full help overlay `V` opens About; Esc closes About and the
+    // help layer is still open underneath.
+    app.help_open = true;
+    key(
+        &mut app,
+        &tx,
+        KeyEvent::new(KeyCode::Char('V'), KeyModifiers::NONE),
+    );
+    assert!(app.about.is_some(), "V in help should open About");
+    key(
+        &mut app,
+        &tx,
+        KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE),
+    );
+    assert!(app.about.is_none() && app.help_open, "help survives About");
+}
+
+/// R110: the About overlay renders on both a 42×22 and a 110×30 screen without
+/// panicking, and the version / link text reaches the screen.
+#[test]
+pub(crate) fn about_dialog_renders_on_small_and_large_screens() {
+    for (w, h) in [(42u16, 22u16), (110u16, 30u16)] {
+        let mut app = test_app();
+        open_about(&mut app);
+        assert!(app.about.is_some());
+        let rows = draw(&mut app, w, h);
+        let text = rows.join("\n");
+        assert!(
+            text.contains("github.com/vst93/dbxt"),
+            "about link missing on {w}x{h}:\n{text}"
+        );
+        assert!(text.contains("dbxt"), "about version missing on {w}x{h}");
+    }
 }
 
 #[test]

@@ -481,6 +481,12 @@ pub(crate) fn browse_key(app: &mut App, tx: &Tx, k: KeyEvent) {
         rename_edit_key(app, tx, k);
         return;
     }
+    // R110: the About dialog is the topmost passive overlay — it sits over the
+    // help layers and owns `Esc` / `q` while open.
+    if app.about.is_some() {
+        about_key(app, k);
+        return;
+    }
     // Overlays are modal, most-specific first. Esc always closes the current one.
     if app.help_open {
         help_key(app, k);
@@ -904,6 +910,13 @@ pub(crate) fn browse_key(app: &mut App, tx: &Tx, k: KeyEvent) {
         || k.code == KeyCode::F(1)
     {
         open_help(app);
+        return;
+    }
+
+    // R110: F10 opens the About dialog from anywhere (help is modal above it,
+    // where the cheat-sheet's `V` is the documented alternate).
+    if k.code == KeyCode::F(10) {
+        open_about(app);
         return;
     }
 

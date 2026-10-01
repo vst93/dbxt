@@ -407,6 +407,10 @@ pub(crate) fn ui(f: &mut Frame, app: &mut App) {
     if app.help_mini {
         render_help_mini(f, f.area(), app);
     }
+    // R110: the About dialog draws over the help layers it was opened from.
+    if app.about.is_some() {
+        render_about(f, f.area(), app);
+    }
     if app.edit_dialog.is_some() {
         render_edit_dialog(f, f.area(), app);
     }
