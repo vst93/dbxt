@@ -119,12 +119,12 @@ pub(crate) fn open_cell_popup(app: &mut App) {
     let Some(v) = row.get(app.col_cursor) else {
         return;
     };
-    let col = grid
+    let raw_col = grid
         .columns
         .get(app.col_cursor)
         .cloned()
         .unwrap_or_default();
-    let col = fix_double_encoding(&col);
+    let col = fix_double_encoding(&raw_col);
     let (text, style) = value_display(v);
     // The raw value (never the pretty form) is what `y`/`Y` copies.
     let raw = cell_copy_text(v);
@@ -144,16 +144,111 @@ pub(crate) fn open_cell_popup(app: &mut App) {
             style: Style::default().fg(Color::DarkGray),
         });
     }
+    // R97: when the browsed column is the referencing side of a foreign key,
+    // append one action line the `f` key follows. Outside a table browse, with
+    // no matching FK, or for a NULL value (which never matches a referenced
+    // row) nothing is added and the popup is unchanged.
+    let fk_jump = fk_jump_for_cell(app, &raw_col, v);
+    if let Some(jump) = &fk_jump {
+        lines.push(PopupLine {
+            text: tf(
+                "→ 跳转 {} · f",
+                &[&format!("{}.{} = {}", jump.table, jump.column, jump.value)],
+            ),
+            style: Style::default().fg(Color::Cyan),
+        });
+    }
     app.popup_cache = None;
-    app.cell_popup = Some(make_cell_popup(
-        title,
-        lines,
-        col,
-        raw,
-        pretty,
-        show_pretty,
-        true,
-    ));
+    let mut popup = make_cell_popup(title, lines, col, raw, pretty, show_pretty, true);
+    popup.fk_jump = fk_jump;
+    app.cell_popup = Some(popup);
+}
+
+/// R97: the first foreign key whose referencing column matches `column`
+/// (case-insensitive). A table may declare several FKs on one column, so the
+/// first in metadata order wins; `None` when none matches.
+pub(crate) fn fk_match<'a>(meta: &'a TableMeta, column: &str) -> Option<&'a ForeignKeyInfo> {
+    meta.foreign_keys
+        .iter()
+        .find(|fk| fk.column.eq_ignore_ascii_case(column))
+}
+
+/// R97: the `WHERE` predicate a FK jump seeds (`ref_column = literal`). The
+/// value is wrapped by the referencing column's declared type, which is
+/// type-compatible with the referenced column by definition of the constraint.
+/// `None` for NULL: a NULL never matches a referenced row, so the action is
+/// hidden rather than offered as a dead end.
+pub(crate) fn fk_predicate(
+    fk: &ForeignKeyInfo,
+    value: &Val,
+    col_type: Option<&str>,
+) -> Option<String> {
+    if matches!(value, Val::Null) {
+        return None;
+    }
+    Some(format!(
+        "{} = {}",
+        fk.ref_column,
+        val_literal(value, col_type)
+    ))
+}
+
+/// R97: the FK jump offered for a browsed cell, or `None` outside a table-data
+/// browse / when the column has no FK / when the value is NULL. The referenced
+/// schema is the FK's own when set, else the browsed table's schema.
+pub(crate) fn fk_jump_for_cell(app: &App, column: &str, value: &Val) -> Option<FkJump> {
+    if app.grid_kind != GridKind::TableData {
+        return None;
+    }
+    let meta = app.table_meta.as_ref()?;
+    let same = app
+        .page_state
+        .as_ref()
+        .is_some_and(|p| p.table == meta.table && p.schema == meta.schema);
+    if !same {
+        return None;
+    }
+    let fk = fk_match(meta, column)?;
+    let col_type = meta
+        .columns
+        .iter()
+        .find(|c| c.name.eq_ignore_ascii_case(column))
+        .map(|c| c.data_type.as_str());
+    let predicate = fk_predicate(fk, value, col_type)?;
+    let schema = fk
+        .ref_schema
+        .clone()
+        .filter(|s| !s.trim().is_empty())
+        .unwrap_or_else(|| meta.schema.clone());
+    Some(FkJump {
+        schema,
+        table: fk.ref_table.clone(),
+        column: fk.ref_column.clone(),
+        predicate,
+        value: value_display(value).0,
+    })
+}
+
+/// R97: follow the cell popup's foreign key — open the referenced table (its
+/// schema when the FK names one) and seed the `f` WHERE filter with the cell's
+/// value so the referenced row is on the first page. This is one explicit
+/// browse query; the FK metadata itself already rode the column load.
+pub(crate) fn fk_jump(app: &mut App, tx: &Tx) {
+    let Some(jump) = app.cell_popup.as_ref().and_then(|p| p.fk_jump.clone()) else {
+        return;
+    };
+    app.cell_popup = None;
+    // Reuse the `f` WHERE pipeline: seed the filter and let the open consume it.
+    app.pending_table_filter = Some(jump.predicate.clone());
+    let qualified = if jump.schema.trim().is_empty() {
+        format!("{}.{}", jump.table, jump.column)
+    } else {
+        format!("{}.{}.{}", jump.schema, jump.table, jump.column)
+    };
+    // Keep the jump visible: the page-load status would otherwise replace it.
+    app.pending_fk_msg = Some(tf("FK 跳转 · {} = {}", &[&qualified, &jump.value]));
+    let db = app.current_db();
+    open_nav_table(app, tx, &db, &jump.schema, &jump.table, "→");
 }
 
 /// Open the focused row as a vertical `column = value` list. Uses the unfiltered

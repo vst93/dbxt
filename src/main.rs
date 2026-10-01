@@ -659,6 +659,9 @@ enum OpResult {
         /// R56: cached index metadata so `g c` can mark `MUL` columns without a
         /// query of its own (best effort; empty when the backend cannot list).
         indexes: Vec<IndexInfo>,
+        /// R97: cached foreign keys so the cell popup can offer a jump to the
+        /// referenced row (best effort; empty when the backend cannot list).
+        foreign_keys: Vec<ForeignKeyInfo>,
     },
     Query(Box<dbx_core::db::QueryResult>, String, usize),
     Script(Vec<StmtOutcome>),
@@ -1877,11 +1880,19 @@ async fn run_op(backend: &LocalBackend, op: Op, tx: &Tx) -> OpResult {
                     } else {
                         Vec::new()
                     };
+                    // R97: foreign keys ride the same metadata pass (best
+                    // effort) so the cell popup can offer a jump to the
+                    // referenced row without a query of its own. Every SQL
+                    // backend that reports them is welcome; a driver that
+                    // cannot simply yields an empty list.
+                    let foreign_keys =
+                        list_foreign_keys_best_effort(backend, &cfg, &db, &schema, &table).await;
                     OpResult::TableColumns {
                         table,
                         schema,
                         columns,
                         indexes,
+                        foreign_keys,
                     }
                 }
                 Err(e) => OpResult::Error(format!("table columns: {e}")),
@@ -3093,6 +3104,21 @@ async fn list_indexes_best_effort(
     table: &str,
 ) -> Vec<IndexInfo> {
     dbx_core::schema::list_indexes_core(backend.state().as_ref(), &cfg.id, db, schema, table)
+        .await
+        .unwrap_or_default()
+}
+
+/// R97: list a table's foreign keys, treating any failure as “none” — the keys
+/// only enrich the cell popup (a jump to the referenced row), so a driver that
+/// cannot list them must never fail the column load.
+async fn list_foreign_keys_best_effort(
+    backend: &LocalBackend,
+    cfg: &ConnectionConfig,
+    db: &str,
+    schema: &str,
+    table: &str,
+) -> Vec<ForeignKeyInfo> {
+    dbx_core::schema::list_foreign_keys_core(backend.state().as_ref(), &cfg.id, db, schema, table)
         .await
         .unwrap_or_default()
 }
@@ -4761,6 +4787,7 @@ impl App {
             edit_dialog: None,
             pending_write: false,
             pending_write_msg: None,
+            pending_fk_msg: None,
             batch: Vec::new(),
             pane_override: [None; 3],
             auto_collapse: false,
@@ -5763,12 +5790,19 @@ fn apply_op_result(app: &mut App, res: OpResult, tx: &Tx) {
             if let Some(msg) = app.pending_write_msg.take() {
                 app.status = tf("{} · 已刷新（第 {} 页）", &[&(msg), &(page + 1)]);
             }
+            // R97: a FK jump seeds the target browse; when its first page lands
+            // the status names the jump instead of being lost behind the page
+            // load that ran in between.
+            if let Some(msg) = app.pending_fk_msg.take() {
+                app.status = msg;
+            }
         }
         OpResult::TableColumns {
             table,
             schema,
             columns,
             indexes,
+            foreign_keys,
         } => {
             // Only keep metadata that belongs to the table on screen (same
             // database *and* schema: `public.orders` ≠ `inv.orders`).
@@ -5784,6 +5818,7 @@ fn apply_op_result(app: &mut App, res: OpResult, tx: &Tx) {
                     schema: schema.clone(),
                     columns,
                     indexes,
+                    foreign_keys,
                 });
             }
             // The initial page load waits for this so keyset-vs-OFFSET is chosen

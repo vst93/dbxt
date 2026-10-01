@@ -535,10 +535,20 @@ pub(crate) fn copy_stmt_result(app: &mut App) {
 /// the row popup underneath when it was drilled from one), the arrows scroll the
 /// wrapped value, `J` toggles the pretty-JSON view when the value is a JSON
 /// object/array, and `y`/`Y` copy the **original** value (never the pretty form).
-pub(crate) fn cell_popup_key(app: &mut App, k: KeyEvent) {
+pub(crate) fn cell_popup_key(app: &mut App, tx: &Tx, k: KeyEvent) {
     if matches!(k.code, KeyCode::Esc | KeyCode::Char('q') | KeyCode::Enter) {
         app.cell_popup = None;
         app.flash(t("已关闭单元格").into());
+        return;
+    }
+    // R97: `f` follows the cell's foreign key when the popup offers one; with no
+    // FK it only says so and leaves the popup untouched.
+    if k.code == KeyCode::Char('f') {
+        if app.cell_popup.as_ref().is_some_and(|p| p.fk_jump.is_some()) {
+            fk_jump(app, tx);
+        } else {
+            app.status = t("该单元格没有外键可跳转").into();
+        }
         return;
     }
     // `U`: cycle the Unicode view — raw → escape-decoded → whole-value

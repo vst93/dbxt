@@ -2426,6 +2426,9 @@ pub(crate) struct App {
     pub(crate) pending_write: bool,
     // success message kept until the refreshed page lands so it is not lost
     pub(crate) pending_write_msg: Option<String>,
+    // R97: a FK-jump status kept until the target browse's first page lands,
+    // so the page-load status never hides which jump the user made.
+    pub(crate) pending_fk_msg: Option<String>,
     // queued edits for one transactional batch commit (Ctrl-S)
     pub(crate) batch: Vec<String>,
     // manual per-pane collapse override (None = follow `auto_collapse`)

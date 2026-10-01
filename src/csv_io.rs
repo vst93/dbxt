@@ -391,6 +391,25 @@ pub(crate) struct PopupSpan {
     pub(crate) style: Style,
 }
 
+/// R97: a foreign-key jump offered for the focused cell. Built from the
+/// browsed table's cached metadata when the cell's column is the referencing
+/// side of a foreign key, so the popup can offer `→ jump to ref.col = value`
+/// with no query of its own.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct FkJump {
+    /// Resolved target schema: the FK's `ref_schema` when set, else the
+    /// current schema.
+    pub(crate) schema: String,
+    /// Referenced table to browse.
+    pub(crate) table: String,
+    /// Referenced column the cell's value is matched against.
+    pub(crate) column: String,
+    /// `WHERE` predicate seeded into the target browse (`col = literal`).
+    pub(crate) predicate: String,
+    /// Display value of the cell (the human-readable form, not the literal).
+    pub(crate) value: String,
+}
+
 /// A modal showing one cell's full, untruncated value.
 #[derive(Clone)]
 pub(crate) struct CellPopup {
@@ -421,6 +440,10 @@ pub(crate) struct CellPopup {
     /// R89: true for a single-value popup (a grid cell / drilled field), false
     /// for the multi-line data-diff summary (whose `lines` are not one value).
     pub(crate) single: bool,
+    /// R97: the foreign-key jump offered for this cell, when the browsed
+    /// column is the referencing side of a FK and the value is non-NULL. `f`
+    /// follows it; `None` keeps the popup exactly as before.
+    pub(crate) fk_jump: Option<FkJump>,
 }
 
 /// Build a cell popup, computing the R89 Unicode views for a single-value
@@ -453,6 +476,7 @@ pub(crate) fn make_cell_popup(
         preview,
         u_mode: UMode::Raw,
         single,
+        fk_jump: None,
     }
 }
 

@@ -156,6 +156,7 @@ pub(crate) fn completion_candidates_are_context_scoped() {
         schema: String::new(),
         columns: vec![col_info("id", "int"), col_info("name", "text")],
         indexes: Vec::new(),
+        foreign_keys: Vec::new(),
     });
     // After FROM: only tables (no columns, no keywords).
     let from = completion_candidates(&app, &CompCtx::TableList, "");
@@ -5131,6 +5132,7 @@ pub(crate) fn orders_app(cols: &[(&str, &str)], rows: usize) -> App {
         schema: String::new(),
         columns,
         indexes: Vec::new(),
+        foreign_keys: Vec::new(),
     });
     let grid = Grid {
         columns: cols.iter().map(|(n, _)| n.to_string()).collect(),
@@ -7291,6 +7293,7 @@ pub(crate) fn table_info_card_reads_cached_metadata_only() {
             ..Default::default()
         }],
         indexes: Vec::new(),
+        foreign_keys: Vec::new(),
     });
     let mut info = DbSizeInfo::default();
     info.rows.insert("orders".into(), 42);
@@ -10947,4 +10950,279 @@ pub(crate) fn r96_keys_are_in_footer_mini_and_full_help() {
         .any(|(k, _)| k.starts_with("Ctrl-P（连接面板）")));
     assert!(HELP_ROWS.iter().any(|(k, _)| k.starts_with("O（连接树）")));
     assert!(HELP_ROWS.iter().any(|(k, _)| k.starts_with("RTT 尾缀")));
+}
+
+// ── R97: FK jump from a cell to the referenced row ──────────────────────────
+
+/// A `ForeignKeyInfo` for the R97 tests.
+pub(crate) fn fk_info(
+    name: &str,
+    column: &str,
+    ref_schema: Option<&str>,
+    ref_table: &str,
+    ref_column: &str,
+) -> ForeignKeyInfo {
+    ForeignKeyInfo {
+        name: name.into(),
+        column: column.into(),
+        ref_schema: ref_schema.map(str::to_string),
+        ref_table: ref_table.into(),
+        ref_column: ref_column.into(),
+        on_update: None,
+        on_delete: None,
+    }
+}
+
+/// A browsable `public.orders` app whose `user_id` column references
+/// `public.users.id`. The focused cell holds `value`.
+fn fk_app(value: Val) -> App {
+    let mut app = orders_app(&[("id", "int"), ("user_id", "bigint")], 1);
+    app.schema = "public".into();
+    if let Some(meta) = app.table_meta.as_mut() {
+        meta.schema = "public".into();
+        meta.foreign_keys = vec![fk_info(
+            "fk_orders_user",
+            "user_id",
+            Some("public"),
+            "users",
+            "id",
+        )];
+    }
+    app.page_state.as_mut().unwrap().schema = "public".into();
+    let grid = Grid {
+        columns: vec!["id".into(), "user_id".into()],
+        rows: vec![vec![Val::Text("1".into()), value]],
+        note: String::new(),
+        types: vec!["int".into(), "bigint".into()],
+    };
+    app.set_grid(grid);
+    app.sel = 0;
+    app.col_cursor = 1;
+    app
+}
+
+/// R97: the column → FK lookup matches case-insensitively and a table with two
+/// keys on one column keeps the first (metadata order).
+#[test]
+pub(crate) fn r97_fk_match_takes_the_first_key_on_the_column() {
+    let mut meta = orders_meta(&[("id", "int")], &[("user_id", "bigint")]);
+    meta.foreign_keys = vec![
+        fk_info("fk_a", "user_id", None, "users", "id"),
+        fk_info("fk_b", "user_id", None, "admins", "id"),
+        fk_info("fk_c", "tenant_id", None, "tenants", "id"),
+    ];
+    assert_eq!(fk_match(&meta, "user_id").unwrap().name, "fk_a");
+    assert_eq!(fk_match(&meta, "USER_ID").unwrap().name, "fk_a");
+    assert_eq!(fk_match(&meta, "tenant_id").unwrap().name, "fk_c");
+    assert!(fk_match(&meta, "note").is_none(), "no key on `note`");
+}
+
+/// R97: the seeded predicate wraps the value by the referencing column's type
+/// (numeric bare, text quoted) and NULL never produces a predicate.
+#[test]
+pub(crate) fn r97_fk_predicate_wraps_by_type_and_hides_null() {
+    let fk = fk_info("fk", "user_id", Some("public"), "users", "id");
+    assert_eq!(
+        fk_predicate(&fk, &Val::Text("42".into()), Some("bigint")).unwrap(),
+        "id = 42"
+    );
+    assert_eq!(
+        fk_predicate(&fk, &Val::Text("O'Brien".into()), Some("varchar(64)")).unwrap(),
+        "id = 'O''Brien'"
+    );
+    assert_eq!(
+        fk_predicate(&fk, &Val::Text(String::new()), Some("text")).unwrap(),
+        "id = ''"
+    );
+    assert!(fk_predicate(&fk, &Val::Null, Some("bigint")).is_none());
+}
+
+/// R97: a jump is offered only inside a table browse whose metadata matches the
+/// page, only for the referencing column, and never for a NULL cell.
+#[test]
+pub(crate) fn r97_fk_jump_for_cell_requires_a_browse_and_a_key() {
+    let app = fk_app(Val::Text("42".into()));
+    let jump = fk_jump_for_cell(&app, "user_id", &Val::Text("42".into())).expect("jump");
+    assert_eq!(jump.schema, "public");
+    assert_eq!(jump.table, "users");
+    assert_eq!(jump.column, "id");
+    assert_eq!(jump.predicate, "id = 42");
+    assert_eq!(jump.value, "42");
+    // NULL: hidden.
+    assert!(fk_jump_for_cell(&app, "user_id", &Val::Null).is_none());
+    // A column with no foreign key: hidden.
+    assert!(fk_jump_for_cell(&app, "id", &Val::Text("1".into())).is_none());
+    // A query result (no table metadata match): hidden.
+    let mut query = app;
+    query.grid_kind = GridKind::Query;
+    assert!(fk_jump_for_cell(&query, "user_id", &Val::Text("42".into())).is_none());
+}
+
+/// R97: the cell popup appends the `→ jump` action line for a matching key and
+/// leaves a keyless cell's popup exactly as before; both render at 42×22 and
+/// 110×30 without panicking.
+#[test]
+pub(crate) fn r97_cell_popup_offers_the_jump_only_for_a_key() {
+    let tx = test_tx();
+    let mut app = fk_app(Val::Text("42".into()));
+    key(
+        &mut app,
+        &tx,
+        KeyEvent::new(KeyCode::Char('v'), KeyModifiers::NONE),
+    );
+    let popup = app.cell_popup.as_ref().expect("cell popup");
+    assert!(popup.fk_jump.is_some(), "a matching key offers a jump");
+    assert!(
+        popup
+            .lines
+            .iter()
+            .any(|l| l.text.contains("→ 跳转 users.id = 42")),
+        "action line missing: {:?}",
+        popup.lines.iter().map(|l| &l.text).collect::<Vec<_>>()
+    );
+    assert!(popup.lines.iter().any(|l| l.text.ends_with("· f")));
+    for (w, h) in [(42u16, 22u16), (110, 30)] {
+        let rows = draw(&mut app, w, h);
+        let flat = |r: &str| r.chars().filter(|c| !c.is_whitespace()).collect::<String>();
+        assert!(
+            rows.iter().any(|r| flat(r).contains("跳转")),
+            "{w}x{h} missing the FK line: {rows:#?}"
+        );
+    }
+    // A column with no key keeps the popup unchanged.
+    let mut app2 = fk_app(Val::Text("42".into()));
+    app2.col_cursor = 0;
+    key(
+        &mut app2,
+        &tx,
+        KeyEvent::new(KeyCode::Char('v'), KeyModifiers::NONE),
+    );
+    let popup = app2.cell_popup.as_ref().expect("cell popup");
+    assert!(popup.fk_jump.is_none());
+    assert!(!popup.lines.iter().any(|l| l.text.contains("→ 跳转")));
+}
+
+/// R97: `f` in the cell popup opens the referenced table with the value seeded
+/// into the `f` WHERE filter, and keeps the jump named in the status.
+#[test]
+pub(crate) fn r97_fk_jump_opens_the_referenced_table_prefiltered() {
+    run_rt(|| {
+        let tx = test_tx();
+        let mut app = fk_app(Val::Text("42".into()));
+        app.tables = vec![table_info("users", "TABLE")];
+        app.tables_all = app.tables.clone();
+        key(
+            &mut app,
+            &tx,
+            KeyEvent::new(KeyCode::Char('v'), KeyModifiers::NONE),
+        );
+        key(
+            &mut app,
+            &tx,
+            KeyEvent::new(KeyCode::Char('f'), KeyModifiers::NONE),
+        );
+        assert!(app.cell_popup.is_none(), "the jump closes the popup");
+        let ps = app.page_state.as_ref().expect("target page state");
+        assert_eq!(ps.table, "users");
+        assert_eq!(ps.schema, "public");
+        assert_eq!(ps.filter, "id = 42");
+        let msg = app.pending_fk_msg.clone().expect("pending FK status");
+        assert!(msg.contains("FK 跳转"), "{msg}");
+        assert!(msg.contains("public.users.id = 42"), "{msg}");
+    });
+}
+
+/// R97: when the FK names another schema, the jump switches to it and stages the
+/// open (the table list is reloaded first).
+#[test]
+pub(crate) fn r97_fk_jump_switches_schema_when_the_key_names_one() {
+    run_rt(|| {
+        let tx = test_tx();
+        let mut app = fk_app(Val::Text("42".into()));
+        app.schema = "sales".into();
+        app.tables = vec![table_info("orders", "TABLE")];
+        app.tables_all = app.tables.clone();
+        key(
+            &mut app,
+            &tx,
+            KeyEvent::new(KeyCode::Char('v'), KeyModifiers::NONE),
+        );
+        key(
+            &mut app,
+            &tx,
+            KeyEvent::new(KeyCode::Char('f'), KeyModifiers::NONE),
+        );
+        assert_eq!(app.schema, "public", "switched to the FK's schema");
+        assert_eq!(
+            app.pending_open_table,
+            Some(("public".to_string(), "users".to_string()))
+        );
+        assert_eq!(app.pending_table_filter.as_deref(), Some("id = 42"));
+    });
+}
+
+/// R97: the `TableColumns` reply carries the FK metadata (best effort), so an
+/// empty list never blocks the columns from landing, and a populated one rides
+/// the same cached metadata.
+#[test]
+pub(crate) fn r97_table_columns_reply_carries_foreign_keys() {
+    let tx = test_tx();
+    let mut app = test_app();
+    app.picker_open = false;
+    app.selected = Some(test_conn("mysql"));
+    app.backend_kind = Backend::Sql;
+    app.grid_kind = GridKind::TableData;
+    app.page_state = Some(page_of("orders"));
+    // A backend that cannot list keys yields an empty list — columns still land.
+    apply_op_result(
+        &mut app,
+        OpResult::TableColumns {
+            table: "orders".into(),
+            schema: String::new(),
+            columns: vec![col_info("id", "int"), col_info("user_id", "bigint")],
+            indexes: Vec::new(),
+            foreign_keys: Vec::new(),
+        },
+        &tx,
+    );
+    let meta = app.table_meta.as_ref().expect("metadata stored");
+    assert_eq!(meta.columns.len(), 2);
+    assert!(meta.foreign_keys.is_empty());
+    // The next pass with keys stores them alongside the columns.
+    apply_op_result(
+        &mut app,
+        OpResult::TableColumns {
+            table: "orders".into(),
+            schema: String::new(),
+            columns: vec![col_info("id", "int"), col_info("user_id", "bigint")],
+            indexes: Vec::new(),
+            foreign_keys: vec![fk_info("fk_user", "user_id", None, "users", "id")],
+        },
+        &tx,
+    );
+    assert_eq!(app.table_meta.as_ref().unwrap().foreign_keys.len(), 1);
+}
+
+/// R97: the full `?` help names the FK jump and the action/status strings are
+/// bilingual.
+#[test]
+pub(crate) fn r97_fk_jump_is_documented_in_full_help() {
+    assert!(
+        HELP_ROWS
+            .iter()
+            .any(|(k, d)| k.contains("单元格弹层") && d.contains("外键跳转")),
+        "full help missing the FK jump row"
+    );
+    assert_eq!(
+        ui_text::t_lang("→ 跳转 {} · f", ui_text::Lang::En),
+        "→ jump to {} · f"
+    );
+    assert_ne!(
+        ui_text::t_lang("FK 跳转 · {} = {}", ui_text::Lang::En),
+        "FK 跳转 · {} = {}"
+    );
+    assert_ne!(
+        ui_text::t_lang("该单元格没有外键可跳转", ui_text::Lang::En),
+        "该单元格没有外键可跳转"
+    );
 }

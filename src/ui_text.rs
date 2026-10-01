@@ -1556,6 +1556,12 @@ pub static ALL_KEYS: &[&str] = &[
     "Unicode 转义转换：原文 → 转义解码 → 整值重新转义（非 ASCII 全转 \\uXXXX）三态循环；纯 ASCII 值仅原文 ↔ 解码两态；解码失败（孤立代理对等）状态栏双语报错；y / Y 始终复制原值",
     "值内含 \\uXXXX 转义（含代理对）时，弹层底部灰显解码结果（仅预览，不改数据、不进剪贴板）",
     "关闭（从行弹层下钻时先回行弹层）",
+    // ── R97: FK jump from a cell to the referenced row ──
+    "→ 跳转 {} · f",
+    "FK 跳转 · {} = {}",
+    "该单元格没有外键可跳转",
+    "f（单元格弹层）",
+    "外键跳转：浏览表时若当前列是外键，单元格弹层（v）底部出现 → 跳转 行，按 f 打开引用表并按该值预置 WHERE 过滤（引用 schema 不同时自动切换；NULL 不提供）",
     // ── R75: Esc flashes + sidebar table info card (`i`) ──
     "已关闭库列表",
     "打开表后可用",
@@ -4224,6 +4230,14 @@ fn en_of(zh: &'static str) -> Option<&'static str> {
         "关闭（从行弹层下钻时先回行弹层）" => {
             Some("close (when drilled from the row popup, returns there first)")
         }
+        // ── R97: FK jump from a cell to the referenced row ──
+        "→ 跳转 {} · f" => Some("→ jump to {} · f"),
+        "FK 跳转 · {} = {}" => Some("FK jump · {} = {}"),
+        "该单元格没有外键可跳转" => Some("no foreign key on this cell to jump"),
+        "f（单元格弹层）" => Some("f (cell popup)"),
+        "外键跳转：浏览表时若当前列是外键，单元格弹层（v）底部出现 → 跳转 行，按 f 打开引用表并按该值预置 WHERE 过滤（引用 schema 不同时自动切换；NULL 不提供）" => Some(
+            "Foreign-key jump: while browsing a table, when the focused column is the referencing side of a foreign key the cell popup (v) appends a → jump line; f opens the referenced table with a WHERE filter pre-seeded from the value (switching schema when the FK names one; a NULL value offers nothing)",
+        ),
         // ── R75: Esc flashes + sidebar table info card (`i`) ──
         "已关闭库列表" => Some("closed database list"),
         "打开表后可用" => Some("available after opening the table"),

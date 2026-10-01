@@ -1179,6 +1179,7 @@ pub(crate) fn gc_chord_opens_the_column_popup() {
         schema: String::new(),
         columns: vec![pk_col("id", "bigint")],
         indexes: Vec::new(),
+        foreign_keys: Vec::new(),
     });
     app.focus = Focus::Preview;
     key(
@@ -1211,6 +1212,7 @@ pub(crate) fn cols_popup_lists_cached_metadata() {
         schema: String::new(),
         columns: vec![pk_col("id", "bigint"), col_info("note", "text")],
         indexes: Vec::new(),
+        foreign_keys: Vec::new(),
     });
     open_cols_popup(&mut app);
     assert!(app.cols_popup_open);
@@ -1310,6 +1312,7 @@ pub(crate) fn cols_popup_rows_carry_default_and_key_marks() {
         schema: String::new(),
         columns: vec![pk_col("id", "bigint"), uq, created, blank],
         indexes: vec![idx_info("idx_note", &["note"], false, false)],
+        foreign_keys: Vec::new(),
     });
 
     let rows = cols_popup_rows(&app);
@@ -1392,6 +1395,7 @@ pub(crate) fn cols_popup_renders_default_and_key() {
         schema: String::new(),
         columns: vec![pk_col("id", "bigint"), created],
         indexes: Vec::new(),
+        foreign_keys: Vec::new(),
     });
     open_cols_popup(&mut app);
     let phone = draw(&mut app, 42, 22).join("\n");
@@ -1426,6 +1430,7 @@ pub(crate) fn cols_popup_filter_state_machine() {
             col_info("total", "numeric"),
         ],
         indexes: Vec::new(),
+        foreign_keys: Vec::new(),
     });
     open_cols_popup(&mut app);
     assert!(app.cols_popup_open);
@@ -1504,6 +1509,7 @@ pub(crate) fn gc_enter_jumps_to_the_highlighted_column() {
         schema: String::new(),
         columns: vec![col_info("column_3", "text"), col_info("column_5", "text")],
         indexes: Vec::new(),
+        foreign_keys: Vec::new(),
     });
     open_cols_popup(&mut app);
     assert_eq!(app.cols_popup_sel, 0);
@@ -1771,6 +1777,7 @@ pub(crate) fn cols_popup_renders_value_stats() {
         schema: String::new(),
         columns: vec![col_info("total", "int"), col_info("note", "text")],
         indexes: Vec::new(),
+        foreign_keys: Vec::new(),
     });
     open_cols_popup(&mut app);
     // CJK glyphs occupy two cells, so compare on a whitespace-stripped copy.
@@ -5412,6 +5419,7 @@ pub(crate) fn column_type_is_matched_per_schema() {
             ..Default::default()
         }],
         indexes: Vec::new(),
+        foreign_keys: Vec::new(),
     });
     assert_eq!(
         column_type(&app, "public", "orders", "amount").as_deref(),
@@ -5708,6 +5716,7 @@ pub(crate) fn locate_target_prefers_sort_then_pk_then_first_column() {
         schema: String::new(),
         columns: vec![pk_col],
         indexes: Vec::new(),
+        foreign_keys: Vec::new(),
     });
     assert_eq!(locate_target_col(&app), Some(1));
     // An explicit sort column wins over the primary key.

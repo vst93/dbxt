@@ -708,6 +708,7 @@ pub(crate) fn row_popup_title_carries_the_primary_key() {
             },
         ],
         indexes: Vec::new(),
+        foreign_keys: Vec::new(),
     });
     app.focus = Focus::Preview;
     app.sel = 0;
@@ -1729,6 +1730,7 @@ pub(crate) fn export_handles_huge_and_binary_cells_in_every_format() {
             },
         ],
         indexes: Vec::new(),
+        foreign_keys: Vec::new(),
     });
     let huge = "x".repeat(1_100_000);
     let grid = Grid {
@@ -1797,6 +1799,7 @@ pub(crate) fn export_meta_app(
             })
             .collect(),
         indexes: Vec::new(),
+        foreign_keys: Vec::new(),
     });
     app
 }
@@ -3750,6 +3753,7 @@ pub(crate) fn orders_meta(pks: &[(&str, &str)], others: &[(&str, &str)]) -> Tabl
         schema: String::new(),
         columns,
         indexes: Vec::new(),
+        foreign_keys: Vec::new(),
     }
 }
 

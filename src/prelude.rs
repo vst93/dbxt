@@ -37,7 +37,7 @@ pub(crate) use dbx_core::sql_dialect::{
     normalize_where_input, qualified_table_name, quote_table_identifier, table_pagination_strategy,
     TableDataSelectSqlOptions, TablePaginationStrategy,
 };
-pub(crate) use dbx_core::types::{ColumnInfo, IndexInfo, TableInfo};
+pub(crate) use dbx_core::types::{ColumnInfo, ForeignKeyInfo, IndexInfo, TableInfo};
 pub(crate) use dbx_mcp::backend::{
     new_connection_config, parse_database_type, BatchStatementResult, DbxBackend, LocalBackend,
 };

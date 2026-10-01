@@ -902,6 +902,10 @@ pub(crate) struct TableMeta {
     /// the `g c` popup can mark a non-unique index column as `MUL` without a
     /// query of its own. Empty when the backend could not list them.
     pub(crate) indexes: Vec<IndexInfo>,
+    /// R97: the table's foreign keys, fetched in the same metadata pass (best
+    /// effort) so the cell popup can offer a jump to the referenced row without
+    /// a query of its own. Empty when the backend could not list them.
+    pub(crate) foreign_keys: Vec<ForeignKeyInfo>,
 }
 
 /// One paginated table-data request (first load, page turn, filter or sort).

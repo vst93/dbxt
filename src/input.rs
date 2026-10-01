@@ -525,7 +525,7 @@ pub(crate) fn browse_key(app: &mut App, tx: &Tx, k: KeyEvent) {
     // The cell popup sits on top of a drilled row popup, so it owns the keyboard
     // first; Esc closes it and reveals the row underneath.
     if app.cell_popup.is_some() {
-        cell_popup_key(app, k);
+        cell_popup_key(app, tx, k);
         return;
     }
     // R82: the MongoDB field-jump / path-copy prompts sit on top of the grid and
