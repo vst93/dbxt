@@ -157,7 +157,7 @@
 - CSV 表头按列名（忽略大小写）匹配表列；CSV 中缺失的表列保留其默认值（通常为 `NULL`），多出的 CSV 列则阻止导入并给出明确提示。
 - `m` 切换追加 / 覆盖（覆盖先清空表，预览边框变红），`s` 切换遇错停止（默认，报告出错行号）/ 跳过继续（列出所有跳过行）。数据以每批 500 行的事务批量写入，并按批报告进度。
 - 自动探测编码 —— UTF-8，否则 GB18030/GBK（常见中文编码）—— 并从表头嗅探分隔符（`,` / `;` / TAB）。明确不支持 Excel `.xlsx`。
-- `Ctrl-Y` 把当前结果导出为 CSV、Excel（`.xlsx`，走内核 `StreamingXlsxWriter`）、JSON（数组）、NDJSON、Markdown、`INSERT`（每行一条）或批量 `INSERT`（多行 `VALUES`）。先选格式再选去向：留空走 OSC 52 复制，输入路径则写文件。Excel **仅支持写入文件**（默认文件名 `{表|query}.xlsx` 已预填），且超过 100,000 行时拒绝导出（工作簿在内存中构建，会提示改用 CSV）。超过 10000 行会提示生成可能耗时。
+- `Ctrl-Y` 把当前结果导出为 CSV、Excel（`.xlsx`，走内核 `StreamingXlsxWriter`）、JSON（数组）、NDJSON、Markdown、`INSERT`（每行一条）或批量 `INSERT`（多行 `VALUES`）。先选格式再选去向：留空走 OSC 52 复制，输入路径则写文件。Excel **仅支持写入文件**（默认文件名 `{表|query}.xlsx` 已预填），且超过 100,000 行时拒绝导出（工作簿在内存中构建，会提示改用 CSV）。超过 10000 行会提示生成可能耗时。弹层内的**全部 Tab**区块把本次会话的每个结果 Tab 一次打包：`A` 写多 sheet `.xlsx`（每 Tab 一 sheet，sheet 名取 Tab 标题截到 Excel 31 字符上限并去掉 `: \ / ? * [ ]`，重名追加 `_2`），`S` 写 `.zip`（每 Tab 一个 `.sql`，含 INSERT，文件名取净化后的 Tab 标题）。无网格的 Tab（脚本语句列表）跳过；超过 20 个 Tab 或 200,000 行先走红色确认，单个 Excel sheet 超 100,000 行则截断并在状态栏标注。两者默认文件名 `{db}-results-{HHMMSS}.{xlsx|zip}`，均仅写文件 —— 纯客户端、零查询。
 
 **Redis**
 - 连接 Redis 后打开分页 `SCAN` key 浏览器（绝不 `KEYS *`），带类型与 TTL 徽标、服务端 `MATCH` 模式（`/`）与逻辑 db 切换。

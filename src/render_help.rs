@@ -1667,6 +1667,10 @@ pub(crate) const HELP_ROWS: &[(&str, &str)] = &[    ("— 全局 —", ""),
         "Ctrl-Y",
         "导出当前结果（CSV / Excel (.xlsx) / JSON / NDJSON / Markdown / INSERT）",
     ),
+    (
+        "Ctrl-Y → A / S",
+        "全部 Tab 导出（弹层内区块，不新增全局键）：A=多 sheet Excel（每 Tab 一 sheet，sheet 名取 Tab 标题截 31 字符并去非法字符，重名追加 _2）· S=SQL zip（每 Tab 一个 .sql，含 INSERT）· 跳过无网格 Tab；>20 Tab 或 >200K 行先红色确认（Esc 取消）；Excel 单 Tab 超 100K 行截断并在状态栏标注",
+    ),
     ("y", "复制当前行为 INSERT 语句（OSC52 + 文件兜底）"),
     ("Y", "复制当前单元格值（状态栏显示列名与字符数）"),
     (
@@ -3416,7 +3420,8 @@ pub(crate) fn render_import_report(f: &mut Frame, area: Rect, app: &mut App) {
 
 pub(crate) fn render_export(f: &mut Frame, area: Rect, app: &mut App) {
     let w = overlay_width(area.width, 76, 30);
-    let h = (EXPORT_FORMATS.len() as u16 + 3).min(area.height);
+    // Seven formats, then the R108 all-tabs section (3 lines), plus borders.
+    let h = (EXPORT_FORMATS.len() as u16 + 5).min(area.height);
     let box_area = centered_overlay(area, w, h);
     f.render_widget(Clear, box_area);
     let rows = active_grid(app).map(|g| g.rows.len()).unwrap_or(0);
@@ -3432,6 +3437,13 @@ pub(crate) fn render_export(f: &mut Frame, area: Rect, app: &mut App) {
         .border_style(Style::default().fg(Color::Cyan));
     let inner = block.inner(box_area);
     f.render_widget(block, box_area);
+    let list_h = (EXPORT_FORMATS.len() as u16).min(inner.height);
+    let list_area = Rect {
+        x: inner.x,
+        y: inner.y,
+        width: inner.width,
+        height: list_h,
+    };
     let items: Vec<ListItem> = EXPORT_FORMATS
         .iter()
         .enumerate()
@@ -3449,8 +3461,33 @@ pub(crate) fn render_export(f: &mut Frame, area: Rect, app: &mut App) {
         )
         .highlight_symbol("> ");
     let mut st = app.export_list.clone();
-    f.render_stateful_widget(list, inner, &mut st);
+    f.render_stateful_widget(list, list_area, &mut st);
     app.export_list = st;
+    // R108: the all-tabs block under the format list. `A` / `S` act directly
+    // (they are not list selections), so it is drawn as plain text.
+    if inner.height > list_h {
+        let batch_area = Rect {
+            x: inner.x,
+            y: inner.y + list_h,
+            width: inner.width,
+            height: inner.height - list_h,
+        };
+        let lines = vec![
+            Line::from(Span::styled(
+                t("全部 Tab（本次会话结果，跳过无网格）:"),
+                Style::default().fg(Color::DarkGray),
+            )),
+            Line::from(Span::styled(
+                t("A. Excel — 每 Tab 一 sheet"),
+                Style::default().fg(Color::Cyan),
+            )),
+            Line::from(Span::styled(
+                t("S. SQL zip — 每 Tab 一个 .sql（含 INSERT）"),
+                Style::default().fg(Color::Cyan),
+            )),
+        ];
+        f.render_widget(Paragraph::new(lines), batch_area);
+    }
 }
 
 pub(crate) fn render_export_path(f: &mut Frame, area: Rect, app: &mut App) {

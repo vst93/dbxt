@@ -1754,6 +1754,9 @@ pub(crate) fn open_export(app: &mut App) {
     app.export_list.select(Some(0));
     app.export_pending = None;
     app.export_path = None;
+    // R108: a fresh picker never inherits a stale all-tabs flow.
+    app.batch_export_pending = None;
+    app.batch_export_confirm = None;
     app.status = if rows > EXPORT_SLOW_ROWS {
         tf("选择导出格式（{} 行，生成可能耗时）", &[&rows])
     } else {
@@ -1794,6 +1797,15 @@ pub(crate) fn export_key(app: &mut App, k: KeyEvent) {
             if idx < n {
                 choose_export_format(app, EXPORT_FORMATS[idx]);
             }
+        }
+        // R108: the "all tabs" section below the format list. `A` packages
+        // every result tab as a worksheet, `S` as a ZIP of per-tab `.sql`
+        // files. Both are scoped to this modal — no new global key.
+        KeyCode::Char('A') | KeyCode::Char('a') => {
+            begin_batch_export(app, BatchExportKind::Xlsx)
+        }
+        KeyCode::Char('S') | KeyCode::Char('s') => {
+            begin_batch_export(app, BatchExportKind::SqlZip)
         }
         _ => {}
     }
@@ -1846,6 +1858,11 @@ pub(crate) fn choose_export_format(app: &mut App, format: ExportFormat) {
 
 /// Destination prompt: blank copies via OSC 52, otherwise writes a file.
 pub(crate) fn export_path_key(app: &mut App, tx: &Tx, k: KeyEvent) {
+    // R108: the all-tabs export reuses this prompt but always writes a file.
+    if app.batch_export_pending.is_some() {
+        batch_export_path_key(app, tx, k);
+        return;
+    }
     let Some(mut ta) = app.export_path.take() else {
         return;
     };
@@ -1915,6 +1932,125 @@ pub(crate) fn export_path_key(app: &mut App, tx: &Tx, k: KeyEvent) {
             schema,
             table,
             types,
+        })),
+    );
+}
+
+// ── R108: export every result tab at once ─────────────────────────────────────
+
+/// `A` / `S` in the export picker: package every result tab. Opens the red
+/// confirmation when the payload is large, otherwise goes straight to the
+/// destination prompt. Purely client-side — the grids are already in memory.
+pub(crate) fn begin_batch_export(app: &mut App, kind: BatchExportKind) {
+    let tabs = collect_batch_tabs(app);
+    if tabs.is_empty() {
+        app.export_open = false;
+        app.status = t("没有可导出的结果 Tab").into();
+        return;
+    }
+    if kind == BatchExportKind::SqlZip && app.selected.is_none() {
+        app.export_open = false;
+        app.status = t("✗ 未选择连接").into();
+        return;
+    }
+    if let Some((n, rows)) = batch_guard(&tabs) {
+        app.export_open = false;
+        app.status = tf(
+            "全部 Tab 导出需确认 · {} 个 Tab · {} 行 · Enter 继续 · Esc 取消",
+            &[&n, &rows],
+        );
+        app.batch_export_confirm = Some(BatchExportConfirm { kind, tabs });
+        return;
+    }
+    open_batch_export_path(app, kind, tabs);
+}
+
+/// Open the destination prompt for an all-tabs export. Both formats are
+/// file-only, so the default `{db}-results-{HHMMSS}.{ext}` filename is
+/// prefilled and blank input keeps it.
+pub(crate) fn open_batch_export_path(app: &mut App, kind: BatchExportKind, tabs: Vec<BatchTab>) {
+    let filename = batch_default_filename(&app.current_db(), kind);
+    let mut ta = TextArea::default();
+    ta.insert_str(&filename);
+    ta.set_placeholder_text(t("输入路径支持 ~"));
+    let tab_count = tabs.len();
+    let rows = batch_rows(&tabs);
+    app.batch_export_pending = Some(BatchExportPending { kind, tabs });
+    app.export_path = Some(ta);
+    app.export_open = false;
+    app.status = tf(
+        "导出全部 Tab · {} 个 · {} 行 · Enter 写入 · Esc 取消",
+        &[&tab_count, &rows],
+    );
+}
+
+/// Keys for the `>20` tabs / `>200_000` rows confirmation layer.
+pub(crate) fn batch_export_confirm_key(app: &mut App, _tx: &Tx, k: KeyEvent) {
+    match k.code {
+        KeyCode::Enter | KeyCode::Char('y') | KeyCode::Char('Y') => {
+            let Some(c) = app.batch_export_confirm.take() else {
+                return;
+            };
+            open_batch_export_path(app, c.kind, c.tabs);
+        }
+        KeyCode::Esc | KeyCode::Char('n') | KeyCode::Char('N') => {
+            app.batch_export_confirm = None;
+            app.flash(t("已取消导出").into());
+        }
+        _ => {}
+    }
+}
+
+/// Destination prompt for an all-tabs export (always a file).
+pub(crate) fn batch_export_path_key(app: &mut App, tx: &Tx, k: KeyEvent) {
+    let Some(mut ta) = app.export_path.take() else {
+        return;
+    };
+    if k.code == KeyCode::Esc {
+        app.batch_export_pending = None;
+        app.flash(t("已取消导出").into());
+        return;
+    }
+    if k.code != KeyCode::Enter {
+        ta.input(k);
+        app.export_path = Some(ta);
+        return;
+    }
+    let Some(pending) = app.batch_export_pending.take() else {
+        return;
+    };
+    let input = ta.lines().join("\n");
+    let input = input.trim();
+    let chosen = if input.is_empty() {
+        batch_default_filename(&app.current_db(), pending.kind)
+    } else {
+        input.to_string()
+    };
+    let expanded = expand_home(&chosen);
+    // The ZIP manifest records just the file name, never a directory.
+    let file_name = PathBuf::from(&chosen)
+        .file_name()
+        .map(|s| s.to_string_lossy().into_owned())
+        .unwrap_or_else(|| chosen.clone());
+    let base = file_name
+        .strip_suffix(&format!(".{}", pending.kind.extension()))
+        .unwrap_or(&file_name)
+        .to_string();
+    let tab_count = pending.tabs.len();
+    let rows = batch_rows(&pending.tabs);
+    app.loading = true;
+    app.status = tf(
+        "导出中… {} · {} 个 Tab · {} 行 → {}",
+        &[&pending.kind.label(), &tab_count, &rows, &(expanded.display())],
+    );
+    app.spawn(
+        tx,
+        Op::BatchExport(Box::new(BatchExportJob {
+            kind: pending.kind,
+            path: expanded,
+            tabs: pending.tabs,
+            cfg: app.selected.clone(),
+            base,
         })),
     );
 }

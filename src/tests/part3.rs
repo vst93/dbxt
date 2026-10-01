@@ -1284,6 +1284,7 @@ pub(crate) fn every_call_site_has_english() {
         include_str!("../main.rs"),
         include_str!("../prelude.rs"),
         include_str!("../state.rs"),
+        include_str!("../batch_export.rs"),
         include_str!("../transfer.rs"),
         include_str!("../textutil.rs"),
         include_str!("../csv_io.rs"),
@@ -14553,3 +14554,391 @@ pub(crate) fn r107_ddl_export_is_documented_in_help_and_footer() {
         "Chinese README missing the D key"
     );
 }
+
+// ── R108: export every result tab at once ────────────────────────────────────
+
+/// A query-result tab with a `sql` (so the INSERT table can be guessed) and a
+/// grid with `types` filled in.
+fn r108_tab(title: &str, sql: &str, cols: &[&str], rows: Vec<Vec<Val>>) -> ResultTab {
+    ResultTab {
+        title: title.into(),
+        sql: Some(sql.into()),
+        grid: Some(Grid {
+            columns: cols.iter().map(|c| c.to_string()).collect(),
+            types: cols.iter().map(|_| "text".to_string()).collect(),
+            rows,
+            note: String::new(),
+        }),
+        grid_full: None,
+        script: None,
+        kind: GridKind::Query,
+        sel: 0,
+        col_offset: 0,
+        col_cursor: 0,
+    }
+}
+
+fn r108_batch_tab(title: &str, table: &str, cols: &[&str], rows: Vec<Vec<Val>>) -> BatchTab {
+    BatchTab {
+        title: title.into(),
+        grid: Grid {
+            columns: cols.iter().map(|c| c.to_string()).collect(),
+            types: cols.iter().map(|_| "text".to_string()).collect(),
+            rows,
+            note: String::new(),
+        },
+        schema: String::new(),
+        table: table.into(),
+        types: vec![None; cols.len()],
+    }
+}
+
+fn r108_zip_names(bytes: &[u8]) -> Vec<String> {
+    let archive = zip::ZipArchive::new(Cursor::new(bytes.to_vec())).expect("open zip");
+    archive.file_names().map(str::to_string).collect()
+}
+
+fn r108_zip_entry(bytes: &[u8], name: &str) -> Vec<u8> {
+    use std::io::Read;
+    let mut archive = zip::ZipArchive::new(Cursor::new(bytes.to_vec())).expect("open zip");
+    let mut entry = archive
+        .by_name(name)
+        .unwrap_or_else(|_| panic!("missing zip entry: {name}"));
+    let mut out = Vec::new();
+    entry.read_to_end(&mut out).expect("read zip entry");
+    out
+}
+
+/// Excel sheet names: illegal characters replaced, 31-char cap, case-insensitive
+/// `_2` dedupe that still fits the limit.
+#[test]
+pub(crate) fn r108_sheet_names_sanitize_truncate_and_dedupe() {
+    assert_eq!(sanitize_sheet_name("a:b/c?d*e[f]g"), "a_b_c_d_e_f_g");
+    assert_eq!(sanitize_sheet_name("   "), "Sheet");
+    assert_eq!(sanitize_sheet_name("'quoted'"), "quoted");
+    assert_eq!(sanitize_sheet_name(&"x".repeat(40)).chars().count(), 31);
+
+    let mut used = Vec::new();
+    assert_eq!(unique_sheet_name("orders", &mut used), "orders");
+    assert_eq!(unique_sheet_name("orders", &mut used), "orders_2");
+    // Excel names are case-insensitive, so ORDERS collides with orders.
+    assert_eq!(unique_sheet_name("ORDERS", &mut used), "ORDERS_3");
+
+    let mut used2 = Vec::new();
+    let base = "y".repeat(31);
+    let first = unique_sheet_name(&base, &mut used2);
+    let second = unique_sheet_name(&base, &mut used2);
+    assert_eq!(first.chars().count(), 31);
+    assert_eq!(second.chars().count(), 31);
+    assert!(second.ends_with("_2"), "{second}");
+}
+
+/// SQL entry names are sanitized and deduped; every `.sql` carries INSERT text.
+#[test]
+pub(crate) fn r108_sql_zip_names_and_insert_content() {
+    assert_eq!(sanitize_sql_file_name("a/b:c*d"), "a_b_c_d.sql");
+    assert_eq!(sanitize_sql_file_name(".."), "result.sql");
+    let cfg = test_conn("sqlite");
+    let tabs = vec![
+        r108_batch_tab("SELECT * FROM a", "a", &["id"], vec![vec![Val::Text("1".into())]]),
+        r108_batch_tab("SELECT * FROM b", "b", &["name"], vec![vec![Val::Text("x".into())]]),
+    ];
+    let entries = build_sql_zip_entries(&tabs, Some(&cfg), "shop-results-120000").unwrap();
+    let names: Vec<String> = entries.iter().map(|(n, _)| n.clone()).collect();
+    assert!(names.contains(&"manifest.json".to_string()));
+    assert_eq!(names.iter().filter(|n| n.ends_with(".sql")).count(), 2);
+    for (name, bytes) in &entries {
+        if name.ends_with(".sql") {
+            let text = String::from_utf8_lossy(bytes);
+            assert!(text.contains("INSERT INTO"), "{name}: {text}");
+            assert!(text.contains("VALUES"), "{name}: {text}");
+        }
+    }
+    // A duplicate title gets a distinct file name.
+    let dup = vec![
+        r108_batch_tab("same", "a", &["id"], vec![]),
+        r108_batch_tab("same", "b", &["id"], vec![]),
+    ];
+    let entries = build_sql_zip_entries(&dup, Some(&cfg), "s").unwrap();
+    let sql: Vec<&str> = entries
+        .iter()
+        .map(|(n, _)| n.as_str())
+        .filter(|n| n.ends_with(".sql"))
+        .collect();
+    assert_eq!(sql, vec!["same.sql", "same_2.sql"]);
+}
+
+/// The hand-rolled ZIP is a real archive and the kernel reader accepts the
+/// package (manifest + parts).
+#[test]
+pub(crate) fn r108_sql_zip_magic_and_kernel_inspect() {
+    let cfg = test_conn("sqlite");
+    let tabs = vec![
+        r108_batch_tab("a", "a", &["id"], vec![vec![Val::Text("1".into())]]),
+        r108_batch_tab("b", "b", &["id"], vec![vec![Val::Text("2".into())]]),
+        r108_batch_tab("c", "c", &["id"], vec![vec![Val::Text("3".into())]]),
+    ];
+    let entries = build_sql_zip_entries(&tabs, Some(&cfg), "db-results-000000").unwrap();
+    let bytes = zip_store(&entries);
+    assert_eq!(&bytes[..4], b"PK\x03\x04", "not a ZIP container");
+    let names = r108_zip_names(&bytes);
+    assert_eq!(names.iter().filter(|n| n.ends_with(".sql")).count(), 3);
+
+    let path = std::env::temp_dir().join(format!("dbxt-r108-{}.zip", std::process::id()));
+    std::fs::write(&path, &bytes).unwrap();
+    let pkg = dbx_core::sql_file_zip_package::inspect_sql_file_zip_package(&path)
+        .expect("kernel reader accepts the package");
+    let _ = std::fs::remove_file(&path);
+    assert_eq!(pkg.part_names.len(), 3);
+    assert!(pkg.source_file_name.contains("db-results-000000"));
+}
+
+/// Tabs without a grid (the script list) and grids with no columns are skipped;
+/// the INSERT table is guessed from the tab's SQL.
+#[test]
+pub(crate) fn r108_collect_skips_tabs_without_a_grid() {
+    let mut app = test_app();
+    app.result_tabs = vec![
+        r108_tab("orders", "SELECT * FROM orders", &["id"], vec![vec![Val::Text("1".into())]]),
+        ResultTab {
+            title: "script".into(),
+            sql: None,
+            grid: None,
+            grid_full: None,
+            script: None,
+            kind: GridKind::Query,
+            sel: 0,
+            col_offset: 0,
+            col_cursor: 0,
+        },
+        r108_tab("empty", "SELECT 1", &[], vec![]),
+    ];
+    let tabs = collect_batch_tabs(&app);
+    assert_eq!(tabs.len(), 1);
+    assert_eq!(tabs[0].title, "orders");
+    assert_eq!(tabs[0].table, "orders");
+}
+
+/// The `>20` tabs / `>200_000` rows guard, with the exact boundaries.
+#[test]
+pub(crate) fn r108_guard_thresholds() {
+    let small = r108_batch_tab("t", "t", &["c"], vec![vec![Val::Text("1".into())]]);
+    let at_tabs = vec![small.clone(); BATCH_EXPORT_MAX_TABS];
+    assert!(batch_guard(&at_tabs).is_none(), "20 tabs must not confirm");
+    let over_tabs = vec![small.clone(); BATCH_EXPORT_MAX_TABS + 1];
+    assert_eq!(batch_guard(&over_tabs), Some((21, 21)));
+
+    let rows = |n: usize| {
+        let data: Vec<Vec<Val>> = (0..n).map(|i| vec![Val::Text(i.to_string())]).collect();
+        r108_batch_tab("t", "t", &["c"], data)
+    };
+    assert!(
+        batch_guard(&[rows(BATCH_EXPORT_MAX_ROWS)]).is_none(),
+        "200K rows must not confirm"
+    );
+    assert_eq!(
+        batch_guard(&[rows(BATCH_EXPORT_MAX_ROWS + 1)]),
+        Some((1, BATCH_EXPORT_MAX_ROWS + 1))
+    );
+}
+
+/// The multi-sheet workbook: PK magic, one worksheet per tab, header per sheet,
+/// and a duplicated title deduped to `_2`.
+#[test]
+pub(crate) fn r108_batch_xlsx_has_one_sheet_per_tab() {
+    let tabs = vec![
+        r108_batch_tab("tabA", "a", &["id"], vec![vec![Val::Text("1".into())]]),
+        r108_batch_tab("tabB", "b", &["name"], vec![vec![Val::Text("x".into())]]),
+        r108_batch_tab("tabA", "c", &["id"], vec![vec![Val::Text("3".into())]]),
+    ];
+    let mut cursor = Cursor::new(Vec::new());
+    let truncated = write_batch_xlsx(&mut cursor, &tabs).unwrap();
+    assert!(truncated.is_empty());
+    let bytes = cursor.into_inner();
+    assert_eq!(&bytes[..4], b"PK\x03\x04", "not a ZIP container");
+    let wb = r105_read_xlsx_entry(&bytes, "xl/workbook.xml");
+    assert!(wb.contains("tabA"), "{wb}");
+    assert!(wb.contains("tabB"), "{wb}");
+    assert!(wb.contains("tabA_2"), "{wb}");
+    let s1 = r105_read_xlsx_entry(&bytes, "xl/worksheets/sheet1.xml");
+    let s2 = r105_read_xlsx_entry(&bytes, "xl/worksheets/sheet2.xml");
+    let s3 = r105_read_xlsx_entry(&bytes, "xl/worksheets/sheet3.xml");
+    assert!(s1.contains(">id<"), "{s1}");
+    assert!(s2.contains(">name<"), "{s2}");
+    assert!(s3.contains(">id<"), "{s3}");
+}
+
+/// A single tab over the R105 in-memory cap is truncated to 100K rows (not
+/// rejected) and reported.
+#[test]
+pub(crate) fn r108_xlsx_sheet_truncates_at_r105_limit() {
+    let rows: Vec<Vec<Val>> = (0..=EXPORT_XLSX_MAX_ROWS)
+        .map(|i| vec![Val::Text(i.to_string())])
+        .collect();
+    let tabs = vec![r108_batch_tab("big", "big", &["id"], rows)];
+    let mut cursor = Cursor::new(Vec::new());
+    let truncated = write_batch_xlsx(&mut cursor, &tabs).unwrap();
+    assert_eq!(truncated, vec!["big".to_string()]);
+    let bytes = cursor.into_inner();
+    let sheet = r105_read_xlsx_entry(&bytes, "xl/worksheets/sheet1.xml");
+    assert!(sheet.contains("A100001"), "row cap not enforced");
+    assert!(!sheet.contains("A100002"), "too many rows written");
+}
+
+/// The exact file pipeline: `run_batch_export` writes readable `.xlsx` / `.zip`
+/// files on disk.
+#[test]
+pub(crate) fn r108_run_batch_export_writes_real_files() {
+    let cfg = test_conn("sqlite");
+    let tabs = vec![
+        r108_batch_tab("a", "a", &["id"], vec![vec![Val::Text("1".into())]]),
+        r108_batch_tab("b", "b", &["id"], vec![vec![Val::Text("2".into())]]),
+    ];
+    let dir = std::env::temp_dir();
+    let xlsx = dir.join(format!("dbxt-r108-{}.xlsx", std::process::id()));
+    run_batch_export(&BatchExportJob {
+        kind: BatchExportKind::Xlsx,
+        path: xlsx.clone(),
+        tabs: tabs.clone(),
+        cfg: Some(cfg.clone()),
+        base: "db-results-000000".into(),
+    })
+    .unwrap();
+    let bytes = std::fs::read(&xlsx).unwrap();
+    let _ = std::fs::remove_file(&xlsx);
+    assert_eq!(&bytes[..4], b"PK\x03\x04");
+    assert!(r105_read_xlsx_entry(&bytes, "xl/workbook.xml").contains("a"));
+
+    let zip_path = dir.join(format!("dbxt-r108-{}.zip", std::process::id()));
+    run_batch_export(&BatchExportJob {
+        kind: BatchExportKind::SqlZip,
+        path: zip_path.clone(),
+        tabs,
+        cfg: Some(cfg),
+        base: "db-results-000000".into(),
+    })
+    .unwrap();
+    let bytes = std::fs::read(&zip_path).unwrap();
+    let _ = std::fs::remove_file(&zip_path);
+    assert_eq!(&bytes[..4], b"PK\x03\x04");
+    assert_eq!(
+        r108_zip_names(&bytes)
+            .iter()
+            .filter(|n| n.ends_with(".sql"))
+            .count(),
+        2
+    );
+    assert!(String::from_utf8_lossy(&r108_zip_entry(&bytes, "a.sql")).contains("INSERT INTO"));
+}
+
+/// `A` / `S` in the picker start the batch flow; over the guard it opens the
+/// confirmation, which Enter continues and Esc cancels.
+#[test]
+pub(crate) fn r108_picker_keys_start_batch_export() {
+    let mut app = test_app();
+    app.selected = Some(test_conn("sqlite"));
+    app.result_tabs = vec![
+        r108_tab("orders", "SELECT * FROM orders", &["id"], vec![vec![Val::Text("1".into())]]),
+        r108_tab("users", "SELECT * FROM users", &["id"], vec![vec![Val::Text("2".into())]]),
+    ];
+    app.grid_kind = GridKind::Query;
+    app.export_open = true;
+    export_key(&mut app, KeyEvent::new(KeyCode::Char('A'), KeyModifiers::NONE));
+    assert!(!app.export_open);
+    assert_eq!(
+        app.batch_export_pending.as_ref().map(|p| p.kind),
+        Some(BatchExportKind::Xlsx)
+    );
+    let name = app.export_path.as_ref().unwrap().lines().join("");
+    assert!(name.ends_with(".xlsx"), "{name}");
+    assert!(name.contains("-results-"), "{name}");
+
+    let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+    export_path_key(&mut app, &tx, KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+    assert!(app.batch_export_pending.is_none());
+    assert!(app.export_path.is_none());
+
+    // 21 tabs trips the guard before the path prompt.
+    let mut app = test_app();
+    app.selected = Some(test_conn("sqlite"));
+    app.result_tabs = (0..21)
+        .map(|i| r108_tab(&format!("t{i}"), "SELECT * FROM t", &["id"], vec![]))
+        .collect();
+    app.export_open = true;
+    export_key(&mut app, KeyEvent::new(KeyCode::Char('S'), KeyModifiers::NONE));
+    assert!(app.batch_export_pending.is_none());
+    assert!(app.batch_export_confirm.is_some());
+    batch_export_confirm_key(&mut app, &tx, KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+    assert!(app.batch_export_confirm.is_none());
+    assert_eq!(
+        app.batch_export_pending.as_ref().map(|p| p.kind),
+        Some(BatchExportKind::SqlZip)
+    );
+}
+
+/// The full `?` help lists the all-tabs section, every new string has an English
+/// form, and both READMEs document it.
+#[test]
+pub(crate) fn r108_help_documents_all_tabs_export() {
+    assert!(
+        HELP_ROWS
+            .iter()
+            .any(|(k, d)| *k == "Ctrl-Y → A / S" && d.contains("全部 Tab")),
+        "full help missing the all-tabs row"
+    );
+    use ui_text::{t_lang, Lang};
+    for s in [
+        "全部 Tab Excel",
+        "全部 Tab SQL zip",
+        "没有可导出的结果 Tab",
+        "全部 Tab 导出需确认 · {} 个 Tab · {} 行 · Enter 继续 · Esc 取消",
+        "输入路径支持 ~",
+        "导出全部 Tab · {} 个 · {} 行 · Enter 写入 · Esc 取消",
+        "导出中… {} · {} 个 Tab · {} 行 → {}",
+        "全部 Tab（本次会话结果，跳过无网格）:",
+        "A. Excel — 每 Tab 一 sheet",
+        "S. SQL zip — 每 Tab 一个 .sql（含 INSERT）",
+        "将导出 {} 个结果 Tab（共 {} 行），可能耗时",
+        " ⚠ 全部 Tab 导出确认 ",
+        " 导出 {} · {} 个 Tab · Enter 写入 · Esc 取消 ",
+        " 全部 Tab 导出 · Enter/Esc ",
+        "✓ 已导出 {} · {} 个 Tab · {} 行 · {} → {}",
+        " · {} 个 Tab 已截断至 100K 行",
+    ] {
+        assert_ne!(t_lang(s, Lang::En), s, "missing English for {s:?}");
+    }
+    assert!(include_str!("../../README.md").contains("all-tabs"));
+    assert!(include_str!("../../README.zh-CN.md").contains("全部 Tab"));
+}
+
+/// The picker's all-tabs block and the confirmation draw at a phone and a
+/// desktop size.
+#[test]
+pub(crate) fn r108_renders_at_both_sizes() {
+    let mut app = test_app();
+    app.picker_open = false;
+    app.selected = Some(test_conn("sqlite"));
+    app.grid_kind = GridKind::Query;
+    app.set_grid(sample_grid());
+    app.export_open = true;
+    for (w, h) in [(42u16, 22u16), (110, 30)] {
+        let joined = draw(&mut app, w, h).join("\n").replace(' ', "");
+        assert!(
+            joined.contains("全部Tab") || joined.contains("Alltabs"),
+            "picker missing all-tabs at {w}x{h}:\n{joined}"
+        );
+    }
+    app.export_open = false;
+    app.batch_export_confirm = Some(BatchExportConfirm {
+        kind: BatchExportKind::Xlsx,
+        tabs: vec![r108_batch_tab("t", "t", &["c"], vec![]); 21],
+    });
+    for (w, h) in [(42u16, 22u16), (110, 30)] {
+        let joined = draw(&mut app, w, h).join("\n").replace(' ', "");
+        assert!(
+            joined.contains("全部Tab") || joined.contains("Alltabs"),
+            "confirm missing at {w}x{h}:\n{joined}"
+        );
+    }
+}
+

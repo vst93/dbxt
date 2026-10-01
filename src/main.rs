@@ -4,6 +4,7 @@
 
 mod ui_text;
 
+mod batch_export;
 mod comments;
 mod csv_io;
 mod ddl_export;
@@ -450,6 +451,9 @@ enum Op {
     /// Stream a result set to a file on a background thread, so a large export
     /// never freezes the UI and never holds the whole document in memory.
     Export(Box<ExportJob>),
+    /// R108: package every result tab in one file (multi-sheet XLSX or a ZIP of
+    /// per-tab `.sql` files) on a background thread.
+    BatchExport(Box<BatchExportJob>),
     /// Scan every text column of every table on one database / schema for a
     /// term, reporting progress between tables. `cancel` lets the UI abort
     /// between tables.
@@ -544,6 +548,7 @@ impl Op {
             Op::Query(..) => OP_WATCHDOG_SQL,
             Op::Import(_) => OP_WATCHDOG_IMPORT,
             Op::Export(_) => OP_WATCHDOG_EXPORT,
+            Op::BatchExport(_) => OP_WATCHDOG_EXPORT,
             Op::GlobalSearch { .. } => OP_WATCHDOG_SEARCH,
             Op::DataDictionary { .. } => OP_WATCHDOG_SEARCH,
             Op::DataDiff { .. } => OP_WATCHDOG_DATA_DIFF,
@@ -861,6 +866,18 @@ enum OpResult {
         rows: usize,
         bytes: u64,
         elapsed_ms: u128,
+        error: Option<String>,
+    },
+    /// R108: a batch (all-tabs) export finished. `tabs`/`rows` describe the
+    /// payload, `truncated` names any tab whose sheet hit the R105 row cap.
+    BatchExportDone {
+        kind: BatchExportKind,
+        path: PathBuf,
+        tabs: usize,
+        rows: usize,
+        bytes: u64,
+        elapsed_ms: u128,
+        truncated: Vec<String>,
         error: Option<String>,
     },
     /// Intermediate global-search progress; like [`OpResult::ImportProgress`] it
@@ -3167,6 +3184,63 @@ async fn run_op(backend: &LocalBackend, op: Op, tx: &Tx) -> OpResult {
                 Err(e) => OpResult::Error(format!("export: {e}")),
             }
         }
+        Op::BatchExport(job) => {
+            let BatchExportJob {
+                kind,
+                path,
+                tabs,
+                cfg,
+                base,
+            } = *job;
+            let tab_count = tabs.len();
+            let rows = batch_rows(&tabs);
+            let write_path = path.clone();
+            // File IO + XLSX/ZIP assembly is blocking; keep the render thread
+            // free exactly like the single-tab export path.
+            let result = tokio::task::spawn_blocking(move || {
+                let start = Instant::now();
+                let job = BatchExportJob {
+                    kind,
+                    path: write_path.clone(),
+                    tabs,
+                    cfg,
+                    base,
+                };
+                let outcome = run_batch_export(&job)?;
+                let bytes = std::fs::metadata(&write_path)
+                    .map(|m| m.len())
+                    .unwrap_or(0);
+                Ok::<(BatchExportOutcome, u64, u128), String>((
+                    outcome,
+                    bytes,
+                    start.elapsed().as_millis(),
+                ))
+            })
+            .await;
+            match result {
+                Ok(Ok((outcome, bytes, elapsed_ms))) => OpResult::BatchExportDone {
+                    kind,
+                    path,
+                    tabs: tab_count,
+                    rows,
+                    bytes,
+                    elapsed_ms,
+                    truncated: outcome.truncated,
+                    error: None,
+                },
+                Ok(Err(e)) => OpResult::BatchExportDone {
+                    kind,
+                    path,
+                    tabs: tab_count,
+                    rows,
+                    bytes: 0,
+                    elapsed_ms: 0,
+                    truncated: Vec::new(),
+                    error: Some(e),
+                },
+                Err(e) => OpResult::Error(format!("batch export: {e}")),
+            }
+        }
         Op::GlobalSearch {
             cfg,
             db,
@@ -5289,6 +5363,8 @@ impl App {
             export_list: ListState::default(),
             export_pending: None,
             export_path: None,
+            batch_export_pending: None,
+            batch_export_confirm: None,
             conn_export: None,
             conn_import_path: None,
             conn_import_plan: None,
@@ -7217,6 +7293,37 @@ fn apply_op_result(app: &mut App, res: OpResult, tx: &Tx) {
                     ],
                 );
             }
+        }
+        OpResult::BatchExportDone {
+            kind,
+            path,
+            tabs,
+            rows,
+            bytes,
+            elapsed_ms,
+            truncated,
+            error,
+        } => {
+            let label = kind.label();
+            app.status = match error {
+                Some(e) => tf("✗ {} 导出失败: {}", &[&label, &e]),
+                None => {
+                    let mut line = tf(
+                        "✓ 已导出 {} · {} 个 Tab · {} 行 · {} → {}",
+                        &[&label, &tabs, &rows, &human_size(bytes), &(path.display())],
+                    );
+                    if !truncated.is_empty() {
+                        line.push_str(&tf(
+                            " · {} 个 Tab 已截断至 100K 行",
+                            &[&truncated.len()],
+                        ));
+                    }
+                    if elapsed_ms >= 250 {
+                        line.push_str(&tf(" · {}ms", &[&elapsed_ms]));
+                    }
+                    line
+                }
+            };
         }
         OpResult::SearchDone {
             gen,

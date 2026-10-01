@@ -1063,6 +1063,23 @@ pub static ALL_KEYS: &[&str] = &[
     "✓ 已导出 {} 到剪贴板（{} 字符）· 兜底 {}",
     "✓ 已导出 {} → {}",
     "✗ 写入失败: {}",
+    // ── R108: all-tabs batch export ──
+    "全部 Tab Excel",
+    "全部 Tab SQL zip",
+    "没有可导出的结果 Tab",
+    "全部 Tab 导出需确认 · {} 个 Tab · {} 行 · Enter 继续 · Esc 取消",
+    "输入路径支持 ~",
+    "导出全部 Tab · {} 个 · {} 行 · Enter 写入 · Esc 取消",
+    "导出中… {} · {} 个 Tab · {} 行 → {}",
+    "全部 Tab（本次会话结果，跳过无网格）:",
+    "A. Excel — 每 Tab 一 sheet",
+    "S. SQL zip — 每 Tab 一个 .sql（含 INSERT）",
+    "将导出 {} 个结果 Tab（共 {} 行），可能耗时",
+    " ⚠ 全部 Tab 导出确认 ",
+    " 导出 {} · {} 个 Tab · Enter 写入 · Esc 取消 ",
+    " 全部 Tab 导出 · Enter/Esc ",
+    "✓ 已导出 {} · {} 个 Tab · {} 行 · {} → {}",
+    " · {} 个 Tab 已截断至 100K 行",
     " {} · {} keys · 已选 {} ",
     "CSV 预览：{} 行 → {}.{} · Enter 导入",
     "⚠ 批量完成 {}/{}：{}",
@@ -3316,6 +3333,40 @@ fn en_of(zh: &'static str) -> Option<&'static str> {
         "✓ 已导出 {} 到剪贴板（{} 字符）· 兜底 {}" => Some("✓ exported {} to the clipboard ({} chars) · fallback {}"),
         "✓ 已导出 {} → {}" => Some("✓ exported {} → {}"),
         "✗ 写入失败: {}" => Some("✗ write failed: {}"),
+        // ── R108: all-tabs batch export ──
+        "全部 Tab Excel" => Some("All-tabs Excel"),
+        "全部 Tab SQL zip" => Some("All-tabs SQL zip"),
+        "没有可导出的结果 Tab" => Some("no result tab to export"),
+        "全部 Tab 导出需确认 · {} 个 Tab · {} 行 · Enter 继续 · Esc 取消" => Some(
+            "all-tabs export needs confirmation · {} tabs · {} rows · Enter continues · Esc cancels",
+        ),
+        "输入路径支持 ~" => Some("paths support ~"),
+        "导出全部 Tab · {} 个 · {} 行 · Enter 写入 · Esc 取消" => Some(
+            "export all tabs · {} tabs · {} rows · Enter writes · Esc cancels",
+        ),
+        "导出中… {} · {} 个 Tab · {} 行 → {}" => Some("exporting… {} · {} tabs · {} rows → {}"),
+        "全部 Tab（本次会话结果，跳过无网格）:" => {
+            Some("All tabs (this session's results; grids only):")
+        }
+        "A. Excel — 每 Tab 一 sheet" => Some("A. Excel — one sheet per tab"),
+        "S. SQL zip — 每 Tab 一个 .sql（含 INSERT）" => {
+            Some("S. SQL zip — one .sql per tab (with INSERT)")
+        }
+        "将导出 {} 个结果 Tab（共 {} 行），可能耗时" => Some(
+            "will export {} result tabs ({} rows in total); this may take a moment",
+        ),
+        " ⚠ 全部 Tab 导出确认 " => Some(" ⚠ All-tabs export confirmation "),
+        " 导出 {} · {} 个 Tab · Enter 写入 · Esc 取消 " => {
+            Some(" Export {} · {} tabs · Enter writes · Esc cancels ")
+        }
+        " 全部 Tab 导出 · Enter/Esc " => Some(" All-tabs export · Enter/Esc "),
+        "✓ 已导出 {} · {} 个 Tab · {} 行 · {} → {}" => {
+            Some("✓ exported {} · {} tabs · {} rows · {} → {}")
+        }
+        " · {} 个 Tab 已截断至 100K 行" => Some(" · {} tabs truncated to 100K rows"),
+        "全部 Tab 导出（弹层内区块，不新增全局键）：A=多 sheet Excel（每 Tab 一 sheet，sheet 名取 Tab 标题截 31 字符并去非法字符，重名追加 _2）· S=SQL zip（每 Tab 一个 .sql，含 INSERT）· 跳过无网格 Tab；>20 Tab 或 >200K 行先红色确认（Esc 取消）；Excel 单 Tab 超 100K 行截断并在状态栏标注" => Some(
+            "all-tabs export (a section inside the picker, no new global key): A = multi-sheet Excel (one sheet per tab; the sheet name is the tab title cut to 31 chars with illegal characters removed, duplicates get _2) · S = SQL zip (one .sql per tab, with INSERT) · tabs without a grid are skipped; >20 tabs or >200K rows asks for red confirmation first (Esc cancels); an Excel sheet over 100K rows is truncated and the status line notes it",
+        ),
         // ── R24: Redis / Mongo / import-export seam strings ──
         " {} · {} keys · 已选 {} " => Some(" {} · {} keys · {} selected "),
         "CSV 预览：{} 行 → {}.{} · Enter 导入" => Some("CSV preview: {} rows → {}.{} · Enter to import"),

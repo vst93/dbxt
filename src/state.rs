@@ -2946,6 +2946,10 @@ pub(crate) struct App {
     pub(crate) export_pending: Option<ExportPending>,
     /// The destination prompt (blank = clipboard, else a file path).
     pub(crate) export_path: Option<TextArea<'static>>,
+    /// R108: the all-tabs export chosen in the picker, waiting for a path.
+    pub(crate) batch_export_pending: Option<BatchExportPending>,
+    /// R108: the `>20` tabs / `>200_000` rows red confirmation.
+    pub(crate) batch_export_confirm: Option<BatchExportConfirm>,
 
     // ── connection import / export (Alt-E / Alt-I) ──
     /// The `Alt-E` bundle export overlay (destination, passwords, confirm).

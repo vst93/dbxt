@@ -345,7 +345,27 @@ pub(crate) fn ui(f: &mut Frame, app: &mut App) {
     if app.export_open {
         render_export(f, f.area(), app);
     }
-    if app.export_path.is_some() {
+    if app.batch_export_pending.is_some() {
+        // R108: the all-tabs destination prompt (always a file). Reuse the
+        // compact prompt bar rather than the single-format overlay.
+        let title = app
+            .batch_export_pending
+            .as_ref()
+            .map(|p| {
+                tf(
+                    " 导出 {} · {} 个 Tab · Enter 写入 · Esc 取消 ",
+                    &[&p.kind.label(), &p.tabs.len()],
+                )
+            })
+            .unwrap_or_default();
+        render_prompt_input(
+            f,
+            f.area(),
+            app.export_path.as_mut(),
+            &title,
+            t(" 全部 Tab 导出 · Enter/Esc "),
+        );
+    } else if app.export_path.is_some() {
         render_export_path(f, f.area(), app);
     }
     // R100: the generated data-dictionary destination prompt (default filename
@@ -398,6 +418,10 @@ pub(crate) fn ui(f: &mut Frame, app: &mut App) {
     // R100: the `>200`-table data-dictionary confirmation.
     if app.dict_confirm.is_some() {
         render_dict_confirm(f, f.area(), app);
+    }
+    // R108: the large all-tabs export confirmation.
+    if app.batch_export_confirm.is_some() {
+        render_batch_export_confirm(f, f.area(), app);
     }
     if let Some(hc) = app.history_confirm.clone() {
         let (ok, cancel) = render_history_confirm(f, f.area(), &hc);

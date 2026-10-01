@@ -556,6 +556,50 @@ pub(crate) fn render_dict_confirm(f: &mut Frame, area: Rect, app: &mut App) {
     f.render_widget(Paragraph::new(lines).block(block), box_area);
 }
 
+/// R108: the red confirmation before a large all-tabs export (`>20` tabs or
+/// `>200_000` rows). Purely informational — Enter proceeds, Esc cancels, and
+/// the payload is client-side.
+pub(crate) fn render_batch_export_confirm(f: &mut Frame, area: Rect, app: &mut App) {
+    let Some(c) = app.batch_export_confirm.as_ref() else {
+        return;
+    };
+    let w = area.width.saturating_sub(4).clamp(30, 72);
+    let inner_w = w.saturating_sub(2) as usize;
+    let rows = batch_rows(&c.tabs);
+    let mut lines: Vec<Line> = wrap_text(
+        &tf(
+            "将导出 {} 个结果 Tab（共 {} 行），可能耗时",
+            &[&c.tabs.len(), &rows],
+        ),
+        inner_w.max(1),
+    )
+    .into_iter()
+    .map(|l| {
+        Line::from(Span::styled(
+            l,
+            Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
+        ))
+    })
+    .collect();
+    lines.push(Line::from(""));
+    lines.push(Line::from(Span::styled(
+        t("Enter/y 继续   Esc/n 取消"),
+        Style::default().fg(Color::DarkGray),
+    )));
+    let h = (lines.len() as u16 + 2).min(area.height.max(3));
+    let box_area = centered_overlay(area, w, h);
+    f.render_widget(Clear, box_area);
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .title(Span::styled(
+            t(" ⚠ 全部 Tab 导出确认 "),
+            Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
+        ))
+        .border_set(border::THICK)
+        .border_style(Style::default().fg(Color::Red));
+    f.render_widget(Paragraph::new(lines).block(block), box_area);
+}
+
 /// Ctrl-Shift-H column-visibility overlay: space toggles the highlighted column,
 /// `a` shows all, `x` keeps only the first. Changes apply live behind the popup.
 /// R48 `gc`: the column-structure mini popup. A compact, scrollable list of the

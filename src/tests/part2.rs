@@ -3675,6 +3675,11 @@ pub(crate) fn help_has_no_bare_uppercase_shortcuts() {
                 // is the results pane's delete-row / generate-DELETE, so the
                 // uppercase carries the deliberate export gesture.
                 || tok == "D"
+                // `A` (R108, the all-tabs multi-sheet export) joins: it lives
+                // only inside the `Ctrl-Y` picker (never a global key), and its
+                // lowercase `a` is unused there, so the uppercase labels the
+                // deliberate all-tabs gesture next to `S` (the SQL-zip one).
+                || tok == "A"
             {
                 continue;
             }

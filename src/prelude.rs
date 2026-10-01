@@ -38,7 +38,9 @@ pub(crate) use dbx_core::sql_dialect::{
     TableDataSelectSqlOptions, TablePaginationStrategy,
 };
 pub(crate) use dbx_core::types::{ColumnInfo, ForeignKeyInfo, IndexInfo, TableInfo};
-pub(crate) use dbx_core::xlsx_export::start_streaming_xlsx_workbook_with_options;
+pub(crate) use dbx_core::xlsx_export::{
+    start_streaming_xlsx_workbook_with_options, XlsxWorksheetData,
+};
 pub(crate) use dbx_mcp::backend::{
     new_connection_config, parse_database_type, BatchStatementResult, DbxBackend, LocalBackend,
 };
@@ -56,6 +58,7 @@ pub(crate) use tui_textarea::{CursorMove, Scrolling, TextArea};
 pub(crate) use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 pub(crate) use uuid::Uuid;
 
+pub(crate) use crate::batch_export::*;
 pub(crate) use crate::comments::*;
 pub(crate) use crate::csv_io::*;
 pub(crate) use crate::ddl_export::*;

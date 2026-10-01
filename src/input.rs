@@ -95,6 +95,8 @@ pub(crate) fn reset_overlays_for_backend_switch(app: &mut App) {
     app.export_open = false;
     app.export_path = None;
     app.export_pending = None;
+    app.batch_export_pending = None;
+    app.batch_export_confirm = None;
     app.recent_open = false;
     app.conn_recent_open = false;
     app.col_picker_open = false;
@@ -527,6 +529,10 @@ pub(crate) fn browse_key(app: &mut App, tx: &Tx, k: KeyEvent) {
     }
     if app.export_path.is_some() {
         export_path_key(app, tx, k);
+        return;
+    }
+    if app.batch_export_confirm.is_some() {
+        batch_export_confirm_key(app, tx, k);
         return;
     }
     if app.export_open {
