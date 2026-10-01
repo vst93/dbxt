@@ -2266,6 +2266,16 @@ pub(crate) struct App {
     pub(crate) redis_sort: RedisSort,
     /// Last Redis first-letter jump, so `;` / `,` repeat it forward / backward.
     pub(crate) redis_jump_letter: Option<char>,
+    /// R104: session-only per-key memory sizes from the explicit `M` sample
+    /// (`key_raw → bytes`, `None` = failed / unsupported). Survives page loads
+    /// and rescans; cleared by `Shift-M` / a connection / db switch.
+    pub(crate) redis_mem: HashMap<String, Option<u64>>,
+    /// R104: whether the loaded list is ordered by memory descending (`Ctrl-M`).
+    pub(crate) redis_mem_sort: bool,
+    /// R104: live progress of an `M` sample (`None` when idle).
+    pub(crate) redis_mem_probe: Option<RedisMemProbe>,
+    /// R104: request id so a late partial from a replaced sample is dropped.
+    pub(crate) redis_mem_gen: u64,
 
     /// R42: the results pane shows a statement separator line plus a `12.3ms`
     /// prefix per statement (console feel). Off by default; `Alt-O` toggles it.

@@ -388,6 +388,11 @@ pub(crate) fn activate_connection(
     app.redis_type_filter = None;
     app.redis_sort = RedisSort::Scan;
     app.redis_jump_letter = None;
+    // R104: the memory cache is keyed by raw key only, so it must not survive a
+    // connection switch (the same name in another server is a different key).
+    app.redis_mem.clear();
+    app.redis_mem_sort = false;
+    app.redis_mem_probe = None;
     app.mongo_filter.clear();
     app.mongo_page = 0;
     app.set_placeholder();
@@ -871,6 +876,9 @@ pub(crate) fn back_to_picker(app: &mut App) {
     app.redis_type_filter = None;
     app.redis_sort = RedisSort::Scan;
     app.redis_jump_letter = None;
+    app.redis_mem.clear();
+    app.redis_mem_sort = false;
+    app.redis_mem_probe = None;
     app.picker_open = true;
 }
 
@@ -891,6 +899,9 @@ pub(crate) fn cycle_redis_db(app: &mut App, tx: &Tx, forward: bool) {
     app.redis_type_filter = None;
     app.redis_sort = RedisSort::Scan;
     app.redis_jump_letter = None;
+    app.redis_mem.clear();
+    app.redis_mem_sort = false;
+    app.redis_mem_probe = None;
     app.status = tf("redis db → {}", &[&(app.redis_db)]);
     start_redis_scan(app, tx, true);
 }

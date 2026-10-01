@@ -949,3 +949,250 @@ pub(crate) fn redis_prompt_key(app: &mut App, tx: &Tx, k: KeyEvent) {
     });
     app.status = t("确认写入 · Enter 执行 · Esc 取消").into();
 }
+
+// ─── R104: per-key memory usage sampling ─────────────────────────────────────
+//
+// An explicit `M` on the key list measures the *loaded* window with
+// `MEMORY USAGE <key> SAMPLES 0`, at most [`REDIS_MEM_SAMPLE_LIMIT`] keys and
+// [`REDIS_MEM_CONCURRENCY`] in flight. The result is a session-only
+// `HashMap<key_raw, Option<u64>>`: `None` is a failed / unsupported key and
+// renders as `· ?`. Nothing here polls — a sample runs only on the keystroke,
+// and the cache survives page loads / rescans until `Shift-M` (or a connection
+// / db switch) clears it.
+
+/// R104: how many keys one `M` sample covers. The list is sampled in its
+/// current on-screen order, so the first 500 rows — the ones being looked at —
+/// are measured; a longer list reports the truncation in the status bar.
+pub(crate) const REDIS_MEM_SAMPLE_LIMIT: usize = 500;
+
+/// R104: `MEMORY USAGE` probes in flight at once. Reuses the R96 `Ctrl-P`
+/// fan-out so a long list stays quick without flooding the server.
+pub(crate) const REDIS_MEM_CONCURRENCY: usize = 4;
+
+/// R104: per-probe ceiling. `SAMPLES 0` walks a whole collection, so this is
+/// more generous than the R96 ping; a key past it is reported as `· ?` rather
+/// than holding up the batch.
+pub(crate) const REDIS_MEM_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// R104: live progress of an `M` sample. `gen` drops a late partial from a
+/// sample the user already replaced (a connection / db switch bumps it).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) struct RedisMemProbe {
+    pub(crate) gen: u64,
+    pub(crate) done: usize,
+    pub(crate) total: usize,
+    pub(crate) truncated: bool,
+}
+
+/// R104: the `MEMORY USAGE` command for one key. The key is quoted / escaped
+/// exactly like `DEL`, so a name with a quote or backslash cannot split the
+/// command.
+pub(crate) fn redis_memory_command(key_display: &str) -> String {
+    format!(
+        "MEMORY USAGE \"{}\" SAMPLES 0",
+        key_display.replace('\\', "\\\\").replace('"', "\\\"")
+    )
+}
+
+/// R104: parse a `MEMORY USAGE` reply into bytes. A JSON integer (or a quoted /
+/// bare integer string) is a value; `null` (nil), a non-numeric string and
+/// every other shape are `None` (rendered as `· ?`). A driver / server error
+/// never reaches here — the caller maps it to `None` too.
+pub(crate) fn parse_memory_usage(value: &serde_json::Value) -> Option<u64> {
+    match value {
+        serde_json::Value::Number(n) => n
+            .as_u64()
+            .or_else(|| n.as_f64().filter(|f| *f >= 0.0).map(|f| f as u64)),
+        serde_json::Value::String(s) => {
+            let trimmed = s.trim().trim_matches('"').trim();
+            trimmed.parse::<u64>().ok()
+        }
+        _ => None,
+    }
+}
+
+/// R104: a compact memory size (`12.3KB` / `45.6MB` / `210MB` / `512B`). One
+/// decimal, base 1024, no space before the unit, and a `.0` fraction dropped so
+/// a round value stays short. Pure display — the raw byte count is what the
+/// summary sums.
+pub(crate) fn redis_mem_size(bytes: u64) -> String {
+    const UNITS: [&str; 5] = ["B", "KB", "MB", "GB", "TB"];
+    let mut v = bytes as f64;
+    let mut unit = 0usize;
+    while v >= 1024.0 && unit + 1 < UNITS.len() {
+        v /= 1024.0;
+        unit += 1;
+    }
+    if unit == 0 {
+        format!("{bytes}B")
+    } else {
+        let num = format!("{v:.1}");
+        let num = num.strip_suffix(".0").unwrap_or(&num);
+        format!("{num}{}", UNITS[unit])
+    }
+}
+
+/// R104: the grey tail appended to a key row. `None` when the key was never
+/// sampled (no tail); `Some("· ?")` when the sample failed / is unsupported;
+/// `Some("· 12.3KB")` otherwise.
+pub(crate) fn redis_mem_tail(mem: Option<&Option<u64>>) -> Option<String> {
+    match mem {
+        None => None,
+        Some(None) => Some("· ?".to_string()),
+        Some(Some(bytes)) => Some(format!("· {}", redis_mem_size(*bytes))),
+    }
+}
+
+/// R104: re-order the loaded keys by memory descending. A key with a value
+/// ranks above an unsampled / failed one; within each group the original order
+/// is preserved (`sort_by` is stable), so an unsampled tail never shuffles.
+/// `on == false` is a no-op, which is how the `Ctrl-M` twin restores the order.
+pub(crate) fn redis_mem_sort_keys(
+    keys: &mut [RedisKeyInfo],
+    mem: &HashMap<String, Option<u64>>,
+    on: bool,
+) {
+    if !on {
+        return;
+    }
+    keys.sort_by(|a, b| {
+        let av = mem.get(&a.key_raw).and_then(|v| *v);
+        let bv = mem.get(&b.key_raw).and_then(|v| *v);
+        match (av, bv) {
+            (Some(x), Some(y)) => y.cmp(&x),
+            (Some(_), None) => std::cmp::Ordering::Less,
+            (None, Some(_)) => std::cmp::Ordering::Greater,
+            (None, None) => std::cmp::Ordering::Equal,
+        }
+    });
+}
+
+/// R104: the `Top: … · 共采样 N 键 · 合计 …` summary over the keys currently in
+/// the list that carry a cached sample. `None` when nothing was sampled.
+pub(crate) fn redis_mem_summary(
+    mem: &HashMap<String, Option<u64>>,
+    keys: &[RedisKeyInfo],
+) -> Option<String> {
+    let mut count = 0usize;
+    let mut total = 0u64;
+    let mut top: Option<(String, u64)> = None;
+    for k in keys {
+        let Some(v) = mem.get(&k.key_raw) else {
+            continue;
+        };
+        count += 1;
+        if let Some(bytes) = *v {
+            total = total.saturating_add(bytes);
+            if top.as_ref().map(|(_, tb)| bytes > *tb).unwrap_or(true) {
+                top = Some((fix_double_encoding(&k.key_display), bytes));
+            }
+        }
+    }
+    if count == 0 {
+        return None;
+    }
+    match top {
+        Some((name, bytes)) => Some(tf(
+            "Top: {} {} · 共采样 {} 键 · 合计 {}",
+            &[
+                &name,
+                &redis_mem_size(bytes),
+                &count,
+                &redis_mem_size(total),
+            ],
+        )),
+        // Every sampled key failed (e.g. Redis < 4.0): name the count, not a
+        // bogus top.
+        None => Some(tf(
+            "共采样 {} 键 · 均不可用（MEMORY USAGE 需要 Redis 4.0+）",
+            &[&count],
+        )),
+    }
+}
+
+/// R104: `M` on the key list — sample the loaded window with bounded
+/// concurrency. A no-op (with a hint) on an empty list; otherwise it spawns the
+/// op and seeds the progress line. The cache is *not* cleared: a re-press
+/// overwrites entries as results arrive.
+pub(crate) fn start_redis_mem_probe(app: &mut App, tx: &Tx) {
+    let Some(cfg) = app.selected.clone() else {
+        app.status = t("✗ 未选择连接").into();
+        return;
+    };
+    let all = &app.redis_scan.keys;
+    if all.is_empty() {
+        app.status = t("还没有 key 可采样").into();
+        return;
+    }
+    let truncated = all.len() > REDIS_MEM_SAMPLE_LIMIT;
+    let targets: Vec<(String, String)> = all
+        .iter()
+        .take(REDIS_MEM_SAMPLE_LIMIT)
+        .map(|k| (k.key_raw.clone(), k.key_display.clone()))
+        .collect();
+    let total = targets.len();
+    app.redis_mem_gen = app.redis_mem_gen.wrapping_add(1);
+    let gen = app.redis_mem_gen;
+    app.redis_mem_probe = Some(RedisMemProbe {
+        gen,
+        done: 0,
+        total,
+        truncated,
+    });
+    app.status = if truncated {
+        tf(
+            "采样中 0/{} · 仅前 {}（共 {} key）",
+            &[&total, &(REDIS_MEM_SAMPLE_LIMIT), &(all.len())],
+        )
+    } else {
+        tf("采样中 0/{}", &[&total])
+    };
+    app.spawn(
+        tx,
+        Op::RedisMemProbe {
+            cfg: Box::new(cfg),
+            db: app.redis_db,
+            keys: targets,
+            gen,
+            truncated,
+        },
+    );
+}
+
+/// R104: `Shift-M` (and the connection / db switch) — drop the session cache and
+/// its ordering, then restore the list's natural order.
+pub(crate) fn clear_redis_mem_cache(app: &mut App) {
+    let had = !app.redis_mem.is_empty() || app.redis_mem_sort;
+    app.redis_mem.clear();
+    app.redis_mem_sort = false;
+    app.redis_mem_probe = None;
+    apply_redis_filter(app);
+    app.status = if had {
+        t("已清除内存采样缓存").into()
+    } else {
+        t("内存采样缓存为空").into()
+    };
+}
+
+/// R104: `Ctrl-M` — re-order the loaded keys by memory descending, again to
+/// restore the scan / TTL order (the R96 `O` two-state twin). A no-op before the
+/// first sample.
+pub(crate) fn toggle_redis_mem_sort(app: &mut App) {
+    if app.redis_mem.is_empty() {
+        app.status = t("先按 M 采样内存").into();
+        return;
+    }
+    app.redis_mem_sort = !app.redis_mem_sort;
+    apply_redis_filter(app);
+    app.status = if app.redis_mem_sort {
+        tf(
+            "内存排序：降序 · {} 个 key",
+            &[&(app.redis_scan.keys.len())],
+        )
+    } else {
+        tf(
+            "内存排序：原序 · {} 个 key",
+            &[&(app.redis_scan.keys.len())],
+        )
+    };
+}

@@ -13179,3 +13179,370 @@ pub(crate) fn r103_prompt_renders_at_both_sizes() {
         );
     }
 }
+
+// ── R104: Redis per-key memory usage sampling ──
+
+/// A Redis key-browser app with three loaded keys, for the memory-sample tests.
+fn r104_redis_app() -> (App, Tx) {
+    let (tx, _rx) = tokio::sync::mpsc::unbounded_channel::<OpResult>();
+    let mut app = test_app();
+    app.picker_open = false;
+    app.selected = Some(test_conn("redis"));
+    app.backend_kind = Backend::Redis;
+    app.redis_scan.keys = vec![rk("a", "a"), rk("b", "b"), rk("c", "c")];
+    app.redis_scan.all = app.redis_scan.keys.clone();
+    app.focus = Focus::Sidebar;
+    (app, tx)
+}
+
+/// The `MEMORY USAGE` reply parser: a JSON integer, a bare / quoted integer
+/// string, and `nil` / junk / negative all map as expected.
+#[test]
+pub(crate) fn r104_parse_memory_usage_handles_int_nil_and_quoted() {
+    assert_eq!(parse_memory_usage(&serde_json::json!(12345)), Some(12345));
+    assert_eq!(parse_memory_usage(&serde_json::json!(0)), Some(0));
+    assert_eq!(parse_memory_usage(&serde_json::json!("6789")), Some(6789));
+    assert_eq!(
+        parse_memory_usage(&serde_json::json!("\"6789\"")),
+        Some(6789)
+    );
+    // nil = the key vanished between SCAN and the probe.
+    assert_eq!(parse_memory_usage(&serde_json::Value::Null), None);
+    // A server error is caught by the caller, but a non-numeric reply is None too.
+    assert_eq!(parse_memory_usage(&serde_json::json!("not-a-number")), None);
+    assert_eq!(parse_memory_usage(&serde_json::json!([1, 2])), None);
+    assert_eq!(parse_memory_usage(&serde_json::json!(-5)), None);
+}
+
+/// The compact size / tail formatters: base 1024, one decimal, `.0` dropped,
+/// and the three tail states (value / failed / unsampled).
+#[test]
+pub(crate) fn r104_memory_size_and_tail_render_value_none_and_unsampled() {
+    assert_eq!(redis_mem_size(512), "512B");
+    assert_eq!(redis_mem_size(1024), "1KB");
+    assert_eq!(redis_mem_size(12_600), "12.3KB");
+    assert_eq!(redis_mem_size(210 * 1024 * 1024), "210MB");
+    assert_eq!(redis_mem_tail(None), None);
+    assert_eq!(redis_mem_tail(Some(&None)).as_deref(), Some("· ?"));
+    assert_eq!(
+        redis_mem_tail(Some(&Some(12_600))).as_deref(),
+        Some("· 12.3KB")
+    );
+}
+
+/// The `Top: … · 共采样 N 键 · 合计 …` summary picks the largest value, counts
+/// the sampled keys and sums the successful bytes; an all-failed / empty set
+/// degrades cleanly.
+#[test]
+pub(crate) fn r104_summary_picks_top_and_totals() {
+    let keys = vec![rk("a", "k1"), rk("b", "k2"), rk("c", "k3")];
+    let mut mem: HashMap<String, Option<u64>> = HashMap::new();
+    mem.insert("a".into(), Some(1024));
+    mem.insert("b".into(), Some(45 * 1024 * 1024));
+    mem.insert("c".into(), Some(2048));
+    let s = redis_mem_summary(&mem, &keys).unwrap();
+    assert!(s.contains("Top: k2 45MB"), "{s}");
+    assert!(s.contains("共采样 3 键"), "{s}");
+    // total = 1 KiB + 45 MiB + 2 KiB = 47,187,968 B ≈ 45MB; assert the field
+    // exists rather than an exact rounding.
+    assert!(s.contains("合计"), "{s}");
+    // A failed key still counts as sampled but contributes no bytes.
+    mem.insert("c".into(), None);
+    let s2 = redis_mem_summary(&mem, &keys).unwrap();
+    assert!(s2.contains("Top: k2 45MB"), "{s2}");
+    assert!(s2.contains("共采样 3 键"), "{s2}");
+    // Nothing cached → no summary.
+    let empty: HashMap<String, Option<u64>> = HashMap::new();
+    assert_eq!(redis_mem_summary(&empty, &keys), None);
+    // Every key failed → the dedicated "unavailable" line.
+    let mut all_none: HashMap<String, Option<u64>> = HashMap::new();
+    all_none.insert("a".into(), None);
+    all_none.insert("b".into(), None);
+    all_none.insert("c".into(), None);
+    let s3 = redis_mem_summary(&all_none, &keys).unwrap();
+    assert!(s3.contains("均不可用"), "{s3}");
+}
+
+/// `Ctrl-M` re-orders by memory descending (unsampled / failed keys last,
+/// original order preserved) and again restores; before a sample it is a no-op.
+#[test]
+pub(crate) fn r104_mem_sort_two_state_and_unsampled_last() {
+    let mut app = test_app();
+    app.redis_scan.all = vec![rk("a", "a"), rk("b", "b"), rk("c", "c"), rk("d", "d")];
+    apply_redis_filter(&mut app);
+    let names = |app: &App| -> Vec<String> {
+        app.redis_scan
+            .keys
+            .iter()
+            .map(|k| k.key_display.clone())
+            .collect()
+    };
+    assert_eq!(names(&app), vec!["a", "b", "c", "d"]);
+
+    // No samples yet: a no-op with a hint.
+    toggle_redis_mem_sort(&mut app);
+    assert!(!app.redis_mem_sort);
+    assert!(app.status.contains("先按 M"), "{}", app.status);
+
+    app.redis_mem.insert("a".into(), Some(10));
+    app.redis_mem.insert("b".into(), None);
+    app.redis_mem.insert("c".into(), Some(100));
+    toggle_redis_mem_sort(&mut app);
+    assert!(app.redis_mem_sort);
+    // c(100) → a(10) → b(failed) → d(unsampled): the last two keep their order.
+    assert_eq!(names(&app), vec!["c", "a", "b", "d"]);
+    toggle_redis_mem_sort(&mut app);
+    assert!(!app.redis_mem_sort);
+    assert_eq!(names(&app), vec!["a", "b", "c", "d"]);
+}
+
+/// `Shift-M` (the `clear_redis_mem_cache` core) drops the cache and the
+/// ordering, restores the list and reports both the cleared and empty states.
+#[test]
+pub(crate) fn r104_clear_cache_resets_sort_and_map() {
+    let mut app = test_app();
+    app.redis_scan.all = vec![rk("a", "a"), rk("b", "b")];
+    apply_redis_filter(&mut app);
+    app.redis_mem.insert("a".into(), Some(5));
+    app.redis_mem_sort = true;
+    app.redis_mem_probe = Some(RedisMemProbe {
+        gen: 1,
+        done: 0,
+        total: 2,
+        truncated: false,
+    });
+    apply_redis_filter(&mut app);
+    clear_redis_mem_cache(&mut app);
+    assert!(app.redis_mem.is_empty());
+    assert!(!app.redis_mem_sort);
+    assert!(app.redis_mem_probe.is_none());
+    assert!(app.status.contains("已清除"), "{}", app.status);
+    clear_redis_mem_cache(&mut app);
+    assert!(app.status.contains("为空"), "{}", app.status);
+}
+
+/// The command builder quotes / escapes the key like `DEL`, and `M` on a list
+/// over the 500-key cap samples only the first 500 and reports the truncation.
+#[test]
+pub(crate) fn r104_truncation_and_command_escaping() {
+    assert_eq!(
+        redis_memory_command("app:x"),
+        "MEMORY USAGE \"app:x\" SAMPLES 0"
+    );
+    assert_eq!(
+        redis_memory_command("a\"b"),
+        "MEMORY USAGE \"a\\\"b\" SAMPLES 0"
+    );
+    assert_eq!(
+        redis_memory_command("a\\b"),
+        "MEMORY USAGE \"a\\\\b\" SAMPLES 0"
+    );
+    assert_eq!(REDIS_MEM_SAMPLE_LIMIT, 500);
+    assert_eq!(REDIS_MEM_CONCURRENCY, 4);
+
+    run_rt(|| {
+        let (mut app, tx) = r104_redis_app();
+        app.redis_scan.keys = (0..510)
+            .map(|i| rk(&format!("k{i}"), &format!("k{i}")))
+            .collect();
+        app.redis_scan.all = app.redis_scan.keys.clone();
+        start_redis_mem_probe(&mut app, &tx);
+        let p = app.redis_mem_probe.unwrap();
+        assert_eq!(p.total, 500);
+        assert!(p.truncated);
+        assert!(app.status.contains("仅前 500"), "{}", app.status);
+    });
+}
+
+/// The key routing: `M` starts a sample, `Ctrl-M` toggles the memory order,
+/// `Ctrl-R` is the legacy-terminal alias and `Alt-⇧M` clears the cache.
+#[test]
+pub(crate) fn r104_key_routing_samples_sorts_and_clears() {
+    run_rt(|| {
+        let (mut app, tx) = r104_redis_app();
+        key(
+            &mut app,
+            &tx,
+            KeyEvent::new(KeyCode::Char('M'), KeyModifiers::SHIFT),
+        );
+        assert!(app.redis_mem_probe.is_some(), "M must start a sample");
+        assert!(app.status.contains("采样中"), "{}", app.status);
+
+        // Seed results so the ordering has data, then sort / restore.
+        app.redis_mem.insert("a".into(), Some(10));
+        app.redis_mem.insert("b".into(), Some(100));
+        app.redis_mem.insert("c".into(), None);
+        app.redis_mem_probe = None;
+        key(
+            &mut app,
+            &tx,
+            KeyEvent::new(KeyCode::Char('m'), KeyModifiers::CONTROL),
+        );
+        assert!(app.redis_mem_sort);
+        assert_eq!(app.redis_scan.keys[0].key_display, "b");
+        key(
+            &mut app,
+            &tx,
+            KeyEvent::new(KeyCode::Char('r'), KeyModifiers::CONTROL),
+        );
+        assert!(!app.redis_mem_sort);
+        assert_eq!(app.redis_scan.keys[0].key_display, "a");
+
+        // Alt-⇧M is the reachable clear.
+        key(
+            &mut app,
+            &tx,
+            KeyEvent::new(KeyCode::Char('M'), KeyModifiers::ALT | KeyModifiers::SHIFT),
+        );
+        assert!(app.redis_mem.is_empty());
+    });
+}
+
+/// The streaming replies: a partial advances the live line and fills the cache,
+/// the done reply summarises it, and a stale generation is dropped.
+#[test]
+pub(crate) fn r104_partial_and_done_update_status_and_summary() {
+    run_rt(|| {
+        let (mut app, tx) = r104_redis_app();
+        app.redis_mem_gen = 7;
+        app.redis_mem_probe = Some(RedisMemProbe {
+            gen: 7,
+            done: 0,
+            total: 2,
+            truncated: false,
+        });
+        apply_op_result(
+            &mut app,
+            OpResult::RedisMemPartial {
+                gen: 7,
+                key_raw: "a".into(),
+                mem: Some(2048),
+            },
+            &tx,
+        );
+        assert!(app.status.contains("采样中 1/2"), "{}", app.status);
+        assert_eq!(app.redis_mem.get("a"), Some(&Some(2048)));
+        apply_op_result(
+            &mut app,
+            OpResult::RedisMemPartial {
+                gen: 7,
+                key_raw: "b".into(),
+                mem: None,
+            },
+            &tx,
+        );
+        apply_op_result(
+            &mut app,
+            OpResult::RedisMemDone {
+                gen: 7,
+                truncated: false,
+            },
+            &tx,
+        );
+        assert!(app.redis_mem_probe.is_none());
+        assert!(app.status.contains("Top: a"), "{}", app.status);
+        assert!(app.status.contains("共采样 2 键"), "{}", app.status);
+
+        // A stale partial from a replaced sample never lands.
+        app.redis_mem_probe = Some(RedisMemProbe {
+            gen: 9,
+            done: 0,
+            total: 1,
+            truncated: false,
+        });
+        apply_op_result(
+            &mut app,
+            OpResult::RedisMemPartial {
+                gen: 8,
+                key_raw: "c".into(),
+                mem: Some(1),
+            },
+            &tx,
+        );
+        assert_eq!(app.redis_mem_probe.map(|p| p.done), Some(0));
+        assert!(!app.redis_mem.contains_key("c"));
+    });
+}
+
+/// The bounded fan-out runs at most 4 probes in flight (the R96 `Ctrl-P`
+/// pattern, reused for the `MEMORY USAGE` batch).
+#[test]
+pub(crate) fn r104_mem_probe_batch_limits_concurrency() {
+    use std::sync::atomic::AtomicUsize;
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    let inflight = Arc::new(AtomicUsize::new(0));
+    let peak = Arc::new(AtomicUsize::new(0));
+    let done = Arc::new(AtomicUsize::new(0));
+    let (i1, p1, d1) = (inflight.clone(), peak.clone(), done.clone());
+    rt.block_on(redis_mem_probe_batch(
+        (0..8usize).collect::<Vec<_>>(),
+        4,
+        move |_i: usize| {
+            let (inf, pk) = (i1.clone(), p1.clone());
+            async move {
+                let cur = inf.fetch_add(1, Ordering::SeqCst) + 1;
+                pk.fetch_max(cur, Ordering::SeqCst);
+                tokio::time::sleep(Duration::from_millis(20)).await;
+                inf.fetch_sub(1, Ordering::SeqCst);
+                Some(7u64)
+            }
+        },
+        move |_i: &usize, _v| {
+            d1.fetch_add(1, Ordering::SeqCst);
+        },
+    ));
+    assert_eq!(done.load(Ordering::SeqCst), 8);
+    assert!(peak.load(Ordering::SeqCst) <= 4, "fan-out exceeded 4");
+}
+
+/// The new keys ship in the Redis footer / mini sheet and the full `?` sheet.
+#[test]
+pub(crate) fn r104_keys_are_in_footer_and_full_help() {
+    let hints = footer_hints_ctx(FooterCtx {
+        view: FooterView::RedisKeys,
+        focus: Focus::Sidebar,
+        has_connection: true,
+    });
+    let keys: Vec<&str> = hints.iter().map(|h| h.0).collect();
+    assert!(keys.contains(&"M"), "redis footer: {keys:?}");
+    assert!(keys.contains(&"Ctrl-M"), "redis footer: {keys:?}");
+    assert!(
+        hints.iter().any(|h| h.0 == "M" && h.1 == t("采样内存")),
+        "redis footer label: {hints:?}"
+    );
+    for k in ["M", "Ctrl-M", "Shift-M"] {
+        assert!(
+            HELP_ROWS.iter().any(|(key, _)| *key == k),
+            "full help missing {k}"
+        );
+    }
+}
+
+/// The grey memory tails (`· 45MB` / `· 12.3KB` / `· ?`) render at the phone and
+/// desktop acceptance sizes without panicking or clipping the row.
+#[test]
+pub(crate) fn r104_redis_mem_renders_at_both_sizes() {
+    let mut app = test_app();
+    app.picker_open = false;
+    app.selected = Some(test_conn("redis"));
+    app.backend_kind = Backend::Redis;
+    app.redis_scan.keys = vec![
+        rk("a", "app:big"),
+        rk("b", "app:small"),
+        rk("c", "app:failed"),
+    ];
+    app.redis_scan.all = app.redis_scan.keys.clone();
+    app.redis_mem.insert("a".into(), Some(45 * 1024 * 1024));
+    app.redis_mem.insert("b".into(), Some(12_600));
+    app.redis_mem.insert("c".into(), None);
+    app.focus = Focus::Sidebar;
+    for (w, h) in [(42u16, 22u16), (110, 30)] {
+        let rows = draw(&mut app, w, h).join("\n");
+        assert!(rows.contains("app:big"), "missing key at {w}x{h}");
+        assert!(rows.contains("· 45MB"), "missing value tail at {w}x{h}");
+        assert!(rows.contains("· ?"), "missing failed tail at {w}x{h}");
+    }
+}

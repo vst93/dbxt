@@ -1841,6 +1841,41 @@ pub(crate) fn sidebar_key(app: &mut App, tx: &Tx, k: KeyEvent) {
             cycle_redis_sort(app);
             return;
         }
+        // R104: explicit per-key memory sampling. `M` samples the loaded list,
+        // `Ctrl-M` toggles the memory-descending order and `Shift-M` clears the
+        // session cache. A legacy terminal delivers `Ctrl-M` as Enter and
+        // `Shift-M` as the same event as `M`, so the practical aliases are
+        // `Ctrl-R` (sort) and `Alt-⇧M` (clear); the spec keys are still accepted
+        // where the terminal can report them (kitty / test harness).
+        if !k.modifiers.contains(KeyModifiers::CONTROL)
+            && !k.modifiers.contains(KeyModifiers::ALT)
+            && k.code == KeyCode::Char('M')
+        {
+            start_redis_mem_probe(app, tx);
+            return;
+        }
+        if k.modifiers.contains(KeyModifiers::CONTROL) && !k.modifiers.contains(KeyModifiers::ALT) {
+            match k.code {
+                KeyCode::Char('m') | KeyCode::Char('M')
+                    if k.modifiers.contains(KeyModifiers::SHIFT) =>
+                {
+                    clear_redis_mem_cache(app);
+                    return;
+                }
+                KeyCode::Char('m') | KeyCode::Char('M') | KeyCode::Char('r') => {
+                    toggle_redis_mem_sort(app);
+                    return;
+                }
+                _ => {}
+            }
+        }
+        if k.modifiers.contains(KeyModifiers::ALT)
+            && k.modifiers.contains(KeyModifiers::SHIFT)
+            && k.code == KeyCode::Char('M')
+        {
+            clear_redis_mem_cache(app);
+            return;
+        }
         // R42 first-letter jump: Alt+<letter> cycles to the next loaded key
         // starting with that letter (the KV twin of the sidebar table jump).
         if k.modifiers.contains(KeyModifiers::ALT) {

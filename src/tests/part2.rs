@@ -3649,6 +3649,8 @@ pub(crate) fn help_has_no_bare_uppercase_shortcuts() {
     // `E` (R100, export the data dictionary from the connection tree) joins: the
     // picker's lowercase `e` edits a connection, and `Alt-E` is the unrelated
     // connection-bundle export, so the plain uppercase carries the new gesture.
+    // `M` (R104, sample the loaded Redis keys' memory) joins: its lowercase `m`
+    // is the key list's prefix-rename, so the uppercase carries the new sample.
     for (key, _) in HELP_ROWS {
         if key.starts_with('—') {
             continue;
@@ -3664,6 +3666,7 @@ pub(crate) fn help_has_no_bare_uppercase_shortcuts() {
                 || tok == "U"
                 || tok == "S"
                 || tok == "E"
+                || tok == "M"
             {
                 continue;
             }

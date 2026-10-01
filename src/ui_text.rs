@@ -4451,6 +4451,37 @@ fn en_of(zh: &'static str) -> Option<&'static str> {
         "紧凑显示 `45s` / `5m` / `2h` / `3d`，`-1` 永久、`-2` 不存在；每秒本地倒计时" => {
             Some("compact `45s` / `5m` / `2h` / `3d`, `-1` permanent, `-2` missing; counts down locally every second")
         }
+        // ── R104: per-key memory usage sampling ──
+        "采样内存" => Some("sample memory"),
+        "内存排序" => Some("memory sort"),
+        "采样内存占用：对当前已加载 key 逐个发 MEMORY USAGE … SAMPLES 0（4 并发、最多前 500 个），行尾灰字显示 `· 12.3KB`（失败/不支持 `· ?`）；纯显式动作，绝不自动轮询，翻页/重扫不清缓存" => {
+            Some("sample memory: one MEMORY USAGE … SAMPLES 0 per loaded key (4 in flight, first 500), a grey `· 12.3KB` tail (`· ?` on failure); an explicit action only — never a poll, and a page load / rescan keeps the cache")
+        }
+        "按内存降序重排当前列表（未采样 key 排尾部并保持原序），再按恢复原序；终端若把 Ctrl-M 当 Enter，用 Ctrl-R" => {
+            Some("re-order the loaded list by memory descending (unsampled keys last, original order), again restores; on a terminal that sends Ctrl-M as Enter, use Ctrl-R")
+        }
+        "清空内存采样缓存（Shift-M 与 M 同键，实用键位 Alt-⇧M；切换连接 / 逻辑库也会清）" => {
+            Some("clear the memory-sample cache (Shift-M is the same event as M; the practical key is Alt-⇧M; switching connection / logical db also clears it)")
+        }
+        "采样中 {}/{}" => Some("sampling {}/{}"),
+        "采样中 0/{}" => Some("sampling 0/{}"),
+        "采样中 0/{} · 仅前 {}（共 {} key）" => {
+            Some("sampling 0/{} · first {} only (of {} keys)")
+        }
+        "Top: {} {} · 共采样 {} 键 · 合计 {}" => {
+            Some("Top: {} {} · {} keys sampled · {} total")
+        }
+        "共采样 {} 键 · 均不可用（MEMORY USAGE 需要 Redis 4.0+）" => {
+            Some("{} keys sampled · none available (MEMORY USAGE needs Redis 4.0+)")
+        }
+        "采样完成 · {} 键无数据" => Some("sample done · no data for {} keys"),
+        "已截断（仅前 500）" => Some("truncated (first 500 only)"),
+        "内存排序：降序 · {} 个 key" => Some("memory order: descending · {} keys"),
+        "内存排序：原序 · {} 个 key" => Some("memory order: original · {} keys"),
+        "先按 M 采样内存" => Some("press M to sample memory first"),
+        "已清除内存采样缓存" => Some("memory-sample cache cleared"),
+        "内存采样缓存为空" => Some("memory-sample cache is empty"),
+        "还没有 key 可采样" => Some("no keys to sample yet"),
         // ── R83: SQLite file quick-open (`L`) ──
         "路径或文件名…" => Some("path or file name…"),
         "打开 SQLite 文件" => Some("Open SQLite file"),

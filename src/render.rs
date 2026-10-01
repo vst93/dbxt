@@ -1377,6 +1377,8 @@ pub(crate) fn footer_hints_ctx(ctx: FooterCtx) -> Vec<Hint> {
             ("T", t("设 TTL")),
             ("t", t("类型过滤")),
             ("Ctrl-T", t("TTL 排序")),
+            ("M", t("采样内存")),
+            ("Ctrl-M", t("内存排序")),
             ("/", t("匹配模式")),
             ("n", t("更多")),
             ("r", t("重扫")),
@@ -4441,7 +4443,14 @@ pub(crate) fn render_redis_sidebar(f: &mut Frame, area: Rect, app: &App, lines: 
             Style::default().fg(Color::DarkGray)
         };
         let prefix_w = 2 + badge_token.chars().count() + 1 + ttl.len();
-        let name_w = w.saturating_sub(prefix_w).max(4);
+        // R104: the grey memory tail (`· 12.3KB` / `· ?`) shares the row width
+        // with the name, so an unsampled key (no tail) keeps the full name.
+        let mem_tail = redis_mem_tail(app.redis_mem.get(&key.key_raw));
+        let mem_w = mem_tail
+            .as_ref()
+            .map(|s| s.chars().count() + 1)
+            .unwrap_or(0);
+        let name_w = w.saturating_sub(prefix_w + mem_w).max(4);
         let name = truncate_disp(&fix_double_encoding(&key.key_display), name_w);
         let row_style = if sel == Some(i) {
             Style::default()
@@ -4467,6 +4476,12 @@ pub(crate) fn render_redis_sidebar(f: &mut Frame, area: Rect, app: &App, lines: 
         ));
         if !ttl.is_empty() {
             spans.push(Span::styled(ttl, Style::default().fg(Color::DarkGray)));
+        }
+        if let Some(mt) = mem_tail {
+            spans.push(Span::styled(
+                format!(" {mt}"),
+                Style::default().fg(Color::DarkGray),
+            ));
         }
         lines.push(Line::from(spans));
     }

@@ -68,6 +68,9 @@ pub(crate) fn apply_redis_filter(app: &mut App) {
         .cloned()
         .collect();
     redis_sort_keys(&mut list, app.redis_sort);
+    // R104: a live memory ordering sits on top of the scan / TTL order, so
+    // turning it off (`Ctrl-M` again) restores exactly that order.
+    redis_mem_sort_keys(&mut list, &app.redis_mem, app.redis_mem_sort);
     app.redis_scan.keys = list;
     let n = app.redis_scan.keys.len();
     if n == 0 {

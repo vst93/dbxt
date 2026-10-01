@@ -301,6 +301,18 @@ enum Op {
         db: u32,
         key_raw: String,
     },
+    /// R104: the explicit `M` memory sample — one `MEMORY USAGE <key> SAMPLES 0`
+    /// per loaded key, at most [`REDIS_MEM_SAMPLE_LIMIT`] keys and
+    /// [`REDIS_MEM_CONCURRENCY`] in flight. Streams a partial result per key so
+    /// the tails fill in live, then a final summary. Never automatic.
+    RedisMemProbe {
+        cfg: Box<ConnectionConfig>,
+        db: u32,
+        /// `(key_raw, key_display)` pairs in current list order.
+        keys: Vec<(String, String)>,
+        gen: u64,
+        truncated: bool,
+    },
     /// Execute a generated write command, then refresh the key list / value.
     RedisWrite {
         cfg: Box<ConnectionConfig>,
@@ -716,6 +728,20 @@ enum OpResult {
         append: bool,
     },
     RedisValue(Box<RedisValueView>),
+    /// R104: one key finished during an `M` memory sample. Updates the cache and
+    /// advances the live `采样中 i/n` line; a side channel that never stops the
+    /// spinner.
+    RedisMemPartial {
+        gen: u64,
+        key_raw: String,
+        mem: Option<u64>,
+    },
+    /// R104: the `M` sample finished — the status bar summarises the top key and
+    /// the total (and notes a truncated run).
+    RedisMemDone {
+        gen: u64,
+        truncated: bool,
+    },
     RedisWritten {
         cmd: String,
         summary: String,
@@ -1489,6 +1515,32 @@ where
 /// `· 超时` tail, so the exact text is never shown.
 pub(crate) const PROBE_TIMEOUT_SENTINEL: &str = "__probe_timeout__";
 
+/// R104: run one `MEMORY USAGE` probe per item with a bounded fan-out (the R96
+/// `Ctrl-P` pattern, but the payload is `Option<u64>` — `None` for a nil /
+/// failed / timed-out key). At most `limit` probes are in flight; `on_done`
+/// fires as each finishes, which drives the live progress line. Generic over the
+/// item and the probe so it can be unit-tested without a socket.
+pub(crate) async fn redis_mem_probe_batch<T, P, Fut>(
+    items: Vec<T>,
+    limit: usize,
+    probe: P,
+    mut on_done: impl FnMut(&T, Option<u64>),
+) where
+    T: Clone,
+    P: Fn(T) -> Fut,
+    Fut: std::future::Future<Output = Option<u64>>,
+{
+    let mut stream = futures::stream::iter(items)
+        .map(|item| {
+            let fut = probe(item.clone());
+            async move { (item, fut.await) }
+        })
+        .buffer_unordered(limit.max(1));
+    while let Some((item, mem)) = stream.next().await {
+        on_done(&item, mem);
+    }
+}
+
 async fn run_op(backend: &LocalBackend, op: Op, tx: &Tx) -> OpResult {
     match op {
         Op::ListConnections => match backend.load_connections().await {
@@ -2156,6 +2208,46 @@ async fn run_op(backend: &LocalBackend, op: Op, tx: &Tx) -> OpResult {
                 Ok(v) => OpResult::RedisValue(Box::new(redis_value_view(v))),
                 Err(e) => OpResult::Error(format!("redis value: {e}")),
             }
+        }
+        // R104: the explicit `M` memory sample. One `MEMORY USAGE … SAMPLES 0`
+        // per key, 4 in flight, a 10 s ceiling each. A driver / server error or
+        // a timeout is `None` (`· ?`), never a hard failure — a Redis < 4.0
+        // server simply reports every key as unavailable instead of aborting.
+        Op::RedisMemProbe {
+            cfg,
+            db,
+            keys,
+            gen,
+            truncated,
+        } => {
+            redis_mem_probe_batch(
+                keys,
+                REDIS_MEM_CONCURRENCY,
+                |(_, display): (String, String)| {
+                    let cfg = cfg.clone();
+                    async move {
+                        let cmd = redis_memory_command(&display);
+                        match tokio::time::timeout(
+                            REDIS_MEM_TIMEOUT,
+                            backend.execute_redis_command(&cfg, db, &cmd, true),
+                        )
+                        .await
+                        {
+                            Ok(Ok(r)) => parse_memory_usage(&r.value),
+                            _ => None,
+                        }
+                    }
+                },
+                |(raw, _), mem| {
+                    let _ = tx.send(OpResult::RedisMemPartial {
+                        gen,
+                        key_raw: raw.clone(),
+                        mem,
+                    });
+                },
+            )
+            .await;
+            OpResult::RedisMemDone { gen, truncated }
         }
         Op::RedisWrite {
             cfg,
@@ -4868,6 +4960,10 @@ impl App {
             redis_type_filter: None,
             redis_sort: RedisSort::Scan,
             redis_jump_letter: None,
+            redis_mem: HashMap::new(),
+            redis_mem_sort: false,
+            redis_mem_probe: None,
+            redis_mem_gen: 0,
             show_stmt_timing: false,
             columns: Vec::new(),
             ddl: None,
@@ -6532,6 +6628,35 @@ fn apply_op_result(app: &mut App, res: OpResult, tx: &Tx) {
                 tf("{} 个 key · 已全部加载", &[&(n)])
             } else {
                 tf("{} 个 key · 已加载 {} · n 加载更多", &[&(total), &(n)])
+            };
+        }
+        OpResult::RedisMemPartial { gen, key_raw, mem } => {
+            // Drop a partial from a sample the user already replaced.
+            let (done, total) = match app.redis_mem_probe.as_mut() {
+                Some(p) if p.gen == gen => {
+                    p.done += 1;
+                    (p.done, p.total)
+                }
+                _ => return,
+            };
+            app.redis_mem.insert(key_raw, mem);
+            app.status = tf("采样中 {}/{}", &[&done, &total]);
+        }
+        OpResult::RedisMemDone { gen, truncated } => {
+            let probe = match app.redis_mem_probe.take() {
+                Some(p) if p.gen == gen => p,
+                _ => return,
+            };
+            // A live memory ordering follows the freshly filled cache.
+            if app.redis_mem_sort {
+                apply_redis_filter(app);
+            }
+            let base = redis_mem_summary(&app.redis_mem, &app.redis_scan.keys)
+                .unwrap_or_else(|| tf("采样完成 · {} 键无数据", &[&probe.total]));
+            app.status = if truncated {
+                format!("{base} · {}", t("已截断（仅前 500）"))
+            } else {
+                base
             };
         }
         OpResult::RedisValue(view) => {
