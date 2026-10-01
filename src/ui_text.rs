@@ -1062,6 +1062,7 @@ pub static ALL_KEYS: &[&str] = &[
     "JSON 数组，每个对象一行记录",
     "每行一个 JSON 对象（NDJSON）",
     "Markdown 表格（| 转义）",
+    "纯文本对齐表格（+---+ 边框，CJK 宽度对齐）",
     "每行一条 INSERT INTO 语句",
     "多行 VALUES 合并为一条 INSERT",
     "选择导出格式（{} 行）",
@@ -1104,7 +1105,7 @@ pub static ALL_KEYS: &[&str] = &[
     "插入文档到 {}…",
     "更新文档 {}…",
     "导入 CSV 到当前表（预览 + 追加/覆盖确认）",
-    "导出当前结果（CSV / Excel (.xlsx) / JSON / NDJSON / Markdown / INSERT）",
+    "导出当前结果（CSV / Excel (.xlsx) / JSON / NDJSON / Markdown / Text / INSERT）",
     "预览",
     "导入",
     "追加/覆盖",
@@ -3376,6 +3377,9 @@ fn en_of(zh: &'static str) -> Option<&'static str> {
         "JSON 数组，每个对象一行记录" => Some("JSON array, one object per row"),
         "每行一个 JSON 对象（NDJSON）" => Some("one JSON object per line (NDJSON)"),
         "Markdown 表格（| 转义）" => Some("Markdown table (| escaped)"),
+        "纯文本对齐表格（+---+ 边框，CJK 宽度对齐）" => {
+            Some("plain-text aligned table (+---+ borders, CJK-width aware)")
+        }
         "每行一条 INSERT INTO 语句" => Some("one INSERT INTO statement per row"),
         "多行 VALUES 合并为一条 INSERT" => Some("multi-row VALUES merged into one INSERT"),
         "选择导出格式（{} 行）" => Some("choose an export format ({} rows)"),
@@ -3436,8 +3440,8 @@ fn en_of(zh: &'static str) -> Option<&'static str> {
         "插入文档到 {}…" => Some("Inserting document into {}…"),
         "更新文档 {}…" => Some("Updating document {}…"),
         "导入 CSV 到当前表（预览 + 追加/覆盖确认）" => Some("Import CSV into the current table (preview + append/overwrite confirmation)"),
-        "导出当前结果（CSV / Excel (.xlsx) / JSON / NDJSON / Markdown / INSERT）" => Some(
-            "Export the current result (CSV / Excel (.xlsx) / JSON / NDJSON / Markdown / INSERT)",
+        "导出当前结果（CSV / Excel (.xlsx) / JSON / NDJSON / Markdown / Text / INSERT）" => Some(
+            "Export the current result (CSV / Excel (.xlsx) / JSON / NDJSON / Markdown / Text / INSERT)",
         ),
         "预览" => Some("preview"),
         "导入" => Some("import"),

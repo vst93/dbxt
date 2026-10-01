@@ -15441,3 +15441,214 @@ pub(crate) fn r109_outline_renders_at_both_sizes() {
     assert!(wide.contains("email"), "email missing at 110x30:\n{wide}");
     assert!(wide.contains("·PK"), "PK marker missing at 110x30:\n{wide}");
 }
+
+// ── R111: plain-text aligned table export (`grid_to_text`) ───────────────────
+
+/// The `+---+` / `|` skeleton, the header rule and the per-row rules, over a
+/// numeric (right-aligned) and a text (left-aligned) column.
+#[test]
+pub(crate) fn r111_text_table_basic_alignment() {
+    let grid = Grid {
+        columns: vec!["id".into(), "name".into()],
+        rows: vec![
+            vec![Val::Text("1".into()), Val::Text("Ada".into())],
+            vec![Val::Text("22".into()), Val::Null],
+        ],
+        note: String::new(),
+        types: Vec::new(),
+    };
+    let expected = "\
++----+------+
+| id | name |
++----+------+
+|  1 | Ada  |
++----+------+
+| 22 |      |
++----+------+
+";
+    assert_eq!(grid_to_text(&grid), expected);
+}
+
+/// A CJK column is two cells wide per glyph: the column keeps its width and the
+/// following column never slides, which a char-count width would break.
+#[test]
+pub(crate) fn r111_text_table_cjk_width_keeps_columns_aligned() {
+    let grid = Grid {
+        columns: vec!["名".into(), "n".into()],
+        rows: vec![
+            vec![Val::Text("张三".into()), Val::Text("1".into())],
+            vec![Val::Text("李".into()), Val::Text("20".into())],
+        ],
+        note: String::new(),
+        types: Vec::new(),
+    };
+    let expected = "\
++------+----+
+| 名   |  n |
++------+----+
+| 张三 |  1 |
++------+----+
+| 李   | 20 |
++------+----+
+";
+    assert_eq!(grid_to_text(&grid), expected);
+    // Every physical line is the same display width (CJK counted as 2).
+    let widths: Vec<usize> = grid_to_text(&grid).lines().map(disp_width).collect();
+    assert!(widths.windows(2).all(|w| w[0] == w[1]), "{widths:?}");
+}
+
+/// A column whose every non-NULL value is numeric is right-aligned (NULL is
+/// ignored); one non-numeric value flips the whole column back to left.
+#[test]
+pub(crate) fn r111_text_table_numeric_column_right_aligns() {
+    let grid = Grid {
+        columns: vec!["amount".into(), "code".into()],
+        rows: vec![
+            vec![Val::Text("1.5".into()), Val::Text("10".into())],
+            vec![Val::Null, Val::Text("x".into())],
+            vec![Val::Text("-200".into()), Val::Text("3".into())],
+        ],
+        note: String::new(),
+        types: Vec::new(),
+    };
+    let out = grid_to_text(&grid);
+    // amount: numeric → right; code: "x" is not → left.
+    assert!(out.contains("|    1.5 | 10   |"), "{out}");
+    assert!(out.contains("|        | x    |"), "{out}");
+    assert!(out.contains("|   -200 | 3    |"), "{out}");
+    assert!(text_table_numeric("1e5"), "scientific notation is numeric");
+    assert!(!text_table_numeric("12abc"));
+    assert!(!text_table_numeric(""));
+}
+
+/// NULL and the empty string are both an empty cell (CSV semantics) and a
+/// zero-row result prints the header plus its closing rule only.
+#[test]
+pub(crate) fn r111_text_table_null_empty_and_zero_rows() {
+    let grid = Grid {
+        columns: vec!["a".into(), "b".into()],
+        rows: vec![vec![Val::Null, Val::Text(String::new())]],
+        note: String::new(),
+        types: Vec::new(),
+    };
+    assert_eq!(
+        grid_to_text(&grid),
+        "+---+---+\n| a | b |\n+---+---+\n|   |   |\n+---+---+\n"
+    );
+    let empty = Grid {
+        columns: vec!["a".into(), "b".into()],
+        rows: Vec::new(),
+        note: String::new(),
+        types: Vec::new(),
+    };
+    assert_eq!(grid_to_text(&empty), "+---+---+\n| a | b |\n+---+---+\n");
+}
+
+/// Label / extension / picker order: `Text` follows Markdown and is a normal
+/// clipboard-or-file format. The R108 batch export keeps its own two kinds, so
+/// Text never enters it.
+#[test]
+pub(crate) fn r111_text_label_extension_and_order() {
+    assert_eq!(ExportFormat::Text.label(), "Text");
+    assert_eq!(ExportFormat::Text.extension(), "txt");
+    assert!(!ExportFormat::Text.file_only());
+    let md = EXPORT_FORMATS
+        .iter()
+        .position(|f| *f == ExportFormat::Markdown)
+        .unwrap();
+    let tx = EXPORT_FORMATS
+        .iter()
+        .position(|f| *f == ExportFormat::Text)
+        .unwrap();
+    assert_eq!(tx, md + 1, "Text must sit right after Markdown");
+    assert_eq!(EXPORT_FORMATS.len(), 8);
+    // R108's batch kinds stay xlsx / zip — no text sheet or text zip member.
+    assert_eq!(BatchExportKind::Xlsx.extension(), "xlsx");
+    assert_eq!(BatchExportKind::SqlZip.extension(), "zip");
+    assert_ne!(
+        BatchExportKind::Xlsx.extension(),
+        ExportFormat::Text.extension()
+    );
+    assert_ne!(
+        BatchExportKind::SqlZip.extension(),
+        ExportFormat::Text.extension()
+    );
+}
+
+/// Full help, the popup self-description and both READMEs name the format, and
+/// every new string has an English form.
+#[test]
+pub(crate) fn r111_text_help_and_readme_document_the_format() {
+    assert!(
+        HELP_ROWS
+            .iter()
+            .any(|(k, d)| *k == "Ctrl-Y" && d.contains("Text")),
+        "full help Ctrl-Y row missing Text"
+    );
+    use ui_text::{t_lang, Lang};
+    for s in [
+        "纯文本对齐表格（+---+ 边框，CJK 宽度对齐）",
+        "导出当前结果（CSV / Excel (.xlsx) / JSON / NDJSON / Markdown / Text / INSERT）",
+    ] {
+        assert_ne!(t_lang(s, Lang::En), s, "missing English for {s:?}");
+    }
+    assert!(include_str!("../../README.md").contains("plain-text aligned table"));
+    assert!(include_str!("../../README.zh-CN.md").contains("纯文本对齐表格"));
+}
+
+/// The picker draws the new row without panicking at the phone and desktop
+/// acceptance sizes.
+#[test]
+pub(crate) fn r111_text_renders_at_both_sizes() {
+    let mut app = test_app();
+    app.picker_open = false;
+    app.selected = Some(test_conn("mysql"));
+    app.grid_kind = GridKind::TableData;
+    app.set_grid(sample_grid());
+    app.export_open = true;
+    for (w, h) in [(42u16, 22u16), (110, 30)] {
+        let joined = draw(&mut app, w, h).join("\n");
+        assert!(
+            joined.contains("Text"),
+            "picker missing Text at {w}x{h}:\n{joined}"
+        );
+    }
+}
+
+/// The exact file pipeline `Op::Export` uses writes a `cat`-able `.txt`: every
+/// line the same display width, NULL empty, CJK intact.
+#[test]
+pub(crate) fn r111_text_write_export_file_pipeline() {
+    let app = test_app();
+    let grid = Grid {
+        columns: vec!["编号".into(), "名称".into(), "金额".into()],
+        rows: vec![
+            vec![
+                Val::Text("1".into()),
+                Val::Text("张三".into()),
+                Val::Text("12.50".into()),
+            ],
+            vec![Val::Text("2".into()), Val::Null, Val::Text("3".into())],
+        ],
+        note: String::new(),
+        types: Vec::new(),
+    };
+    let types = grid_column_types(&app, "", "", &grid);
+    let path = std::env::temp_dir().join(format!("dbxt-r111-{}.txt", std::process::id()));
+    {
+        let file = std::fs::File::create(&path).unwrap();
+        let mut w = BufWriter::new(file);
+        write_export(&mut w, None, "", "", &types, &grid, ExportFormat::Text).unwrap();
+        w.flush().unwrap();
+    }
+    let text = std::fs::read_to_string(&path).unwrap();
+    let _ = std::fs::remove_file(&path);
+    assert_eq!(path.extension().unwrap(), "txt");
+    assert_eq!(text, grid_to_text(&grid));
+    assert!(text.contains("张三"), "{text}");
+    let widths: Vec<usize> = text.lines().map(disp_width).collect();
+    assert!(
+        widths.windows(2).all(|w| w[0] == w[1]),
+        "ragged table:\n{text}"
+    );
+}

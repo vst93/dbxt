@@ -149,6 +149,9 @@ pub(crate) enum ExportFormat {
     JsonArray,
     JsonNdjson,
     Markdown,
+    /// R111: plain-text aligned table (`+---+` borders), the neutral format
+    /// that pastes straight into a terminal / wiki / mail body.
+    Text,
     Insert,
     InsertBatch,
 }
@@ -161,6 +164,7 @@ impl ExportFormat {
             ExportFormat::JsonArray => "JSON",
             ExportFormat::JsonNdjson => "NDJSON",
             ExportFormat::Markdown => "Markdown",
+            ExportFormat::Text => "Text",
             ExportFormat::Insert => "INSERT",
             ExportFormat::InsertBatch => t("INSERT (批量)"),
         }
@@ -172,6 +176,7 @@ impl ExportFormat {
             ExportFormat::JsonArray => t("JSON 数组，每个对象一行记录"),
             ExportFormat::JsonNdjson => t("每行一个 JSON 对象（NDJSON）"),
             ExportFormat::Markdown => t("Markdown 表格（| 转义）"),
+            ExportFormat::Text => t("纯文本对齐表格（+---+ 边框，CJK 宽度对齐）"),
             ExportFormat::Insert => t("每行一条 INSERT INTO 语句"),
             ExportFormat::InsertBatch => t("多行 VALUES 合并为一条 INSERT"),
         }
@@ -184,6 +189,7 @@ impl ExportFormat {
             ExportFormat::JsonArray => "json",
             ExportFormat::JsonNdjson => "ndjson",
             ExportFormat::Markdown => "md",
+            ExportFormat::Text => "txt",
             ExportFormat::Insert | ExportFormat::InsertBatch => "sql",
         }
     }
@@ -206,6 +212,7 @@ pub(crate) const EXPORT_FORMATS: &[ExportFormat] = &[
     ExportFormat::JsonArray,
     ExportFormat::JsonNdjson,
     ExportFormat::Markdown,
+    ExportFormat::Text,
     ExportFormat::Insert,
     ExportFormat::InsertBatch,
 ];

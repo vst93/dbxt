@@ -579,6 +579,118 @@ pub(crate) fn grid_to_markdown(grid: &Grid) -> String {
     out
 }
 
+// ── R111: plain-text aligned table ───────────────────────────────────────────
+//
+// The neutral, dependency-free format a CLI veteran pastes into a terminal,
+// wiki or mail body: `+---+` rules with `|` column borders. Column width is the
+// widest display width (Unicode aware — a CJK glyph counts 2), a NULL is an
+// empty cell and values are passed through verbatim (CSV semantics, R105). A
+// column whose every non-NULL value parses as a finite number is right-aligned
+// (header included, so the column reads as one block); everything else is
+// left-aligned. Cells are never wrapped or truncated — a faithful export wins
+// over a pretty one — and a rule is drawn under every data row.
+
+/// True when `s` parses as a finite number, used to classify a column.
+pub(crate) fn text_table_numeric(s: &str) -> bool {
+    s.trim().parse::<f64>().map(f64::is_finite).unwrap_or(false)
+}
+
+/// Widest display width of the header and every cell, per column.
+pub(crate) fn text_table_widths(grid: &Grid) -> Vec<usize> {
+    let mut widths: Vec<usize> = grid.columns.iter().map(|c| disp_width(c)).collect();
+    for row in &grid.rows {
+        for (ci, w) in widths.iter_mut().enumerate() {
+            let cw = disp_width(row.get(ci).map(Val::text).unwrap_or(""));
+            if cw > *w {
+                *w = cw;
+            }
+        }
+    }
+    widths
+}
+
+/// Per-column right-alignment: true when the column has at least one non-NULL
+/// value and every one of them is numeric.
+pub(crate) fn text_table_right(grid: &Grid) -> Vec<bool> {
+    (0..grid.columns.len())
+        .map(|ci| {
+            let mut any = false;
+            for row in &grid.rows {
+                if let Some(Val::Text(s)) = row.get(ci) {
+                    if !text_table_numeric(s) {
+                        return false;
+                    }
+                    any = true;
+                }
+            }
+            any
+        })
+        .collect()
+}
+
+/// Append one `+---+` rule spanning every column width.
+pub(crate) fn text_table_border_into(out: &mut String, widths: &[usize]) {
+    out.push('+');
+    for w in widths {
+        for _ in 0..w + 2 {
+            out.push('-');
+        }
+        out.push('+');
+    }
+    out.push('\n');
+}
+
+/// Append one `| cell | cell |` row, padding each cell to its column width on
+/// the aligned side. `right[ci]` picks the alignment per column.
+pub(crate) fn text_table_row_into(
+    out: &mut String,
+    cells: &[&str],
+    widths: &[usize],
+    right: &[bool],
+) {
+    out.push('|');
+    for (ci, w) in widths.iter().enumerate() {
+        let cell = cells.get(ci).copied().unwrap_or("");
+        let pad = w.saturating_sub(disp_width(cell));
+        out.push(' ');
+        if right.get(ci).copied().unwrap_or(false) {
+            for _ in 0..pad {
+                out.push(' ');
+            }
+            out.push_str(cell);
+        } else {
+            out.push_str(cell);
+            for _ in 0..pad {
+                out.push(' ');
+            }
+        }
+        out.push_str(" |");
+    }
+    out.push('\n');
+}
+
+/// Serialise a grid as a plain-text aligned table (see the section comment
+/// above). An empty result set prints the header and its closing rule only.
+pub(crate) fn grid_to_text(grid: &Grid) -> String {
+    let widths = text_table_widths(grid);
+    let right = text_table_right(grid);
+    let mut out = String::new();
+    text_table_border_into(&mut out, &widths);
+    let header: Vec<&str> = grid.columns.iter().map(String::as_str).collect();
+    text_table_row_into(&mut out, &header, &widths, &right);
+    text_table_border_into(&mut out, &widths);
+    let mut cells: Vec<&str> = Vec::with_capacity(widths.len());
+    for row in &grid.rows {
+        cells.clear();
+        for ci in 0..widths.len() {
+            cells.push(row.get(ci).map(Val::text).unwrap_or(""));
+        }
+        text_table_row_into(&mut out, &cells, &widths, &right);
+        text_table_border_into(&mut out, &widths);
+    }
+    out
+}
+
 /// `(schema, table)` for an INSERT export, or `None` when it cannot be
 /// determined.
 pub(crate) fn export_insert_table(app: &App) -> Option<(String, String)> {
@@ -692,6 +804,7 @@ pub(crate) fn render_export_content(
         ExportFormat::JsonArray => grid_to_json_array(grid),
         ExportFormat::JsonNdjson => grid_to_json_ndjson(grid),
         ExportFormat::Markdown => grid_to_markdown(grid),
+        ExportFormat::Text => grid_to_text(grid),
         ExportFormat::Insert => match (app.selected.as_ref(), table) {
             (Some(cfg), Some((schema, t))) => grid_to_inserts(cfg, schema, t, grid, app),
             _ => String::new(),
@@ -732,6 +845,7 @@ pub(crate) fn write_export<W: Write + Seek>(
         ExportFormat::JsonArray => write_json_array(w, grid),
         ExportFormat::JsonNdjson => write_json_ndjson(w, grid),
         ExportFormat::Markdown => write_markdown(w, grid),
+        ExportFormat::Text => write_text(w, grid),
         ExportFormat::Insert => match cfg {
             Some(cfg) => write_inserts(w, cfg, schema, table, types, grid),
             None => Ok(()),
@@ -894,6 +1008,38 @@ pub(crate) fn write_markdown<W: Write>(w: &mut W, grid: &Grid) -> std::io::Resul
             line.push_str(" |");
         }
         line.push('\n');
+        w.write_all(line.as_bytes())?;
+    }
+    Ok(())
+}
+
+/// Stream the plain-text aligned table (byte-identical to [`grid_to_text`]).
+/// The column widths need one full pass, but that is a `Vec<usize>` of column
+/// count — the rows themselves are still written one line at a time.
+pub(crate) fn write_text<W: Write>(w: &mut W, grid: &Grid) -> std::io::Result<()> {
+    let widths = text_table_widths(grid);
+    let right = text_table_right(grid);
+    let mut line = String::new();
+    text_table_border_into(&mut line, &widths);
+    w.write_all(line.as_bytes())?;
+    line.clear();
+    let header: Vec<&str> = grid.columns.iter().map(String::as_str).collect();
+    text_table_row_into(&mut line, &header, &widths, &right);
+    w.write_all(line.as_bytes())?;
+    line.clear();
+    text_table_border_into(&mut line, &widths);
+    w.write_all(line.as_bytes())?;
+    let mut cells: Vec<&str> = Vec::with_capacity(widths.len());
+    for row in &grid.rows {
+        line.clear();
+        cells.clear();
+        for ci in 0..widths.len() {
+            cells.push(row.get(ci).map(Val::text).unwrap_or(""));
+        }
+        text_table_row_into(&mut line, &cells, &widths, &right);
+        w.write_all(line.as_bytes())?;
+        line.clear();
+        text_table_border_into(&mut line, &widths);
         w.write_all(line.as_bytes())?;
     }
     Ok(())
@@ -1792,7 +1938,7 @@ pub(crate) fn export_key(app: &mut App, k: KeyEvent) {
             let idx = app.export_list.selected().unwrap_or(0).min(n - 1);
             choose_export_format(app, EXPORT_FORMATS[idx]);
         }
-        KeyCode::Char(c @ '1'..='7') => {
+        KeyCode::Char(c @ '1'..='9') => {
             let idx = (c as usize) - ('1' as usize);
             if idx < n {
                 choose_export_format(app, EXPORT_FORMATS[idx]);

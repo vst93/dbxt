@@ -1673,7 +1673,7 @@ pub(crate) const HELP_ROWS: &[(&str, &str)] = &[    ("— 全局 —", ""),
     ),
     (
         "Ctrl-Y",
-        "导出当前结果（CSV / Excel (.xlsx) / JSON / NDJSON / Markdown / INSERT）",
+        "导出当前结果（CSV / Excel (.xlsx) / JSON / NDJSON / Markdown / Text / INSERT）",
     ),
     (
         "Ctrl-Y → A / S",
@@ -3563,7 +3563,7 @@ pub(crate) fn render_import_report(f: &mut Frame, area: Rect, app: &mut App) {
 
 pub(crate) fn render_export(f: &mut Frame, area: Rect, app: &mut App) {
     let w = overlay_width(area.width, 76, 30);
-    // Seven formats, then the R108 all-tabs section (3 lines), plus borders.
+    // Eight formats, then the R108 all-tabs section (3 lines), plus borders.
     let h = (EXPORT_FORMATS.len() as u16 + 5).min(area.height);
     let box_area = centered_overlay(area, w, h);
     f.render_widget(Clear, box_area);
