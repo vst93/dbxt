@@ -584,11 +584,24 @@ pub(crate) fn grid_to_markdown(grid: &Grid) -> String {
 // The neutral, dependency-free format a CLI veteran pastes into a terminal,
 // wiki or mail body: `+---+` rules with `|` column borders. Column width is the
 // widest display width (Unicode aware — a CJK glyph counts 2), a NULL is an
-// empty cell and values are passed through verbatim (CSV semantics, R105). A
-// column whose every non-NULL value parses as a finite number is right-aligned
-// (header included, so the column reads as one block); everything else is
-// left-aligned. Cells are never wrapped or truncated — a faithful export wins
-// over a pretty one — and a rule is drawn under every data row.
+// empty cell and values are passed through verbatim (CSV semantics, R105), with
+// one exception: a literal `|` is escaped to `\|` and an embedded newline
+// collapses to a space (see [`text_table_cell`]), so a cell can never break the
+// border grid or split one logical row across physical lines. A column whose
+// every non-NULL value parses as a finite number is right-aligned (header
+// included, so the column reads as one block); everything else is left-aligned.
+// Cells are never wrapped or truncated — a faithful export wins over a pretty
+// one — and a rule is drawn under every data row.
+
+/// One cell as it appears in the aligned table: a `|` is escaped to `\|` (the
+/// Markdown table convention, so the value round-trips) and CR / LF collapse to
+/// a single space so one row stays one physical line. Applied identically by
+/// the width pass and the row writer, keeping them aligned.
+pub(crate) fn text_table_cell(s: &str) -> String {
+    s.replace('|', "\\|")
+        .replace("\r\n", " ")
+        .replace(['\n', '\r'], " ")
+}
 
 /// True when `s` parses as a finite number, used to classify a column.
 pub(crate) fn text_table_numeric(s: &str) -> bool {
@@ -597,10 +610,14 @@ pub(crate) fn text_table_numeric(s: &str) -> bool {
 
 /// Widest display width of the header and every cell, per column.
 pub(crate) fn text_table_widths(grid: &Grid) -> Vec<usize> {
-    let mut widths: Vec<usize> = grid.columns.iter().map(|c| disp_width(c)).collect();
+    let mut widths: Vec<usize> = grid
+        .columns
+        .iter()
+        .map(|c| disp_width(&text_table_cell(c)))
+        .collect();
     for row in &grid.rows {
         for (ci, w) in widths.iter_mut().enumerate() {
-            let cw = disp_width(row.get(ci).map(Val::text).unwrap_or(""));
+            let cw = disp_width(&text_table_cell(row.get(ci).map(Val::text).unwrap_or("")));
             if cw > *w {
                 *w = cw;
             }
@@ -650,16 +667,16 @@ pub(crate) fn text_table_row_into(
 ) {
     out.push('|');
     for (ci, w) in widths.iter().enumerate() {
-        let cell = cells.get(ci).copied().unwrap_or("");
-        let pad = w.saturating_sub(disp_width(cell));
+        let cell = text_table_cell(cells.get(ci).copied().unwrap_or(""));
+        let pad = w.saturating_sub(disp_width(&cell));
         out.push(' ');
         if right.get(ci).copied().unwrap_or(false) {
             for _ in 0..pad {
                 out.push(' ');
             }
-            out.push_str(cell);
+            out.push_str(&cell);
         } else {
-            out.push_str(cell);
+            out.push_str(&cell);
             for _ in 0..pad {
                 out.push(' ');
             }

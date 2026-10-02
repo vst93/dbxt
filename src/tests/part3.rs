@@ -5524,6 +5524,8 @@ pub(crate) fn global_key_ledger_is_documented_in_help() {
         "Ctrl-X",
         "Ctrl-D",
         "F1",
+        // R115: the R110 About dialog's global key is part of the ledger too.
+        "F10",
         "?",
     ];
     let mut in_global = false;
@@ -14886,7 +14888,7 @@ pub(crate) fn r108_sql_zip_magic_and_kernel_inspect() {
     let names = r108_zip_names(&bytes);
     assert_eq!(names.iter().filter(|n| n.ends_with(".sql")).count(), 3);
 
-    let path = std::env::temp_dir().join(format!("dbxt-r108-{}.zip", std::process::id()));
+    let path = std::env::temp_dir().join(format!("dbxt-r108-inspect-{}.zip", std::process::id()));
     std::fs::write(&path, &bytes).unwrap();
     let pkg = dbx_core::sql_file_zip_package::inspect_sql_file_zip_package(&path)
         .expect("kernel reader accepts the package");
@@ -15013,7 +15015,7 @@ pub(crate) fn r108_run_batch_export_writes_real_files() {
     assert_eq!(&bytes[..4], b"PK\x03\x04");
     assert!(r105_read_xlsx_entry(&bytes, "xl/workbook.xml").contains("a"));
 
-    let zip_path = dir.join(format!("dbxt-r108-{}.zip", std::process::id()));
+    let zip_path = dir.join(format!("dbxt-r108-batch-{}.zip", std::process::id()));
     run_batch_export(&BatchExportJob {
         kind: BatchExportKind::SqlZip,
         path: zip_path.clone(),
@@ -16398,4 +16400,673 @@ pub(crate) fn r114_sqlite_export_smoke_round_trip() {
         );
     }
     let _ = std::fs::remove_file(&path);
+}
+
+// ── R115: hardening round 2 — R107-R114 edge cases ───────────────────────────
+
+/// R115 (R107): a MySQL `SHOW CREATE TABLE` reply whose DDL carries doubled
+/// backticks and quoted comments is taken from column 2 and returned
+/// byte-for-byte — the extractor never re-quotes or strips anything.
+#[test]
+pub(crate) fn r115_r107_ddl_cell_is_verbatim_through_quotes_and_backticks() {
+    use serde_json::json;
+    let ddl = "CREATE TABLE `order``s` (\n  `id` int NOT NULL COMMENT 'it''s a key',\n  PRIMARY KEY (`id`)\n) ENGINE=InnoDB";
+    let rows = vec![vec![json!("order`s"), json!(ddl)]];
+    assert_eq!(ddl_from_rows(DatabaseType::Mysql, &rows).unwrap(), ddl);
+    // A non-string JSON cell is stringified, never dropped.
+    let rows = vec![vec![json!("t"), json!(123)]];
+    assert_eq!(ddl_from_rows(DatabaseType::Mysql, &rows).unwrap(), "123");
+}
+
+/// R115 (R107): an SQLite internal table whose stored `sql` is NULL or empty is
+/// rejected as an error, never rendered as an empty DDL box.
+#[test]
+pub(crate) fn r115_r107_sqlite_internal_null_or_empty_sql_is_rejected() {
+    use serde_json::json;
+    assert!(ddl_from_rows(DatabaseType::Sqlite, &[vec![serde_json::Value::Null]]).is_err());
+    assert!(ddl_from_rows(DatabaseType::Sqlite, &[vec![json!("")]]).is_err());
+    assert!(ddl_from_rows(DatabaseType::Sqlite, &[vec![json!("\n\t ")]]).is_err());
+}
+
+/// R115 (R107): a >10 KB DDL scrolls in the popup without panicking, and the
+/// render clamps an absurd scroll to the last page at both acceptance sizes.
+#[test]
+pub(crate) fn r115_r107_huge_ddl_popup_scroll_clamps_at_both_sizes() {
+    let ddl: String = (0..600)
+        .map(|i| format!("  `col_{i}` varchar(255) NOT NULL COMMENT 'col {i}',\n"))
+        .collect();
+    assert!(ddl.len() > 10 * 1024, "fixture must exceed 10 KB");
+    for (w, h) in [(42u16, 22u16), (110, 30)] {
+        let mut app = test_app();
+        app.ddl_popup = Some(DdlPopup {
+            table: "big".into(),
+            schema: String::new(),
+            text: ddl.clone(),
+            scroll: u16::MAX,
+        });
+        let rows = draw(&mut app, w, h);
+        assert!(rows.iter().any(|r| !r.trim().is_empty()), "blank at {w}x{h}");
+        let clamped = app.ddl_popup.as_ref().unwrap().scroll;
+        assert!(clamped < u16::MAX, "scroll not clamped at {w}x{h}: {clamped}");
+        let flat: String = rows.join("\n").chars().filter(|c| !c.is_whitespace()).collect();
+        assert!(flat.contains("完整"), "title missing at {w}x{h}");
+    }
+}
+
+/// R115 (R107): the `Ctrl-Y` default filename neutralises spaces and keeps dots
+/// (only path-hostile characters become `_`), always ending in `.sql`.
+#[test]
+pub(crate) fn r115_r107_ddl_default_filename_handles_spaces_and_dots() {
+    assert_eq!(ddl_default_filename("my table"), "my_table.sql");
+    assert_eq!(ddl_default_filename("a.b c"), "a.b_c.sql");
+    assert_eq!(ddl_default_filename("orders.v2"), "orders.v2.sql");
+    assert_eq!(ddl_default_filename("a\tb"), "a_b.sql");
+}
+
+/// R115 (R108): a CJK sheet title is capped at 31 characters, not 31 bytes, and
+/// the dedupe suffix still fits inside the character budget.
+#[test]
+pub(crate) fn r115_r108_cjk_sheet_name_truncates_by_chars_not_bytes() {
+    let long = "表".repeat(40);
+    let name = sanitize_sheet_name(&long);
+    assert_eq!(name.chars().count(), 31);
+    assert!(name.len() > 31, "CJK bytes must exceed the char cap");
+    assert!(name.chars().all(|c| c == '表'));
+
+    let mut used = Vec::new();
+    let first = unique_sheet_name(&name, &mut used);
+    let second = unique_sheet_name(&name, &mut used);
+    assert_eq!(first.chars().count(), 31);
+    assert_eq!(second.chars().count(), 31);
+    assert!(second.ends_with("_2"), "{second}");
+    // The deduped name keeps 29 CJK glyphs plus the two-char `_2` suffix.
+    assert_eq!(second.chars().filter(|c| *c == '表').count(), 29);
+}
+
+/// R115 (R108): the same title three times gets `_2` then `_3` (the counter is
+/// never reset) and the SQL entry names dedupe the same way.
+#[test]
+pub(crate) fn r115_r108_duplicate_sheet_names_dedupe_twice() {
+    let mut used = Vec::new();
+    assert_eq!(unique_sheet_name("data", &mut used), "data");
+    assert_eq!(unique_sheet_name("data", &mut used), "data_2");
+    assert_eq!(unique_sheet_name("data", &mut used), "data_3");
+    assert_eq!(unique_sheet_name("DATA", &mut used), "DATA_4");
+
+    let mut sql_used = Vec::new();
+    assert_eq!(unique_sql_file_name("q.sql", &mut sql_used), "q.sql");
+    assert_eq!(unique_sql_file_name("q.sql", &mut sql_used), "q_2.sql");
+    assert_eq!(unique_sql_file_name("q.sql", &mut sql_used), "q_3.sql");
+}
+
+/// R115 (R108): a zero-row grid with columns is still an exportable tab and
+/// writes a valid header-only workbook; an all-skipped set is refused instead
+/// of producing an empty artifact.
+#[test]
+pub(crate) fn r115_r108_zero_row_tab_exports_and_all_skipped_is_refused() {
+    let mut app = test_app();
+    app.picker_open = false;
+    app.selected = Some(test_conn("sqlite"));
+    app.result_tabs = vec![r108_tab(
+        "empty",
+        "SELECT * FROM t",
+        &["id", "name"],
+        vec![],
+    )];
+    let tabs = collect_batch_tabs(&app);
+    assert_eq!(tabs.len(), 1, "a zero-row tab is still collected");
+    assert_eq!(tabs[0].rows(), 0);
+    let mut cursor = Cursor::new(Vec::new());
+    let truncated = write_batch_xlsx(&mut cursor, &tabs).unwrap();
+    assert!(truncated.is_empty());
+    let bytes = cursor.into_inner();
+    assert_eq!(&bytes[..4], b"PK\x03\x04");
+    let sheet = r105_read_xlsx_entry(&bytes, "xl/worksheets/sheet1.xml");
+    assert!(sheet.contains(">id<"), "{sheet}");
+
+    // Every tab skipped (no grid) → refused, no prompt, no pending job.
+    app.result_tabs = vec![ResultTab {
+        title: "script".into(),
+        sql: None,
+        grid: None,
+        grid_full: None,
+        script: None,
+        kind: GridKind::Query,
+        sel: 0,
+        col_offset: 0,
+        col_cursor: 0,
+        freeze_first: false,
+        show_row_numbers: false,
+    }];
+    assert!(collect_batch_tabs(&app).is_empty());
+    begin_batch_export(&mut app, BatchExportKind::Xlsx);
+    assert!(app.batch_export_pending.is_none());
+    assert!(app.batch_export_confirm.is_none());
+    assert!(app.status.contains("没有可导出"), "{}", app.status);
+}
+
+/// R115 (R108): Esc (and `n`) at the >20-tab confirmation cancels without ever
+/// opening the destination prompt.
+#[test]
+pub(crate) fn r115_r108_large_batch_confirmation_esc_cancels() {
+    let tx = test_tx();
+    for cancel in [KeyCode::Esc, KeyCode::Char('n')] {
+        let mut app = test_app();
+        app.picker_open = false;
+        app.selected = Some(test_conn("sqlite"));
+        app.result_tabs = (0..21)
+            .map(|i| {
+                r108_tab(
+                    &format!("t{i}"),
+                    "SELECT * FROM t",
+                    &["id"],
+                    vec![vec![Val::Text("1".into())]],
+                )
+            })
+            .collect();
+        app.export_open = true;
+        export_key(
+            &mut app,
+            KeyEvent::new(KeyCode::Char('A'), KeyModifiers::NONE),
+        );
+        assert!(app.batch_export_confirm.is_some(), "guard did not trip");
+        assert!(app.batch_export_pending.is_none());
+        batch_export_confirm_key(&mut app, &tx, KeyEvent::new(cancel, KeyModifiers::NONE));
+        assert!(app.batch_export_confirm.is_none(), "confirm survived {cancel:?}");
+        assert!(app.batch_export_pending.is_none());
+        assert!(app.export_path.is_none());
+        assert!(app.status.contains("已取消"), "{}", app.status);
+    }
+}
+
+/// R115 (R109): `>` on a connection / database row is a no-op with a hint; it
+/// never opens an outline, arms a fetch or spawns an op.
+#[test]
+pub(crate) fn r115_r109_outline_expand_on_non_table_is_a_noop() {
+    let tx = test_tx();
+    let mut app = tree_app();
+    app.focus = Focus::Sidebar;
+    app.picker_open = false;
+    rebuild_side_rows(&mut app);
+    let mut checked = 0;
+    for pos in 0..app.side_rows.len() {
+        if matches!(app.side_rows[pos], SideRow::Table { .. }) {
+            continue;
+        }
+        checked += 1;
+        app.side_sel = pos;
+        let before = app.pending_ops;
+        side_outline_expand(&mut app, &tx);
+        assert!(app.outline_open.is_none(), "row {pos} opened an outline");
+        assert!(app.outline_pending.is_none(), "row {pos} armed a fetch");
+        assert_eq!(app.pending_ops, before, "row {pos} spawned an op");
+        assert!(app.status.contains("表行"), "{}", app.status);
+    }
+    assert!(checked >= 3, "fixture should have conn / db rows");
+}
+
+/// R115 (R109): under an active `/` filter the expanded outline narrows to the
+/// columns whose name matches, while the table row stays as the anchor.
+#[test]
+pub(crate) fn r115_r109_outline_narrows_under_the_slash_filter() {
+    let mut app = r109_outline_app();
+    app.table_filter = "email".into();
+    rebuild_side_rows(&mut app);
+    let cols: Vec<usize> = app
+        .side_rows
+        .iter()
+        .filter_map(|r| match r {
+            SideRow::Column { col, .. } => Some(*col),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(cols, vec![1], "only the matching email column is drawn");
+    assert!(
+        app.side_rows
+            .iter()
+            .any(|r| matches!(r, SideRow::Table { .. })),
+        "the table anchor survived the filter"
+    );
+}
+
+/// R115 (R109): a table that vanished from the reloaded list no longer draws its
+/// stale cached columns (the index no longer resolves to its key).
+#[test]
+pub(crate) fn r115_r109_stale_outline_does_not_render_after_table_removed() {
+    let mut app = r109_outline_app();
+    app.tables = vec![table_info("users", "TABLE")];
+    app.tables_all = app.tables.clone();
+    app.table_list.select(Some(0));
+    rebuild_side_rows(&mut app);
+    assert!(
+        app.side_rows
+            .iter()
+            .all(|r| !matches!(r, SideRow::Column { .. })),
+        "stale columns leaked: {:?}",
+        app.side_rows
+    );
+}
+
+/// R115 (R109): Enter on a column row still inserts the name on a read-only
+/// connection — the insert is editor-side and never a write.
+#[tokio::test(flavor = "multi_thread")]
+async fn r115_r109_column_enter_works_on_a_read_only_connection() {
+    let (tx, _rx) = tokio::sync::mpsc::unbounded_channel::<OpResult>();
+    let mut app = r109_outline_app();
+    app.selected.as_mut().unwrap().read_only = true;
+    app.set_editor_text("SELECT ");
+    let pos = app
+        .side_rows
+        .iter()
+        .position(|r| matches!(r, SideRow::Column { col: 0, .. }))
+        .unwrap();
+    app.side_sel = pos;
+    side_activate(&mut app, &tx);
+    assert_eq!(app.editor_sql(), "SELECT id");
+    assert!(app.focus == Focus::Sidebar);
+}
+
+/// R115 (R110): pressing F10 while About is already open does not re-capture it
+/// (no stacked window, the frozen uptime survives).
+#[test]
+pub(crate) fn r115_r110_f10_while_about_open_does_not_stack() {
+    let tx = test_tx();
+    let mut app = test_app();
+    key(&mut app, &tx, KeyEvent::new(KeyCode::F(10), KeyModifiers::NONE));
+    assert!(app.about.is_some());
+    app.about.as_mut().unwrap().uptime = "SENTINEL".into();
+    key(&mut app, &tx, KeyEvent::new(KeyCode::F(10), KeyModifiers::NONE));
+    assert_eq!(
+        app.about.as_ref().unwrap().uptime,
+        "SENTINEL",
+        "F10 re-captured the About snapshot"
+    );
+}
+
+/// R115 (R110): F10 opens About from every focus context.
+#[test]
+pub(crate) fn r115_r110_about_opens_from_every_focus() {
+    let tx = test_tx();
+    for (focus, name) in [
+        (Focus::Sidebar, "sidebar"),
+        (Focus::Editor, "editor"),
+        (Focus::CmdInput, "cmd input"),
+        (Focus::Preview, "preview"),
+    ] {
+        let mut app = test_app();
+        app.focus = focus;
+        key(&mut app, &tx, KeyEvent::new(KeyCode::F(10), KeyModifiers::NONE));
+        assert!(app.about.is_some(), "F10 did not open About from {name}");
+    }
+}
+
+/// R115 (R111): a `|` in a cell is escaped and an embedded newline collapses to
+/// a space, so the table keeps one `|` per border and every line the same width.
+#[test]
+pub(crate) fn r115_r111_pipe_and_newline_do_not_break_the_table() {
+    let grid = Grid {
+        columns: vec!["a".into()],
+        rows: vec![
+            vec![Val::Text("x|y".into())],
+            vec![Val::Text("p\nq".into())],
+        ],
+        note: String::new(),
+        types: Vec::new(),
+    };
+    let out = grid_to_text(&grid);
+    assert!(out.contains(r"| x\|y |"), "{out}");
+    assert!(out.contains("| p q  |"), "{out}");
+    assert_eq!(out.lines().count(), 7, "one physical line per logical row: {out}");
+    let widths: Vec<usize> = out.lines().map(disp_width).collect();
+    assert!(widths.windows(2).all(|w| w[0] == w[1]), "{widths:?}");
+    assert_eq!(text_table_cell("a|b\r\nc"), r"a\|b c");
+}
+
+/// R115 (R111): zero-width characters count as width 0 so the column stays
+/// aligned; CJK still counts two cells.
+#[test]
+pub(crate) fn r115_r111_zero_width_characters_keep_columns_aligned() {
+    let zwsp = "\u{200b}";
+    let grid = Grid {
+        columns: vec!["k".into(), "n".into()],
+        rows: vec![
+            vec![Val::Text(format!("a{zwsp}b")), Val::Text("1".into())],
+            vec![Val::Text("张三".into()), Val::Text("22".into())],
+        ],
+        note: String::new(),
+        types: Vec::new(),
+    };
+    assert_eq!(disp_width(&format!("a{zwsp}b")), 2);
+    let out = grid_to_text(&grid);
+    let widths: Vec<usize> = out.lines().map(disp_width).collect();
+    assert!(widths.windows(2).all(|w| w[0] == w[1]), "{out}\n{widths:?}");
+    assert!(out.contains("| 张三 | 22 |"), "{out}");
+}
+
+/// R115 (R111): a single-column grid and a zero-row grid both render their
+/// skeleton; the single numeric column stays right-aligned.
+#[test]
+pub(crate) fn r115_r111_single_column_and_zero_row() {
+    let one = Grid {
+        columns: vec!["v".into()],
+        rows: vec![vec![Val::Text("7".into())], vec![Val::Null]],
+        note: String::new(),
+        types: Vec::new(),
+    };
+    assert_eq!(
+        grid_to_text(&one),
+        "+---+\n| v |\n+---+\n| 7 |\n+---+\n|   |\n+---+\n"
+    );
+    let zero = Grid {
+        columns: vec!["v".into()],
+        rows: vec![],
+        note: String::new(),
+        types: Vec::new(),
+    };
+    assert_eq!(grid_to_text(&zero), "+---+\n| v |\n+---+\n");
+}
+
+/// R115 (R112): the first-column freeze and the R113 row-number column stack —
+/// the gutter and the pinned data column both stay on screen.
+#[test]
+pub(crate) fn r115_r112_freeze_and_row_numbers_stack() {
+    let (tx, _rx) = tokio::sync::mpsc::unbounded_channel::<OpResult>();
+    let mut app = test_app();
+    app.picker_open = false;
+    app.term_w = 42;
+    app.grid_kind = GridKind::Query;
+    app.focus = Focus::Preview;
+    app.set_grid(sample_grid());
+    press_g(&mut app, &tx, 'N');
+    press_g(&mut app, &tx, 'F');
+    assert!(app.show_row_numbers && app.freeze_first);
+    app.status.clear();
+    let rows = draw(&mut app, 42, 22);
+    assert_eq!(app.grid_frozen_cols, vec![0], "the first column is pinned");
+    let text = rows.join("\n");
+    assert!(text.contains('#'), "row-number header missing:\n{text}");
+    assert!(text.contains("r0c0"), "frozen first column missing:\n{text}");
+    let info = context_info(&app);
+    assert!(info.contains("行号"), "{info}");
+    assert!(info.contains("冻结首列"), "{info}");
+    // The wide acceptance size renders both too.
+    let wide = draw(&mut app, 110, 30).join("\n");
+    assert!(wide.contains("r0c0"), "{wide}");
+}
+
+/// R115 (R112): a single-column grid can toggle the freeze without panicking;
+/// there is nothing to scroll, so the layout is stable.
+#[test]
+pub(crate) fn r115_r112_single_column_freeze_renders() {
+    let (tx, _rx) = tokio::sync::mpsc::unbounded_channel::<OpResult>();
+    let mut app = test_app();
+    app.picker_open = false;
+    app.focus = Focus::Preview;
+    app.grid_kind = GridKind::Query;
+    app.set_grid(Grid {
+        columns: vec!["only".into()],
+        rows: vec![vec![Val::Text("v".into())]],
+        note: String::new(),
+        types: Vec::new(),
+    });
+    press_g(&mut app, &tx, 'F');
+    assert!(app.freeze_first);
+    for (w, h) in [(42u16, 22u16), (110, 30)] {
+        app.status.clear();
+        let rows = draw(&mut app, w, h);
+        assert!(rows.join("\n").contains("only"), "missing at {w}x{h}");
+    }
+}
+
+/// R115 (R112): the freeze and the row-number column are per-tab — toggling both
+/// on tab B leaves tab A untouched and restores B's pair on return.
+#[test]
+pub(crate) fn r115_r112_freeze_and_row_numbers_are_isolated_per_tab() {
+    let (tx, _rx) = tokio::sync::mpsc::unbounded_channel::<OpResult>();
+    let mut app = test_app();
+    app.picker_open = false;
+    app.focus = Focus::Preview;
+    push_result_tab(
+        &mut app,
+        "select a".into(),
+        Some(sample_grid()),
+        None,
+        GridKind::Query,
+    );
+    push_result_tab(
+        &mut app,
+        "select b".into(),
+        Some(sample_grid()),
+        None,
+        GridKind::Query,
+    );
+    assert_eq!(app.result_tab, 1, "tab B is on screen");
+    press_g(&mut app, &tx, 'F');
+    press_g(&mut app, &tx, 'N');
+    assert!(app.freeze_first && app.show_row_numbers);
+    switch_result_tab(&mut app, -1);
+    assert!(
+        !app.freeze_first && !app.show_row_numbers,
+        "tab A is untouched"
+    );
+    switch_result_tab(&mut app, 1);
+    assert!(
+        app.freeze_first && app.show_row_numbers,
+        "tab B kept both toggles"
+    );
+}
+
+/// R115 (R113): the `:` `$` jump lands on the last row and the drawn absolute
+/// ordinal matches the total (and sizes the gutter).
+#[test]
+pub(crate) fn r115_r113_dollar_jump_matches_the_row_numbers() {
+    let mut app = test_app();
+    app.picker_open = false;
+    app.focus = Focus::Preview;
+    app.grid_kind = GridKind::Query;
+    app.set_grid(Grid {
+        columns: vec!["n".into()],
+        rows: (1..=12).map(|i| vec![Val::Text(i.to_string())]).collect(),
+        note: String::new(),
+        types: Vec::new(),
+    });
+    app.show_row_numbers = true;
+    let total = goto_row_total(&app);
+    assert_eq!(total, 12);
+    let last = parse_row_jump(total, "$").unwrap();
+    assert_eq!(last, 11, "`$` is the 0-based last row");
+    app.sel = last;
+    assert_eq!(abs_display_row(&app, app.sel), 12, "the ordinal is 1-based");
+    assert_eq!(max_abs_row_number(&app, app.grid.as_ref().unwrap()), 12);
+    assert_eq!(row_number_width(12), 2);
+    app.status.clear();
+    let rows = draw(&mut app, 42, 22);
+    let text = rows.join("\n");
+    assert!(text.contains('#'), "gutter header missing:\n{text}");
+    assert!(text.contains("12"), "last ordinal missing:\n{text}");
+}
+
+/// R115 (R113): the row-number column coexists with the R101 snapshot-diff view
+/// — opening the diff over a numbered grid renders its markers at both sizes,
+/// and the numbering flag is untouched underneath.
+#[test]
+pub(crate) fn r115_r113_row_numbers_with_snapshot_diff_render() {
+    let mut app = test_app();
+    app.picker_open = false;
+    app.focus = Focus::Preview;
+    app.grid_kind = GridKind::Query;
+    app.selected = Some(test_conn("sqlite"));
+    app.set_grid(Grid {
+        columns: vec!["id".into(), "v".into()],
+        rows: vec![
+            vec![Val::Text("1".into()), Val::Text("a".into())],
+            vec![Val::Text("2".into()), Val::Text("b".into())],
+        ],
+        note: String::new(),
+        types: Vec::new(),
+    });
+    app.show_row_numbers = true;
+    save_result_snapshot(&mut app);
+    app.set_grid(Grid {
+        columns: vec!["id".into(), "v".into()],
+        rows: vec![
+            vec![Val::Text("1".into()), Val::Text("A".into())],
+            vec![Val::Text("2".into()), Val::Text("b".into())],
+            vec![Val::Text("3".into()), Val::Text("c".into())],
+        ],
+        note: String::new(),
+        types: Vec::new(),
+    });
+    open_result_diff(&mut app);
+    assert!(app.result_diff.is_some(), "diff did not open");
+    assert!(app.show_row_numbers, "the numbering flag survives the diff");
+    for (w, h) in [(42u16, 22u16), (110, 30)] {
+        let text = draw(&mut app, w, h).join("\n");
+        let flat: String = text.chars().filter(|c| !c.is_whitespace()).collect();
+        assert!(
+            flat.contains("快照对比") || text.contains("Snapshot"),
+            "diff missing at {w}x{h}:\n{text}"
+        );
+        assert!(text.contains('+') && text.contains('~'), "markers missing at {w}x{h}");
+    }
+}
+
+/// R115 (R114): cancelling the destination prompt clears the grey footer but
+/// keeps the remembered path; a relative remembered path prefills only the
+/// default name because it has no directory to inherit.
+#[test]
+pub(crate) fn r115_r114_cancel_keeps_memory_and_relative_path_is_name_only() {
+    let tx = test_tx();
+    let mut app = test_app();
+    app.picker_open = false;
+    app.set_grid(sample_grid());
+    app.last_sql = Some("SELECT * FROM orders".into());
+    let dir = std::env::temp_dir().join(format!("dbxt-r115-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let file = dir.join("orders.csv");
+    std::fs::write(&file, "x").unwrap();
+    app.last_export_path = Some(file.clone());
+    choose_export_format(&mut app, ExportFormat::Csv);
+    assert_eq!(app.export_memory_dir.as_deref(), Some(dir.as_path()));
+    export_path_key(
+        &mut app,
+        &tx,
+        KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE),
+    );
+    assert!(
+        app.export_memory_dir.is_none(),
+        "the grey footer clears on cancel"
+    );
+    assert_eq!(
+        app.last_export_path.as_deref(),
+        Some(file.as_path()),
+        "the memory survives a cancel"
+    );
+
+    let mut rel = test_app();
+    rel.picker_open = false;
+    rel.set_grid(sample_grid());
+    rel.last_sql = Some("SELECT * FROM orders".into());
+    rel.last_export_path = Some(PathBuf::from("orders.csv"));
+    choose_export_format(&mut rel, ExportFormat::Csv);
+    assert_eq!(
+        rel.export_path.as_ref().unwrap().lines().join(""),
+        "orders.csv"
+    );
+    assert!(
+        rel.export_memory_dir.is_none(),
+        "a relative path has no directory to inherit"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// R115 (R114): a failed save never replaces the remembered path, even when it
+/// tried a different directory.
+#[test]
+pub(crate) fn r115_r114_failed_save_does_not_replace_memory() {
+    let tx = test_tx();
+    let mut app = test_app();
+    let good = std::env::temp_dir().join("dbxt-r115-good.csv");
+    apply_op_result(
+        &mut app,
+        OpResult::ExportDone {
+            format: ExportFormat::Csv,
+            path: good.clone(),
+            rows: 2,
+            bytes: 4,
+            elapsed_ms: 0,
+            error: None,
+        },
+        &tx,
+    );
+    let other = std::env::temp_dir().join("dbxt-r115-other/orders.csv");
+    apply_op_result(
+        &mut app,
+        OpResult::ExportDone {
+            format: ExportFormat::Csv,
+            path: other,
+            rows: 0,
+            bytes: 0,
+            elapsed_ms: 0,
+            error: Some("permission denied".into()),
+        },
+        &tx,
+    );
+    assert_eq!(app.last_export_path.as_deref(), Some(good.as_path()));
+    assert!(app.status.contains("失败"), "{}", app.status);
+}
+
+/// R115: every `g` chord is reconciled — each letter has exactly one handler in
+/// the results router, the top-level router forwards it, and the full help
+/// documents it once (so no chord is silently claimed twice).
+#[test]
+pub(crate) fn r115_g_chords_are_fully_reconciled() {
+    let results = include_str!("../results.rs");
+    for c in ['d', 't', 'v', 'c', 'b', 'g', 'w', 'W', 'f', 'F', 'N', 's', 'm'] {
+        assert!(
+            results.contains(&format!("KeyCode::Char('{c}')")),
+            "results.rs has no handler for g {c}"
+        );
+    }
+    // The router forwards the chord before any other shortcut.
+    let input = include_str!("../input.rs");
+    let fwd = input
+        .split("if app.pending_g {")
+        .nth(1)
+        .unwrap_or("")
+        .split("KeyCode::Esc")
+        .next()
+        .unwrap_or("");
+    for c in [
+        'd', 't', 'v', 'c', 'b', 'g', 'f', 's', 'w', 'm', 'W', 'F', 'N',
+    ] {
+        assert!(
+            fwd.contains(&format!("KeyCode::Char('{c}')")),
+            "input.rs does not forward g {c}"
+        );
+    }
+    // Every chord has a help row. (`g v` is intentionally documented in both
+    // the results-grid and the locate sections, so "at least one" is the rule.)
+    let keys: Vec<&str> = HELP_ROWS.iter().map(|(k, _)| *k).collect();
+    for key in [
+        "g d / g t",
+        "g v",
+        "g c",
+        "g b",
+        "g w / gW",
+        "g f",
+        "g F",
+        "g N",
+        "g s",
+        "g m",
+    ] {
+        assert!(
+            keys.contains(&key),
+            "help row {key:?} is missing"
+        );
+    }
+    assert!(
+        HELP_ROWS.iter().any(|(k, _)| k.contains("g g")),
+        "gg is not documented"
+    );
 }
