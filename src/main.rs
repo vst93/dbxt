@@ -5440,6 +5440,8 @@ impl App {
             export_list: ListState::default(),
             export_pending: None,
             export_path: None,
+            last_export_path: None,
+            export_memory_dir: None,
             batch_export_pending: None,
             batch_export_confirm: None,
             conn_export: None,
@@ -7387,6 +7389,11 @@ fn apply_op_result(app: &mut App, res: OpResult, tx: &Tx) {
         } => {
             let label = format.label();
             let ok = error.is_none();
+            // R114: only a file that actually landed is remembered; a failed or
+            // cancelled export leaves the previous directory untouched.
+            if ok {
+                app.last_export_path = Some(path.clone());
+            }
             app.status = match error {
                 Some(e) => tf("✗ {} 导出失败: {}", &[&label, &e]),
                 None => tf(

@@ -905,10 +905,10 @@ pub(crate) fn grid_to_xlsx(grid: &Grid) -> Vec<u8> {
     cursor.into_inner()
 }
 
-/// The default destination filename for an XLSX export: `{base}.xlsx`, with any
+/// The default destination filename for an export: `{base}.{ext}`, with any
 /// path separator neutralised so the default stays one filename in the working
-/// directory.
-pub(crate) fn xlsx_default_filename(base: &str) -> String {
+/// directory. `base` is the guessed table name or `query`.
+pub(crate) fn export_default_filename(base: &str, format: ExportFormat) -> String {
     let safe: String = base
         .chars()
         .map(|c| {
@@ -919,7 +919,15 @@ pub(crate) fn xlsx_default_filename(base: &str) -> String {
             }
         })
         .collect();
-    format!("{safe}.{}", ExportFormat::Xlsx.extension())
+    format!("{safe}.{}", format.extension())
+}
+
+/// The default destination filename for an XLSX export: `{base}.xlsx`, with any
+/// path separator neutralised so the default stays one filename in the working
+/// directory. Kept as the XLSX-specific spelling of [`export_default_filename`].
+#[allow(dead_code)]
+pub(crate) fn xlsx_default_filename(base: &str) -> String {
+    export_default_filename(base, ExportFormat::Xlsx)
 }
 
 pub(crate) fn write_csv<W: Write>(w: &mut W, grid: &Grid) -> std::io::Result<()> {
@@ -1926,6 +1934,8 @@ pub(crate) fn open_export(app: &mut App) {
     app.export_list.select(Some(0));
     app.export_pending = None;
     app.export_path = None;
+    // R114: a fresh picker has no prefilled memory until a format is chosen.
+    app.export_memory_dir = None;
     // R108: a fresh picker never inherits a stale all-tabs flow.
     app.batch_export_pending = None;
     app.batch_export_confirm = None;
@@ -2012,17 +2022,40 @@ pub(crate) fn choose_export_format(app: &mut App, format: ExportFormat) {
         None
     };
     let mut ta = TextArea::default();
-    if format.file_only() {
+    // R114: remember the directory of the last successful file export and
+    // prefill `{memory_dir}/{default name}` so a repeat export is one Enter. The
+    // filename is always regenerated for the current format; only the directory
+    // is inherited. When the last file has this exact name and still exists, its
+    // full path is reused (re-exporting the same result overwrites it).
+    let base = export_insert_table(app)
+        .map(|(_, t)| t)
+        .unwrap_or_else(|| "query".to_string());
+    let default_name = export_default_filename(&base, format);
+    let mut memory_dir: Option<PathBuf> = None;
+    if let Some(last) = app.last_export_path.clone() {
+        let same_name = last
+            .file_name()
+            .is_some_and(|n| n.to_string_lossy() == default_name.as_str());
+        let dir = last.parent().filter(|p| !p.as_os_str().is_empty());
+        if same_name && last.exists() {
+            ta.insert_str(last.display().to_string());
+        } else if let Some(dir) = dir {
+            ta.insert_str(dir.join(&default_name).display().to_string());
+        } else {
+            ta.insert_str(&default_name);
+        }
+        memory_dir = dir.map(PathBuf::from);
+    } else if format.file_only() {
         // The clipboard cannot carry a binary workbook, so the default
         // filename is prefilled and Enter writes it straight away.
-        let base = export_insert_table(app)
-            .map(|(_, t)| t)
-            .unwrap_or_else(|| "query".to_string());
-        ta.insert_str(xlsx_default_filename(&base));
+        ta.insert_str(&default_name);
+    }
+    if format.file_only() {
         ta.set_placeholder_text(t("Excel 仅支持写入文件 · 请输入文件名"));
     } else {
         ta.set_placeholder_text(t("留空 = 复制到剪贴板 · 输入路径 = 写入文件"));
     }
+    app.export_memory_dir = memory_dir;
     app.export_pending = Some(ExportPending { format, table });
     app.export_path = Some(ta);
     app.export_open = false;
@@ -2040,6 +2073,7 @@ pub(crate) fn export_path_key(app: &mut App, tx: &Tx, k: KeyEvent) {
     };
     if k.code == KeyCode::Esc {
         app.export_pending = None;
+        app.export_memory_dir = None;
         app.flash(t("已取消导出").into());
         return;
     }
@@ -2069,6 +2103,7 @@ pub(crate) fn export_path_key(app: &mut App, tx: &Tx, k: KeyEvent) {
         }
         // Clipboard export stays synchronous: the payload is bounded by what a
         // terminal can carry and the OSC 52 write must run on the UI thread.
+        app.export_memory_dir = None;
         let content = render_export_content(app, &grid, pending.format, pending.table.as_ref());
         let n = content.chars().count();
         match clipboard_copy(&content) {
@@ -2085,6 +2120,7 @@ pub(crate) fn export_path_key(app: &mut App, tx: &Tx, k: KeyEvent) {
     // File export runs on a background worker and streams to disk: the UI keeps
     // painting (spinner) and peak memory stays at one row, not the whole file.
     let expanded = expand_home(path);
+    app.export_memory_dir = None;
     let cfg = app.selected.clone();
     let (schema, table) = pending.table.clone().unwrap_or_default();
     let types = grid_column_types(app, &schema, &table, &grid);

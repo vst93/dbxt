@@ -972,6 +972,44 @@ pub(crate) fn truncate_disp(s: &str, max: usize) -> String {
     out
 }
 
+/// Truncate to `max` display columns keeping both ends and eliding the middle
+/// with `…`. Used for long directory paths where the tail (the leaf) and the
+/// head (the mount / home) are both worth showing.
+pub(crate) fn truncate_middle_disp(s: &str, max: usize) -> String {
+    if max == 0 {
+        return String::new();
+    }
+    if disp_width(s) <= max {
+        return s.to_string();
+    }
+    // One column is reserved for the ellipsis; split the rest head/tail.
+    let budget = max.saturating_sub(1);
+    let head_budget = budget / 2;
+    let tail_budget = budget - head_budget;
+    let mut head = String::new();
+    let mut w = 0usize;
+    for c in s.chars() {
+        let cw = UnicodeWidthChar::width(c).unwrap_or(0);
+        if w + cw > head_budget {
+            break;
+        }
+        head.push(c);
+        w += cw;
+    }
+    let mut tail: Vec<char> = Vec::new();
+    let mut w = 0usize;
+    for c in s.chars().rev() {
+        let cw = UnicodeWidthChar::width(c).unwrap_or(0);
+        if w + cw > tail_budget {
+            break;
+        }
+        tail.push(c);
+        w += cw;
+    }
+    tail.reverse();
+    format!("{head}…{}", tail.into_iter().collect::<String>())
+}
+
 pub(crate) fn one_line(s: &str) -> String {
     s.split_whitespace().collect::<Vec<_>>().join(" ")
 }

@@ -2981,6 +2981,13 @@ pub(crate) struct App {
     pub(crate) export_pending: Option<ExportPending>,
     /// The destination prompt (blank = clipboard, else a file path).
     pub(crate) export_path: Option<TextArea<'static>>,
+    /// R114: directory of the last successful file export, so the next export
+    /// prompt prefills it. Session-only (never persisted — the last-session
+    /// store has its own format and adding a field would version it).
+    pub(crate) last_export_path: Option<PathBuf>,
+    /// R114: the remembered directory shown in the open prompt's grey footer
+    /// (`None` when the prompt was not prefilled from memory).
+    pub(crate) export_memory_dir: Option<PathBuf>,
     /// R108: the all-tabs export chosen in the picker, waiting for a path.
     pub(crate) batch_export_pending: Option<BatchExportPending>,
     /// R108: the `>20` tabs / `>200_000` rows red confirmation.

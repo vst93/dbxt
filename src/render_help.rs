@@ -1673,7 +1673,7 @@ pub(crate) const HELP_ROWS: &[(&str, &str)] = &[    ("— 全局 —", ""),
     ),
     (
         "Ctrl-Y",
-        "导出当前结果（CSV / Excel (.xlsx) / JSON / NDJSON / Markdown / Text / INSERT）",
+        "导出当前结果（CSV / Excel (.xlsx) / JSON / NDJSON / Markdown / Text / INSERT）；导出弹层记忆上次目录",
     ),
     (
         "Ctrl-Y → A / S",
@@ -3657,7 +3657,10 @@ pub(crate) fn render_export_path(f: &mut Frame, area: Rect, app: &mut App) {
         .border_style(Style::default().fg(Color::Cyan));
     let inner = block.inner(box_area);
     f.render_widget(block, box_area);
-    let hint_h = 2u16.min(inner.height.saturating_sub(1));
+    // R114: when the prompt was prefilled from the last export directory, a grey
+    // footer line names it so the inherited path is never a surprise.
+    let memory = app.export_memory_dir.clone();
+    let hint_h = (if memory.is_some() { 3u16 } else { 2 }).min(inner.height.saturating_sub(1));
     let ta_h = inner.height.saturating_sub(hint_h).max(1);
     let ta_area = Rect {
         x: inner.x,
@@ -3681,13 +3684,25 @@ pub(crate) fn render_export_path(f: &mut Frame, area: Rect, app: &mut App) {
         } else {
             t("留空 = 复制到剪贴板（OSC52）· 输入路径 = 写入文件（支持 ~）")
         };
-        let hints = vec![
-            Line::from(Span::styled(first, Style::default().fg(Color::DarkGray))),
-            Line::from(Span::styled(
-                t("Enter 确认 · Esc 取消"),
+        let mut hints: Vec<Line> = Vec::new();
+        if let Some(dir) = memory {
+            let tmpl = t("上次目录: {}");
+            let prefix = tmpl.split("{}").next().unwrap_or("");
+            let room = (inner.width as usize).saturating_sub(disp_width(prefix));
+            let shown = truncate_middle_disp(&dir.display().to_string(), room);
+            hints.push(Line::from(Span::styled(
+                tf("上次目录: {}", &[&shown]),
                 Style::default().fg(Color::DarkGray),
-            )),
-        ];
+            )));
+        }
+        hints.push(Line::from(Span::styled(
+            first,
+            Style::default().fg(Color::DarkGray),
+        )));
+        hints.push(Line::from(Span::styled(
+            t("Enter 确认 · Esc 取消"),
+            Style::default().fg(Color::DarkGray),
+        )));
         f.render_widget(Paragraph::new(hints), hint_area);
     }
 }

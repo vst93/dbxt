@@ -15595,7 +15595,7 @@ pub(crate) fn r111_text_help_and_readme_document_the_format() {
     use ui_text::{t_lang, Lang};
     for s in [
         "纯文本对齐表格（+---+ 边框，CJK 宽度对齐）",
-        "导出当前结果（CSV / Excel (.xlsx) / JSON / NDJSON / Markdown / Text / INSERT）",
+        "导出当前结果（CSV / Excel (.xlsx) / JSON / NDJSON / Markdown / Text / INSERT）；导出弹层记忆上次目录",
     ] {
         assert_ne!(t_lang(s, Lang::En), s, "missing English for {s:?}");
     }
@@ -16069,4 +16069,333 @@ pub(crate) fn r113_row_number_key_is_in_footer_full_help_and_readme() {
         "Chinese README missing g N"
     );
     assert_eq!(ui_text::t_lang("行号", ui_text::Lang::En), "row#");
+}
+
+// ── R114: export prompt remembers the last export directory ──────────────────
+
+/// Without any memory the prefill is exactly the old behaviour: a text format
+/// starts blank (blank = clipboard) and Excel keeps its `{table|query}.xlsx`
+/// default. No memory also means no grey footer directory.
+#[test]
+pub(crate) fn r114_no_memory_keeps_default_prefill() {
+    let mut app = test_app();
+    app.picker_open = false;
+    app.set_grid(sample_grid());
+
+    choose_export_format(&mut app, ExportFormat::Csv);
+    assert_eq!(
+        app.export_path.as_ref().unwrap().lines().join(""),
+        "",
+        "a text format without memory must stay blank"
+    );
+    assert!(app.export_memory_dir.is_none());
+
+    choose_export_format(&mut app, ExportFormat::Xlsx);
+    assert_eq!(
+        app.export_path.as_ref().unwrap().lines().join(""),
+        "query.xlsx"
+    );
+    assert!(app.export_memory_dir.is_none());
+}
+
+/// Only a file that actually landed is remembered; a failure keeps the previous
+/// directory and cancelling the destination prompt records nothing.
+#[test]
+pub(crate) fn r114_only_successful_file_export_is_remembered() {
+    let tx = test_tx();
+    let mut app = test_app();
+    let good = std::env::temp_dir().join("dbxt-r114-memory.csv");
+    apply_op_result(
+        &mut app,
+        OpResult::ExportDone {
+            format: ExportFormat::Csv,
+            path: good.clone(),
+            rows: 3,
+            bytes: 12,
+            elapsed_ms: 1,
+            error: None,
+        },
+        &tx,
+    );
+    assert_eq!(app.last_export_path.as_deref(), Some(good.as_path()));
+
+    // A failed export must not overwrite the remembered directory.
+    let bad = std::env::temp_dir().join("dbxt-r114-bad.csv");
+    apply_op_result(
+        &mut app,
+        OpResult::ExportDone {
+            format: ExportFormat::Csv,
+            path: bad.clone(),
+            rows: 0,
+            bytes: 0,
+            elapsed_ms: 0,
+            error: Some("disk full".into()),
+        },
+        &tx,
+    );
+    assert_eq!(app.last_export_path.as_deref(), Some(good.as_path()));
+
+    // Cancelling the destination prompt records nothing and clears the footer.
+    let mut app = test_app();
+    app.set_grid(sample_grid());
+    app.export_pending = Some(ExportPending {
+        format: ExportFormat::Csv,
+        table: None,
+    });
+    app.export_path = Some(TextArea::default());
+    app.export_memory_dir = Some(std::env::temp_dir());
+    export_path_key(
+        &mut app,
+        &tx,
+        KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE),
+    );
+    assert!(app.last_export_path.is_none());
+    assert!(app.export_memory_dir.is_none());
+}
+
+/// The next export inherits only the remembered directory; the filename is
+/// regenerated for the current result and format.
+#[test]
+pub(crate) fn r114_second_export_prefills_memory_dir_with_current_default_name() {
+    let mut app = test_app();
+    app.picker_open = false;
+    app.set_grid(sample_grid());
+    let dir = std::env::temp_dir().join(format!("dbxt-r114-dir-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    app.last_export_path = Some(dir.join("orders.csv"));
+    app.last_sql = Some("SELECT * FROM users".into());
+
+    choose_export_format(&mut app, ExportFormat::Csv);
+    assert_eq!(
+        app.export_path.as_ref().unwrap().lines().join(""),
+        dir.join("users.csv").display().to_string()
+    );
+    assert_eq!(app.export_memory_dir.as_deref(), Some(dir.as_path()));
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Re-exporting the same result to the same name reuses the full remembered
+/// path (a plain overwrite); a different format inherits only the directory.
+#[test]
+pub(crate) fn r114_same_name_and_format_reuses_full_path() {
+    let mut app = test_app();
+    app.picker_open = false;
+    app.set_grid(sample_grid());
+    let dir = std::env::temp_dir().join(format!("dbxt-r114-reuse-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let file = dir.join("orders.csv");
+    std::fs::write(&file, "x").unwrap();
+    app.last_export_path = Some(file.clone());
+    app.last_sql = Some("SELECT * FROM orders".into());
+
+    choose_export_format(&mut app, ExportFormat::Csv);
+    assert_eq!(
+        app.export_path.as_ref().unwrap().lines().join(""),
+        file.display().to_string()
+    );
+
+    choose_export_format(&mut app, ExportFormat::Text);
+    assert_eq!(
+        app.export_path.as_ref().unwrap().lines().join(""),
+        dir.join("orders.txt").display().to_string()
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// A remembered directory that no longer exists is prefilled verbatim: there is
+/// no existence pre-check, the file pipeline reports the failure on Enter.
+#[test]
+pub(crate) fn r114_deleted_memory_dir_still_prefills_the_remembered_path() {
+    let mut app = test_app();
+    app.picker_open = false;
+    app.set_grid(sample_grid());
+    let gone = std::env::temp_dir().join(format!("dbxt-r114-gone-{}-xyz", std::process::id()));
+    let _ = std::fs::remove_dir_all(&gone);
+    assert!(!gone.exists());
+    app.last_export_path = Some(gone.join("orders.csv"));
+    app.last_sql = Some("SELECT * FROM orders".into());
+
+    choose_export_format(&mut app, ExportFormat::Csv);
+    assert_eq!(
+        app.export_path.as_ref().unwrap().lines().join(""),
+        gone.join("orders.csv").display().to_string()
+    );
+    assert_eq!(app.export_memory_dir.as_deref(), Some(gone.as_path()));
+}
+
+/// The prefilled directory is shown as a grey footer line, at the phone and the
+/// desktop size, and is absent when nothing was remembered. A long path is
+/// elided in the middle.
+#[test]
+pub(crate) fn r114_memory_footer_renders_at_both_sizes() {
+    let mut app = test_app();
+    app.picker_open = false;
+    app.selected = Some(test_conn("sqlite"));
+    app.grid_kind = GridKind::Query;
+    app.set_grid(sample_grid());
+    app.export_pending = Some(ExportPending {
+        format: ExportFormat::Csv,
+        table: None,
+    });
+    let long = std::env::temp_dir().join("dbxt-r114-a-very-long-remembered-directory-name");
+    app.export_path = Some(TextArea::from([long
+        .join("orders.csv")
+        .display()
+        .to_string()]));
+    app.export_memory_dir = Some(long.clone());
+    for (w, h) in [(42u16, 22u16), (110, 30)] {
+        let joined = draw(&mut app, w, h).join("\n").replace(' ', "");
+        assert!(
+            joined.contains("上次目录") || joined.contains("Lastdirectory"),
+            "memory footer missing at {w}x{h}:\n{joined}"
+        );
+    }
+
+    app.export_memory_dir = None;
+    let joined = draw(&mut app, 110, 30).join("\n").replace(' ', "");
+    assert!(
+        !joined.contains("上次目录") && !joined.contains("Lastdirectory"),
+        "memory footer shown without memory:\n{joined}"
+    );
+}
+
+/// The per-format default name helper and the middle-elision helper.
+#[test]
+pub(crate) fn r114_default_filename_per_format_and_middle_truncation() {
+    assert_eq!(
+        export_default_filename("orders", ExportFormat::Csv),
+        "orders.csv"
+    );
+    assert_eq!(
+        export_default_filename("orders", ExportFormat::Text),
+        "orders.txt"
+    );
+    assert_eq!(
+        export_default_filename("orders", ExportFormat::JsonNdjson),
+        "orders.ndjson"
+    );
+    assert_eq!(
+        export_default_filename("orders", ExportFormat::InsertBatch),
+        "orders.sql"
+    );
+    assert_eq!(
+        export_default_filename("a/b:c\\d", ExportFormat::Csv),
+        "a_b_c_d.csv"
+    );
+
+    assert_eq!(truncate_middle_disp("short", 10), "short");
+    let t = truncate_middle_disp("/home/user/projects/deep/dir", 12);
+    assert!(disp_width(&t) <= 12, "{t:?} is wider than 12");
+    assert!(t.contains('…'), "{t:?} has no ellipsis");
+    assert!(t.starts_with('/'), "{t:?} lost the head");
+    assert!(t.ends_with("dir"), "{t:?} lost the tail");
+    assert_eq!(truncate_middle_disp("abc", 0), "");
+}
+
+/// The full help, both READMEs and the new strings carry the memory note.
+#[test]
+pub(crate) fn r114_help_and_readme_document_export_memory() {
+    assert!(
+        HELP_ROWS
+            .iter()
+            .any(|(k, d)| *k == "Ctrl-Y" && d.contains("记忆上次目录")),
+        "full help Ctrl-Y row is missing the export-memory note"
+    );
+    use ui_text::{t_lang, Lang};
+    for s in [
+        "上次目录: {}",
+        "导出当前结果（CSV / Excel (.xlsx) / JSON / NDJSON / Markdown / Text / INSERT）；导出弹层记忆上次目录",
+    ] {
+        assert_ne!(t_lang(s, Lang::En), s, "missing English for {s:?}");
+    }
+    assert!(include_str!("../../README.md").contains("remembers the directory of the last successful export"));
+    assert!(include_str!("../../README.zh-CN.md").contains("记住上次成功导出的目录"));
+}
+
+/// R114 smoke: the real file pipeline writes under `/tmp/dbxt-smoke/`, the next
+/// `Ctrl-Y` prefills that directory, cancelling leaves the memory intact, and
+/// the prompt still draws at the phone and desktop acceptance sizes.
+#[test]
+pub(crate) fn r114_sqlite_export_smoke_round_trip() {
+    let mut app = test_app();
+    app.picker_open = false;
+    app.selected = Some(test_conn("sqlite"));
+    app.grid_kind = GridKind::Query;
+    app.set_grid(sample_grid());
+    app.last_sql = Some("SELECT * FROM orders".into());
+
+    // 1. Export through the exact `Op::Export` file pipeline.
+    let dir = std::path::PathBuf::from("/tmp/dbxt-smoke");
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join(format!("orders-{}.csv", std::process::id()));
+    {
+        let grid = active_grid(&app).unwrap();
+        let types = grid_column_types(&app, "", "", &grid);
+        let file = std::fs::File::create(&path).unwrap();
+        let mut w = BufWriter::new(file);
+        write_export(
+            &mut w,
+            app.selected.as_ref(),
+            "",
+            "",
+            &types,
+            &grid,
+            ExportFormat::Csv,
+        )
+        .unwrap();
+        w.flush().unwrap();
+    }
+    assert!(path.exists(), "smoke export did not land");
+    let tx = test_tx();
+    apply_op_result(
+        &mut app,
+        OpResult::ExportDone {
+            format: ExportFormat::Csv,
+            path: path.clone(),
+            rows: 4,
+            bytes: std::fs::metadata(&path).unwrap().len(),
+            elapsed_ms: 1,
+            error: None,
+        },
+        &tx,
+    );
+    assert_eq!(app.last_export_path.as_deref(), Some(path.as_path()));
+
+    // 2. Reopen `Ctrl-Y` and pick CSV again: the smoke directory is prefilled.
+    open_export(&mut app);
+    assert!(app.export_open);
+    assert!(
+        app.export_memory_dir.is_none(),
+        "a fresh picker shows no memory footer"
+    );
+    choose_export_format(&mut app, ExportFormat::Csv);
+    assert_eq!(
+        app.export_path.as_ref().unwrap().lines().join(""),
+        dir.join("orders.csv").display().to_string()
+    );
+
+    // 3. Cancel: the remembered directory is untouched.
+    let (tx2, _rx) = tokio::sync::mpsc::unbounded_channel();
+    export_path_key(
+        &mut app,
+        &tx2,
+        KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE),
+    );
+    assert_eq!(app.last_export_path.as_deref(), Some(path.as_path()));
+
+    // 4. The prefilled prompt draws at 42×22 and 110×30 without panicking.
+    app.export_pending = Some(ExportPending {
+        format: ExportFormat::Csv,
+        table: None,
+    });
+    app.export_path = Some(TextArea::from([path.display().to_string()]));
+    app.export_memory_dir = Some(dir.clone());
+    for (w, h) in [(42u16, 22u16), (110, 30)] {
+        let joined = draw(&mut app, w, h).join("\n");
+        assert!(
+            joined.contains("dbxt-smoke"),
+            "prompt missing the smoke path at {w}x{h}:\n{joined}"
+        );
+    }
+    let _ = std::fs::remove_file(&path);
 }
