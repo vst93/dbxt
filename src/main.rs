@@ -5219,6 +5219,9 @@ impl App {
             // R112: the first-column freeze is off by default (visual default
             // red line); `g F` turns it on for the active result tab only.
             freeze_first: false,
+            // R113: the absolute row-number column is off by default (visual
+            // default red line); `g N` turns it on for the active result tab.
+            show_row_numbers: false,
             frozen_cols: Vec::new(),
             cell_popup: None,
             error_popup: None,

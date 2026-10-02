@@ -614,6 +614,19 @@ pub(crate) fn toggle_freeze_first(app: &mut App) {
     };
 }
 
+/// R113: `g N` — show / hide the absolute row-number column left of the first
+/// data column. Off by default and per result tab; the numbers are the result
+/// set's original ordinals (a client-side filter never renumbers them). Purely a
+/// render-time layout choice, zero queries.
+pub(crate) fn toggle_row_numbers(app: &mut App) {
+    app.show_row_numbers = !app.show_row_numbers;
+    app.status = if app.show_row_numbers {
+        t("行号列已开启 · g N 关闭").into()
+    } else {
+        t("行号列已关闭 · g N 开启").into()
+    };
+}
+
 /// R91: `g f` — pin / unpin the *focused* column at the left edge. The wide-table
 /// twin of `z` (which only ever pins column 0): at most [`MAX_FROZEN_COLS`]
 /// columns are pinned in total, and pressing the key on an already-pinned column

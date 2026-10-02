@@ -14776,6 +14776,7 @@ fn r108_tab(title: &str, sql: &str, cols: &[&str], rows: Vec<Vec<Val>>) -> Resul
         col_offset: 0,
         col_cursor: 0,
         freeze_first: false,
+        show_row_numbers: false,
     }
 }
 
@@ -14912,6 +14913,7 @@ pub(crate) fn r108_collect_skips_tabs_without_a_grid() {
             col_offset: 0,
             col_cursor: 0,
             freeze_first: false,
+            show_row_numbers: false,
         },
         r108_tab("empty", "SELECT 1", &[], vec![]),
     ];
@@ -15814,4 +15816,257 @@ pub(crate) fn r112_freeze_key_is_in_footer_and_full_help() {
         ui_text::t_lang("冻结首列", ui_text::Lang::En),
         "first col frozen"
     );
+}
+
+// ─── R113: absolute row-number column in the results grid (`g N`) ───────────
+
+/// `g N` toggles the absolute row-number column, which is off by default; the
+/// status flash names the new state in both directions and the persistent
+/// status marker appears only while the column is on.
+#[test]
+pub(crate) fn r113_g_n_toggles_the_row_number_column() {
+    let (tx, _rx) = tokio::sync::mpsc::unbounded_channel::<OpResult>();
+    let mut app = test_app();
+    app.picker_open = false;
+    app.focus = Focus::Preview;
+    app.grid_kind = GridKind::Query;
+    app.set_grid(sample_grid());
+    assert!(!app.show_row_numbers, "the row-number column is off by default");
+    assert!(
+        !context_info(&app).contains("行号"),
+        "the off state carries no marker: {}",
+        context_info(&app)
+    );
+
+    press_g(&mut app, &tx, 'N');
+    assert!(app.show_row_numbers, "g N shows the row-number column");
+    assert_eq!(app.status, t("行号列已开启 · g N 关闭"));
+    assert!(
+        context_info(&app).contains("行号"),
+        "the on state is marked: {}",
+        context_info(&app)
+    );
+
+    press_g(&mut app, &tx, 'N');
+    assert!(!app.show_row_numbers, "g N again hides it");
+    assert_eq!(app.status, t("行号列已关闭 · g N 开启"));
+    assert!(!context_info(&app).contains("行号"));
+}
+
+/// The R113 status strings carry an English translation (the same mechanism
+/// `every_call_site_has_english` guards), so `DBXT_LANG=en` never leaks Chinese.
+#[test]
+pub(crate) fn r113_row_number_status_is_bilingual() {
+    assert_eq!(
+        ui_text::t_lang("行号列已开启 · g N 关闭", ui_text::Lang::En),
+        "row numbers on · g N to turn off"
+    );
+    assert_eq!(
+        ui_text::t_lang("行号列已关闭 · g N 开启", ui_text::Lang::En),
+        "row numbers off · g N to turn on"
+    );
+    assert_eq!(ui_text::t_lang("行号", ui_text::Lang::En), "row#");
+    assert_eq!(
+        ui_text::t_lang("行号列已开启 · g N 关闭", ui_text::Lang::Zh),
+        "行号列已开启 · g N 关闭"
+    );
+}
+
+/// Under a client-side row filter the drawn ordinal is the source row's own
+/// number, never the viewport position: filtering out rows 0–1 still labels the
+/// surviving third row `3`.
+#[test]
+pub(crate) fn r113_row_numbers_stay_absolute_under_a_row_filter() {
+    let mut app = test_app();
+    app.picker_open = false;
+    app.focus = Focus::Preview;
+    app.grid_kind = GridKind::Query;
+    let grid = Grid {
+        columns: vec!["name".into()],
+        rows: ["apple", "banana", "cherry", "date"]
+            .iter()
+            .map(|s| vec![Val::Text((*s).into())])
+            .collect(),
+        note: String::new(),
+        types: Vec::new(),
+    };
+    app.set_grid(grid);
+    app.result_needle = "cherry".into();
+    app.rebuild_view();
+    assert_eq!(
+        app.grid.as_ref().unwrap().rows.len(),
+        1,
+        "only the matching row survives"
+    );
+    assert_eq!(app.result_rows, vec![2], "display→source map keeps the ordinal");
+    assert_eq!(
+        abs_display_row(&app, 0),
+        3,
+        "the visible row keeps its original number, not its viewport index"
+    );
+    // The unfiltered count sizes the column, so a filter never shrinks it.
+    assert_eq!(
+        max_abs_row_number(&app, app.grid.as_ref().unwrap()),
+        4,
+        "the width is sized from the full result set"
+    );
+
+    app.show_row_numbers = true;
+    app.status.clear();
+    let rows = draw(&mut app, 42, 22);
+    let line = rows
+        .iter()
+        .find(|r| r.contains("cherry") && r.contains('3'))
+        .unwrap_or_else(|| panic!("the grid row with its absolute ordinal is on screen: {rows:?}"));
+    assert!(
+        line.contains("3 cherry"),
+        "the absolute ordinal 3 is drawn next to the surviving row: {line:?}"
+    );
+}
+
+/// The toggle is per result tab: switching tabs shows each tab's own state and
+/// flipping back restores it.
+#[test]
+pub(crate) fn r113_row_number_state_is_isolated_per_result_tab() {
+    let (tx, _rx) = tokio::sync::mpsc::unbounded_channel::<OpResult>();
+    let mut app = test_app();
+    app.picker_open = false;
+    app.focus = Focus::Preview;
+    push_result_tab(
+        &mut app,
+        "select a".into(),
+        Some(sample_grid()),
+        None,
+        GridKind::Query,
+    );
+    push_result_tab(
+        &mut app,
+        "select b".into(),
+        Some(sample_grid()),
+        None,
+        GridKind::Query,
+    );
+    assert_eq!(app.result_tabs.len(), 2);
+    assert_eq!(app.result_tab, 1, "tab B is on screen");
+    assert!(!app.show_row_numbers, "tab B starts without row numbers");
+
+    // Turn the column on for B only.
+    press_g(&mut app, &tx, 'N');
+    assert!(app.show_row_numbers);
+
+    switch_result_tab(&mut app, -1);
+    assert_eq!(app.result_tab, 0);
+    assert!(!app.show_row_numbers, "tab A is unaffected");
+    switch_result_tab(&mut app, 1);
+    assert_eq!(app.result_tab, 1);
+    assert!(app.show_row_numbers, "tab B kept its row-number column");
+}
+
+/// A brand-new result tab is born without the row-number column, even when the
+/// tab it was opened from had it on.
+#[test]
+pub(crate) fn r113_new_result_tab_defaults_to_no_row_numbers() {
+    let mut app = test_app();
+    app.picker_open = false;
+    app.focus = Focus::Preview;
+    app.grid_kind = GridKind::Query;
+    app.set_grid(sample_grid());
+    app.show_row_numbers = true;
+    push_result_tab(
+        &mut app,
+        "select b".into(),
+        Some(sample_grid()),
+        None,
+        GridKind::Query,
+    );
+    assert!(
+        !app.show_row_numbers,
+        "the fresh tab is on screen without row numbers"
+    );
+    assert!(
+        !app.result_tabs.last().unwrap().show_row_numbers,
+        "the fresh tab's own flag is off"
+    );
+}
+
+/// The column reserves one cell per digit of the largest absolute row number,
+/// so 9 / 99 / 999 rows get 1 / 2 / 3 cells and both acceptance sizes render.
+#[test]
+pub(crate) fn r113_row_number_width_adapts_to_the_largest_number() {
+    assert_eq!(row_number_width(1), 1);
+    assert_eq!(row_number_width(9), 1);
+    assert_eq!(row_number_width(10), 2);
+    assert_eq!(row_number_width(99), 2);
+    assert_eq!(row_number_width(100), 3);
+    assert_eq!(row_number_width(999), 3);
+    assert_eq!(row_number_width(0), 1, "an empty grid still fits the `#`");
+
+    for (n, want) in [(9usize, 1usize), (99, 2), (999, 3)] {
+        let mut app = test_app();
+        app.picker_open = false;
+        app.focus = Focus::Preview;
+        app.grid_kind = GridKind::Query;
+        let grid = Grid {
+            columns: vec!["n".into()],
+            rows: (0..n)
+                .map(|i| vec![Val::Text(i.to_string())])
+                .collect(),
+            note: String::new(),
+            types: Vec::new(),
+        };
+        app.set_grid(grid);
+        app.show_row_numbers = true;
+        assert_eq!(
+            row_number_width(max_abs_row_number(&app, app.grid.as_ref().unwrap())),
+            want,
+            "{n} rows reserve {want} cells"
+        );
+        app.status.clear();
+        let rows = draw(&mut app, 42, 22);
+        assert!(
+            rows.iter().any(|r| r.contains('#')),
+            "the `#` header is drawn at {n} rows"
+        );
+        let wide = draw(&mut app, 110, 30);
+        assert!(
+            wide.iter().any(|r| r.contains('#')),
+            "the wide acceptance size renders at {n} rows"
+        );
+    }
+}
+
+/// `g N` is documented in the results footer / mini sheet, the full F1 help and
+/// both README keymaps, and its marker translates.
+#[test]
+pub(crate) fn r113_row_number_key_is_in_footer_full_help_and_readme() {
+    assert!(
+        HELP_ROWS
+            .iter()
+            .any(|(k, d)| *k == "g N" && d.contains("行号")),
+        "full help is missing the g N row"
+    );
+    let hints = footer_hints_ctx(FooterCtx {
+        view: FooterView::Browse,
+        focus: Focus::Preview,
+        has_connection: true,
+    });
+    assert!(
+        hints.iter().any(|h| h.0 == "gN" && h.1 == t("行号")),
+        "result footer names gN: {hints:?}"
+    );
+    let mini: Vec<&str> = hints
+        .iter()
+        .filter(|h| h.0 != "?" && h.0 != "F1")
+        .map(|h| h.0)
+        .collect();
+    assert!(mini.contains(&"gN"), "mini help: {mini:?}");
+    assert!(
+        include_str!("../../README.md").contains("`g N`"),
+        "English README missing g N"
+    );
+    assert!(
+        include_str!("../../README.zh-CN.md").contains("`g N`"),
+        "Chinese README missing g N"
+    );
+    assert_eq!(ui_text::t_lang("行号", ui_text::Lang::En), "row#");
 }

@@ -668,12 +668,21 @@ pub(crate) fn context_info(app: &App) -> String {
     // it survives the status bar's tail truncation on a narrow terminal. Only
     // shown while the grid actually clips columns: a fully fitting grid looks
     // the same frozen or not, so the marker would be pure noise there.
-    if app.freeze_first && app.grid_kind != GridKind::Columns && app.grid_frozen > 0 {
-        if let Some(grid) = &app.grid {
-            if grid.columns.len() > app.grid_frozen + app.vis_cols.max(1) {
-                parts.push(t("冻结首列").into());
-            }
-        }
+    if app.freeze_first
+        && app.grid_kind != GridKind::Columns
+        && app.grid_frozen > 0
+        && app.grid.as_ref().is_some_and(|grid| {
+            grid.columns.len() > app.grid_frozen + app.vis_cols.max(1)
+        })
+    {
+        parts.push(t("冻结首列").into());
+    }
+    // R113: a persistent marker for the opt-in absolute row-number column, so
+    // the numbers' meaning (the result set's original ordinals, unaffected by a
+    // client-side filter) is never a mystery. Sits with the other explicit,
+    // user-toggled markers ahead of the identity fields.
+    if app.show_row_numbers {
+        parts.push(t("行号").into());
     }
     // R65: where the open data view lives (`db.table`, table alone when narrow).
     // The connection name leads the left block, so only the location is added
@@ -1571,6 +1580,9 @@ pub(crate) fn footer_hints_ctx(ctx: FooterCtx) -> Vec<Hint> {
                 // R112: freeze the first column so the row identity survives a
                 // sideways scroll (Ctrl-F was already page-forward here).
                 ("gF", t("冻结首列")),
+                // R113: the opt-in absolute row-number column (`g n` is free and
+                // Ctrl-N is page-forward here).
+                ("gN", t("行号")),
                 // R80 additions: the R51–R79 keys that were missing here.
                 // `v` already leads this group; the epoch preview it shows is
                 // passive (no key), so it stays documented in the full help.
@@ -2965,8 +2977,15 @@ pub(crate) fn render_grid(
         return;
     }
 
-    let total_rows = grid.rows.len();
-    let gutter = ((total_rows + 1).to_string().len()).max(2) as u16;
+    // R113: the absolute row-number column (`g N`) is off by default; when on
+    // its width adapts to the largest absolute row number on screen. The
+    // structure list numbers its own rows (columns) the same way. With the
+    // column off the grid has no left gutter at all.
+    let gutter = if app.show_row_numbers {
+        row_number_width(max_abs_row_number(app, grid)) as u16
+    } else {
+        0
+    };
 
     // Fixed layout for the structure field list; windowed layout for data grids.
     if kind == GridKind::Columns {
@@ -3026,7 +3045,10 @@ pub(crate) fn render_grid(
     let pinned_w: usize = pinned.iter().map(|&c| widths[c]).sum();
     let left_w: usize = gutter as usize + pinned.len() + pinned_w;
     const GAP: usize = 1;
-    let avail = inner_w.saturating_sub(left_w + GAP).max(MIN_CELL_WIDTH);
+    // R113: with the row-number column off and nothing pinned there is no left
+    // rail, so the scroll window starts at the pane's left edge (no stray gap).
+    let gap = if left_w > 0 { GAP } else { 0 };
+    let avail = inner_w.saturating_sub(left_w + gap).max(MIN_CELL_WIDTH);
     app.grid_avail = avail;
     let (off, visible) =
         window_for_cursor_pinned(&widths, app.col_cursor, app.col_offset, avail, &pinned);
@@ -3072,10 +3094,17 @@ pub(crate) fn render_grid(
     let inner = block.inner(area);
     f.render_widget(block, area);
 
-    // ── pinned block: row-number gutter + optionally the first data column ──
-    let mut left_widths: Vec<usize> = vec![gutter as usize];
+    // ── pinned block: row-number column + optionally the first data column ──
+    // R113: the row-number column is optional (`g N`) and, when shown, is the
+    // leftmost cell of the pinned rail — so it stays put together with the
+    // R112 frozen first column while the rest scrolls sideways.
+    let mut left_widths: Vec<usize> = Vec::new();
+    let mut lheader: Vec<Cell> = Vec::new();
+    if gutter > 0 {
+        left_widths.push(gutter as usize);
+        lheader.push(gutter_header_cell());
+    }
     left_widths.extend(pinned.iter().map(|&c| widths[c]));
-    let mut lheader: Vec<Cell> = vec![gutter_header_cell()];
     for &ci in &pinned {
         let name = &grid.columns[ci];
         lheader.push(col_header_cell(
@@ -3088,7 +3117,14 @@ pub(crate) fn render_grid(
     }
     let mut lrows: Vec<Row> = Vec::new();
     for (i, row) in grid.rows.iter().enumerate().skip(start).take(h) {
-        let mut cells: Vec<Cell> = vec![gutter_cell(i, i == sel)];
+        let mut cells: Vec<Cell> = Vec::new();
+        if gutter > 0 {
+            cells.push(gutter_cell(
+                abs_display_row(app, i),
+                gutter as usize,
+                i == sel,
+            ));
+        }
         for &ci in &pinned {
             cells.push(match row.get(ci) {
                 Some(v) => cell_widget_hl(
@@ -3120,20 +3156,22 @@ pub(crate) fn render_grid(
         width: (left_w.min(inner.width as usize)) as u16,
         height: inner.height,
     };
-    let ltable = Table::new(
-        lrows,
-        left_widths
-            .iter()
-            .map(|w| Constraint::Length(*w as u16))
-            .collect::<Vec<_>>(),
-    )
-    .header(Row::new(lheader))
-    .column_spacing(1);
-    f.render_widget(ltable, left_area);
+    if left_w > 0 {
+        let ltable = Table::new(
+            lrows,
+            left_widths
+                .iter()
+                .map(|w| Constraint::Length(*w as u16))
+                .collect::<Vec<_>>(),
+        )
+        .header(Row::new(lheader))
+        .column_spacing(1);
+        f.render_widget(ltable, left_area);
+    }
 
     // ── scrollable window ──
-    if visible > 0 && (inner.width as usize) > left_w + GAP {
-        let right_x = inner.x + (left_w + GAP) as u16;
+    if visible > 0 && (inner.width as usize) > left_w + gap {
+        let right_x = inner.x + (left_w + gap) as u16;
         let right_w = (inner.x + inner.width).saturating_sub(right_x);
         if right_w > 0 {
             let right_area = Rect {
@@ -3202,7 +3240,7 @@ pub(crate) fn render_grid(
     if !pinned.is_empty()
         && frozen_scroll_total > visible
         && visible > 0
-        && (inner.width as usize) > left_w + GAP
+        && (inner.width as usize) > left_w + gap
     {
         let sep_x = inner.x + left_w as u16;
         if sep_x < inner.x + inner.width {
@@ -3468,19 +3506,27 @@ pub(crate) fn render_columns_grid(
     block: Block,
     gutter: u16,
 ) {
-    let widths = [
-        Constraint::Length(gutter),
+    // R113: the row-number column is optional here too (`g N`); when off the
+    // first data column takes the full width and there is no ordinal cell.
+    let mut widths: Vec<Constraint> = Vec::new();
+    if gutter > 0 {
+        widths.push(Constraint::Length(gutter));
+    }
+    widths.extend([
         Constraint::Percentage(22),
         Constraint::Percentage(20),
         Constraint::Length(5),
         Constraint::Length(5),
         Constraint::Percentage(22),
         Constraint::Percentage(26),
-    ];
+    ]);
     let cc = app.col_cursor;
     let num_fmt = app.num_fmt;
     let stripe = app.stripe;
-    let mut header = vec![gutter_header_cell()];
+    let mut header: Vec<Cell> = Vec::new();
+    if gutter > 0 {
+        header.push(gutter_header_cell());
+    }
     header.extend(grid.columns.iter().enumerate().map(|(ci, c)| {
         let shown = fix_double_encoding(c);
         col_header_cell(&shown, disp_width(&shown), ci == cc, None, false)
@@ -3490,7 +3536,10 @@ pub(crate) fn render_columns_grid(
         .iter()
         .enumerate()
         .map(|(i, row)| {
-            let mut cells = vec![gutter_cell(i, i == app.sel)];
+            let mut cells: Vec<Cell> = Vec::new();
+            if gutter > 0 {
+                cells.push(gutter_cell(i + 1, gutter as usize, i == app.sel));
+            }
             cells.extend(row.iter().enumerate().map(|(ci, v)| {
                 cell_widget_hl(
                     v,
@@ -3519,11 +3568,51 @@ pub(crate) fn render_columns_grid(
     f.render_widget(table, area);
 }
 
+/// R113: the width of the row-number column for the largest absolute row number
+/// `max_row` (1-based). The width follows the digit count, so 9 / 99 / 999 rows
+/// reserve 1 / 2 / 3 cells; a zero-row grid still reserves one cell for the `#`
+/// header. Pure, so the adaptive rule is unit-testable.
+pub(crate) fn row_number_width(max_row: usize) -> usize {
+    max_row.max(1).to_string().len()
+}
+
+/// R113: the largest absolute row number the current grid can show, used to size
+/// the row-number column. A paginated table view uses its row total so the
+/// column width does not jump between pages; a query result uses its full
+/// (unfiltered) row count so a client-side filter never shrinks the column.
+pub(crate) fn max_abs_row_number(app: &App, grid: &Grid) -> usize {
+    if let Some(ps) = &app.page_state {
+        if let Some(t) = ps.total {
+            return t as usize;
+        }
+        return ps.page * ps.page_size + grid.rows.len();
+    }
+    if let Some(full) = &app.grid_full {
+        return full.rows.len();
+    }
+    app.result_rows
+        .last()
+        .map(|s| s + 1)
+        .unwrap_or(grid.rows.len())
+}
+
+/// R113: the absolute 1-based row number for display row `i` — the source row's
+/// ordinal, page-aware. A client-side row filter only removes display rows, so
+/// the mapping through `result_rows` keeps the original number; a paginated view
+/// keeps counting across pages (same space as `cursor_abs_row`).
+pub(crate) fn abs_display_row(app: &App, i: usize) -> usize {
+    let src = app.result_rows.get(i).copied().unwrap_or(i);
+    match &app.page_state {
+        Some(ps) => abs_row(ps.page, ps.page_size, src),
+        None => src + 1,
+    }
+}
+
 pub(crate) fn gutter_header_cell() -> Cell<'static> {
     Cell::from(Span::styled("#", Style::default().fg(Color::DarkGray)))
 }
 
-pub(crate) fn gutter_cell(i: usize, selected: bool) -> Cell<'static> {
+pub(crate) fn gutter_cell(abs: usize, width: usize, selected: bool) -> Cell<'static> {
     let style = if selected {
         Style::default()
             .fg(Color::Black)
@@ -3532,7 +3621,12 @@ pub(crate) fn gutter_cell(i: usize, selected: bool) -> Cell<'static> {
     } else {
         Style::default().fg(Color::DarkGray)
     };
-    Cell::from(Span::styled(format!("{}", i + 1), style))
+    // R113: muted gray, right-aligned inside the adaptive-width column so the
+    // digits line up under the `#` header regardless of magnitude.
+    Cell::from(Span::styled(
+        format!("{:>w$}", abs, w = width.max(1)),
+        style,
+    ))
 }
 
 pub(crate) fn col_header_cell(

@@ -2452,6 +2452,11 @@ pub(crate) struct App {
     /// Width cap actually used for the last render (compact mode aware).
     pub(crate) grid_max_cell: usize,
     pub(crate) freeze_first: bool, // pin the first data column (row-number gutter is always pinned)
+    /// R113: `g N` — show the absolute row-number column left of the first data
+    /// column. Off by default (visual default red line) and per result tab; the
+    /// numbers are the result set's original ordinals, so a client-side filter
+    /// never renumbers them. Pure render-time, zero queries.
+    pub(crate) show_row_numbers: bool,
     /// R91: `g f` — additional pinned columns (ascending, deduped). The first
     /// column keeps its own `z` toggle; together they pin at most
     /// [`MAX_FROZEN_COLS`]. Out-of-range indices are ignored at render time.

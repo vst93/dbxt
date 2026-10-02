@@ -842,6 +842,10 @@ pub(crate) struct ResultTab {
     /// so flipping to another result keeps its own frozen rail (new tabs start
     /// off). Purely a render-time layout choice, never persisted.
     pub(crate) freeze_first: bool,
+    /// R113: the absolute row-number column toggle (`g N`) is per-tab and
+    /// session-only, exactly like the first-column freeze. Off by default;
+    /// purely a render-time layout choice, never persisted.
+    pub(crate) show_row_numbers: bool,
 }
 
 #[derive(Clone)]

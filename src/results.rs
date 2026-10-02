@@ -186,6 +186,18 @@ pub(crate) fn preview_key(app: &mut App, tx: &Tx, k: KeyEvent) {
                 toggle_freeze_first(app);
                 return;
             }
+            // R113: `g N` shows / hides the absolute row-number column left of
+            // the first data column. `g n` is unused and Ctrl-N is a global
+            // page/next key, so the free `g N` chord is used. Shift is allowed
+            // (uppercase N), and a bare `N` keeps its search-hit meaning.
+            KeyCode::Char('N')
+                if !k.modifiers.contains(KeyModifiers::CONTROL)
+                    && !k.modifiers.contains(KeyModifiers::ALT) =>
+            {
+                app.pending_g = false;
+                toggle_row_numbers(app);
+                return;
+            }
             // R91: `gs` pins / unpins the focused row as the *reference* row, so
             // a wide grid can be read against a fixed baseline (status bar `Δ`).
             KeyCode::Char('s') if k.modifiers.is_empty() => {

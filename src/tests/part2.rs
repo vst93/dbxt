@@ -3685,6 +3685,10 @@ pub(crate) fn help_has_no_bare_uppercase_shortcuts() {
                 // appears as the `g F` chord (Ctrl-F is page-forward), and its
                 // lowercase `g f` freezes the focused column.
                 || tok == "F"
+                // `N` (R113, show the absolute row-number column) joins: it only
+                // ever appears as the `g N` chord (Ctrl-N is page-forward), and
+                // its lowercase `g n` is unused.
+                || tok == "N"
             {
                 continue;
             }
