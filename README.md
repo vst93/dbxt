@@ -293,6 +293,8 @@ dbxt builds against **DBX v0.6.34**. From v0.6.27 the kernel encrypts connection
 
 When it performs the upgrade, dbxt provisions the key exactly the way the desktop wizard does (OS keychain, or the managed per-user file where no keychain is reachable), so installing DBX Desktop again keeps working. It never overwrites an existing key: if ciphertext already exists without its key, dbxt stops and asks for the original (`DBX_SECRET_KEY_FILE` / `DBX_SECRET_KEY`) instead of creating a new one. The confirmation prompt names the resulting version floor (DBX v0.6.21+, the release that introduced the `dbxenc1` store); `DBXT_ASSUME_YES=1` skips the prompt for provisioning scripts.
 
+On a host where the OS keychain exists but is **locked** (common over SSH or before a desktop login), the kernel refuses to create a key there — and deliberately does not silently pick another location. dbxt catches that `KEYRING_WRITE_FAILED` / `KEYRING_ACCESS_FAILED` and falls back to the kernel's managed key file at `<data-dir>/.dbx/secret.key`, then adopts it on every later run so the store stays readable. Other DBX tools (Desktop, `dbx-mcp`, `dbx`) can use the same key by pointing `DBX_SECRET_KEY_FILE` at that path. Unlocking the keychain first avoids the fallback entirely.
+
 Version note: a dbxt built against a pre-encryption kernel (v0.6.20 and earlier) cannot read an upgraded store — upgrade dbxt alongside Desktop. The reverse also holds: the v0.6.21+ kernel will not silently read a plaintext store; let dbxt (or the Desktop wizard) upgrade it first.
 
 ## MCP server (`dbxt mcp`)

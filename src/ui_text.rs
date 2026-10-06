@@ -1154,6 +1154,8 @@ pub static ALL_KEYS: &[&str] = &[
     "升级完成：已加密 {} 项密钥",
     "DBX 数据需要加密升级，但读不到正确的数据加密密钥（{}）：请用 DBX_SECRET_KEY_FILE / DBX_SECRET_KEY 提供创建该库时所用的密钥。",
     "DBX 数据需要加密升级，但当前进程既无法访问系统钥匙串，也无法创建本地密钥：请使用带系统钥匙串支持的构建，或用 DBX_SECRET_KEY_FILE / DBX_SECRET_KEY 提供密钥。",
+    "系统钥匙串不可写（{}）；改用受管密钥文件 {}（其它 DBX 工具可用 DBX_SECRET_KEY_FILE 指向它）。",
+    "系统钥匙串被锁定或拒绝访问（{}），无法读取或创建数据加密密钥：请解锁钥匙串后重试，或用 DBX_SECRET_KEY_FILE / DBX_SECRET_KEY 提供密钥。",
     // ── R117: `dbxt mcp` reuses DBX's own MCP server ──
     "以 DBX 原生 MCP 服务运行",
     "  --store PATH  指定 dbx.db（默认：DBX_DATA_DIR 或平台默认位置）",
@@ -3570,6 +3572,16 @@ fn en_of(zh: &'static str) -> Option<&'static str> {
         "DBX 数据需要加密升级，但当前进程既无法访问系统钥匙串，也无法创建本地密钥：请使用带系统钥匙串支持的构建，或用 DBX_SECRET_KEY_FILE / DBX_SECRET_KEY 提供密钥。" => {
             Some(
                 "The DBX data needs an encryption upgrade, but this process can neither reach the OS keychain nor create a local key: use a build with OS keychain support, or supply a key via DBX_SECRET_KEY_FILE / DBX_SECRET_KEY.",
+            )
+        }
+        "系统钥匙串不可写（{}）；改用受管密钥文件 {}（其它 DBX 工具可用 DBX_SECRET_KEY_FILE 指向它）。" => {
+            Some(
+                "The OS keychain is not writable ({}); falling back to the managed key file {} (other DBX tools can point DBX_SECRET_KEY_FILE at it).",
+            )
+        }
+        "系统钥匙串被锁定或拒绝访问（{}），无法读取或创建数据加密密钥：请解锁钥匙串后重试，或用 DBX_SECRET_KEY_FILE / DBX_SECRET_KEY 提供密钥。" => {
+            Some(
+                "The OS keychain is locked or refused access ({}), so the data encryption key cannot be read or created: unlock the keychain and retry, or supply a key via DBX_SECRET_KEY_FILE / DBX_SECRET_KEY.",
             )
         }
         // ── R117: `dbxt mcp` reuses DBX's own MCP server ──
