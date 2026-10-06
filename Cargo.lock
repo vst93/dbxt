@@ -1854,6 +1854,7 @@ dependencies = [
  "encoding_rs",
  "futures",
  "ratatui",
+ "rmcp",
  "serde_json",
  "tokio",
  "tui-textarea",

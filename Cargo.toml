@@ -14,6 +14,11 @@ dbx-mcp = { git = "https://github.com/t8y2/dbx", tag = "v0.6.34", default-featur
     "sqlite-bundled",
     "duckdb-sidecar",
 ] }
+# R117: `dbxt mcp` serves DBX's own MCP server (`dbx_mcp::DbxMcpServer`) rather
+# than reimplementing any tool. rmcp is only needed for the stdio transport
+# wrapper; it is already in the lock via dbx-mcp, so this adds no new crate to
+# the build.
+rmcp = { version = "2.2.0", features = ["transport-io"] }
 ratatui = "0.29"
 crossterm = { version = "0.28", features = ["event-stream"] }
 tui-textarea = "0.7"

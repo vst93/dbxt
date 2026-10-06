@@ -1298,6 +1298,7 @@ pub(crate) fn every_call_site_has_english() {
         include_str!("../jsonview.rs"),
         include_str!("../last_session.rs"),
         include_str!("../materialize.rs"),
+        include_str!("../mcp.rs"),
         include_str!("../migrate.rs"),
         include_str!("../sidebar.rs"),
         include_str!("../editor.rs"),
@@ -1654,10 +1655,12 @@ pub(crate) fn help_text_matches_the_real_cli() {
     assert!(help.contains("--last"));
     assert!(help.contains("https://github.com/vst93/dbxt"));
     assert!(help.ends_with('\n'));
-    // The usage line plus exactly the three long options the parser accepts.
+    // The usage line plus every long option the parser accepts: `--last` in
+    // the usage line and in the option list, `--help`, `--version`, and the
+    // `mcp` line's `--http` (also shown in the usage line).
     assert_eq!(
         help.matches("--").count(),
-        4,
+        6,
         "unexpected --help drift: {help:?}"
     );
 }

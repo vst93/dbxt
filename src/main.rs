@@ -16,6 +16,7 @@ mod input;
 mod jsonview;
 mod last_session;
 mod materialize;
+mod mcp;
 mod migrate;
 mod mongo;
 mod nav;
@@ -4919,7 +4920,7 @@ fn version_line() -> String {
 /// [`write_stdout`], which tolerates a closed pipe.
 fn help_text() -> String {
     format!(
-        "dbxt {} — {}\n\n{}: dbxt [DBX_STORE] [--last]\n\n{}:\n{}\n\n{}:\n{}\n{}\n{}\n\n{}: https://github.com/vst93/dbxt\n",
+        "dbxt {} — {}\n\n{}: dbxt [DBX_STORE] [--last] | dbxt mcp [--http]\n\n{}:\n{}\n\n{}:\n{}\n{}\n{}\n{}\n\n{}: https://github.com/vst93/dbxt\n",
         dbxt_version(),
         t("DBX 的终端界面"),
         t("用法"),
@@ -4929,6 +4930,7 @@ fn help_text() -> String {
         t("  -h, --help     显示本帮助"),
         t("  -V, --version  显示版本"),
         t("  --last         启动即恢复上次会话的连接与库表（失败逐级降级）"),
+        t("  mcp            以 DBX 原生 MCP 服务运行（默认 stdio，--http 为 Streamable HTTP）"),
         t("文档"),
     )
 }
@@ -5004,6 +5006,12 @@ async fn run_async() -> Result<()> {
     // `--version` / `--help` answer before the TUI is initialised, so they work
     // over a pipe (the install scripts query `--version`) and without a terminal.
     let args: Vec<String> = std::env::args().skip(1).collect();
+    // `dbxt mcp` runs DBX's own MCP server. It is answered before the TUI's
+    // terminal check because a stdio MCP client talks over stdout, which is
+    // not a terminal.
+    if args.first().is_some_and(|a| a == "mcp") {
+        return run_mcp(&args[1..]).await;
+    }
     if args.iter().any(|a| a == "-h" || a == "--help") {
         write_stdout(&help_text())?;
         return Ok(());

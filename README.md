@@ -18,6 +18,7 @@ A keyboard-first terminal UI for databases, built on the [DBX](https://github.co
 The biggest jump since the first preview — the sidebar became a real tree, and the safety net around production connections grew up.
 
 - **Encrypted store upgrade without the desktop app** — when dbxt finds a legacy plaintext `dbx.db`, it now runs the kernel's own data-security upgrade at startup (automatic backup, encryption, verification) instead of refusing to open and pointing at DBX Desktop. A store already encrypted with an unreachable key still stops with an actionable hint.
+- **MCP server (`dbxt mcp`)** — the dbxt binary now serves DBX's own MCP server over stdio or loopback Streamable HTTP, so AI agents can call the same `dbx_*` tools without a separate `dbx-mcp` install. It reuses `dbx_mcp::DbxMcpServer`, so tools, resources, sessions, transactions and the `Settings → MCP` policy are identical to the official server; dbxt only adds the entry point.
 
 - **Connection tree** — the sidebar is now `connection → database → table`, foldable with `h`/`l` and remembered per session (`3j`/`3k` count-prefix moves included).
 - **Desktop groups** — DBX Desktop's connection groups mirror into the tree as `▾ name [n]` nodes.
@@ -294,6 +295,73 @@ When it performs the upgrade, dbxt provisions the key exactly the way the deskto
 
 Version note: a dbxt built against a pre-encryption kernel (v0.6.20 and earlier) cannot read an upgraded store — upgrade dbxt alongside Desktop. The reverse also holds: the v0.6.21+ kernel will not silently read a plaintext store; let dbxt (or the Desktop wizard) upgrade it first.
 
+## MCP server (`dbxt mcp`)
+
+`dbxt mcp` runs **DBX's own MCP server** out of the dbxt binary. It is not a reimplementation: the server is `dbx_mcp::DbxMcpServer`, the exact struct the official `dbx-mcp` binary serves, so the tools, resources, sessions, transactions, plugin tools and `Settings → MCP` policy are identical. dbxt only supplies the entry point — the same backend/store the TUI uses. A client talking to `dbxt mcp` sees the same `dbx_*` catalog as `dbx-mcp`.
+
+Two transports:
+
+| Command | Transport | Use it for |
+| --- | --- | --- |
+| `dbxt mcp` | stdio (newline-delimited JSON-RPC) | Claude Code, Cursor, Codex, DeepSeek Harness — the clients that spawn a command |
+| `dbxt mcp --http` | Streamable HTTP (loopback + bearer token) | HTTP-capable clients, Docker, long-lived endpoints |
+
+```bash
+dbxt mcp                      # stdio; DBX_DATA_DIR / platform default store
+dbxt mcp --store ./data       # point at a specific dbx.db (file or its directory)
+dbxt mcp --help               # full option list
+```
+
+### stdio clients
+
+Point the client at the absolute path of the `dbxt` executable (GUI clients do not always inherit your shell `PATH`) and pass `mcp` as the only argument:
+
+```json
+{
+  "mcpServers": {
+    "dbx": {
+      "command": "/absolute/path/to/dbxt",
+      "args": ["mcp"],
+      "env": { "DBX_DATA_DIR": "/home/me/.local/share/com.dbx.app" }
+    }
+  }
+}
+```
+
+This is the same `.mcp.json` shape DBX documents; only the command changes. The official `dbx-mcp` binary keeps working too — both read the same `dbx.db`, so you can keep either.
+
+### HTTP clients
+
+HTTP is **loopback-only** and always requires a bearer token, using the same environment variables as `dbx-mcp`:
+
+```bash
+DBX_MCP_HTTP_TOKEN=$(openssl rand -hex 32) dbxt mcp --http --port 5225
+# → DBX MCP Streamable HTTP listening on http://127.0.0.1:5225/mcp
+```
+
+```json
+{
+  "type": "http",
+  "url": "http://127.0.0.1:5225/mcp",
+  "headers": { "Authorization": "Bearer <the token above>" }
+}
+```
+
+Remote (non-loopback) binding is deliberately not offered here — use DBX's own `dbx-mcp --http --http-allow-remote` with its allowed-hosts/origins configuration. `dbxt mcp --http` refuses a non-loopback `--host` rather than exposing the store by accident.
+
+### Environment
+
+| Variable | Meaning |
+| --- | --- |
+| `DBX_DATA_DIR` | Directory holding `dbx.db` (shared with Desktop / `dbx-mcp`) |
+| `DBX_SECRET_KEY_FILE` / `DBX_SECRET_KEY` | Headless encryption key (see the Secret Store section) |
+| `DBX_MCP_TRANSPORT` | `stdio` (default) or `http`/`streamable-http` |
+| `DBX_MCP_HTTP_TOKEN` / `DBX_MCP_HTTP_TOKEN_FILE` | Bearer token for `--http` (one of them, required) |
+| `DBX_MCP_HTTP_HOST` / `DBX_MCP_HTTP_PORT` / `DBX_MCP_HTTP_PATH` | Listen address (default `127.0.0.1:5225/mcp`) |
+| `DBXT_ASSUME_YES=1` | Run the encryption upgrade without the interactive prompt (MCP has no terminal to answer it) |
+
+MCP policy, connection allowlists and database scopes are the ones saved in DBX (`Settings → MCP`) and are re-checked on every call — `dbxt mcp` does not add a second permission model.
+
 ## Status & roadmap
 
 Early but usable. Verified end-to-end against real MySQL 8.4, PostgreSQL 16, Redis and MongoDB servers.
@@ -307,6 +375,7 @@ Early but usable. Verified end-to-end against real MySQL 8.4, PostgreSQL 16, Red
 - [x] Prebuilt archives for seven targets — only the Linux x86_64 build has been exercised locally, the others are untested
 - [x] In-TUI connection deletion (red confirmation; config only, never database data)
 - [x] Result export to XLSX (via the kernel `StreamingXlsxWriter`)
+- [x] DBX-native MCP server over stdio / loopback HTTP (`dbxt mcp`; reuses `dbx-mcp`'s own tools, sessions and policy)
 - [ ] Search across pages
 - [ ] Excel (`.xlsx`) import
 - [ ] A dedicated Android/Termux build

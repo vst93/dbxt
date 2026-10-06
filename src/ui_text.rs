@@ -1154,6 +1154,32 @@ pub static ALL_KEYS: &[&str] = &[
     "升级完成：已加密 {} 项密钥",
     "DBX 数据需要加密升级，但读不到正确的数据加密密钥（{}）：请用 DBX_SECRET_KEY_FILE / DBX_SECRET_KEY 提供创建该库时所用的密钥。",
     "DBX 数据需要加密升级，但当前进程既无法访问系统钥匙串，也无法创建本地密钥：请使用带系统钥匙串支持的构建，或用 DBX_SECRET_KEY_FILE / DBX_SECRET_KEY 提供密钥。",
+    // ── R117: `dbxt mcp` reuses DBX's own MCP server ──
+    "以 DBX 原生 MCP 服务运行",
+    "  --store PATH  指定 dbx.db（默认：DBX_DATA_DIR 或平台默认位置）",
+    "  --http        改用 Streamable HTTP 监听（默认 stdio）",
+    "  --host H      仅回环地址，默认 127.0.0.1",
+    "  --port P      HTTP 端口，默认 5225",
+    "  --path P      HTTP 路径，默认 /mcp",
+    "  -h, --help    显示本帮助",
+    "HTTP 环境变量",
+    "  DBX_MCP_HTTP_TOKEN / DBX_MCP_HTTP_TOKEN_FILE  Bearer 令牌（必填）",
+    "  DBX_MCP_HTTP_HOST / _PORT / _PATH            监听地址",
+    "  DBX_MCP_TRANSPORT=http                       等价于 --http",
+    "说明",
+    "  工具 / 资源 / 会话 / 事务 / 权限策略全部来自 DBX 的 DbxMcpServer，",
+    "  与桌面端、dbxt 共用同一个 dbx.db；dbxt 只提供入口，不重写任何 MCP 逻辑。",
+    "  mcp            以 DBX 原生 MCP 服务运行（默认 stdio，--http 为 Streamable HTTP）",
+    "{} 需要值",
+    "{} 需要 1-65535 之间的端口号",
+    "DBX 存储不可用：{}",
+    "无效的监听地址：{}",
+    "dbxt 的 MCP HTTP 只监听本机回环地址；需要远程访问请改用 DBX 自带的 dbx-mcp --http",
+    "只能设置 DBX_MCP_HTTP_TOKEN 或 DBX_MCP_HTTP_TOKEN_FILE 之一",
+    "读取 DBX_MCP_HTTP_TOKEN_FILE 失败：{}",
+    "DBX_MCP_HTTP_TOKEN_FILE 为空",
+    "Streamable HTTP 需要 DBX_MCP_HTTP_TOKEN 或 DBX_MCP_HTTP_TOKEN_FILE",
+    "HTTP 路径必须是 / 开头的绝对路径，且不能以 / 结尾（例如 /mcp）",
     "⚠ SSH 主机密钥已变化（{}:{}），可能被中间人攻击",
     "SSH 主机密钥被拒绝（{}:{}）",
     "SSH 主机密钥已接受但无法保存（{}:{}）：仅本次会话信任",
@@ -3545,6 +3571,56 @@ fn en_of(zh: &'static str) -> Option<&'static str> {
             Some(
                 "The DBX data needs an encryption upgrade, but this process can neither reach the OS keychain nor create a local key: use a build with OS keychain support, or supply a key via DBX_SECRET_KEY_FILE / DBX_SECRET_KEY.",
             )
+        }
+        // ── R117: `dbxt mcp` reuses DBX's own MCP server ──
+        "以 DBX 原生 MCP 服务运行" => Some("Run as DBX's native MCP server"),
+        "  --store PATH  指定 dbx.db（默认：DBX_DATA_DIR 或平台默认位置）" => {
+            Some("  --store PATH  dbx.db file or its directory (default: DBX_DATA_DIR or the platform location)")
+        }
+        "  --http        改用 Streamable HTTP 监听（默认 stdio）" => {
+            Some("  --http        listen over Streamable HTTP instead of stdio")
+        }
+        "  --host H      仅回环地址，默认 127.0.0.1" => Some("  --host H      loopback address only, default 127.0.0.1"),
+        "  --port P      HTTP 端口，默认 5225" => Some("  --port P      HTTP port, default 5225"),
+        "  --path P      HTTP 路径，默认 /mcp" => Some("  --path P      HTTP path, default /mcp"),
+        "  -h, --help    显示本帮助" => Some("  -h, --help    show this help"),
+        "HTTP 环境变量" => Some("HTTP environment variables"),
+        "  DBX_MCP_HTTP_TOKEN / DBX_MCP_HTTP_TOKEN_FILE  Bearer 令牌（必填）" => {
+            Some("  DBX_MCP_HTTP_TOKEN / DBX_MCP_HTTP_TOKEN_FILE  bearer token (required)")
+        }
+        "  DBX_MCP_HTTP_HOST / _PORT / _PATH            监听地址" => {
+            Some("  DBX_MCP_HTTP_HOST / _PORT / _PATH            listen address")
+        }
+        "  DBX_MCP_TRANSPORT=http                       等价于 --http" => {
+            Some("  DBX_MCP_TRANSPORT=http                       same as --http")
+        }
+        "说明" => Some("Notes"),
+        "  工具 / 资源 / 会话 / 事务 / 权限策略全部来自 DBX 的 DbxMcpServer，" => {
+            Some("  Tools, resources, sessions, transactions and policy all come from DBX's DbxMcpServer;")
+        }
+        "  与桌面端、dbxt 共用同一个 dbx.db；dbxt 只提供入口，不重写任何 MCP 逻辑。" => {
+            Some("  dbxt shares the same dbx.db and only provides the entry point, reimplementing no MCP logic.")
+        }
+        "  mcp            以 DBX 原生 MCP 服务运行（默认 stdio，--http 为 Streamable HTTP）" => {
+            Some("  mcp            run as DBX's native MCP server (stdio by default; --http for Streamable HTTP)")
+        }
+        "{} 需要值" => Some("{} requires a value"),
+        "{} 需要 1-65535 之间的端口号" => Some("{} requires a port between 1 and 65535"),
+        "DBX 存储不可用：{}" => Some("DBX store unavailable: {}"),
+        "无效的监听地址：{}" => Some("invalid listen address: {}"),
+        "dbxt 的 MCP HTTP 只监听本机回环地址；需要远程访问请改用 DBX 自带的 dbx-mcp --http" => {
+            Some("dbxt's MCP HTTP listens on loopback only; for remote access use DBX's own dbx-mcp --http")
+        }
+        "只能设置 DBX_MCP_HTTP_TOKEN 或 DBX_MCP_HTTP_TOKEN_FILE 之一" => {
+            Some("set only one of DBX_MCP_HTTP_TOKEN or DBX_MCP_HTTP_TOKEN_FILE")
+        }
+        "读取 DBX_MCP_HTTP_TOKEN_FILE 失败：{}" => Some("failed to read DBX_MCP_HTTP_TOKEN_FILE: {}"),
+        "DBX_MCP_HTTP_TOKEN_FILE 为空" => Some("DBX_MCP_HTTP_TOKEN_FILE is empty"),
+        "Streamable HTTP 需要 DBX_MCP_HTTP_TOKEN 或 DBX_MCP_HTTP_TOKEN_FILE" => {
+            Some("Streamable HTTP requires DBX_MCP_HTTP_TOKEN or DBX_MCP_HTTP_TOKEN_FILE")
+        }
+        "HTTP 路径必须是 / 开头的绝对路径，且不能以 / 结尾（例如 /mcp）" => {
+            Some("the HTTP path must be absolute starting with / and must not end with / (for example /mcp)")
         }
         "⚠ SSH 主机密钥已变化（{}:{}），可能被中间人攻击" => {
             Some("⚠ SSH host key changed for {}:{} — possible man-in-the-middle")

@@ -18,6 +18,7 @@
 自首个预览以来最大的一次跃迁 —— 侧栏变成了真正的树，围绕生产连接的安全网也成型了。
 
 - **无需桌面端即可完成加密升级** —— 发现旧的明文 `dbx.db` 时，dbxt 现在会在启动阶段直接跑内核自带的数据安全升级（自动备份 → 加密 → 校验），不再拒绝打开并把用户推回 DBX 桌面端。若库已加密但密钥不可达，仍会停下并给出可操作的提示。
+- **MCP 服务（`dbxt mcp`）** —— dbxt 二进制现在可直接以 stdio 或回环 Streamable HTTP 提供 DBX 原生 MCP 服务，AI agent 无需另装 `dbx-mcp` 就能调用同一套 `dbx_*` 工具。它复用 `dbx_mcp::DbxMcpServer`，工具 / 资源 / 会话 / 事务 / `Settings → MCP` 策略与官方服务完全一致；dbxt 只新增入口。
 
 - **连接树** —— 侧栏现在是 `连接 → 库 → 表`，`h`/`l` 折叠、按会话记忆（含 `3j`/`3k` 计数前缀移动）。
 - **桌面端分组** —— DBX 桌面端的连接分组映射成树里的 `▾ 名称 [n]` 节点。
@@ -294,6 +295,73 @@ dbxt 基于 **DBX v0.6.34** 构建。自 v0.6.27 起，内核会对连接 / 插�
 
 版本对应：基于加密前内核（v0.6.20 及更早）构建的 dbxt 无法读取已升级的库 —— 升级 dbxt 与桌面端同步。反之亦然：v0.6.21+ 内核不会静默读取明文库，请先让 dbxt（或桌面向导）完成升级。
 
+## MCP 服务（`dbxt mcp`）
+
+`dbxt mcp` 由 dbxt 二进制直接运行 **DBX 原生的 MCP 服务**。它不是重新实现：服务端就是 `dbx_mcp::DbxMcpServer` —— 官方 `dbx-mcp` 二进制所服务的同一个结构 —— 因此工具、资源、会话、事务、插件工具与 `Settings → MCP` 策略完全一致。dbxt 只提供入口，用的是与 TUI 相同的后端与存储。客户端连 `dbxt mcp` 看到的 `dbx_*` 工具目录与 `dbx-mcp` 一模一样。
+
+两种传输：
+
+| 命令 | 传输 | 适用 |
+| --- | --- | --- |
+| `dbxt mcp` | stdio（换行分隔 JSON-RPC） | Claude Code、Cursor、Codex、DeepSeek Harness 等“由客户端 spawn 命令”的客户端 |
+| `dbxt mcp --http` | Streamable HTTP（仅回环 + Bearer 令牌） | 支持 HTTP 的客户端、Docker、长期端点 |
+
+```bash
+dbxt mcp                      # stdio；使用 DBX_DATA_DIR / 平台默认存储
+dbxt mcp --store ./data       # 指定 dbx.db（文件或其所在目录）
+dbxt mcp --help               # 完整选项
+```
+
+### stdio 客户端
+
+把客户端指向 `dbxt` 可执行文件的**绝对路径**（GUI 客户端不一定继承 shell 的 `PATH`），参数只传 `mcp`：
+
+```json
+{
+  "mcpServers": {
+    "dbx": {
+      "command": "/absolute/path/to/dbxt",
+      "args": ["mcp"],
+      "env": { "DBX_DATA_DIR": "/home/me/.local/share/com.dbx.app" }
+    }
+  }
+}
+```
+
+与 DBX 官方文档的 `.mcp.json` 形状相同，只是 command 换了。官方 `dbx-mcp` 依然可用 —— 两者读同一个 `dbx.db`，二选一或共存都行。
+
+### HTTP 客户端
+
+HTTP **只监听回环地址**，且每次请求都要求 Bearer 令牌，环境变量与 `dbx-mcp` 一致：
+
+```bash
+DBX_MCP_HTTP_TOKEN=$(openssl rand -hex 32) dbxt mcp --http --port 5225
+# → DBX MCP Streamable HTTP listening on http://127.0.0.1:5225/mcp
+```
+
+```json
+{
+  "type": "http",
+  "url": "http://127.0.0.1:5225/mcp",
+  "headers": { "Authorization": "Bearer <上面的令牌>" }
+}
+```
+
+远程（非回环）绑定特意不提供 —— 请用 DBX 自带的 `dbx-mcp --http --http-allow-remote` 及其 allowed-hosts/origins 配置。`dbxt mcp --http` 对非回环 `--host` 会直接报错，避免误暴露存储。
+
+### 环境变量
+
+| 变量 | 含义 |
+| --- | --- |
+| `DBX_DATA_DIR` | 存放 `dbx.db` 的目录（与桌面端 / `dbx-mcp` 共用） |
+| `DBX_SECRET_KEY_FILE` / `DBX_SECRET_KEY` | 无头环境的加密密钥（见上节） |
+| `DBX_MCP_TRANSPORT` | `stdio`（默认）或 `http`/`streamable-http` |
+| `DBX_MCP_HTTP_TOKEN` / `DBX_MCP_HTTP_TOKEN_FILE` | `--http` 的 Bearer 令牌（二选一，必填） |
+| `DBX_MCP_HTTP_HOST` / `DBX_MCP_HTTP_PORT` / `DBX_MCP_HTTP_PATH` | 监听地址（默认 `127.0.0.1:5225/mcp`） |
+| `DBXT_ASSUME_YES=1` | 无终端时跳过加密升级确认 |
+
+MCP 权限、连接白名单与库范围就是 DBX（`Settings → MCP`）里保存的那一套，每次调用都会重新校验 —— `dbxt mcp` 不新增第二套权限模型。
+
 ## 状态与路线图
 
 早期但已可用。已对真实 MySQL 8.4、PostgreSQL 16、Redis 和 MongoDB 端到端实测。
@@ -307,6 +375,7 @@ dbxt 基于 **DBX v0.6.34** 构建。自 v0.6.27 起，内核会对连接 / 插�
 - [x] 七个平台的预编译包 —— 目前只有 Linux x86_64 在本机实测，其余未验证
 - [x] TUI 内删除连接（红色确认；只删配置，不删数据库数据）
 - [x] 结果导出 XLSX（走内核 `StreamingXlsxWriter`）
+- [x] DBX 原生 MCP 服务（`dbxt mcp`，stdio / 回环 HTTP；复用 `dbx-mcp` 自身的工具、会话与策略）
 - [ ] 跨页搜索
 - [ ] Excel（`.xlsx`）导入
 - [ ] 官方 Android/Termux 构建
