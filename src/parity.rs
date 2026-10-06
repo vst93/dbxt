@@ -3219,6 +3219,7 @@ pub(crate) fn import_ssh_to_layer(conn_name: &str, s: &ImportSsh) -> SshTunnelCo
         ssh_agent_sock_path: s.agent_sock.clone().unwrap_or_default(),
         auth_method: s.auth_method.clone(),
         allow_exec_channel_proxy: false,
+        proxy_command: String::new(),
         profile_id: String::new(),
     }
 }

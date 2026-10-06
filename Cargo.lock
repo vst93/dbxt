@@ -1350,7 +1350,7 @@ dependencies = [
 [[package]]
 name = "dbx-ai-provider"
 version = "0.1.0"
-source = "git+https://github.com/t8y2/dbx?tag=v0.6.27#52f2e8904d8bf4f5d05afe144a1355949af1450a"
+source = "git+https://github.com/t8y2/dbx?tag=v0.6.34#b25154466a1b9c2422af207c4f76c4259a9966d9"
 dependencies = [
  "base64 0.22.1",
  "bytes",
@@ -1369,7 +1369,7 @@ dependencies = [
 [[package]]
 name = "dbx-core"
 version = "0.1.0"
-source = "git+https://github.com/t8y2/dbx?tag=v0.6.27#52f2e8904d8bf4f5d05afe144a1355949af1450a"
+source = "git+https://github.com/t8y2/dbx?tag=v0.6.34#b25154466a1b9c2422af207c4f76c4259a9966d9"
 dependencies = [
  "aes 0.8.4",
  "aes-gcm 0.10.3",
@@ -1438,7 +1438,7 @@ dependencies = [
 [[package]]
 name = "dbx-driver-agent"
 version = "0.1.0"
-source = "git+https://github.com/t8y2/dbx?tag=v0.6.27#52f2e8904d8bf4f5d05afe144a1355949af1450a"
+source = "git+https://github.com/t8y2/dbx?tag=v0.6.34#b25154466a1b9c2422af207c4f76c4259a9966d9"
 dependencies = [
  "chrono",
  "crc",
@@ -1466,7 +1466,7 @@ dependencies = [
 [[package]]
 name = "dbx-driver-elasticsearch"
 version = "0.1.0"
-source = "git+https://github.com/t8y2/dbx?tag=v0.6.27#52f2e8904d8bf4f5d05afe144a1355949af1450a"
+source = "git+https://github.com/t8y2/dbx?tag=v0.6.34#b25154466a1b9c2422af207c4f76c4259a9966d9"
 dependencies = [
  "dbx-driver-support",
  "dbx-types",
@@ -1481,7 +1481,7 @@ dependencies = [
 [[package]]
 name = "dbx-driver-mongodb"
 version = "0.1.0"
-source = "git+https://github.com/t8y2/dbx?tag=v0.6.27#52f2e8904d8bf4f5d05afe144a1355949af1450a"
+source = "git+https://github.com/t8y2/dbx?tag=v0.6.34#b25154466a1b9c2422af207c4f76c4259a9966d9"
 dependencies = [
  "base64 0.22.1",
  "chrono",
@@ -1503,7 +1503,7 @@ dependencies = [
 [[package]]
 name = "dbx-driver-mysql"
 version = "0.1.0"
-source = "git+https://github.com/t8y2/dbx?tag=v0.6.27#52f2e8904d8bf4f5d05afe144a1355949af1450a"
+source = "git+https://github.com/t8y2/dbx?tag=v0.6.34#b25154466a1b9c2422af207c4f76c4259a9966d9"
 dependencies = [
  "chrono",
  "dbx-driver-support",
@@ -1524,7 +1524,7 @@ dependencies = [
 [[package]]
 name = "dbx-driver-postgres"
 version = "0.1.0"
-source = "git+https://github.com/t8y2/dbx?tag=v0.6.27#52f2e8904d8bf4f5d05afe144a1355949af1450a"
+source = "git+https://github.com/t8y2/dbx?tag=v0.6.34#b25154466a1b9c2422af207c4f76c4259a9966d9"
 dependencies = [
  "bytes",
  "chrono",
@@ -1552,7 +1552,7 @@ dependencies = [
 [[package]]
 name = "dbx-driver-redis"
 version = "0.1.0"
-source = "git+https://github.com/t8y2/dbx?tag=v0.6.27#52f2e8904d8bf4f5d05afe144a1355949af1450a"
+source = "git+https://github.com/t8y2/dbx?tag=v0.6.34#b25154466a1b9c2422af207c4f76c4259a9966d9"
 dependencies = [
  "base64 0.22.1",
  "dbx-driver-support",
@@ -1566,7 +1566,7 @@ dependencies = [
 [[package]]
 name = "dbx-driver-sqlserver"
 version = "0.1.0"
-source = "git+https://github.com/t8y2/dbx?tag=v0.6.27#52f2e8904d8bf4f5d05afe144a1355949af1450a"
+source = "git+https://github.com/t8y2/dbx?tag=v0.6.34#b25154466a1b9c2422af207c4f76c4259a9966d9"
 dependencies = [
  "chrono",
  "dbx-driver-support",
@@ -1589,7 +1589,7 @@ dependencies = [
 [[package]]
 name = "dbx-driver-support"
 version = "0.1.0"
-source = "git+https://github.com/t8y2/dbx?tag=v0.6.27#52f2e8904d8bf4f5d05afe144a1355949af1450a"
+source = "git+https://github.com/t8y2/dbx?tag=v0.6.34#b25154466a1b9c2422af207c4f76c4259a9966d9"
 dependencies = [
  "bytes",
  "dbx-platform",
@@ -1609,7 +1609,7 @@ dependencies = [
 [[package]]
 name = "dbx-drivers"
 version = "0.1.0"
-source = "git+https://github.com/t8y2/dbx?tag=v0.6.27#52f2e8904d8bf4f5d05afe144a1355949af1450a"
+source = "git+https://github.com/t8y2/dbx?tag=v0.6.34#b25154466a1b9c2422af207c4f76c4259a9966d9"
 dependencies = [
  "base64 0.22.1",
  "bytes",
@@ -1671,7 +1671,7 @@ dependencies = [
 [[package]]
 name = "dbx-formats"
 version = "0.1.0"
-source = "git+https://github.com/t8y2/dbx?tag=v0.6.27#52f2e8904d8bf4f5d05afe144a1355949af1450a"
+source = "git+https://github.com/t8y2/dbx?tag=v0.6.34#b25154466a1b9c2422af207c4f76c4259a9966d9"
 dependencies = [
  "chrono",
  "serde",
@@ -1681,8 +1681,8 @@ dependencies = [
 
 [[package]]
 name = "dbx-mcp"
-version = "0.4.100"
-source = "git+https://github.com/t8y2/dbx?tag=v0.6.27#52f2e8904d8bf4f5d05afe144a1355949af1450a"
+version = "0.4.106"
+source = "git+https://github.com/t8y2/dbx?tag=v0.6.34#b25154466a1b9c2422af207c4f76c4259a9966d9"
 dependencies = [
  "async-trait",
  "axum",
@@ -1710,7 +1710,7 @@ dependencies = [
 [[package]]
 name = "dbx-platform"
 version = "0.1.0"
-source = "git+https://github.com/t8y2/dbx?tag=v0.6.27#52f2e8904d8bf4f5d05afe144a1355949af1450a"
+source = "git+https://github.com/t8y2/dbx?tag=v0.6.34#b25154466a1b9c2422af207c4f76c4259a9966d9"
 dependencies = [
  "futures",
  "nix 0.31.3",
@@ -1718,12 +1718,13 @@ dependencies = [
  "serde",
  "tokio",
  "uuid",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
 name = "dbx-plugin-runtime"
 version = "0.1.0"
-source = "git+https://github.com/t8y2/dbx?tag=v0.6.27#52f2e8904d8bf4f5d05afe144a1355949af1450a"
+source = "git+https://github.com/t8y2/dbx?tag=v0.6.34#b25154466a1b9c2422af207c4f76c4259a9966d9"
 dependencies = [
  "base64 0.22.1",
  "bytes",
@@ -1748,7 +1749,7 @@ dependencies = [
 [[package]]
 name = "dbx-sql"
 version = "0.1.0"
-source = "git+https://github.com/t8y2/dbx?tag=v0.6.27#52f2e8904d8bf4f5d05afe144a1355949af1450a"
+source = "git+https://github.com/t8y2/dbx?tag=v0.6.34#b25154466a1b9c2422af207c4f76c4259a9966d9"
 dependencies = [
  "dbx-sql-core",
  "dbx-sql-data",
@@ -1760,7 +1761,7 @@ dependencies = [
 [[package]]
 name = "dbx-sql-core"
 version = "0.1.0"
-source = "git+https://github.com/t8y2/dbx?tag=v0.6.27#52f2e8904d8bf4f5d05afe144a1355949af1450a"
+source = "git+https://github.com/t8y2/dbx?tag=v0.6.34#b25154466a1b9c2422af207c4f76c4259a9966d9"
 dependencies = [
  "chrono",
  "dbx-types",
@@ -1777,7 +1778,7 @@ dependencies = [
 [[package]]
 name = "dbx-sql-data"
 version = "0.1.0"
-source = "git+https://github.com/t8y2/dbx?tag=v0.6.27#52f2e8904d8bf4f5d05afe144a1355949af1450a"
+source = "git+https://github.com/t8y2/dbx?tag=v0.6.34#b25154466a1b9c2422af207c4f76c4259a9966d9"
 dependencies = [
  "chrono",
  "dbx-sql-core",
@@ -1792,7 +1793,7 @@ dependencies = [
 [[package]]
 name = "dbx-sql-dialect"
 version = "0.1.0"
-source = "git+https://github.com/t8y2/dbx?tag=v0.6.27#52f2e8904d8bf4f5d05afe144a1355949af1450a"
+source = "git+https://github.com/t8y2/dbx?tag=v0.6.34#b25154466a1b9c2422af207c4f76c4259a9966d9"
 dependencies = [
  "chrono",
  "dbx-types",
@@ -1807,7 +1808,7 @@ dependencies = [
 [[package]]
 name = "dbx-sql-schema"
 version = "0.1.0"
-source = "git+https://github.com/t8y2/dbx?tag=v0.6.27#52f2e8904d8bf4f5d05afe144a1355949af1450a"
+source = "git+https://github.com/t8y2/dbx?tag=v0.6.34#b25154466a1b9c2422af207c4f76c4259a9966d9"
 dependencies = [
  "dbx-sql-core",
  "dbx-sql-dialect",
@@ -1824,7 +1825,7 @@ dependencies = [
 [[package]]
 name = "dbx-sqlite-worker"
 version = "0.1.1"
-source = "git+https://github.com/t8y2/dbx?tag=v0.6.27#52f2e8904d8bf4f5d05afe144a1355949af1450a"
+source = "git+https://github.com/t8y2/dbx?tag=v0.6.34#b25154466a1b9c2422af207c4f76c4259a9966d9"
 dependencies = [
  "serde",
  "serde_json",
@@ -1833,7 +1834,7 @@ dependencies = [
 [[package]]
 name = "dbx-types"
 version = "0.1.0"
-source = "git+https://github.com/t8y2/dbx?tag=v0.6.27#52f2e8904d8bf4f5d05afe144a1355949af1450a"
+source = "git+https://github.com/t8y2/dbx?tag=v0.6.34#b25154466a1b9c2422af207c4f76c4259a9966d9"
 dependencies = [
  "percent-encoding",
  "serde",

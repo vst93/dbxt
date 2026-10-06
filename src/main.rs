@@ -16,6 +16,7 @@ mod input;
 mod jsonview;
 mod last_session;
 mod materialize;
+mod migrate;
 mod mongo;
 mod nav;
 mod numfmt;
@@ -5051,6 +5052,14 @@ async fn run_async() -> Result<()> {
             std::fs::create_dir_all(parent)?;
         }
     }
+    // R116: from the encrypted-secret-store kernel onward, dbxt must not open a
+    // store that still holds plaintext secrets. Do the desktop-equivalent
+    // upgrade here (with its own backup + verification) so a user without the
+    // desktop app is not locked out. A fresh or already-encrypted store is a
+    // cheap read-only no-op.
+    ensure_encrypted_store(&db_path)
+        .await
+        .map_err(|e| anyhow::anyhow!("{}", e))?;
     let backend = Arc::new(LocalBackend::open(&db_path).await.map_err(|e| {
         let detail = humanize_backend_error(&e);
         anyhow::anyhow!("{}", tf("打开 DBX 存储文件失败 ({}): {}\n(可用 DBX_DATA_DIR 指定目录，或把 dbx.db 文件路径作为第一个位置参数传入)", &[&format!("{:?}", db_path), &(detail)]))

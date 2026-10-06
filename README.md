@@ -17,6 +17,8 @@ A keyboard-first terminal UI for databases, built on the [DBX](https://github.co
 
 The biggest jump since the first preview — the sidebar became a real tree, and the safety net around production connections grew up.
 
+- **Encrypted store upgrade without the desktop app** — when dbxt finds a legacy plaintext `dbx.db`, it now runs the kernel's own data-security upgrade at startup (automatic backup, encryption, verification) instead of refusing to open and pointing at DBX Desktop. A store already encrypted with an unreachable key still stops with an actionable hint.
+
 - **Connection tree** — the sidebar is now `connection → database → table`, foldable with `h`/`l` and remembered per session (`3j`/`3k` count-prefix moves included).
 - **Desktop groups** — DBX Desktop's connection groups mirror into the tree as `▾ name [n]` nodes.
 - **Status dots + manual disconnect** — every root carries `●` live / `○` disconnected / `◐` connecting; `x` drops its pools behind a red confirmation (config untouched).
@@ -266,19 +268,20 @@ The TUI's `?` overlay and `dbxt --help` carry the complete list; this is the sho
 
 ## Persistence & configuration
 
-Per-table choices (compact widths, hidden columns, sort) and remembered column widths (`<`/`>` in the results pane) are written to `~/.config/dbxt/tui.json`, keyed by `database.table` (a column width also carries the connection and column name, capped at 200 entries with LRU eviction); the connection / database / table the last run left off on is written to `~/.config/dbxt/last-session.json` (only after a connection actually opened) and reloaded at startup to highlight that connection, or to auto-resume it with `--last`; `DBXT_CONFIG` overrides the directory for both, `DBXT_LAST_SESSION` overrides just the session file, and `DBXT_NO_PERSIST=1` disables them. `DBXT_LANG=en|zh` selects the UI language (the locale decides when unset), `DBX_DATA_DIR` points dbxt at a different DBX store, and `DBXT_INSTALL_DIR` is the install script's target directory.
+Per-table choices (compact widths, hidden columns, sort) and remembered column widths (`<`/`>` in the results pane) are written to `~/.config/dbxt/tui.json`, keyed by `database.table` (a column width also carries the connection and column name, capped at 200 entries with LRU eviction); the connection / database / table the last run left off on is written to `~/.config/dbxt/last-session.json` (only after a connection actually opened) and reloaded at startup to highlight that connection, or to auto-resume it with `--last`; `DBXT_CONFIG` overrides the directory for both, `DBXT_LAST_SESSION` overrides just the session file, and `DBXT_NO_PERSIST=1` disables them. `DBXT_LANG=en|zh` selects the UI language (the locale decides when unset), `DBX_DATA_DIR` points dbxt at a different DBX store, `DBXT_ASSUME_YES=1` skips the first-run encryption-upgrade confirmation, and `DBXT_INSTALL_DIR` is the install script's target directory.
 
 The SSH-tunnel unit tests (serialization shape, form mapping, auth/error classification, host-key prompt) run with the normal `cargo test`. Two extra end-to-end tests drive a real tunnel (dbxt → local `sshd` → MySQL) and are skipped unless `DBXT_SSH_TEST=1`; they read `DBXT_SSH_TEST_USER` / `_PASSWORD` / `_KEY`, `DBXT_SSH_TEST_MYSQL_PORT` (default 13306) and `DBXT_SSH_TEST_MYSQL_USER` / `_PASSWORD`. `tests/secret_store.rs` also runs with `cargo test`: it generates a throwaway `DBX_SECRET_KEY_FILE`, saves an encrypted connection and reads its password back (the key is never committed).
 
 ## DBX Secret Store compatibility
 
-dbxt builds against **DBX v0.6.27**. From v0.6.27 the kernel encrypts connection / plugin / AI / tunnel secrets at rest (`dbxenc1` envelopes, AES-256-GCM) with a key that lives **outside** the database. dbxt does not manage that key — it passes the kernel's resolution straight through — so which store it can open depends on the key provider being reachable.
+dbxt builds against **DBX v0.6.34**. From v0.6.27 the kernel encrypts connection / plugin / AI / tunnel secrets at rest (`dbxenc1` envelopes, AES-256-GCM) with a key that lives **outside** the database. dbxt passes the kernel's key resolution straight through, and at startup it runs the kernel's own **data security upgrade** when it finds a legacy plaintext store — so a user who only has dbxt (DBX Desktop already uninstalled) is no longer locked out.
 
 | Store state | What dbxt does |
 | --- | --- |
-| Plaintext (legacy, not yet upgraded) | Refuses to open with `DATA_MIGRATION_REQUIRED` and prints a hint: finish the **Data Security Upgrade** wizard in DBX Desktop (or Web) first. dbxt never migrates data and never bypasses the gate. |
+| Plaintext (legacy, not yet upgraded) | Asks for confirmation at startup, then upgrades in place: the kernel backs `dbx.db` up first, encrypts every secret, verifies it, then renames the legacy JSON files aside. Progress and the backup path are printed to stderr. After the upgrade the store needs **DBX v0.6.21 or later** to be read. |
 | Encrypted, key reachable | Opens transparently; passwords and tunnel credentials decrypt as usual. |
 | Encrypted, key unreachable | Refuses to open with `SECRET_KEY_UNAVAILABLE` and prints a hint pointing at the key sources below. |
+| Encrypted with a key that cannot decrypt it | Refuses to open with `SECRET_KEY_MISMATCH` / `ENCRYPTED_DATA_KEY_MISSING`; supply the original key. |
 
 **Key sources**, in the order the kernel resolves them:
 
@@ -287,9 +290,9 @@ dbxt builds against **DBX v0.6.27**. From v0.6.27 the kernel encrypts connection
 3. OS keychain — macOS Keychain, Windows Credential Manager, Linux Secret Service (compiled in via the `os-keyring` feature). This is where DBX Desktop stores the key.
 4. `<data-dir>/.dbx/secret.key` — the managed per-user fallback.
 
-A CLI/MCP process only *reads* the key: it never provisions one and never migrates legacy credentials. If you run dbxt without DBX Desktop, export the key (`DBX_SECRET_KEY_FILE`) so it can decrypt the store.
+When it performs the upgrade, dbxt provisions the key exactly the way the desktop wizard does (OS keychain, or the managed per-user file where no keychain is reachable), so installing DBX Desktop again keeps working. It never overwrites an existing key: if ciphertext already exists without its key, dbxt stops and asks for the original (`DBX_SECRET_KEY_FILE` / `DBX_SECRET_KEY`) instead of creating a new one. The confirmation prompt names the resulting version floor (DBX v0.6.21+, the release that introduced the `dbxenc1` store); `DBXT_ASSUME_YES=1` skips the prompt for provisioning scripts.
 
-Version note: a dbxt built against the plaintext-era kernel (v0.6.9 and earlier) cannot read a store that DBX Desktop has already upgraded — upgrade dbxt alongside Desktop. The reverse also holds: the v0.6.27 kernel will not silently read a plaintext store; complete the wizard first.
+Version note: a dbxt built against a pre-encryption kernel (v0.6.20 and earlier) cannot read an upgraded store — upgrade dbxt alongside Desktop. The reverse also holds: the v0.6.21+ kernel will not silently read a plaintext store; let dbxt (or the Desktop wizard) upgrade it first.
 
 ## Status & roadmap
 

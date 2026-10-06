@@ -1298,6 +1298,7 @@ pub(crate) fn every_call_site_has_english() {
         include_str!("../jsonview.rs"),
         include_str!("../last_session.rs"),
         include_str!("../materialize.rs"),
+        include_str!("../migrate.rs"),
         include_str!("../sidebar.rs"),
         include_str!("../editor.rs"),
         include_str!("../mongo.rs"),
@@ -2171,6 +2172,7 @@ pub(crate) fn ssh_tunnel_round_trips_and_prefills_the_form() {
         ssh_agent_sock_path: String::new(),
         auth_method: "password".into(),
         allow_exec_channel_proxy: false,
+        proxy_command: String::new(),
         profile_id: String::new(),
     })];
     let json = serde_json::to_string(&cfg).unwrap();
@@ -2211,6 +2213,7 @@ pub(crate) fn ssh_auth_infers_from_legacy_layer_fields() {
         ssh_agent_sock_path: String::new(),
         auth_method: String::new(),
         allow_exec_channel_proxy: false,
+        proxy_command: String::new(),
         profile_id: String::new(),
     };
     assert_eq!(SshAuth::from_layer(&layer), SshAuth::Key);
@@ -2574,6 +2577,7 @@ async fn ssh_tunnel_end_to_end_through_local_jump_host() {
             ssh_agent_sock_path: String::new(),
             auth_method: auth.as_str().to_string(),
             allow_exec_channel_proxy: false,
+            proxy_command: String::new(),
             profile_id: String::new(),
         })];
         // The kernel resolves the tunnel through the connection's cached
@@ -2662,6 +2666,7 @@ async fn ssh_tunnel_error_paths_are_classified() {
             ssh_agent_sock_path: String::new(),
             auth_method: "password".into(),
             allow_exec_channel_proxy: false,
+            proxy_command: String::new(),
             profile_id: String::new(),
         })];
         cfg
@@ -4703,6 +4708,7 @@ pub(crate) fn export_fixture_conn(name: &str) -> ConnectionConfig {
         ssh_agent_sock_path: String::new(),
         auth_method: "password".into(),
         allow_exec_channel_proxy: false,
+        proxy_command: String::new(),
         profile_id: String::new(),
     })];
     cfg

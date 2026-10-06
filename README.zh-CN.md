@@ -17,6 +17,8 @@
 
 自首个预览以来最大的一次跃迁 —— 侧栏变成了真正的树，围绕生产连接的安全网也成型了。
 
+- **无需桌面端即可完成加密升级** —— 发现旧的明文 `dbx.db` 时，dbxt 现在会在启动阶段直接跑内核自带的数据安全升级（自动备份 → 加密 → 校验），不再拒绝打开并把用户推回 DBX 桌面端。若库已加密但密钥不可达，仍会停下并给出可操作的提示。
+
 - **连接树** —— 侧栏现在是 `连接 → 库 → 表`，`h`/`l` 折叠、按会话记忆（含 `3j`/`3k` 计数前缀移动）。
 - **桌面端分组** —— DBX 桌面端的连接分组映射成树里的 `▾ 名称 [n]` 节点。
 - **状态点 + 手动断开** —— 每个连接根带 `●` 活跃 / `○` 已断开 / `◐` 连接中；`x` 红色确认后断开池（不动配置）。
@@ -266,19 +268,20 @@ cargo install --git https://github.com/vst93/dbxt
 
 ## 持久化与配置
 
-按表偏好（列宽压缩、隐藏列、排序）与记住的列宽（结果区 `<`/`>`）写入 `~/.config/dbxt/tui.json`，以 `库.表` 为键（列宽另带连接与列名，上限 200 条、LRU 淘汰）；上次退出时所在的连接 / 库 / 表写入 `~/.config/dbxt/last-session.json`（仅在确实连上连接后写），启动时读取以高亮该连接，`--last` 则自动恢复；`DBXT_CONFIG` 可覆盖两者所在目录，`DBXT_LAST_SESSION` 单独覆盖会话文件，`DBXT_NO_PERSIST=1` 可关闭。`DBXT_LANG=en|zh` 选择界面语言（未设置时由 locale 决定），`DBX_DATA_DIR` 指定其他 DBX 存储，`DBXT_INSTALL_DIR` 是安装脚本的目标目录。
+按表偏好（列宽压缩、隐藏列、排序）与记住的列宽（结果区 `<`/`>`）写入 `~/.config/dbxt/tui.json`，以 `库.表` 为键（列宽另带连接与列名，上限 200 条、LRU 淘汰）；上次退出时所在的连接 / 库 / 表写入 `~/.config/dbxt/last-session.json`（仅在确实连上连接后写），启动时读取以高亮该连接，`--last` 则自动恢复；`DBXT_CONFIG` 可覆盖两者所在目录，`DBXT_LAST_SESSION` 单独覆盖会话文件，`DBXT_NO_PERSIST=1` 可关闭。`DBXT_LANG=en|zh` 选择界面语言（未设置时由 locale 决定），`DBX_DATA_DIR` 指定其他 DBX 存储，`DBXT_ASSUME_YES=1` 跳过首次加密升级的确认，`DBXT_INSTALL_DIR` 是安装脚本的目标目录。
 
 SSH 隧道的单测（序列化形状、表单映射、认证/错误分类、主机密钥提示）随 `cargo test` 运行。另有两个端到端测试会驱动真实隧道（dbxt → 本机 `sshd` → MySQL），默认跳过，需 `DBXT_SSH_TEST=1` 开启；它们读取 `DBXT_SSH_TEST_USER` / `_PASSWORD` / `_KEY`、`DBXT_SSH_TEST_MYSQL_PORT`（默认 13306）与 `DBXT_SSH_TEST_MYSQL_USER` / `_PASSWORD`。`tests/secret_store.rs` 也随 `cargo test` 运行：它临时生成一个 `DBX_SECRET_KEY_FILE`，写入加密连接再读回密码（密钥不提交）。
 
 ## DBX Secret Store 兼容
 
-dbxt 基于 **DBX v0.6.27** 构建。自 v0.6.27 起，内核会对连接 / 插件 / AI / 隧道等敏感字段强制加密落库（`dbxenc1` envelope，AES-256-GCM），密钥存放在**数据库之外**。dbxt 不做任何密钥管理 —— 密钥解析完全透传内核 —— 因此能打开哪类库取决于密钥提供者是否可达。
+dbxt 基于 **DBX v0.6.34** 构建。自 v0.6.27 起，内核会对连接 / 插件 / AI / 隧道等敏感字段强制加密落库（`dbxenc1` envelope，AES-256-GCM），密钥存放在**数据库之外**。dbxt 透传内核的密钥解析，并在启动时对旧的明文库执行内核自带的**数据安全升级** —— 因此只装了 dbxt（桌面端已卸载）的用户不会再被挡在外面。
 
 | 库状态 | dbxt 行为 |
 | --- | --- |
-| 明文（旧版，尚未迁移） | 拒绝打开，报 `DATA_MIGRATION_REQUIRED` 并提示：请先在 DBX 桌面端（或 Web）完成「**数据安全升级**向导」。dbxt 不迁移数据，也不绕过这道门。 |
+| 明文（旧版，尚未迁移） | 启动时先弹确认，确认后原地升级：内核先备份 `dbx.db`，再加密全部敏感字段并校验，最后把旧 JSON 文件改名归档。进度与备份路径打印到 stderr。升级后的库需要 **DBX v0.6.21 或更高版本**才能读取。 |
 | 密文，密钥可达 | 透明打开；密码与隧道凭据照常解密。 |
 | 密文，密钥不可达 | 拒绝打开，报 `SECRET_KEY_UNAVAILABLE` 并提示下方密钥来源。 |
+| 密文，但密钥无法解密 | 拒绝打开，报 `SECRET_KEY_MISMATCH` / `ENCRYPTED_DATA_KEY_MISSING`；请提供原密钥。 |
 
 **密钥来源**（内核解析顺序）：
 
@@ -287,9 +290,9 @@ dbxt 基于 **DBX v0.6.27** 构建。自 v0.6.27 起，内核会对连接 / 插�
 3. 系统钥匙串 —— macOS Keychain、Windows 凭据管理器、Linux Secret Service（由 `os-keyring` feature 编译进内核）。DBX 桌面端把密钥存在这里。
 4. `<data-dir>/.dbx/secret.key` —— 内核管理的用户级兜底密钥。
 
-CLI/MCP 进程只**读取**密钥：不创建、不迁移旧凭据。若没有桌面端，请导出密钥（`DBX_SECRET_KEY_FILE`）供 dbxt 解密。
+执行升级时，dbxt 按桌面向导完全相同的方式创建密钥（有钥匙串就用钥匙串，否则用用户级兜底文件），所以之后重新安装桌面端依然可用。它绝不覆盖已有密钥：若库里已有密文却找不到对应密钥，dbxt 会停下来要求提供原密钥（`DBX_SECRET_KEY_FILE` / `DBX_SECRET_KEY`），而不是新建一个。确认提示会写明升级后的版本门槛（DBX v0.6.21+，即引入 `dbxenc1` 存储的版本）；脚本化场景可用 `DBXT_ASSUME_YES=1` 跳过确认。
 
-版本对应：基于明文时代内核（v0.6.9 及更早）构建的 dbxt 无法读取桌面端已升级的库 —— 升级 dbxt 与桌面端同步。反之亦然：v0.6.27 内核不会静默读取明文库，请先完成向导。
+版本对应：基于加密前内核（v0.6.20 及更早）构建的 dbxt 无法读取已升级的库 —— 升级 dbxt 与桌面端同步。反之亦然：v0.6.21+ 内核不会静默读取明文库，请先让 dbxt（或桌面向导）完成升级。
 
 ## 状态与路线图
 

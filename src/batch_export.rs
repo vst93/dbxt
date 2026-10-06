@@ -241,6 +241,7 @@ pub(crate) fn write_batch_xlsx<W: Write + Seek>(
             column_types: types,
             rows,
             numeric_column_right_align: false,
+            auto_filter: None,
         });
     }
 

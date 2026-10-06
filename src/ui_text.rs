@@ -1139,9 +1139,21 @@ pub static ALL_KEYS: &[&str] = &[
     "隧道已建立但远端数据库不可达（{} → {}:{}）：请确认跳板机能访问该地址",
     "SSH 隧道连接失败（{}）：{}",
     // ── R44: DBX Secret Store (v0.6.27+) ──
-    "DBX 数据安全升级未完成：请先打开 DBX 桌面端并完成「数据安全升级向导」（dbxt 不会迁移数据）；无桌面环境可用 DBX_SECRET_KEY_FILE 提供密钥",
+    "DBX 数据安全升级未完成：重启 dbxt 会自动完成加密升级（无需桌面端）；若仍失败，请用 DBX_SECRET_KEY_FILE / DBX_SECRET_KEY 提供密钥",
     "读不到 DBX 数据加密密钥：桌面端把密钥存放在系统钥匙串，本进程无法访问；请改用带系统钥匙串支持的构建，或用 DBX_SECRET_KEY_FILE / DBX_SECRET_KEY 提供密钥",
     "DBX 数据加密密钥缺失或不匹配：请提供创建该库时所用的密钥（DBX_SECRET_KEY_FILE / DBX_SECRET_KEY），或重新运行桌面端升级向导",
+    // ── R116: first-run encryption upgrade (no desktop app needed) ──
+    "检测到 DBX 数据尚未加密：{} 项明文凭据、{} 个旧版明文文件。",
+    "升级会先自动备份 dbx.db，再加密全部敏感字段并校验。",
+    "升级后该库需要 DBX {} 或更高版本（桌面端 / CLI / dbxt）才能读取。",
+    "是否现在升级？[Y/n] ",
+    "正在升级为加密存储…",
+    "已取消 DBX 数据加密升级：库仍为明文，dbxt 无法打开。请重新运行并确认；若在脚本 / 无终端环境，请设置 DBXT_ASSUME_YES=1 后重试。",
+    "DBX 数据加密升级失败：{}（原始数据已保留，可修正后重试）",
+    "升级完成：已加密 {} 项密钥；备份位于 {}",
+    "升级完成：已加密 {} 项密钥",
+    "DBX 数据需要加密升级，但读不到正确的数据加密密钥（{}）：请用 DBX_SECRET_KEY_FILE / DBX_SECRET_KEY 提供创建该库时所用的密钥。",
+    "DBX 数据需要加密升级，但当前进程既无法访问系统钥匙串，也无法创建本地密钥：请使用带系统钥匙串支持的构建，或用 DBX_SECRET_KEY_FILE / DBX_SECRET_KEY 提供密钥。",
     "⚠ SSH 主机密钥已变化（{}:{}），可能被中间人攻击",
     "SSH 主机密钥被拒绝（{}:{}）",
     "SSH 主机密钥已接受但无法保存（{}:{}）：仅本次会话信任",
@@ -3487,9 +3499,9 @@ fn en_of(zh: &'static str) -> Option<&'static str> {
         }
         "SSH 隧道连接失败（{}）：{}" => Some("SSH tunnel connection failed ({}): {}"),
         // ── R44: DBX Secret Store (v0.6.27+) ──
-        "DBX 数据安全升级未完成：请先打开 DBX 桌面端并完成「数据安全升级向导」（dbxt 不会迁移数据）；无桌面环境可用 DBX_SECRET_KEY_FILE 提供密钥" => {
+        "DBX 数据安全升级未完成：重启 dbxt 会自动完成加密升级（无需桌面端）；若仍失败，请用 DBX_SECRET_KEY_FILE / DBX_SECRET_KEY 提供密钥" => {
             Some(
-                "DBX data security upgrade not finished: open DBX Desktop and complete the Data Security Upgrade wizard first (dbxt never migrates data); on a headless host supply a key via DBX_SECRET_KEY_FILE",
+                "DBX data security upgrade not finished: restart dbxt to complete the encryption upgrade automatically (no desktop app needed); if it still fails, supply a key via DBX_SECRET_KEY_FILE / DBX_SECRET_KEY",
             )
         }
         "读不到 DBX 数据加密密钥：桌面端把密钥存放在系统钥匙串，本进程无法访问；请改用带系统钥匙串支持的构建，或用 DBX_SECRET_KEY_FILE / DBX_SECRET_KEY 提供密钥" => {
@@ -3500,6 +3512,38 @@ fn en_of(zh: &'static str) -> Option<&'static str> {
         "DBX 数据加密密钥缺失或不匹配：请提供创建该库时所用的密钥（DBX_SECRET_KEY_FILE / DBX_SECRET_KEY），或重新运行桌面端升级向导" => {
             Some(
                 "The DBX data encryption key is missing or does not match: supply the key that created this store (DBX_SECRET_KEY_FILE / DBX_SECRET_KEY), or re-run the Desktop upgrade wizard",
+            )
+        }
+        // ── R116: first-run encryption upgrade (no desktop app needed) ──
+        "检测到 DBX 数据尚未加密：{} 项明文凭据、{} 个旧版明文文件。" => {
+            Some("The DBX data is not encrypted yet: {} plaintext credential(s) and {} legacy plaintext file(s).")
+        }
+        "升级会先自动备份 dbx.db，再加密全部敏感字段并校验。" => {
+            Some("The upgrade backs up dbx.db first, then encrypts and verifies every secret.")
+        }
+        "升级后该库需要 DBX {} 或更高版本（桌面端 / CLI / dbxt）才能读取。" => {
+            Some("After the upgrade this store requires DBX {} or later (Desktop / CLI / dbxt) to be read.")
+        }
+        "是否现在升级？[Y/n] " => Some("Upgrade now? [Y/n] "),
+        "正在升级为加密存储…" => Some("Upgrading to encrypted storage…"),
+        "已取消 DBX 数据加密升级：库仍为明文，dbxt 无法打开。请重新运行并确认；若在脚本 / 无终端环境，请设置 DBXT_ASSUME_YES=1 后重试。" => {
+            Some(
+                "DBX encryption upgrade cancelled: the store is still plaintext and dbxt cannot open it. Run again and confirm; in a script or non-interactive environment, set DBXT_ASSUME_YES=1 and retry.",
+            )
+        }
+        "DBX 数据加密升级失败：{}（原始数据已保留，可修正后重试）" => {
+            Some("DBX encryption upgrade failed: {} (your original data was preserved; fix the cause and retry)")
+        }
+        "升级完成：已加密 {} 项密钥；备份位于 {}" => Some("Upgrade complete: encrypted {} secret(s); backup at {}"),
+        "升级完成：已加密 {} 项密钥" => Some("Upgrade complete: encrypted {} secret(s)"),
+        "DBX 数据需要加密升级，但读不到正确的数据加密密钥（{}）：请用 DBX_SECRET_KEY_FILE / DBX_SECRET_KEY 提供创建该库时所用的密钥。" => {
+            Some(
+                "The DBX data needs an encryption upgrade, but the correct data encryption key cannot be read ({}): supply the key the database was created with via DBX_SECRET_KEY_FILE / DBX_SECRET_KEY.",
+            )
+        }
+        "DBX 数据需要加密升级，但当前进程既无法访问系统钥匙串，也无法创建本地密钥：请使用带系统钥匙串支持的构建，或用 DBX_SECRET_KEY_FILE / DBX_SECRET_KEY 提供密钥。" => {
+            Some(
+                "The DBX data needs an encryption upgrade, but this process can neither reach the OS keychain nor create a local key: use a build with OS keychain support, or supply a key via DBX_SECRET_KEY_FILE / DBX_SECRET_KEY.",
             )
         }
         "⚠ SSH 主机密钥已变化（{}:{}），可能被中间人攻击" => {

@@ -1,0 +1,11 @@
+# R116: keep test worker threads on the same footing as the production runtime.
+#
+# `main()` builds its tokio runtime with a 16 MiB worker stack on purpose: the
+# driver/`sqlparser` call chain is deeply recursive and a debug build can
+# exhaust tokio's 2 MiB default while running a single operation, aborting the
+# process. `#[tokio::test(flavor = "multi_thread")]` cannot set a stack size, so
+# op-driven tests inherited the 2 MiB default and started aborting once the
+# v0.6.34 kernel widened the async frames. `RUST_MIN_STACK` raises the std
+# default that tokio uses when it has no explicit size of its own.
+[env]
+RUST_MIN_STACK = "16777216"

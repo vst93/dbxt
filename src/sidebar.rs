@@ -544,14 +544,13 @@ pub(crate) fn ssh_connect_error_message(cfg: &ConnectionConfig, error: &str) -> 
 /// Translate the DBX kernel's secret-store failure codes (v0.6.27+) into an
 /// actionable hint. From v0.6.27 the kernel encrypts connection / plugin / AI /
 /// tunnel secrets with a key that lives *outside* the database (OS keychain, or
-/// `DBX_SECRET_KEY_FILE` / `DBX_SECRET_KEY`); a headless CLI can only read it
-/// when that provider is reachable, and it never provisions a key itself. dbxt
-/// passes the key resolution straight through to the kernel — this only turns
-/// the raw code into something a TUI user can act on.
+/// `DBX_SECRET_KEY_FILE` / `DBX_SECRET_KEY`). dbxt runs the kernel's own data
+/// security upgrade at startup when it finds legacy plaintext (`ensure_encrypted_store`),
+/// so these hints only cover what remains: a key that cannot be read or created.
 pub(crate) fn secret_store_error_hint(error: &str) -> Option<&'static str> {
     if error.contains("DATA_MIGRATION_REQUIRED") {
         return Some(t(
-            "DBX 数据安全升级未完成：请先打开 DBX 桌面端并完成「数据安全升级向导」（dbxt 不会迁移数据）；无桌面环境可用 DBX_SECRET_KEY_FILE 提供密钥",
+            "DBX 数据安全升级未完成：重启 dbxt 会自动完成加密升级（无需桌面端）；若仍失败，请用 DBX_SECRET_KEY_FILE / DBX_SECRET_KEY 提供密钥",
         ));
     }
     if error.contains("SECRET_KEY_UNAVAILABLE") || error.contains("KEY_PROVIDER_UNAVAILABLE") {

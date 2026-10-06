@@ -789,6 +789,7 @@ pub(crate) fn build_ssh_layer(f: &ConnForm) -> Result<Option<SshTunnelConfig>, S
         ssh_agent_sock_path: agent_sock,
         auth_method: f.ssh_auth.as_str().to_string(),
         allow_exec_channel_proxy: false,
+        proxy_command: String::new(),
         profile_id: String::new(),
     }))
 }
