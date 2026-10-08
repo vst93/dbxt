@@ -19,7 +19,11 @@ fn temp_data_dir(tag: &str) -> std::path::PathBuf {
     let dir = std::env::temp_dir().join(format!("dbxt-mcp-{tag}-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).unwrap();
-    std::fs::write(dir.join("secret.key"), format!("{}{}", "a".repeat(32), "b".repeat(32))).unwrap();
+    std::fs::write(
+        dir.join("secret.key"),
+        format!("{}{}", "a".repeat(32), "b".repeat(32)),
+    )
+    .unwrap();
     dir
 }
 
@@ -61,7 +65,9 @@ fn response_with_id(rx: &Receiver<String>, id: i64, timeout: Duration) -> Value 
     let deadline = Instant::now() + timeout;
     loop {
         let remaining = deadline.saturating_duration_since(Instant::now());
-        let line = rx.recv_timeout(remaining).unwrap_or_else(|_| panic!("no response for id {id} within {timeout:?}"));
+        let line = rx
+            .recv_timeout(remaining)
+            .unwrap_or_else(|_| panic!("no response for id {id} within {timeout:?}"));
         if let Ok(value) = serde_json::from_str::<Value>(&line) {
             if value.get("id").and_then(Value::as_i64) == Some(id) {
                 return value;
@@ -95,11 +101,24 @@ fn stdio_lists_the_same_dbx_tools_as_the_official_server() {
     .unwrap();
     let init = response_with_id(&rx, 1, Duration::from_secs(30));
     assert!(init.get("result").is_some(), "initialize failed: {init}");
-    assert!(init["result"]["serverInfo"]["name"].as_str().is_some(), "no serverInfo: {init}");
+    assert!(
+        init["result"]["serverInfo"]["name"].as_str().is_some(),
+        "no serverInfo: {init}"
+    );
 
     // 2. initialized notification, then tools/list
-    writeln!(stdin, "{}", json!({ "jsonrpc": "2.0", "method": "notifications/initialized" })).unwrap();
-    writeln!(stdin, "{}", json!({ "jsonrpc": "2.0", "id": 2, "method": "tools/list" })).unwrap();
+    writeln!(
+        stdin,
+        "{}",
+        json!({ "jsonrpc": "2.0", "method": "notifications/initialized" })
+    )
+    .unwrap();
+    writeln!(
+        stdin,
+        "{}",
+        json!({ "jsonrpc": "2.0", "id": 2, "method": "tools/list" })
+    )
+    .unwrap();
     let listed = response_with_id(&rx, 2, Duration::from_secs(30));
 
     let tools: Vec<&str> = listed["result"]["tools"]
@@ -108,8 +127,17 @@ fn stdio_lists_the_same_dbx_tools_as_the_official_server() {
         .iter()
         .filter_map(|tool| tool["name"].as_str())
         .collect();
-    assert!(tools.len() >= 20, "expected the DBX tool catalog, got {}: {tools:?}", tools.len());
-    for expected in ["dbx_list_connections", "dbx_list_tables", "dbx_describe_table", "dbx_execute_query"] {
+    assert!(
+        tools.len() >= 20,
+        "expected the DBX tool catalog, got {}: {tools:?}",
+        tools.len()
+    );
+    for expected in [
+        "dbx_list_connections",
+        "dbx_list_tables",
+        "dbx_describe_table",
+        "dbx_execute_query",
+    ] {
         assert!(tools.contains(&expected), "missing {expected} in {tools:?}");
     }
 
@@ -126,8 +154,14 @@ fn mcp_help_is_answered_without_a_terminal() {
         .expect("run `dbxt mcp --help`");
     assert!(output.status.success());
     let text = String::from_utf8_lossy(&output.stdout);
-    assert!(text.contains("dbxt mcp"), "help does not describe the subcommand: {text}");
-    assert!(text.contains("DBX_MCP_HTTP_TOKEN"), "help does not name the HTTP token: {text}");
+    assert!(
+        text.contains("dbxt mcp"),
+        "help does not describe the subcommand: {text}"
+    );
+    assert!(
+        text.contains("DBX_MCP_HTTP_TOKEN"),
+        "help does not name the HTTP token: {text}"
+    );
 }
 
 #[test]
@@ -140,8 +174,14 @@ fn http_refuses_a_non_loopback_bind() {
         .env("DBX_MCP_HTTP_TOKEN", "test-token")
         .output()
         .expect("run `dbxt mcp --http --host 0.0.0.0`");
-    assert!(!output.status.success(), "non-loopback bind must be refused");
+    assert!(
+        !output.status.success(),
+        "non-loopback bind must be refused"
+    );
     let text = String::from_utf8_lossy(&output.stderr);
-    assert!(text.contains("回环") || text.to_ascii_lowercase().contains("loopback"), "unexpected error: {text}");
+    assert!(
+        text.contains("回环") || text.to_ascii_lowercase().contains("loopback"),
+        "unexpected error: {text}"
+    );
     let _ = std::fs::remove_dir_all(&dir);
 }

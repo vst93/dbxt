@@ -47,9 +47,14 @@ pub(crate) struct HttpOptions {
 impl Default for HttpOptions {
     fn default() -> Self {
         Self {
-            host: std::env::var("DBX_MCP_HTTP_HOST").unwrap_or_else(|_| DEFAULT_HTTP_HOST.to_string()),
-            port: std::env::var("DBX_MCP_HTTP_PORT").ok().and_then(|v| v.parse().ok()).unwrap_or(DEFAULT_HTTP_PORT),
-            path: std::env::var("DBX_MCP_HTTP_PATH").unwrap_or_else(|_| DEFAULT_HTTP_PATH.to_string()),
+            host: std::env::var("DBX_MCP_HTTP_HOST")
+                .unwrap_or_else(|_| DEFAULT_HTTP_HOST.to_string()),
+            port: std::env::var("DBX_MCP_HTTP_PORT")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(DEFAULT_HTTP_PORT),
+            path: std::env::var("DBX_MCP_HTTP_PATH")
+                .unwrap_or_else(|_| DEFAULT_HTTP_PATH.to_string()),
         }
     }
 }
@@ -62,7 +67,11 @@ pub(crate) fn parse_mcp_args(args: &[String]) -> std::result::Result<McpOptions,
         transport_env.trim().to_ascii_lowercase().as_str(),
         "http" | "streamable-http" | "streamable_http"
     );
-    let mut opts = McpOptions { store: None, http: env_http.then(HttpOptions::default), help: false };
+    let mut opts = McpOptions {
+        store: None,
+        http: env_http.then(HttpOptions::default),
+        help: false,
+    };
 
     let mut i = 0;
     while i < args.len() {
@@ -102,9 +111,16 @@ pub(crate) fn parse_mcp_args(args: &[String]) -> std::result::Result<McpOptions,
 }
 
 /// Consume the value following a flag.
-fn next_value(args: &[String], index: &mut usize, flag: &str) -> std::result::Result<String, String> {
+fn next_value(
+    args: &[String],
+    index: &mut usize,
+    flag: &str,
+) -> std::result::Result<String, String> {
     *index += 1;
-    args.get(*index).filter(|v| !v.starts_with("--")).cloned().ok_or_else(|| tf("{} 需要值", &[&flag]))
+    args.get(*index)
+        .filter(|v| !v.starts_with("--"))
+        .cloned()
+        .ok_or_else(|| tf("{} 需要值", &[&flag]))
 }
 
 /// The HTTP options, materialised on first use so `--host` works without `--http`.
@@ -187,7 +203,10 @@ async fn serve_stdio(backend: Arc<dyn DbxBackend>) -> Result<()> {
 /// installs a Ctrl-C shutdown handler, so a plain `dbxt mcp --http` process
 /// stops cleanly on interrupt.
 async fn serve_http(backend: Arc<dyn DbxBackend>, opts: HttpOptions) -> Result<()> {
-    let ip: IpAddr = opts.host.parse().map_err(|_| anyhow::anyhow!(tf("无效的监听地址：{}", &[&opts.host])))?;
+    let ip: IpAddr = opts
+        .host
+        .parse()
+        .map_err(|_| anyhow::anyhow!(tf("无效的监听地址：{}", &[&opts.host])))?;
     if !ip.is_loopback() {
         return Err(anyhow::anyhow!(t(
             "dbxt 的 MCP HTTP 只监听本机回环地址；需要远程访问请改用 DBX 自带的 dbx-mcp --http",
@@ -198,35 +217,63 @@ async fn serve_http(backend: Arc<dyn DbxBackend>, opts: HttpOptions) -> Result<(
     // Loopback + browser origins from localhost; the bearer token is still
     // required for every request, exactly as `dbx-mcp --http` does.
     let auth = HttpAuth::new(token, Vec::<String>::new(), true).map_err(|e| anyhow::anyhow!(e))?;
-    let allowed_hosts = vec!["localhost".to_string(), "127.0.0.1".to_string(), "[::1]".to_string()];
-    let config = HttpRuntimeConfig::new(SocketAddr::new(ip, opts.port), opts.path, auth, allowed_hosts);
+    let allowed_hosts = vec![
+        "localhost".to_string(),
+        "127.0.0.1".to_string(),
+        "[::1]".to_string(),
+    ];
+    let config = HttpRuntimeConfig::new(
+        SocketAddr::new(ip, opts.port),
+        opts.path,
+        auth,
+        allowed_hosts,
+    );
     // `serve_streamable_http` is not re-exported from the crate root, but the
     // `http` module is public, and this is DBX's own listener + Ctrl-C shutdown.
-    dbx_mcp::http::serve_streamable_http(backend, config).await.map_err(|e| anyhow::anyhow!("{e}"))?;
+    dbx_mcp::http::serve_streamable_http(backend, config)
+        .await
+        .map_err(|e| anyhow::anyhow!("{e}"))?;
     Ok(())
 }
 
 /// Same shape `dbx-mcp` accepts: `DBX_MCP_HTTP_TOKEN` or `DBX_MCP_HTTP_TOKEN_FILE`.
 fn http_token() -> std::result::Result<String, String> {
-    let inline = std::env::var("DBX_MCP_HTTP_TOKEN").ok().filter(|v| !v.trim().is_empty());
-    let file = std::env::var("DBX_MCP_HTTP_TOKEN_FILE").ok().filter(|v| !v.trim().is_empty());
+    let inline = std::env::var("DBX_MCP_HTTP_TOKEN")
+        .ok()
+        .filter(|v| !v.trim().is_empty());
+    let file = std::env::var("DBX_MCP_HTTP_TOKEN_FILE")
+        .ok()
+        .filter(|v| !v.trim().is_empty());
     match (inline, file) {
-        (Some(_), Some(_)) => Err(t("只能设置 DBX_MCP_HTTP_TOKEN 或 DBX_MCP_HTTP_TOKEN_FILE 之一").to_string()),
+        (Some(_), Some(_)) => {
+            Err(t("只能设置 DBX_MCP_HTTP_TOKEN 或 DBX_MCP_HTTP_TOKEN_FILE 之一").to_string())
+        }
         (Some(token), None) => Ok(token),
         (None, Some(path)) => std::fs::read_to_string(&path)
             .map_err(|e| tf("读取 DBX_MCP_HTTP_TOKEN_FILE 失败：{}", &[&e]))
             .and_then(|token| {
                 let token = token.trim_end_matches(['\r', '\n']).to_string();
-                (!token.is_empty()).then_some(token).ok_or_else(|| t("DBX_MCP_HTTP_TOKEN_FILE 为空").to_string())
+                (!token.is_empty())
+                    .then_some(token)
+                    .ok_or_else(|| t("DBX_MCP_HTTP_TOKEN_FILE 为空").to_string())
             }),
-        (None, None) => Err(t("Streamable HTTP 需要 DBX_MCP_HTTP_TOKEN 或 DBX_MCP_HTTP_TOKEN_FILE").to_string()),
+        (None, None) => {
+            Err(t("Streamable HTTP 需要 DBX_MCP_HTTP_TOKEN 或 DBX_MCP_HTTP_TOKEN_FILE").to_string())
+        }
     }
 }
 
 /// Mirror `dbx-mcp`'s path rule: absolute, no trailing slash, no query/fragment.
 fn validate_http_path(path: &str) -> Result<()> {
-    if path == "/" || !path.starts_with('/') || path.ends_with('/') || path.contains('?') || path.contains('#') {
-        return Err(anyhow::anyhow!(t("HTTP 路径必须是 / 开头的绝对路径，且不能以 / 结尾（例如 /mcp）")));
+    if path == "/"
+        || !path.starts_with('/')
+        || path.ends_with('/')
+        || path.contains('?')
+        || path.contains('#')
+    {
+        return Err(anyhow::anyhow!(t(
+            "HTTP 路径必须是 / 开头的绝对路径，且不能以 / 结尾（例如 /mcp）"
+        )));
     }
     Ok(())
 }
@@ -287,7 +334,16 @@ mod tests {
     fn http_flag_and_overrides() {
         let _guard = lock();
         std::env::remove_var("DBX_MCP_TRANSPORT");
-        let opts = parse_mcp_args(&args(&["--http", "--host", "127.0.0.1", "--port", "5300", "--path", "/dbx"])).unwrap();
+        let opts = parse_mcp_args(&args(&[
+            "--http",
+            "--host",
+            "127.0.0.1",
+            "--port",
+            "5300",
+            "--path",
+            "/dbx",
+        ]))
+        .unwrap();
         let http = opts.http.expect("http mode");
         assert_eq!(http.host, "127.0.0.1");
         assert_eq!(http.port, 5300);
@@ -298,8 +354,17 @@ mod tests {
     fn store_can_be_a_flag_or_a_bare_word() {
         let _guard = lock();
         std::env::remove_var("DBX_MCP_TRANSPORT");
-        assert_eq!(parse_mcp_args(&args(&["--store", "/tmp/a"])).unwrap().store.as_deref(), Some("/tmp/a"));
-        assert_eq!(parse_mcp_args(&args(&["/tmp/b"])).unwrap().store.as_deref(), Some("/tmp/b"));
+        assert_eq!(
+            parse_mcp_args(&args(&["--store", "/tmp/a"]))
+                .unwrap()
+                .store
+                .as_deref(),
+            Some("/tmp/a")
+        );
+        assert_eq!(
+            parse_mcp_args(&args(&["/tmp/b"])).unwrap().store.as_deref(),
+            Some("/tmp/b")
+        );
     }
 
     #[test]

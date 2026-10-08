@@ -1983,7 +1983,12 @@ pub(crate) fn result_diff_visible_indices(state: &ResultDiffState) -> Vec<usize>
 pub(crate) fn result_diff_summary(state: &ResultDiffState) -> String {
     let mut s = tf(
         "+{} -{} ~{} · 快照 {}",
-        &[&state.added, &state.removed, &state.changed, &state.taken_at],
+        &[
+            &state.added,
+            &state.removed,
+            &state.changed,
+            &state.taken_at,
+        ],
     );
     if !state.extra_cols.is_empty() || !state.missing_cols.is_empty() {
         s.push_str(&tf(
@@ -2029,10 +2034,7 @@ pub(crate) fn save_result_snapshot(app: &mut App) {
         },
     );
     app.result_diff = None;
-    app.status = tf(
-        "快照已存 {} · {} 行 · Ctrl-Shift-D 对比",
-        &[&taken_at, &n],
-    );
+    app.status = tf("快照已存 {} · {} 行 · Ctrl-Shift-D 对比", &[&taken_at, &n]);
 }
 
 /// `Ctrl-Shift-D` with a snapshot: diff the current result against it. Pure
@@ -2065,8 +2067,7 @@ pub(crate) fn snapshot_or_diff(app: &mut App) {
         app.status = t("快照对比仅支持 SQL 结果").into();
         return;
     }
-    let has = current_conn_id(app)
-        .is_some_and(|c| app.result_snapshot.contains_key(&c));
+    let has = current_conn_id(app).is_some_and(|c| app.result_snapshot.contains_key(&c));
     if has {
         open_result_diff(app);
     } else {
@@ -2167,8 +2168,7 @@ pub(crate) fn result_diff_key(app: &mut App, k: KeyEvent) {
             if let Some(s) = app.result_diff.as_mut() {
                 s.show_all = !s.show_all;
                 let n = result_diff_visible_indices(s).len();
-                s.table
-                    .select(if n == 0 { None } else { Some(0) });
+                s.table.select(if n == 0 { None } else { Some(0) });
             }
         }
         KeyCode::Up | KeyCode::Char('k') | KeyCode::Char('p') => step(app, -1),

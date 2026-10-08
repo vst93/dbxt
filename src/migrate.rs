@@ -105,7 +105,10 @@ pub(crate) async fn ensure_encrypted_store(db_path: &Path) -> Result<bool, Strin
         ),
         None => eprintln!(
             "{}",
-            tf("升级完成：已加密 {} 项密钥", &[&report.verified_secret_count])
+            tf(
+                "升级完成：已加密 {} 项密钥",
+                &[&report.verified_secret_count]
+            )
         ),
     }
     Ok(true)
@@ -114,7 +117,10 @@ pub(crate) async fn ensure_encrypted_store(db_path: &Path) -> Result<bool, Strin
 /// Open the store with the given key policy, allowing the kernel to provision a
 /// key for plaintext-only data.
 async fn open_storage(db_path: &Path, policy: SecretKeyPolicy) -> Result<Storage, String> {
-    Ok(Storage::open_unmigrated(db_path).await?.with_secret_key_policy(policy).with_secret_key_creation(true))
+    Ok(Storage::open_unmigrated(db_path)
+        .await?
+        .with_secret_key_policy(policy)
+        .with_secret_key_creation(true))
 }
 
 /// True when the platform credential store itself failed (locked collection,
@@ -138,7 +144,9 @@ fn managed_key_display(db_path: &Path) -> String {
 /// `LocalBackend`'s read-only preflight — then agrees on the same key, which is
 /// what keeps a fallback-encrypted store readable across restarts.
 fn adopt_managed_key_if_present(db_path: &Path) {
-    if std::env::var_os("DBX_SECRET_KEY_FILE").is_some() || std::env::var_os("DBX_SECRET_KEY").is_some() {
+    if std::env::var_os("DBX_SECRET_KEY_FILE").is_some()
+        || std::env::var_os("DBX_SECRET_KEY").is_some()
+    {
         return;
     }
     let Some(data_dir) = db_path.parent() else {
@@ -155,7 +163,11 @@ fn adopt_managed_key_if_present(db_path: &Path) {
 /// unless `DBXT_ASSUME_YES` opts in, so a piped run never rewrites the store by
 /// surprise.
 fn confirm_migration(preflight: &MigrationPreflight) -> bool {
-    let legacy_files = preflight.legacy_json_files.iter().filter(|file| file.exists).count();
+    let legacy_files = preflight
+        .legacy_json_files
+        .iter()
+        .filter(|file| file.exists)
+        .count();
     eprintln!(
         "{}",
         tf(
@@ -163,7 +175,10 @@ fn confirm_migration(preflight: &MigrationPreflight) -> bool {
             &[&preflight.database_plaintext_count, &legacy_files],
         )
     );
-    eprintln!("{}", t("升级会先自动备份 dbx.db，再加密全部敏感字段并校验。"));
+    eprintln!(
+        "{}",
+        t("升级会先自动备份 dbx.db，再加密全部敏感字段并校验。")
+    );
     eprintln!(
         "{}",
         tf(
@@ -197,7 +212,12 @@ fn confirm_migration(preflight: &MigrationPreflight) -> bool {
 /// for provisioning scripts; the upgrade still takes its own backup first.
 fn assume_yes() -> bool {
     std::env::var("DBXT_ASSUME_YES")
-        .map(|value| matches!(value.trim().to_ascii_lowercase().as_str(), "1" | "true" | "yes"))
+        .map(|value| {
+            matches!(
+                value.trim().to_ascii_lowercase().as_str(),
+                "1" | "true" | "yes"
+            )
+        })
         .unwrap_or(false)
 }
 
@@ -247,7 +267,11 @@ mod tests {
     /// A 64-hex-character (32-byte) key, the shape `DBX_SECRET_KEY_FILE`
     /// accepts. Generated per test run; nothing secret is committed.
     fn fresh_key_material() -> String {
-        format!("{}{}", uuid::Uuid::new_v4().simple(), uuid::Uuid::new_v4().simple())
+        format!(
+            "{}{}",
+            uuid::Uuid::new_v4().simple(),
+            uuid::Uuid::new_v4().simple()
+        )
     }
 
     fn contains(haystack: &[u8], needle: &[u8]) -> bool {
@@ -256,7 +280,9 @@ mod tests {
 
     #[test]
     fn platform_key_errors_are_recognised() {
-        assert!(is_platform_key_error("KEYRING_WRITE_FAILED: zbus error: IsLocked"));
+        assert!(is_platform_key_error(
+            "KEYRING_WRITE_FAILED: zbus error: IsLocked"
+        ));
         assert!(is_platform_key_error("KEYRING_ACCESS_FAILED: denied"));
         assert!(!is_platform_key_error("SECRET_KEY_MISMATCH"));
         assert!(!is_platform_key_error("BACKUP_FAILED"));
@@ -281,12 +307,18 @@ mod tests {
         std::fs::create_dir_all(managed.parent().unwrap()).unwrap();
         std::fs::write(&managed, fresh_key_material()).unwrap();
         adopt_managed_key_if_present(&db_path);
-        assert_eq!(std::env::var_os("DBX_SECRET_KEY_FILE").as_deref(), Some(managed.as_os_str()));
+        assert_eq!(
+            std::env::var_os("DBX_SECRET_KEY_FILE").as_deref(),
+            Some(managed.as_os_str())
+        );
 
         // An explicit user key is never overwritten.
         std::env::set_var("DBX_SECRET_KEY_FILE", "/tmp/user-key");
         adopt_managed_key_if_present(&db_path);
-        assert_eq!(std::env::var("DBX_SECRET_KEY_FILE").unwrap(), "/tmp/user-key");
+        assert_eq!(
+            std::env::var("DBX_SECRET_KEY_FILE").unwrap(),
+            "/tmp/user-key"
+        );
 
         std::env::remove_var("DBX_SECRET_KEY_FILE");
         let _ = std::fs::remove_dir_all(&dir);
@@ -312,7 +344,10 @@ mod tests {
         // A fresh, empty profile has nothing to upgrade.
         let fresh = dir.join("fresh").join("dbx.db");
         std::fs::create_dir_all(fresh.parent().unwrap()).unwrap();
-        assert!(!ensure_encrypted_store(&fresh).await.unwrap(), "an empty profile has nothing to migrate");
+        assert!(
+            !ensure_encrypted_store(&fresh).await.unwrap(),
+            "an empty profile has nothing to migrate"
+        );
 
         // A legacy profile: `connections.json` still carries the plaintext
         // password, and no encrypted rows exist yet.
@@ -330,7 +365,11 @@ mod tests {
             None,
         )
         .unwrap();
-        std::fs::write(dir.join("connections.json"), serde_json::to_string(&vec![cfg]).unwrap()).unwrap();
+        std::fs::write(
+            dir.join("connections.json"),
+            serde_json::to_string(&vec![cfg]).unwrap(),
+        )
+        .unwrap();
 
         let db_path = dir.join("dbx.db");
         assert!(
@@ -339,7 +378,10 @@ mod tests {
         );
 
         // The upgrade left a backup and the legacy file renamed aside.
-        assert!(dir.join("connections.json.bak").exists(), "legacy file not finalized");
+        assert!(
+            dir.join("connections.json.bak").exists(),
+            "legacy file not finalized"
+        );
 
         // The password is now stored as an envelope, never as plaintext.
         let mut raw = std::fs::read(&db_path).unwrap();
@@ -350,17 +392,28 @@ mod tests {
             !contains(&raw, password.as_bytes()),
             "the plaintext password survived the upgrade"
         );
-        assert!(contains(&raw, b"dbxenc1"), "no dbxenc1 envelope was written");
+        assert!(
+            contains(&raw, b"dbxenc1"),
+            "no dbxenc1 envelope was written"
+        );
 
         // The migrated store opens through the normal dbxt path and the secret
         // round-trips.
-        let backend = LocalBackend::open(&db_path).await.expect("open after upgrade");
+        let backend = LocalBackend::open(&db_path)
+            .await
+            .expect("open after upgrade");
         let connections = backend.load_connections().await.unwrap();
-        let got = connections.iter().find(|c| c.id == "legacy-1").expect("connection listed");
+        let got = connections
+            .iter()
+            .find(|c| c.id == "legacy-1")
+            .expect("connection listed");
         assert_eq!(got.password, password, "the password did not round-trip");
 
         // A second startup is a no-op.
-        assert!(!ensure_encrypted_store(&db_path).await.unwrap(), "second run must not re-migrate");
+        assert!(
+            !ensure_encrypted_store(&db_path).await.unwrap(),
+            "second run must not re-migrate"
+        );
 
         std::env::remove_var("DBX_SECRET_KEY_FILE");
         std::env::remove_var("DBXT_ASSUME_YES");

@@ -826,7 +826,10 @@ pub(crate) fn render_cols_popup(f: &mut Frame, area: Rect, app: &mut App) {
             t(" n 编辑列注释 · y 复制表结构 Markdown · D 完整DDL · Esc 关 ").to_string()
         } else {
             match column_comment_hint(app) {
-                Some(note) => tf(" y 复制表结构 Markdown · D 完整DDL · {} · Esc 关 ", &[&note]),
+                Some(note) => tf(
+                    " y 复制表结构 Markdown · D 完整DDL · {} · Esc 关 ",
+                    &[&note],
+                ),
                 None => t(" y 复制表结构 Markdown · D 完整DDL · Esc 关 ").to_string(),
             }
         };
@@ -888,9 +891,7 @@ pub(crate) fn render_ddl_popup(f: &mut Frame, area: Rect, app: &mut App) {
         height: action_h,
         ..inner
     };
-    let max_scroll = total
-        .saturating_sub(body_h as usize)
-        .min(u16::MAX as usize) as u16;
+    let max_scroll = total.saturating_sub(body_h as usize).min(u16::MAX as usize) as u16;
     let scroll = app
         .ddl_popup
         .as_ref()
@@ -3294,10 +3295,7 @@ pub(crate) fn render_result_diff(f: &mut Frame, area: Rect, app: &mut App) {
         rows.push(r);
     }
 
-    let mut widths: Vec<Constraint> = vec![
-        Constraint::Length(2),
-        Constraint::Length(key_w as u16),
-    ];
+    let mut widths: Vec<Constraint> = vec![Constraint::Length(2), Constraint::Length(key_w as u16)];
     widths.extend(col_w.iter().map(|w| Constraint::Length(*w as u16)));
     let table = Table::new(rows, widths)
         .header(Row::new(header))

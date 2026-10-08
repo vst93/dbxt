@@ -1,6 +1,6 @@
 [package]
 name = "dbxt"
-version = "0.0.4"
+version = "0.0.5"
 edition = "2021"
 description = "Terminal UI client for DBX — reuse dbx connections and drivers in any terminal"
 license = "Apache-2.0"

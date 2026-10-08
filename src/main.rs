@@ -3237,9 +3237,7 @@ async fn run_op(backend: &LocalBackend, op: Op, tx: &Tx) -> OpResult {
                     base,
                 };
                 let outcome = run_batch_export(&job)?;
-                let bytes = std::fs::metadata(&write_path)
-                    .map(|m| m.len())
-                    .unwrap_or(0);
+                let bytes = std::fs::metadata(&write_path).map(|m| m.len()).unwrap_or(0);
                 Ok::<(BatchExportOutcome, u64, u128), String>((
                     outcome,
                     bytes,
@@ -7451,10 +7449,7 @@ fn apply_op_result(app: &mut App, res: OpResult, tx: &Tx) {
                         &[&label, &tabs, &rows, &human_size(bytes), &(path.display())],
                     );
                     if !truncated.is_empty() {
-                        line.push_str(&tf(
-                            " · {} 个 Tab 已截断至 100K 行",
-                            &[&truncated.len()],
-                        ));
+                        line.push_str(&tf(" · {} 个 Tab 已截断至 100K 行", &[&truncated.len()]));
                     }
                     if elapsed_ms >= 250 {
                         line.push_str(&tf(" · {}ms", &[&elapsed_ms]));

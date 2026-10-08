@@ -133,7 +133,11 @@ pub(crate) fn unique_sheet_name(base: &str, used: &mut Vec<String>) -> String {
     while used.iter().any(|u| u.eq_ignore_ascii_case(&candidate)) {
         let suffix = format!("_{n}");
         let max_base = 31usize.saturating_sub(suffix.chars().count());
-        candidate = format!("{}{}", base.chars().take(max_base).collect::<String>(), suffix);
+        candidate = format!(
+            "{}{}",
+            base.chars().take(max_base).collect::<String>(),
+            suffix
+        );
         n += 1;
     }
     used.push(candidate.clone());
@@ -183,7 +187,11 @@ pub(crate) fn unique_sql_file_name(base: &str, used: &mut Vec<String>) -> String
 /// The default destination filename `{db}-results-{HHMMSS}.{ext}`.
 pub(crate) fn batch_default_filename(db: &str, kind: BatchExportKind) -> String {
     let stem = sanitize_file_stem(db);
-    let stem = if stem == "result" { "db".to_string() } else { stem };
+    let stem = if stem == "result" {
+        "db".to_string()
+    } else {
+        stem
+    };
     let stamp = chrono::Local::now().format("%H%M%S");
     format!("{stem}-results-{stamp}.{}", kind.extension())
 }

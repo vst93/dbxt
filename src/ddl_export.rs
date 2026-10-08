@@ -80,7 +80,9 @@ pub(crate) fn ddl_from_rows(
     rows: &[Vec<serde_json::Value>],
 ) -> Result<String, String> {
     let idx = ddl_column_index(db_type);
-    let row = rows.first().ok_or_else(|| t("源语句没有返回 DDL").to_string())?;
+    let row = rows
+        .first()
+        .ok_or_else(|| t("源语句没有返回 DDL").to_string())?;
     let cell = row
         .get(idx)
         .ok_or_else(|| t("DDL 结果缺少目标列").to_string())?;
@@ -176,17 +178,10 @@ pub(crate) fn save_ddl_popup(app: &mut App) {
         return;
     };
     let filename = ddl_default_filename(&popup.table);
-    let path = std::env::current_dir()
-        .unwrap_or_default()
-        .join(&filename);
+    let path = std::env::current_dir().unwrap_or_default().join(&filename);
     let n = popup.text.chars().count();
     match std::fs::write(&path, popup.text.as_bytes()) {
-        Ok(()) => {
-            app.status = tf(
-                "✓ 完整 DDL 已写入 {}（{} 字符）",
-                &[&(path.display()), &n],
-            )
-        }
+        Ok(()) => app.status = tf("✓ 完整 DDL 已写入 {}（{} 字符）", &[&(path.display()), &n]),
         Err(e) => app.status = tf("✗ DDL 写入失败：{}", &[&e]),
     }
 }

@@ -2000,12 +2000,8 @@ pub(crate) fn export_key(app: &mut App, k: KeyEvent) {
         // R108: the "all tabs" section below the format list. `A` packages
         // every result tab as a worksheet, `S` as a ZIP of per-tab `.sql`
         // files. Both are scoped to this modal — no new global key.
-        KeyCode::Char('A') | KeyCode::Char('a') => {
-            begin_batch_export(app, BatchExportKind::Xlsx)
-        }
-        KeyCode::Char('S') | KeyCode::Char('s') => {
-            begin_batch_export(app, BatchExportKind::SqlZip)
-        }
+        KeyCode::Char('A') | KeyCode::Char('a') => begin_batch_export(app, BatchExportKind::Xlsx),
+        KeyCode::Char('S') | KeyCode::Char('s') => begin_batch_export(app, BatchExportKind::SqlZip),
         _ => {}
     }
 }
@@ -2266,7 +2262,12 @@ pub(crate) fn batch_export_path_key(app: &mut App, tx: &Tx, k: KeyEvent) {
     app.loading = true;
     app.status = tf(
         "导出中… {} · {} 个 Tab · {} 行 → {}",
-        &[&pending.kind.label(), &tab_count, &rows, &(expanded.display())],
+        &[
+            &pending.kind.label(),
+            &tab_count,
+            &rows,
+            &(expanded.display()),
+        ],
     );
     app.spawn(
         tx,

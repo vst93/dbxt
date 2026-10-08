@@ -12462,13 +12462,7 @@ fn snap_grid(cols: &[&str], rows: &[&[&str]]) -> Grid {
             .iter()
             .map(|r| {
                 r.iter()
-                    .map(|v| {
-                        if *v == "<null>" {
-                            Val::Null
-                        } else {
-                            tv(v)
-                        }
-                    })
+                    .map(|v| if *v == "<null>" { Val::Null } else { tv(v) })
                     .collect()
             })
             .collect(),
@@ -12488,10 +12482,7 @@ pub(crate) fn result_snapshot_saves_overwrites_and_isolates_per_connection() {
     let a = app.selected.as_ref().unwrap().id.clone();
     assert_eq!(app.result_snapshot.get(&a).unwrap().rows.len(), 1);
     // A second capture on the same connection overwrites the first.
-    app.set_grid(snap_grid(
-        &["id", "name"],
-        &[&["1", "a"], &["2", "b"]],
-    ));
+    app.set_grid(snap_grid(&["id", "name"], &[&["1", "a"], &["2", "b"]]));
     save_result_snapshot(&mut app);
     assert_eq!(app.result_snapshot.get(&a).unwrap().rows.len(), 2);
     // Another connection has no snapshot (isolation).
@@ -12628,9 +12619,10 @@ pub(crate) fn result_snapshot_key_is_two_state_and_renders() {
     assert!(app.result_diff.is_none(), "first press stores");
     assert_eq!(app.result_snapshot.len(), 1);
     // The footer advertises the compare key while a snapshot is live.
-    assert!(footer_hints(&app)
-        .iter()
-        .any(|(k, _)| *k == "Ctrl-⇧D"), "footer missing compare hint");
+    assert!(
+        footer_hints(&app).iter().any(|(k, _)| *k == "Ctrl-⇧D"),
+        "footer missing compare hint"
+    );
     // Re-run: one new row.
     app.set_grid(snap_grid(
         &["id", "name"],
@@ -12671,7 +12663,11 @@ pub(crate) fn result_snapshot_invalidation_chain() {
     assert!(app.result_snapshot.contains_key(&id));
     // "Clear screen": Esc collapses the results pane.
     app.focus = Focus::Preview;
-    preview_key(&mut app, &tx, KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+    preview_key(
+        &mut app,
+        &tx,
+        KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE),
+    );
     assert!(app.focus == Focus::Sidebar);
     assert!(!app.result_snapshot.contains_key(&id), "Esc should drop it");
     // Disconnect drops it too.
@@ -12698,7 +12694,10 @@ pub(crate) fn result_snapshot_refuses_oversized_results() {
         note: String::new(),
     });
     save_result_snapshot(&mut app);
-    assert!(app.result_snapshot.is_empty(), "oversized result must be refused");
+    assert!(
+        app.result_snapshot.is_empty(),
+        "oversized result must be refused"
+    );
     assert!(app.status.contains("10000"), "{}", app.status);
 }
 
@@ -12739,13 +12738,19 @@ pub(crate) fn result_diff_key_toggles_a_moves_and_closes() {
     };
     let cols = vec!["id".to_string()];
     let rows = vec![vec![tv("1")], vec![tv("2")]];
-    app.result_snapshot.insert(
-        app.selected.as_ref().unwrap().id.clone(),
-        snap.clone(),
-    );
-    app.result_diff = Some(Box::new(compute_result_diff(&snap, &cols, &rows, &["id".into()])));
+    app.result_snapshot
+        .insert(app.selected.as_ref().unwrap().id.clone(), snap.clone());
+    app.result_diff = Some(Box::new(compute_result_diff(
+        &snap,
+        &cols,
+        &rows,
+        &["id".into()],
+    )));
     // `a` reveals the unchanged rows.
-    result_diff_key(&mut app, KeyEvent::new(KeyCode::Char('a'), KeyModifiers::NONE));
+    result_diff_key(
+        &mut app,
+        KeyEvent::new(KeyCode::Char('a'), KeyModifiers::NONE),
+    );
     assert!(app.result_diff.as_ref().unwrap().show_all);
     result_diff_key(&mut app, KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
     assert_eq!(app.result_diff.as_ref().unwrap().table.selected(), Some(1));
@@ -13141,13 +13146,8 @@ pub(crate) fn r103_default_name_is_result_hhmmss() {
 #[test]
 pub(crate) fn r103_browse_equivalent_select_carries_filter_and_sort() {
     let cfg = test_conn("mysql");
-    let sql = browse_equivalent_select(
-        &cfg,
-        "",
-        "orders",
-        "amount > 10",
-        Some("`created_at` DESC"),
-    );
+    let sql =
+        browse_equivalent_select(&cfg, "", "orders", "amount > 10", Some("`created_at` DESC"));
     assert_eq!(
         sql,
         "SELECT * FROM `orders` WHERE (amount > 10) ORDER BY `created_at` DESC"
@@ -13326,7 +13326,11 @@ pub(crate) fn r103_prompt_prefills_and_submit_routes_to_confirm() {
         Some("orders_copy")
     );
     // Cancelling clears the pending materialization.
-    confirm_key(&mut app, &test_tx(), KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+    confirm_key(
+        &mut app,
+        &test_tx(),
+        KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE),
+    );
     assert!(app.confirm.is_none());
     assert!(app.materialize_write.is_none());
 }
@@ -14052,7 +14056,11 @@ pub(crate) fn r106_r98_deleted_conn_id_degrades_without_dangling_state() {
         app.want_last = true;
         let cs = app.connections.clone();
         apply_op_result(&mut app, OpResult::Connections(cs), &tx);
-        assert_eq!(app.conn_list.selected(), Some(0), "cursor falls back to row 0");
+        assert_eq!(
+            app.conn_list.selected(),
+            Some(0),
+            "cursor falls back to row 0"
+        );
         assert!(app.selected.is_none(), "nothing auto-connects");
         assert!(!app.resume_last, "no resume chain is armed");
         assert!(app.status.contains("已不存在"), "{}", app.status);
@@ -14127,7 +14135,10 @@ pub(crate) fn r106_r99_reply_one_tick_after_the_cancel_mark_is_stale() {
         &tx,
     );
     assert!(app.grid.is_none(), "the cancelled generation never renders");
-    assert_eq!(app.pending_ops, 0, "the released slot is not double-counted");
+    assert_eq!(
+        app.pending_ops, 0,
+        "the released slot is not double-counted"
+    );
 }
 
 /// R100: a database with no tables still produces a valid overview document
@@ -14169,10 +14180,7 @@ pub(crate) fn r106_r100_long_comment_over_1kb_is_escaped_intact() {
     assert!(md.contains("注释"), "the comment column must appear");
     let escaped = long.replace('|', "\\|");
     assert!(md.contains(&escaped), "the full comment must survive");
-    let row = md
-        .lines()
-        .find(|l| l.starts_with("| id "))
-        .expect("id row");
+    let row = md.lines().find(|l| l.starts_with("| id ")).expect("id row");
     assert!(row.ends_with('|'), "row must stay a single line: {row}");
     assert!(row.contains(&escaped), "escaped comment must be on the row");
 }
@@ -14191,7 +14199,10 @@ pub(crate) fn r106_r101_identical_results_report_zero_diff() {
     };
     let st = compute_result_diff(&snap, &cols, &rows, &["id".into()]);
     assert!(st.matched_by_pk);
-    assert_eq!((st.added, st.removed, st.changed, st.unchanged), (0, 0, 0, 2));
+    assert_eq!(
+        (st.added, st.removed, st.changed, st.unchanged),
+        (0, 0, 0, 2)
+    );
     let summary = result_diff_summary(&st);
     assert!(summary.contains("+0 -0 ~0"), "{summary}");
     assert!(summary.contains("12:00"), "{summary}");
@@ -14230,7 +14241,10 @@ pub(crate) fn r106_r101_pk_match_ignores_row_order() {
     ];
     let st = compute_result_diff(&snap, &cols, &reversed, &["id".into()]);
     assert!(st.matched_by_pk);
-    assert_eq!((st.added, st.removed, st.changed, st.unchanged), (0, 0, 0, 3));
+    assert_eq!(
+        (st.added, st.removed, st.changed, st.unchanged),
+        (0, 0, 0, 3)
+    );
     assert!(st.rows.iter().all(|r| r.kind == ResultDiffKind::Unchanged));
     // Without any PK metadata the multiset match is order-independent too.
     let snap_no_pk = ResultSnapshot {
@@ -14261,10 +14275,16 @@ pub(crate) fn r106_r101_single_column_result_set_diffs() {
     let st = compute_result_diff(&snap, &cols, &rows, &["id".into()]);
     assert_eq!(st.columns, vec!["id".to_string()]);
     assert!(st.extra_cols.is_empty() && st.missing_cols.is_empty());
-    assert_eq!((st.added, st.removed, st.changed, st.unchanged), (1, 1, 0, 1));
+    assert_eq!(
+        (st.added, st.removed, st.changed, st.unchanged),
+        (1, 1, 0, 1)
+    );
     let summary = result_diff_summary(&st);
     assert!(summary.contains("+1 -1 ~0"), "{summary}");
-    assert!(!summary.contains("列"), "no column drift on one column: {summary}");
+    assert!(
+        !summary.contains("列"),
+        "no column drift on one column: {summary}"
+    );
 }
 
 /// R102: a comment carrying a single quote and a newline is escaped for SQL —
@@ -14436,7 +14456,10 @@ pub(crate) fn r106_r105_xlsx_minimal_single_column_all_null_single_row() {
     assert!(sheet.contains("<c r=\"A2\"/>"), "{sheet}");
     assert!(sheet.contains("<row r=\"1\""), "{sheet}");
     assert!(sheet.contains("<row r=\"2\""), "{sheet}");
-    assert!(!sheet.contains("<row r=\"3\""), "no phantom third row: {sheet}");
+    assert!(
+        !sheet.contains("<row r=\"3\""),
+        "no phantom third row: {sheet}"
+    );
 }
 
 // ── R107: complete single-table DDL export (SHOW CREATE family) ──────────────
@@ -14520,7 +14543,10 @@ pub(crate) fn r107_kernel_source_sql_family_is_directly_queryable() {
 #[test]
 pub(crate) fn r107_ddl_from_rows_picks_the_ddl_column() {
     use serde_json::json;
-    let mysql = vec![vec![json!("orders"), json!("CREATE TABLE `orders` (`id` int)")]];
+    let mysql = vec![vec![
+        json!("orders"),
+        json!("CREATE TABLE `orders` (`id` int)"),
+    ]];
     assert_eq!(
         ddl_from_rows(DatabaseType::Mysql, &mysql).unwrap(),
         "CREATE TABLE `orders` (`id` int)"
@@ -14537,7 +14563,10 @@ pub(crate) fn r107_ddl_from_rows_picks_the_ddl_column() {
 #[test]
 pub(crate) fn r107_ddl_from_rows_tolerates_empty_missing_and_extra_rows() {
     use serde_json::json;
-    assert!(ddl_from_rows(DatabaseType::Mysql, &[]).is_err(), "empty reply");
+    assert!(
+        ddl_from_rows(DatabaseType::Mysql, &[]).is_err(),
+        "empty reply"
+    );
     assert!(
         ddl_from_rows(DatabaseType::Mysql, &[vec![json!("orders")]]).is_err(),
         "missing the DDL column"
@@ -14609,7 +14638,10 @@ pub(crate) fn r107_ddl_popup_keys_and_reply_routing() {
         text: "a\nb\nc".into(),
         scroll: 0,
     });
-    ddl_popup_key(&mut app, KeyEvent::new(KeyCode::Char('j'), KeyModifiers::NONE));
+    ddl_popup_key(
+        &mut app,
+        KeyEvent::new(KeyCode::Char('j'), KeyModifiers::NONE),
+    );
     assert_eq!(app.ddl_popup.as_ref().unwrap().scroll, 1);
     ddl_popup_key(
         &mut app,
@@ -14735,7 +14767,10 @@ pub(crate) fn r107_ddl_export_is_documented_in_help_and_footer() {
     });
     let keys: Vec<&str> = popup.iter().map(|(k, _)| *k).collect();
     for k in ["y", "Ctrl-Y", "Esc"] {
-        assert!(keys.contains(&k), "DDL popup footer missing {k:?}: {keys:?}");
+        assert!(
+            keys.contains(&k),
+            "DDL popup footer missing {k:?}: {keys:?}"
+        );
     }
 
     // Every new literal translates.
@@ -14853,8 +14888,18 @@ pub(crate) fn r108_sql_zip_names_and_insert_content() {
     assert_eq!(sanitize_sql_file_name(".."), "result.sql");
     let cfg = test_conn("sqlite");
     let tabs = vec![
-        r108_batch_tab("SELECT * FROM a", "a", &["id"], vec![vec![Val::Text("1".into())]]),
-        r108_batch_tab("SELECT * FROM b", "b", &["name"], vec![vec![Val::Text("x".into())]]),
+        r108_batch_tab(
+            "SELECT * FROM a",
+            "a",
+            &["id"],
+            vec![vec![Val::Text("1".into())]],
+        ),
+        r108_batch_tab(
+            "SELECT * FROM b",
+            "b",
+            &["name"],
+            vec![vec![Val::Text("x".into())]],
+        ),
     ];
     let entries = build_sql_zip_entries(&tabs, Some(&cfg), "shop-results-120000").unwrap();
     let names: Vec<String> = entries.iter().map(|(n, _)| n.clone()).collect();
@@ -14912,7 +14957,12 @@ pub(crate) fn r108_sql_zip_magic_and_kernel_inspect() {
 pub(crate) fn r108_collect_skips_tabs_without_a_grid() {
     let mut app = test_app();
     app.result_tabs = vec![
-        r108_tab("orders", "SELECT * FROM orders", &["id"], vec![vec![Val::Text("1".into())]]),
+        r108_tab(
+            "orders",
+            "SELECT * FROM orders",
+            &["id"],
+            vec![vec![Val::Text("1".into())]],
+        ),
         ResultTab {
             title: "script".into(),
             sql: None,
@@ -15053,12 +15103,25 @@ pub(crate) fn r108_picker_keys_start_batch_export() {
     let mut app = test_app();
     app.selected = Some(test_conn("sqlite"));
     app.result_tabs = vec![
-        r108_tab("orders", "SELECT * FROM orders", &["id"], vec![vec![Val::Text("1".into())]]),
-        r108_tab("users", "SELECT * FROM users", &["id"], vec![vec![Val::Text("2".into())]]),
+        r108_tab(
+            "orders",
+            "SELECT * FROM orders",
+            &["id"],
+            vec![vec![Val::Text("1".into())]],
+        ),
+        r108_tab(
+            "users",
+            "SELECT * FROM users",
+            &["id"],
+            vec![vec![Val::Text("2".into())]],
+        ),
     ];
     app.grid_kind = GridKind::Query;
     app.export_open = true;
-    export_key(&mut app, KeyEvent::new(KeyCode::Char('A'), KeyModifiers::NONE));
+    export_key(
+        &mut app,
+        KeyEvent::new(KeyCode::Char('A'), KeyModifiers::NONE),
+    );
     assert!(!app.export_open);
     assert_eq!(
         app.batch_export_pending.as_ref().map(|p| p.kind),
@@ -15069,7 +15132,11 @@ pub(crate) fn r108_picker_keys_start_batch_export() {
     assert!(name.contains("-results-"), "{name}");
 
     let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
-    export_path_key(&mut app, &tx, KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+    export_path_key(
+        &mut app,
+        &tx,
+        KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE),
+    );
     assert!(app.batch_export_pending.is_none());
     assert!(app.export_path.is_none());
 
@@ -15080,10 +15147,17 @@ pub(crate) fn r108_picker_keys_start_batch_export() {
         .map(|i| r108_tab(&format!("t{i}"), "SELECT * FROM t", &["id"], vec![]))
         .collect();
     app.export_open = true;
-    export_key(&mut app, KeyEvent::new(KeyCode::Char('S'), KeyModifiers::NONE));
+    export_key(
+        &mut app,
+        KeyEvent::new(KeyCode::Char('S'), KeyModifiers::NONE),
+    );
     assert!(app.batch_export_pending.is_none());
     assert!(app.batch_export_confirm.is_some());
-    batch_export_confirm_key(&mut app, &tx, KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+    batch_export_confirm_key(
+        &mut app,
+        &tx,
+        KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+    );
     assert!(app.batch_export_confirm.is_none());
     assert_eq!(
         app.batch_export_pending.as_ref().map(|p| p.kind),
@@ -15842,7 +15916,10 @@ pub(crate) fn r113_g_n_toggles_the_row_number_column() {
     app.focus = Focus::Preview;
     app.grid_kind = GridKind::Query;
     app.set_grid(sample_grid());
-    assert!(!app.show_row_numbers, "the row-number column is off by default");
+    assert!(
+        !app.show_row_numbers,
+        "the row-number column is off by default"
+    );
     assert!(
         !context_info(&app).contains("行号"),
         "the off state carries no marker: {}",
@@ -15909,7 +15986,11 @@ pub(crate) fn r113_row_numbers_stay_absolute_under_a_row_filter() {
         1,
         "only the matching row survives"
     );
-    assert_eq!(app.result_rows, vec![2], "display→source map keeps the ordinal");
+    assert_eq!(
+        app.result_rows,
+        vec![2],
+        "display→source map keeps the ordinal"
+    );
     assert_eq!(
         abs_display_row(&app, 0),
         3,
@@ -16019,9 +16100,7 @@ pub(crate) fn r113_row_number_width_adapts_to_the_largest_number() {
         app.grid_kind = GridKind::Query;
         let grid = Grid {
             columns: vec!["n".into()],
-            rows: (0..n)
-                .map(|i| vec![Val::Text(i.to_string())])
-                .collect(),
+            rows: (0..n).map(|i| vec![Val::Text(i.to_string())]).collect(),
             note: String::new(),
             types: Vec::new(),
         };
@@ -16319,7 +16398,8 @@ pub(crate) fn r114_help_and_readme_document_export_memory() {
     ] {
         assert_ne!(t_lang(s, Lang::En), s, "missing English for {s:?}");
     }
-    assert!(include_str!("../../README.md").contains("remembers the directory of the last successful export"));
+    assert!(include_str!("../../README.md")
+        .contains("remembers the directory of the last successful export"));
     assert!(include_str!("../../README.zh-CN.md").contains("记住上次成功导出的目录"));
 }
 
@@ -16454,10 +16534,20 @@ pub(crate) fn r115_r107_huge_ddl_popup_scroll_clamps_at_both_sizes() {
             scroll: u16::MAX,
         });
         let rows = draw(&mut app, w, h);
-        assert!(rows.iter().any(|r| !r.trim().is_empty()), "blank at {w}x{h}");
+        assert!(
+            rows.iter().any(|r| !r.trim().is_empty()),
+            "blank at {w}x{h}"
+        );
         let clamped = app.ddl_popup.as_ref().unwrap().scroll;
-        assert!(clamped < u16::MAX, "scroll not clamped at {w}x{h}: {clamped}");
-        let flat: String = rows.join("\n").chars().filter(|c| !c.is_whitespace()).collect();
+        assert!(
+            clamped < u16::MAX,
+            "scroll not clamped at {w}x{h}: {clamped}"
+        );
+        let flat: String = rows
+            .join("\n")
+            .chars()
+            .filter(|c| !c.is_whitespace())
+            .collect();
         assert!(flat.contains("完整"), "title missing at {w}x{h}");
     }
 }
@@ -16581,7 +16671,10 @@ pub(crate) fn r115_r108_large_batch_confirmation_esc_cancels() {
         assert!(app.batch_export_confirm.is_some(), "guard did not trip");
         assert!(app.batch_export_pending.is_none());
         batch_export_confirm_key(&mut app, &tx, KeyEvent::new(cancel, KeyModifiers::NONE));
-        assert!(app.batch_export_confirm.is_none(), "confirm survived {cancel:?}");
+        assert!(
+            app.batch_export_confirm.is_none(),
+            "confirm survived {cancel:?}"
+        );
         assert!(app.batch_export_pending.is_none());
         assert!(app.export_path.is_none());
         assert!(app.status.contains("已取消"), "{}", app.status);
@@ -16681,10 +16774,18 @@ async fn r115_r109_column_enter_works_on_a_read_only_connection() {
 pub(crate) fn r115_r110_f10_while_about_open_does_not_stack() {
     let tx = test_tx();
     let mut app = test_app();
-    key(&mut app, &tx, KeyEvent::new(KeyCode::F(10), KeyModifiers::NONE));
+    key(
+        &mut app,
+        &tx,
+        KeyEvent::new(KeyCode::F(10), KeyModifiers::NONE),
+    );
     assert!(app.about.is_some());
     app.about.as_mut().unwrap().uptime = "SENTINEL".into();
-    key(&mut app, &tx, KeyEvent::new(KeyCode::F(10), KeyModifiers::NONE));
+    key(
+        &mut app,
+        &tx,
+        KeyEvent::new(KeyCode::F(10), KeyModifiers::NONE),
+    );
     assert_eq!(
         app.about.as_ref().unwrap().uptime,
         "SENTINEL",
@@ -16704,7 +16805,11 @@ pub(crate) fn r115_r110_about_opens_from_every_focus() {
     ] {
         let mut app = test_app();
         app.focus = focus;
-        key(&mut app, &tx, KeyEvent::new(KeyCode::F(10), KeyModifiers::NONE));
+        key(
+            &mut app,
+            &tx,
+            KeyEvent::new(KeyCode::F(10), KeyModifiers::NONE),
+        );
         assert!(app.about.is_some(), "F10 did not open About from {name}");
     }
 }
@@ -16725,7 +16830,11 @@ pub(crate) fn r115_r111_pipe_and_newline_do_not_break_the_table() {
     let out = grid_to_text(&grid);
     assert!(out.contains(r"| x\|y |"), "{out}");
     assert!(out.contains("| p q  |"), "{out}");
-    assert_eq!(out.lines().count(), 7, "one physical line per logical row: {out}");
+    assert_eq!(
+        out.lines().count(),
+        7,
+        "one physical line per logical row: {out}"
+    );
     let widths: Vec<usize> = out.lines().map(disp_width).collect();
     assert!(widths.windows(2).all(|w| w[0] == w[1]), "{widths:?}");
     assert_eq!(text_table_cell("a|b\r\nc"), r"a\|b c");
@@ -16794,7 +16903,10 @@ pub(crate) fn r115_r112_freeze_and_row_numbers_stack() {
     assert_eq!(app.grid_frozen_cols, vec![0], "the first column is pinned");
     let text = rows.join("\n");
     assert!(text.contains('#'), "row-number header missing:\n{text}");
-    assert!(text.contains("r0c0"), "frozen first column missing:\n{text}");
+    assert!(
+        text.contains("r0c0"),
+        "frozen first column missing:\n{text}"
+    );
     let info = context_info(&app);
     assert!(info.contains("行号"), "{info}");
     assert!(info.contains("冻结首列"), "{info}");
@@ -16936,7 +17048,10 @@ pub(crate) fn r115_r113_row_numbers_with_snapshot_diff_render() {
             flat.contains("快照对比") || text.contains("Snapshot"),
             "diff missing at {w}x{h}:\n{text}"
         );
-        assert!(text.contains('+') && text.contains('~'), "markers missing at {w}x{h}");
+        assert!(
+            text.contains('+') && text.contains('~'),
+            "markers missing at {w}x{h}"
+        );
     }
 }
 
@@ -17031,7 +17146,9 @@ pub(crate) fn r115_r114_failed_save_does_not_replace_memory() {
 #[test]
 pub(crate) fn r115_g_chords_are_fully_reconciled() {
     let results = include_str!("../results.rs");
-    for c in ['d', 't', 'v', 'c', 'b', 'g', 'w', 'W', 'f', 'F', 'N', 's', 'm'] {
+    for c in [
+        'd', 't', 'v', 'c', 'b', 'g', 'w', 'W', 'f', 'F', 'N', 's', 'm',
+    ] {
         assert!(
             results.contains(&format!("KeyCode::Char('{c}')")),
             "results.rs has no handler for g {c}"
@@ -17069,10 +17186,7 @@ pub(crate) fn r115_g_chords_are_fully_reconciled() {
         "g s",
         "g m",
     ] {
-        assert!(
-            keys.contains(&key),
-            "help row {key:?} is missing"
-        );
+        assert!(keys.contains(&key), "help row {key:?} is missing");
     }
     assert!(
         HELP_ROWS.iter().any(|(k, _)| k.contains("g g")),

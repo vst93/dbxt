@@ -671,9 +671,10 @@ pub(crate) fn context_info(app: &App) -> String {
     if app.freeze_first
         && app.grid_kind != GridKind::Columns
         && app.grid_frozen > 0
-        && app.grid.as_ref().is_some_and(|grid| {
-            grid.columns.len() > app.grid_frozen + app.vis_cols.max(1)
-        })
+        && app
+            .grid
+            .as_ref()
+            .is_some_and(|grid| grid.columns.len() > app.grid_frozen + app.vis_cols.max(1))
     {
         parts.push(t("冻结首列").into());
     }
@@ -1627,9 +1628,7 @@ pub(crate) fn footer_hints(app: &App) -> Vec<Hint> {
         if app.result_diff.is_some() {
             v.insert(0, ("a", t("全部行")));
             v.insert(1, ("Ctrl-⇧X", t("清快照")));
-        } else if current_conn_id(app)
-            .is_some_and(|c| app.result_snapshot.contains_key(&c))
-        {
+        } else if current_conn_id(app).is_some_and(|c| app.result_snapshot.contains_key(&c)) {
             v.insert(0, ("Ctrl-⇧D", t("对比快照")));
         }
     }
