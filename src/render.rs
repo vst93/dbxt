@@ -987,6 +987,8 @@ pub(crate) enum FooterView {
     DdlPopup,
     ConnPicker,
     NewConn,
+    /// R119: the option list opened from a form enum row.
+    FormPicker,
     RedisKeys,
     RedisValue,
     MongoDocs,
@@ -1150,6 +1152,8 @@ pub(crate) fn footer_ctx_inner(app: &App, include_help: bool) -> FooterCtx {
         FooterView::DdlPopup
     } else if app.table_info_open {
         FooterView::TableInfo
+    } else if app.page == Page::NewConn && app.form.picker.is_some() {
+        FooterView::FormPicker
     } else if app.page == Page::NewConn {
         FooterView::NewConn
     } else if app.picker_open && app.selected.is_none() {
@@ -1427,9 +1431,15 @@ pub(crate) fn footer_hints_ctx(ctx: FooterCtx) -> Vec<Hint> {
         ],
         FooterView::NewConn => vec![
             ("↑↓/Tab", t("字段")),
-            ("Enter", t("编辑/切换/保存")),
+            ("Enter", t("选择/编辑")),
             ("Space", t("切换")),
             ("Esc", t("返回")),
+        ],
+        FooterView::FormPicker => vec![
+            ("↑↓", t("选择")),
+            ("a-z", t("过滤")),
+            ("Enter", t("确定")),
+            ("Esc", t("取消")),
         ],
         FooterView::RedisKeys => vec![
             ("↑↓", t("key")),
@@ -4767,6 +4777,9 @@ pub(crate) fn form_row_value(f: &ConnForm, row: FormRow) -> String {
             }
         }
         FormRow::Ssl => if f.ssl { "y" } else { "n" }.to_string(),
+        FormRow::SslCaCert => f.ssl_ca_cert.clone(),
+        FormRow::SslClientCert => f.ssl_client_cert.clone(),
+        FormRow::SslClientKey => f.ssl_client_key.clone(),
         FormRow::ReadOnly => {
             if f.read_only {
                 format!("y  {}", t("拒绝写语句"))
@@ -4800,6 +4813,33 @@ pub(crate) fn form_row_value(f: &ConnForm, row: FormRow) -> String {
     }
 }
 
+/// R119: one dim section rule (`── 连接 ────`) inside the form box.
+fn form_section_line(section: &str, inner_w: usize) -> Line<'static> {
+    let head = format!("── {section} ");
+    let fill = inner_w.saturating_sub(head.as_str().width());
+    Line::from(Span::styled(
+        format!("{head}{}", "─".repeat(fill)),
+        Style::default().fg(Color::DarkGray),
+    ))
+}
+
+/// R119: the checkbox value for a boolean row.
+fn form_toggle_value(f: &ConnForm, row: FormRow) -> String {
+    let mark = |on: bool| if on { "[x]" } else { "[ ]" };
+    match row {
+        FormRow::Ssl => mark(f.ssl).to_string(),
+        FormRow::ReadOnly => {
+            if f.read_only {
+                format!("{} {}", mark(true), t("拒绝写语句"))
+            } else {
+                mark(false).to_string()
+            }
+        }
+        FormRow::SshEnabled => mark(f.ssh_enabled).to_string(),
+        _ => String::new(),
+    }
+}
+
 pub(crate) fn render_form(f: &mut Frame, area: Rect, app: &mut App) {
     let form = app.form.clone();
     let rows = form_rows(&form);
@@ -4808,53 +4848,42 @@ pub(crate) fn render_form(f: &mut Frame, area: Rect, app: &mut App) {
     } else {
         52.min(area.width.saturating_sub(4))
     };
-    // Two lines are reserved below the fields for the error / type hint.
-    let reserved: u16 = 2;
-    let want_h = (rows.len() as u16).saturating_add(reserved + 2);
-    let box_h = want_h
-        .min(area.height.saturating_sub(2))
-        .max(3.min(area.height));
-    let x = area.x + area.width.saturating_sub(box_w) / 2;
-    let y = area.y + area.height.saturating_sub(box_h) / 2;
-    let box_area = Rect {
-        x,
-        y,
-        width: box_w,
-        height: box_h,
-    };
-
-    let inner_h = box_h.saturating_sub(2);
-    let visible = inner_h.saturating_sub(reserved).max(1) as usize;
-    let active = form.field.min(rows.len().saturating_sub(1));
-    let mut scroll = form.scroll.min(rows.len().saturating_sub(visible));
-    if active < scroll {
-        scroll = active;
-    }
-    if active >= scroll + visible {
-        scroll = active + 1 - visible;
-    }
-    app.form.scroll = scroll;
-
-    let mut lines: Vec<Line> = Vec::new();
     // R41: on a very narrow terminal the label column shrinks and the SSH
     // section's labels are abbreviated so the value keeps a readable width. The
     // rows themselves already expand / collapse with the tunnel toggle.
     let narrow = app.layout_mode == LayoutMode::Narrow || box_w < 44;
     let label_w = if narrow { 9usize } else { 16 };
-    let end = (scroll + visible).min(rows.len());
-    for (i, (row, label)) in rows.iter().enumerate().take(end).skip(scroll) {
+    let inner_w = (box_w as usize).saturating_sub(2);
+    let active = form.field.min(rows.len().saturating_sub(1));
+
+    // R119: build the display lines first (section headers, rows, and the SSH
+    // forward-target note) so scrolling can follow the *rendered* lines, not the
+    // logical row list — a form that grows with SSL / SSH stays navigable.
+    let mut display: Vec<(Option<usize>, Line)> = Vec::new();
+    let mut last_section: Option<&'static str> = None;
+    for (i, (row, label)) in rows.iter().enumerate() {
         let (row, label) = (*row, *label);
+        if let Some(section) = form_section(row) {
+            if last_section != Some(section) {
+                display.push((None, form_section_line(section, inner_w)));
+                last_section = Some(section);
+            }
+        }
         let label = if narrow {
             form_label_short(label)
         } else {
             label
         };
         let is_active = i == active;
+        let is_picker = form_row_is_picker(row);
+        let is_toggle = matches!(row, FormRow::Ssl | FormRow::ReadOnly | FormRow::SshEnabled);
         // R58: while the query-timeout row is being edited, show its raw buffer
         // (not the derived `30 s` / `默认（60s）` display) so the caret sits where
         // the next digit will land.
         let mut value = if form.editing && is_active && row == FormRow::QueryTimeout {
             form.query_timeout.clone()
+        } else if is_toggle {
+            form_toggle_value(&form, row)
         } else {
             form_row_value(&form, row)
         };
@@ -4869,20 +4898,22 @@ pub(crate) fn render_form(f: &mut Frame, area: Rect, app: &mut App) {
         } else {
             Style::default()
         };
-        lines.push(Line::from({
-            let mut spans = vec![Span::styled(
-                format!("{marker}{label:<label_w$} {value}"),
-                style,
-            )];
-            // Read-only colour preview swatch: the connection colour when set,
-            // else the database-family default the sidebar will use.
-            if row == FormRow::Color {
-                let swatch =
-                    parse_hex_color(&form.color).unwrap_or_else(|| db_type_color(&form.db_type));
-                spans.push(Span::styled("  ███", Style::default().fg(swatch)));
-            }
-            spans
-        }));
+        let mut spans = vec![Span::styled(
+            format!("{marker}{label:<label_w$} {value}"),
+            style,
+        )];
+        // R119: a closed set advertises itself with a picker caret.
+        if is_picker {
+            spans.push(Span::styled(" ▾", Style::default().fg(Color::DarkGray)));
+        }
+        // Read-only colour preview swatch: the connection colour when set,
+        // else the database-family default the sidebar will use.
+        if row == FormRow::Color {
+            let swatch =
+                parse_hex_color(&form.color).unwrap_or_else(|| db_type_color(&form.db_type));
+            spans.push(Span::styled("  ███", Style::default().fg(swatch)));
+        }
+        display.push((Some(i), Line::from(spans)));
         // The kernel forwards the tunnel to the connection's own host:port —
         // there is no separate remote-target field in TransportLayerConfig, so
         // it is shown (and overridden by editing host/port above).
@@ -4892,17 +4923,62 @@ pub(crate) fn render_form(f: &mut Frame, area: Rect, app: &mut App) {
             } else {
                 form.port.trim().to_string()
             };
-            lines.push(Line::from(Span::styled(
-                format!(
-                    "  {:<label_w$} {}:{}",
-                    if narrow { "remote" } else { t("远端目标") },
-                    form.host.trim(),
-                    target_port
-                ),
-                Style::default().fg(Color::DarkGray),
-            )));
+            display.push((
+                None,
+                Line::from(Span::styled(
+                    format!(
+                        "  {:<label_w$} {}:{}",
+                        if narrow { "remote" } else { t("远端目标") },
+                        form.host.trim(),
+                        target_port
+                    ),
+                    Style::default().fg(Color::DarkGray),
+                )),
+            ));
         }
     }
+
+    // Two lines are reserved below the fields for the error / type hint.
+    let reserved: u16 = 2;
+    let want_h = (display.len() as u16).saturating_add(reserved + 2);
+    let box_h = want_h
+        .min(area.height.saturating_sub(2))
+        .max(3.min(area.height));
+    let x = area.x + area.width.saturating_sub(box_w) / 2;
+    let y = area.y + area.height.saturating_sub(box_h) / 2;
+    let box_area = Rect {
+        x,
+        y,
+        width: box_w,
+        height: box_h,
+    };
+
+    let inner_h = box_h.saturating_sub(2);
+    let visible = inner_h.saturating_sub(reserved).max(1) as usize;
+    let active_line = display
+        .iter()
+        .position(|(r, _)| *r == Some(active))
+        .unwrap_or(0);
+    // Keep the active row's trailing note (e.g. the SSH forward target) on screen
+    // too, so selecting `ssh_auth` shows where the tunnel points.
+    let mut focus_end = active_line;
+    while focus_end + 1 < display.len() && display[focus_end + 1].0.is_none() {
+        focus_end += 1;
+    }
+    let mut scroll = form.scroll.min(display.len().saturating_sub(visible));
+    if focus_end >= scroll + visible {
+        scroll = focus_end + 1 - visible;
+    }
+    if active_line < scroll {
+        scroll = active_line;
+    }
+    app.form.scroll = scroll;
+
+    let end = (scroll + visible).min(display.len());
+    let mut lines: Vec<Line> = display[scroll..end]
+        .iter()
+        .map(|(_, line)| line.clone())
+        .collect();
     if !form.err.is_empty() {
         lines.push(Line::from(Span::styled(
             format!("✗ {}", form.err),
@@ -4926,5 +5002,76 @@ pub(crate) fn render_form(f: &mut Frame, area: Rect, app: &mut App) {
         .border_set(border::ROUNDED)
         .border_style(Style::default().fg(Color::Green));
     f.render_widget(Clear, box_area);
+    f.render_widget(Paragraph::new(lines).block(block), box_area);
+
+    // R119: the option list draws over the form, matching the key router which
+    // hands it the keyboard while it is open.
+    render_form_picker(f, area, app);
+}
+
+/// R119: draw the modal option list for an enum row. Filterable, with a scroll
+/// window that keeps the highlighted item visible.
+pub(crate) fn render_form_picker(f: &mut Frame, area: Rect, app: &mut App) {
+    let Some(picker) = app.form.picker.clone() else {
+        return;
+    };
+    let matches = picker.matches();
+    let w = area.width.min(if app.layout_mode == LayoutMode::Narrow {
+        area.width
+    } else {
+        52
+    });
+    let want_rows = matches.len().min(12);
+    let (y, h) = overlay_list_box(want_rows, area);
+    let x = area.x + area.width.saturating_sub(w) / 2;
+    let box_area = Rect {
+        x,
+        y,
+        width: w,
+        height: h,
+    };
+    f.render_widget(Clear, box_area);
+    let rows = (box_area.height.saturating_sub(2)) as usize;
+    let total = matches.len();
+    let start = if total > rows && picker.sel >= rows {
+        picker.sel + 1 - rows
+    } else {
+        0
+    };
+    let end = (start + rows).min(total);
+    let mut lines: Vec<Line> = Vec::new();
+    if total == 0 {
+        lines.push(Line::from(Span::styled(
+            t("无匹配"),
+            Style::default().fg(Color::DarkGray),
+        )));
+    } else {
+        for vi in start..end {
+            let (_, label, _) = matches[vi];
+            let selected = vi == picker.sel;
+            let marker = if selected { "▸ " } else { "  " };
+            let style = if selected {
+                Style::default()
+                    .fg(Color::Green)
+                    .add_modifier(Modifier::BOLD)
+            } else {
+                Style::default()
+            };
+            lines.push(Line::from(Span::styled(format!("{marker}{label}"), style)));
+        }
+    }
+    let title = format!(
+        " {} · ↑↓ {} · {} · Enter {} · Esc {} ",
+        t("选择"),
+        t("移动"),
+        t("输入过滤"),
+        t("确定"),
+        t("取消")
+    );
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .title(title)
+        .border_set(border::ROUNDED)
+        .border_style(Style::default().fg(Color::Cyan));
     f.render_widget(Paragraph::new(lines).block(block), box_area);
 }

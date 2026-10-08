@@ -5560,6 +5560,14 @@ async fn run_app(
                 match maybe_ev {
                     Some(Ok(ev)) => {
                         handle_event(&mut app, &tx, ev);
+                        // R121: apply a wheel burst in one frame instead of one
+                        // redraw per notch, and let a key press interrupt it.
+                        drain_ready_events(&mut app, &tx, || {
+                            match events.next().now_or_never() {
+                                Some(Some(Ok(ev))) => Some(ev),
+                                _ => None,
+                            }
+                        });
                         while let Ok(res) = rx.try_recv() {
                             apply_op_result(&mut app, res, &tx);
                         }
@@ -5626,6 +5634,47 @@ async fn run_app(
         save_last_session(&app, &path);
     }
     Ok(())
+}
+
+/// R121: is this a wheel event (the atoms of a trackpad / mouse scroll burst)?
+fn is_wheel_event(ev: &Event) -> bool {
+    matches!(
+        ev,
+        Event::Mouse(m)
+            if matches!(
+                m.kind,
+                MouseEventKind::ScrollUp
+                    | MouseEventKind::ScrollDown
+                    | MouseEventKind::ScrollLeft
+                    | MouseEventKind::ScrollRight
+            )
+    )
+}
+
+/// R121: drain every event the terminal has already queued, in one frame.
+///
+/// A trackpad wheel arrives as a rapid burst of `ScrollUp`/`ScrollDown` events.
+/// Handling one per frame made each notch cost a full redraw, so a burst left a
+/// backlog that kept scrolling after the fingers stopped and could not be
+/// interrupted. Batching applies the whole burst before the next draw; and once
+/// a key arrives mid-burst the remaining wheel events are dropped, so a keypress
+/// stops the scroll immediately.
+///
+/// `next` yields the next already-queued event (`None` when the queue is empty),
+/// which keeps the batching policy testable without a real terminal.
+fn drain_ready_events(app: &mut App, tx: &Tx, mut next: impl FnMut() -> Option<Event>) {
+    let mut key_seen = false;
+    while let Some(ev) = next() {
+        // A key press interrupts the wheel: drop the stale notches behind it so
+        // the view stops where the user took back control.
+        if key_seen && is_wheel_event(&ev) {
+            continue;
+        }
+        if matches!(ev, Event::Key(_)) {
+            key_seen = true;
+        }
+        handle_event(app, tx, ev);
+    }
 }
 
 /// R99: the [`QueryTag`] carried by a query reply, if it is one. Used to drop a
@@ -6529,14 +6578,15 @@ fn apply_op_result(app: &mut App, res: OpResult, tx: &Tx) {
                     &(extra),
                 ],
             );
-            // A deep OFFSET page (no primary key to seek by) is slow; say so
-            // once instead of silently taking seconds.
+            // A deep OFFSET page (no keyset seek: no primary key, a custom sort,
+            // or a dialect without keyset support) is slow; say so once instead of
+            // silently taking seconds.
             if app.pending_deep_hint {
                 app.pending_deep_hint = false;
                 app.status = format!(
                     "{} · {}",
                     app.status,
-                    t("深翻页较慢（无主键或自定义排序）；加过滤可提速")
+                    t("深翻页较慢（无主键 / 自定义排序 / 该方言不支持 keyset）；加过滤可提速")
                 );
             }
             if let Some(msg) = app.pending_write_msg.take() {
@@ -7938,12 +7988,49 @@ fn is_binary_pk_type(t: &str) -> bool {
     t.contains("blob") || t.contains("bytea") || t.contains("binary") || t.contains("image")
 }
 
+/// R120: dialects whose engine understands the row-value comparison
+/// `(a, b) > (va, vb)` that [`table_data_keyset_predicate`] emits for a composite
+/// key. Anything else must keep the OFFSET path — it is always correct, just
+/// slower on deep pages — because the seek would be a syntax / semantic error
+/// (SQL Server, for one, has no row-value comparison at all).
+///
+/// `TRUE` / `FALSE` boolean literals (see [`pk_value_literal`]) are also valid on
+/// every dialect listed here. Redshift is deliberately absent: it forks
+/// PostgreSQL 8.0, which predates row-value comparison (8.2).
+fn table_browser_keyset_supported(db_type: DatabaseType) -> bool {
+    matches!(
+        db_type,
+        DatabaseType::Mysql
+            | DatabaseType::Postgres
+            | DatabaseType::Sqlite
+            | DatabaseType::Gaussdb
+            | DatabaseType::OpenGauss
+            | DatabaseType::Kingbase
+            | DatabaseType::Highgo
+            | DatabaseType::Uxdb
+            | DatabaseType::Vastbase
+            | DatabaseType::Oscar
+    )
+}
+
 /// Can this view be browsed by primary-key seek? Returns the key columns and the
 /// display direction when the effective order is exactly the table's primary
 /// key — either the implicit default (no ORDER BY, so we impose `pk ASC`) or an
 /// explicit order over precisely those columns in that order, one direction for
 /// all of them. Anything else (a custom sort) keeps the classic OFFSET path.
-fn keyset_plan(meta: Option<&TableMeta>, ps: &PageState) -> Option<(Vec<String>, bool)> {
+///
+/// R120: the dialect must also support the seek predicate's row-value comparison;
+/// a dialect outside [`table_browser_keyset_supported`] never plans a keyset read,
+/// so every downstream keyset decision (seek, deep-page hint, bounded COUNT)
+/// falls back to OFFSET automatically.
+fn keyset_plan(
+    db_type: DatabaseType,
+    meta: Option<&TableMeta>,
+    ps: &PageState,
+) -> Option<(Vec<String>, bool)> {
+    if !table_browser_keyset_supported(db_type) {
+        return None;
+    }
     let meta = meta?;
     if meta.table != ps.table || meta.schema != ps.schema {
         return None;

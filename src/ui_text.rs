@@ -598,7 +598,7 @@ pub static ALL_KEYS: &[&str] = &[
     "行数上限",
     "50 万行以上的表显示 >50万，不再每页 COUNT",
     ">{} 行",
-    "深翻页较慢（无主键或自定义排序）；加过滤可提速",
+    "深翻页较慢（无主键 / 自定义排序 / 该方言不支持 keyset）；加过滤可提速",
     "手动",
     "打开 DBX 存储文件失败 ({}): {}\n(可用 DBX_DATA_DIR 指定目录，或把 dbx.db 文件路径作为第一个位置参数传入)",
     "执行",
@@ -1105,8 +1105,8 @@ pub static ALL_KEYS: &[&str] = &[
     "已更新文档 _id={}（{} 处修改）",
     "插入文档到 {}…",
     "更新文档 {}…",
-    "导入 CSV 到当前表（预览 + 追加/覆盖确认）",
-    "导出当前结果（CSV / Excel (.xlsx) / JSON / NDJSON / Markdown / Text / INSERT）；导出弹层记忆上次目录",
+    "导入 CSV 到当前表：预览 + 追加/覆盖确认（预览里 m 切追加/覆盖 · s 遇错停止/跳过 · ↑↓ 滚动）",
+    "导出当前结果（CSV / Excel (.xlsx) / JSON / NDJSON / Markdown / Text / INSERT）；弹层内 ↑↓ 选择、1-6 快选格式，记忆上次目录",
     "预览",
     "导入",
     "追加/覆盖",
@@ -2614,6 +2614,14 @@ fn en_of(zh: &'static str) -> Option<&'static str> {
         "预览 s/r/b" => Some("preview s/r/b"),
         "预览 Space / d" => Some("preview Space / d"),
         "密码" => Some("passwords"),
+        // ── R119 connection-form sections / pickers ──
+        "基础" => Some("basic"),
+        "高级" => Some("advanced"),
+        "SSH 隧道" => Some("SSH tunnel"),
+        "私钥" => Some("private key"),
+        "密码认证" => Some("password auth"),
+        "输入过滤" => Some("type to filter"),
+        "无匹配" => Some("no match"),
         "导出全部连接为 JSON 包（默认 ~/dbxt-connections.json）" => {
             Some("Export every connection as a JSON bundle (default ~/dbxt-connections.json)")
         }
@@ -2920,8 +2928,8 @@ fn en_of(zh: &'static str) -> Option<&'static str> {
             Some("a table over 500k rows shows >500k instead of a per-page COUNT")
         }
         ">{} 行" => Some(">{} rows"),
-        "深翻页较慢（无主键或自定义排序）；加过滤可提速" => {
-            Some("deep paging is slow without a primary key or with a custom sort; add a filter to speed it up")
+        "深翻页较慢（无主键 / 自定义排序 / 该方言不支持 keyset）；加过滤可提速" => {
+            Some("deep paging is slow without a primary key, with a custom sort, or on a dialect without keyset paging; add a filter to speed it up")
         }
         "手动" => Some("manual"),
         "打开 DBX 存储文件失败 ({}): {}\n(可用 DBX_DATA_DIR 指定目录，或把 dbx.db 文件路径作为第一个位置参数传入)" => Some("Failed to open the DBX storage file ({}): {}\n(set DBX_DATA_DIR, or pass the dbx.db file path as the first positional argument)"),
@@ -3126,6 +3134,7 @@ fn en_of(zh: &'static str) -> Option<&'static str> {
         "连接 {} ({})…" => Some("Connecting {} ({})…"),
         "退出" => Some("quit"),
         "选择" => Some("select"),
+        "选择/编辑" => Some("select / edit"),
         "选择 / 插入到编辑器" => Some("Select / insert into editor"),
         "选择 / 连接" => Some("Select / connect"),
         "选择连接" => Some("select connection"),
@@ -3481,8 +3490,12 @@ fn en_of(zh: &'static str) -> Option<&'static str> {
         "插入文档到 {}…" => Some("Inserting document into {}…"),
         "更新文档 {}…" => Some("Updating document {}…"),
         "导入 CSV 到当前表（预览 + 追加/覆盖确认）" => Some("Import CSV into the current table (preview + append/overwrite confirmation)"),
+        "导入 CSV 到当前表：预览 + 追加/覆盖确认（预览里 m 切追加/覆盖 · s 遇错停止/跳过 · ↑↓ 滚动）" => Some("Import CSV into the current table: preview + append/overwrite confirmation (in the preview, m toggles append/overwrite · s stops/skips on error · ↑↓ scrolls)"),
         "导出当前结果（CSV / Excel (.xlsx) / JSON / NDJSON / Markdown / Text / INSERT）；导出弹层记忆上次目录" => Some(
             "Export the current result (CSV / Excel (.xlsx) / JSON / NDJSON / Markdown / Text / INSERT); the export prompt remembers the last directory",
+        ),
+        "导出当前结果（CSV / Excel (.xlsx) / JSON / NDJSON / Markdown / Text / INSERT）；弹层内 ↑↓ 选择、1-6 快选格式，记忆上次目录" => Some(
+            "Export the current result (CSV / Excel (.xlsx) / JSON / NDJSON / Markdown / Text / INSERT); in the prompt ↑↓ picks and 1-6 quick-selects a format, and the last directory is remembered",
         ),
         "上次目录: {}" => Some("Last directory: {}"),
         "预览" => Some("preview"),
@@ -3673,6 +3686,29 @@ fn en_of(zh: &'static str) -> Option<&'static str> {
         // Help overlay: connection form / SSH tunnel.
         "编辑选中连接（含 SSH 隧道，预填表单）" => Some("Edit the selected connection (incl. its SSH tunnel; form prefilled)"),
         "— 连接表单 —" => Some("— Connection form —"),
+        "分区" => Some("section"),
+        "连接 / 高级（query_timeout · ssl · read_only · color）/ SSH 隧道；开启 ssl 或 ssh_tunnel 后相关字段实时展开" => {
+            Some("Connection / advanced (query_timeout · ssl · read_only · color) / SSH tunnel; enabling ssl or ssh_tunnel reveals the related fields live")
+        }
+        "切换字段（按分区顺序；开启 ssh_tunnel 后自动展开 SSH 段）" => {
+            Some("Move between fields in section order (enabling ssh_tunnel expands the SSH section)")
+        }
+        "编辑文本字段 / 打开选项列表（db_type · ssh_auth）/ 切换开关 / 保存连接" => {
+            Some("Edit a text field / open the option list (db_type · ssh_auth) / toggle a switch / save the connection")
+        }
+        "db_type 选项" => Some("db_type options"),
+        "Enter 打开可筛选列表（输入即过滤，↑↓ 选择，Enter 确定，Esc 取消）" => {
+            Some("Enter opens a filterable list (type to filter, ↑↓ to pick, Enter to confirm, Esc to cancel)")
+        }
+        "切换 ssh_tunnel / ssl / read_only；ssh 登录方式快速轮换" => {
+            Some("Toggle ssh_tunnel / ssl / read_only; quickly cycle the SSH login method")
+        }
+        "开启后展开 ssl_ca / ssl_cert / ssl_key（CA 证书 / 客户端证书 / 客户端私钥路径）；关闭即清除" => {
+            Some("When on, reveals ssl_ca / ssl_cert / ssl_key (CA cert / client cert / client key paths); turning it off clears them")
+        }
+        "有主键且方言支持行值比较时按主键续读（keyset，MySQL / PostgreSQL / SQLite 及 PG 系），翻页耗时与页深无关；否则（含 SQL Server / Oracle）走 OFFSET，深翻页较慢" => {
+            Some("With a primary key and a dialect that supports row-value comparison (keyset: MySQL / PostgreSQL / SQLite and PG-family), paging continues by key at any depth; otherwise (including SQL Server / Oracle) it falls back to OFFSET and deep pages are slow")
+        }
         "切换字段（开启 ssh_tunnel 后自动展开 SSH 段）" => {
             Some("Move between fields (enabling ssh_tunnel expands the SSH section)")
         }

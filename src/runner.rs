@@ -606,6 +606,11 @@ pub(crate) fn run_cmd_line(app: &mut App, tx: &Tx) {
 // ── new connection form ──
 
 pub(crate) fn form_key(app: &mut App, tx: &Tx, k: KeyEvent) {
+    // R119: an open option list owns the keyboard until it is committed / closed.
+    if app.form.picker.is_some() {
+        form_picker_key(app, k);
+        return;
+    }
     // The row list shrinks when the SSH tunnel is toggled off or the auth method
     // changes; keep the cursor on a real row.
     let len = form_rows(&app.form).len().max(1);
@@ -684,7 +689,10 @@ pub(crate) fn form_key(app: &mut App, tx: &Tx, k: KeyEvent) {
             FormRow::Ssl => app.form.ssl = !app.form.ssl,
             FormRow::ReadOnly => app.form.read_only = !app.form.read_only,
             FormRow::SshEnabled => app.form.ssh_enabled = !app.form.ssh_enabled,
-            FormRow::SshAuth => app.form.ssh_auth = app.form.ssh_auth.next(),
+            // R119: Enter opens the option list for closed sets; Space still
+            // cycles the three SSH auth methods for a quick change.
+            FormRow::SshAuth => open_form_picker(app, cur),
+            FormRow::DbType => open_form_picker(app, cur),
             FormRow::Save => save_form(app, tx),
             _ => app.form.editing = true,
         },
@@ -693,6 +701,7 @@ pub(crate) fn form_key(app: &mut App, tx: &Tx, k: KeyEvent) {
             FormRow::ReadOnly => app.form.read_only = !app.form.read_only,
             FormRow::SshEnabled => app.form.ssh_enabled = !app.form.ssh_enabled,
             FormRow::SshAuth => app.form.ssh_auth = app.form.ssh_auth.next(),
+            FormRow::DbType => open_form_picker(app, cur),
             // Space cycles the colour palette; the custom stop opens the hex editor.
             FormRow::Color => {
                 let next = color_next_sel(app.form.color_sel);
@@ -715,6 +724,71 @@ pub(crate) fn form_key(app: &mut App, tx: &Tx, k: KeyEvent) {
         KeyCode::Right | KeyCode::Char('l') => app.form.field = (app.form.field + 1) % len,
         _ => {}
     }
+}
+
+/// R119: open the option list for a picker row, highlighting the current value.
+/// No-op for rows that are not closed sets.
+pub(crate) fn open_form_picker(app: &mut App, row: FormRow) {
+    if !form_row_is_picker(row) {
+        return;
+    }
+    let items = form_picker_items(row);
+    if items.is_empty() {
+        return;
+    }
+    let current = form_picker_value(&app.form, row);
+    let sel = items.iter().position(|(_, v)| *v == current).unwrap_or(0);
+    app.form.picker = Some(FormPicker {
+        row,
+        items,
+        sel,
+        filter: String::new(),
+    });
+}
+
+/// R119: keys for the modal option list — typing filters, ↑↓/Tab move, Enter
+/// commits, Esc cancels. Everything else is swallowed so a stray key never
+/// edits the form underneath.
+pub(crate) fn form_picker_key(app: &mut App, k: KeyEvent) {
+    let Some(mut picker) = app.form.picker.take() else {
+        return;
+    };
+    let row = picker.row;
+    match k.code {
+        KeyCode::Esc => return,
+        KeyCode::Enter => {
+            let chosen = picker
+                .matches()
+                .get(picker.sel)
+                .map(|(_, _, value)| value.to_string());
+            if let Some(value) = chosen {
+                form_apply_picker(&mut app.form, row, &value);
+            }
+            return;
+        }
+        KeyCode::Up => {
+            let n = picker.matches().len();
+            if n > 0 {
+                picker.sel = (picker.sel + n - 1) % n;
+            }
+        }
+        KeyCode::Down | KeyCode::Tab => {
+            let n = picker.matches().len();
+            if n > 0 {
+                picker.sel = (picker.sel + 1) % n;
+            }
+        }
+        KeyCode::Backspace => {
+            picker.filter.pop();
+            picker.sel = 0;
+        }
+        KeyCode::Char(c) => {
+            picker.filter.push(c);
+            picker.sel = 0;
+        }
+        _ => {}
+    }
+    app.form.picker = Some(picker);
 }
 
 /// Serialize the SSH section of the form into a kernel [`SshTunnelConfig`].
@@ -887,6 +961,17 @@ pub(crate) fn save_form(app: &mut App, tx: &Tx) {
         Some(f.database.trim().to_string())
     };
     cfg.ssl = f.ssl;
+    // R119: TLS material. Cleared when SSL is off so a stale path never leaks
+    // into the connection URL after the toggle is switched back off.
+    if f.ssl {
+        cfg.ca_cert_path = f.ssl_ca_cert.trim().to_string();
+        cfg.client_cert_path = f.ssl_client_cert.trim().to_string();
+        cfg.client_key_path = f.ssl_client_key.trim().to_string();
+    } else {
+        cfg.ca_cert_path.clear();
+        cfg.client_cert_path.clear();
+        cfg.client_key_path.clear();
+    }
     cfg.read_only = f.read_only;
     cfg.color = color;
     if let Err(()) = apply_form_query_timeout(&mut cfg, &f.query_timeout) {

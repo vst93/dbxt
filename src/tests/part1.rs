@@ -1602,6 +1602,15 @@ pub(crate) fn new_connection_form_renders_at_extreme_sizes() {
     for (w, h) in [(40u16, 12u16), (250, 70), (20, 6), (1, 1)] {
         draw(&mut app, w, h);
     }
+    // R119: the SSL cert rows and the open db_type picker render too, at the
+    // same tiny-to-huge sizes.
+    app.form.ssl = true;
+    app.form.ssl_ca_cert = "/etc/ssl/ca.pem".into();
+    open_form_picker(&mut app, FormRow::DbType);
+    assert!(app.form.picker.is_some());
+    for (w, h) in [(40u16, 12u16), (250, 70), (20, 6), (1, 1)] {
+        draw(&mut app, w, h);
+    }
 }
 
 /// The SSH-expanded form must render (and scroll) at phone and desktop sizes
@@ -3909,63 +3918,105 @@ pub(crate) fn table_page_query_uses_keyset_and_reverses_a_backward_read() {
 #[test]
 pub(crate) fn keyset_plan_only_accepts_the_primary_key_order() {
     let single = orders_meta(&[("id", "int")], &[("name", "varchar(64)")]);
+    let mysql = DatabaseType::Mysql;
     // No explicit sort → the implicit primary-key order (ascending).
     assert_eq!(
-        keyset_plan(Some(&single), &orders_page(None)),
+        keyset_plan(mysql, Some(&single), &orders_page(None)),
         Some((vec!["id".to_string()], true))
     );
     // Explicit sort on the key, either direction.
     assert_eq!(
-        keyset_plan(Some(&single), &orders_page(Some("`id` ASC"))),
+        keyset_plan(mysql, Some(&single), &orders_page(Some("`id` ASC"))),
         Some((vec!["id".to_string()], true))
     );
     assert_eq!(
-        keyset_plan(Some(&single), &orders_page(Some("`id` DESC"))),
+        keyset_plan(mysql, Some(&single), &orders_page(Some("`id` DESC"))),
         Some((vec!["id".to_string()], false))
     );
     // A custom sort falls back to OFFSET.
     assert_eq!(
-        keyset_plan(Some(&single), &orders_page(Some("`name` ASC"))),
+        keyset_plan(mysql, Some(&single), &orders_page(Some("`name` ASC"))),
         None
     );
 
     // Composite key: column order must match and the direction must agree.
     let composite = orders_meta(&[("a", "int"), ("b", "int")], &[]);
     assert_eq!(
-        keyset_plan(Some(&composite), &orders_page(None)),
+        keyset_plan(mysql, Some(&composite), &orders_page(None)),
         Some((vec!["a".to_string(), "b".to_string()], true))
     );
     assert_eq!(
-        keyset_plan(Some(&composite), &orders_page(Some("`a` ASC, `b` ASC"))),
+        keyset_plan(
+            mysql,
+            Some(&composite),
+            &orders_page(Some("`a` ASC, `b` ASC"))
+        ),
         Some((vec!["a".to_string(), "b".to_string()], true))
     );
     assert_eq!(
-        keyset_plan(Some(&composite), &orders_page(Some("`a` DESC, `b` DESC"))),
+        keyset_plan(
+            mysql,
+            Some(&composite),
+            &orders_page(Some("`a` DESC, `b` DESC"))
+        ),
         Some((vec!["a".to_string(), "b".to_string()], false))
     );
     // Mixed directions, swapped order, or a partial key cannot seek.
     assert_eq!(
-        keyset_plan(Some(&composite), &orders_page(Some("`a` ASC, `b` DESC"))),
+        keyset_plan(
+            mysql,
+            Some(&composite),
+            &orders_page(Some("`a` ASC, `b` DESC"))
+        ),
         None
     );
     assert_eq!(
-        keyset_plan(Some(&composite), &orders_page(Some("`b` ASC, `a` ASC"))),
+        keyset_plan(
+            mysql,
+            Some(&composite),
+            &orders_page(Some("`b` ASC, `a` ASC"))
+        ),
         None
     );
     assert_eq!(
-        keyset_plan(Some(&composite), &orders_page(Some("`a` ASC"))),
+        keyset_plan(mysql, Some(&composite), &orders_page(Some("`a` ASC"))),
         None
     );
 
     // No primary key, a binary key, or metadata for another table → OFFSET.
     let keyless = orders_meta(&[], &[("x", "int")]);
-    assert_eq!(keyset_plan(Some(&keyless), &orders_page(None)), None);
+    assert_eq!(keyset_plan(mysql, Some(&keyless), &orders_page(None)), None);
     let binary = orders_meta(&[("k", "blob")], &[]);
-    assert_eq!(keyset_plan(Some(&binary), &orders_page(None)), None);
-    assert_eq!(keyset_plan(None, &orders_page(None)), None);
+    assert_eq!(keyset_plan(mysql, Some(&binary), &orders_page(None)), None);
+    assert_eq!(keyset_plan(mysql, None, &orders_page(None)), None);
     let mut other = orders_page(None);
     other.table = "other".into();
-    assert_eq!(keyset_plan(Some(&single), &other), None);
+    assert_eq!(keyset_plan(mysql, Some(&single), &other), None);
+
+    // R120: the dialect gate. A whitelisted engine (including PG-family forks)
+    // plans a seek; an engine without row-value comparison (SQL Server, Oracle)
+    // never does — even with a perfectly seekable composite primary key — so it
+    // keeps the OFFSET path instead of emitting an invalid `(a, b) > (…)`.
+    assert!(keyset_plan(DatabaseType::Postgres, Some(&composite), &orders_page(None)).is_some());
+    assert!(keyset_plan(DatabaseType::Sqlite, Some(&composite), &orders_page(None)).is_some());
+    assert!(keyset_plan(DatabaseType::Kingbase, Some(&single), &orders_page(None)).is_some());
+    assert_eq!(
+        keyset_plan(
+            DatabaseType::SqlServer,
+            Some(&composite),
+            &orders_page(None)
+        ),
+        None
+    );
+    assert_eq!(
+        keyset_plan(DatabaseType::Oracle, Some(&single), &orders_page(None)),
+        None
+    );
+    // Redshift forks PostgreSQL 8.0, before row-value comparison existed.
+    assert_eq!(
+        keyset_plan(DatabaseType::Redshift, Some(&single), &orders_page(None)),
+        None
+    );
 }
 
 #[test]

@@ -2505,14 +2505,18 @@ pub(crate) fn spawn_table_page(app: &mut App, tx: &Tx, page: usize) {
         app.page_pending = false;
         return;
     };
-    let plan = keyset_plan(app.table_meta.as_ref(), &ps);
+    // R120: keyset seek is gated on the dialect (row-value comparison is not
+    // portable), so an unsupported engine falls back to OFFSET here and every
+    // downstream keyset decision follows automatically.
+    let plan = keyset_plan(cfg.db_type, app.table_meta.as_ref(), &ps);
     let (keyset_pk, keyset_asc) = match &plan {
         Some((pk, asc)) => (pk.clone(), *asc),
         None => (Vec::new(), true),
     };
     let seek = keyset_seek_for(plan.as_ref(), ps.keyset.as_ref(), ps.page, page);
-    // Deep OFFSET paging (no primary key to seek by) is slow; flag the hint so
-    // the reply can mention it once.
+    // Deep OFFSET paging (no primary key to seek by, a custom sort, or a dialect
+    // without keyset support) is slow; flag the hint so the reply can mention it
+    // once.
     app.pending_deep_hint = false;
     if plan.is_none() && page >= DEEP_PAGE_HINT_AFTER && !app.deep_page_hint_shown {
         app.deep_page_hint_shown = true;

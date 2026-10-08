@@ -484,6 +484,23 @@ impl SshAuth {
             SshAuth::Agent => SshAuth::Password,
         }
     }
+    /// R119: parse a picker value back into an auth method. Unknown strings
+    /// fall back to password, matching the empty `auth_method` case.
+    pub(crate) fn from_value(value: &str) -> Self {
+        match value {
+            "key" | "key+password" => SshAuth::Key,
+            "agent" => SshAuth::Agent,
+            _ => SshAuth::Password,
+        }
+    }
+    /// Localised label for the picker list.
+    pub(crate) fn label(self) -> &'static str {
+        match self {
+            SshAuth::Password => t("密码认证"),
+            SshAuth::Key => t("私钥"),
+            SshAuth::Agent => t("SSH Agent"),
+        }
+    }
     /// Map a kernel `auth_method` (possibly empty on legacy layers) back to a
     /// form value, inferring from the populated credential fields when unset.
     pub(crate) fn from_layer(layer: &SshTunnelConfig) -> Self {
@@ -521,6 +538,11 @@ pub(crate) enum FormRow {
     /// PostgreSQL, to a `statement_timeout` connection option.
     QueryTimeout,
     Ssl,
+    /// R119: TLS material paths, revealed only while `ssl` is on so the SSL
+    /// section follows the toggle in real time.
+    SslCaCert,
+    SslClientCert,
+    SslClientKey,
     /// Hard-block every write statement on this connection (safety valve).
     ReadOnly,
     Color,
@@ -552,6 +574,11 @@ pub(crate) struct ConnForm {
     /// (60 s)"; `0` means unlimited; a positive number is used verbatim.
     pub(crate) query_timeout: String,
     pub(crate) ssl: bool,
+    /// R119: TLS material paths (kernel `ca_cert_path` / `client_cert_path` /
+    /// `client_key_path`), shown only when `ssl` is on.
+    pub(crate) ssl_ca_cert: String,
+    pub(crate) ssl_client_cert: String,
+    pub(crate) ssl_client_key: String,
     /// Read-only connection flag (kernel `ConnectionConfig::read_only`).
     pub(crate) read_only: bool,
     /// Connection colour as `#rrggbb` (empty = no colour, family default).
@@ -576,6 +603,40 @@ pub(crate) struct ConnForm {
     pub(crate) scroll: usize,
     pub(crate) editing: bool,
     pub(crate) err: String,
+    /// R119: the open option list for an enum row (`db_type` / `ssh_auth`), or
+    /// `None`. While set it owns the arrow keys, Enter and typing.
+    pub(crate) picker: Option<FormPicker>,
+}
+
+/// R119: a modal option list opened from an enum form row. Replaces free-text
+/// entry for closed sets (database type, SSH auth) with a filterable picker:
+/// arrows move, typing filters, Enter commits, Esc cancels.
+#[derive(Clone)]
+pub(crate) struct FormPicker {
+    pub(crate) row: FormRow,
+    /// `(label, stored value)` pairs in display order.
+    pub(crate) items: Vec<(String, String)>,
+    /// Highlighted item index into the *filtered* list.
+    pub(crate) sel: usize,
+    /// Type-to-filter buffer (empty = every item).
+    pub(crate) filter: String,
+}
+
+impl FormPicker {
+    /// Items matching the current filter, as `(index into items, label, value)`.
+    pub(crate) fn matches(&self) -> Vec<(usize, &str, &str)> {
+        let needle = self.filter.trim().to_ascii_lowercase();
+        self.items
+            .iter()
+            .enumerate()
+            .filter(|(_, (label, value))| {
+                needle.is_empty()
+                    || label.to_ascii_lowercase().contains(&needle)
+                    || value.to_ascii_lowercase().contains(&needle)
+            })
+            .map(|(i, (label, value))| (i, label.as_str(), value.as_str()))
+            .collect()
+    }
 }
 
 impl Default for ConnForm {
@@ -594,6 +655,9 @@ impl Default for ConnForm {
             database: String::new(),
             query_timeout: String::new(),
             ssl: false,
+            ssl_ca_cert: String::new(),
+            ssl_client_cert: String::new(),
+            ssl_client_key: String::new(),
             read_only: false,
             color: String::new(),
             color_sel: 0,
@@ -611,6 +675,7 @@ impl Default for ConnForm {
             scroll: 0,
             editing: false,
             err: String::new(),
+            picker: None,
         }
     }
 }
@@ -949,10 +1014,17 @@ pub(crate) fn form_rows(f: &ConnForm) -> Vec<(FormRow, &'static str)> {
         (FormRow::Database, "database"),
         (FormRow::QueryTimeout, "query_timeout"),
         (FormRow::Ssl, "ssl"),
-        (FormRow::ReadOnly, "read_only"),
-        (FormRow::Color, "color"),
-        (FormRow::SshEnabled, "ssh_tunnel"),
     ];
+    // R119: TLS material only matters while SSL is on, so the cert rows appear
+    // (and disappear) with the toggle, mirroring the SSH section.
+    if f.ssl {
+        rows.push((FormRow::SslCaCert, "ssl_ca"));
+        rows.push((FormRow::SslClientCert, "ssl_cert"));
+        rows.push((FormRow::SslClientKey, "ssl_key"));
+    }
+    rows.push((FormRow::ReadOnly, "read_only"));
+    rows.push((FormRow::Color, "color"));
+    rows.push((FormRow::SshEnabled, "ssh_tunnel"));
     if f.ssh_enabled {
         rows.push((FormRow::SshHost, "ssh_host"));
         rows.push((FormRow::SshPort, "ssh_port"));
@@ -981,6 +1053,9 @@ pub(crate) fn form_label_short(label: &'static str) -> &'static str {
         "password" => "pass",
         "database" => "db",
         "query_timeout" => "timeout",
+        "ssl_ca" => "ssl.ca",
+        "ssl_cert" => "ssl.cert",
+        "ssl_key" => "ssl.key",
         "ssh_tunnel" => "ssh",
         "ssh_host" => "ssh.host",
         "ssh_port" => "ssh.port",
@@ -1006,6 +1081,9 @@ pub(crate) fn form_text_mut(f: &mut ConnForm, row: FormRow) -> Option<&mut Strin
         FormRow::Password => Some(&mut f.password),
         FormRow::Database => Some(&mut f.database),
         FormRow::QueryTimeout => Some(&mut f.query_timeout),
+        FormRow::SslCaCert => Some(&mut f.ssl_ca_cert),
+        FormRow::SslClientCert => Some(&mut f.ssl_client_cert),
+        FormRow::SslClientKey => Some(&mut f.ssl_client_key),
         FormRow::Color => Some(&mut f.color),
         FormRow::SshHost => Some(&mut f.ssh_host),
         FormRow::SshPort => Some(&mut f.ssh_port),
@@ -1019,6 +1097,94 @@ pub(crate) fn form_text_mut(f: &mut ConnForm, row: FormRow) -> Option<&mut Strin
         | FormRow::SshEnabled
         | FormRow::SshAuth
         | FormRow::Save => None,
+    }
+}
+
+/// R119: the section a form row belongs to, so the renderer can draw a dim
+/// group header before the first row of each block. `None` means "no header"
+/// (the save row stands alone).
+pub(crate) fn form_section(row: FormRow) -> Option<&'static str> {
+    match row {
+        FormRow::DbType
+        | FormRow::Name
+        | FormRow::Host
+        | FormRow::Port
+        | FormRow::Username
+        | FormRow::Password
+        | FormRow::Database => Some(t("基础")),
+        FormRow::QueryTimeout
+        | FormRow::Ssl
+        | FormRow::SslCaCert
+        | FormRow::SslClientCert
+        | FormRow::SslClientKey
+        | FormRow::ReadOnly
+        | FormRow::Color => Some(t("高级")),
+        FormRow::SshEnabled
+        | FormRow::SshHost
+        | FormRow::SshPort
+        | FormRow::SshUser
+        | FormRow::SshAuth
+        | FormRow::SshPassword
+        | FormRow::SshKeyPath
+        | FormRow::SshKeyPassphrase
+        | FormRow::SshAgentSock => Some(t("SSH 隧道")),
+        FormRow::Save => None,
+    }
+}
+
+/// R119: the rows whose value is a closed set (a picker, not a text field).
+pub(crate) fn form_row_is_picker(row: FormRow) -> bool {
+    matches!(row, FormRow::DbType | FormRow::SshAuth)
+}
+
+/// R119: the option list for a picker row, as `(label, stored value)`. Database
+/// types use the manifest's display label plus the machine name so the picker is
+/// scannable *and* unambiguous; SSH auth lists its three methods.
+pub(crate) fn form_picker_items(row: FormRow) -> Vec<(String, String)> {
+    match row {
+        FormRow::DbType => DatabaseType::ALL
+            .iter()
+            .map(|dt| {
+                let code = dt.as_str().to_string();
+                let label = dbx_core::database_manifest::entry(dt)
+                    .map(|entry| entry.label.clone())
+                    .unwrap_or_else(|| code.clone());
+                (format!("{label}  ({code})"), code)
+            })
+            .collect(),
+        FormRow::SshAuth => [SshAuth::Password, SshAuth::Key, SshAuth::Agent]
+            .iter()
+            .map(|auth| {
+                (
+                    format!("{}  ({})", auth.label(), auth.as_str()),
+                    auth.as_str().to_string(),
+                )
+            })
+            .collect(),
+        _ => Vec::new(),
+    }
+}
+
+/// R119: the current stored value of a picker row, used to preselect the
+/// highlighted option when the picker opens.
+pub(crate) fn form_picker_value(f: &ConnForm, row: FormRow) -> String {
+    match row {
+        FormRow::DbType => f.db_type.clone(),
+        FormRow::SshAuth => f.ssh_auth.as_str().to_string(),
+        _ => String::new(),
+    }
+}
+
+/// R119: write a committed picker value back into the form. The database type
+/// also re-derives the default port (unless the user pinned one).
+pub(crate) fn form_apply_picker(f: &mut ConnForm, row: FormRow, value: &str) {
+    match row {
+        FormRow::DbType => {
+            f.db_type = value.to_string();
+            apply_default_port(f);
+        }
+        FormRow::SshAuth => f.ssh_auth = SshAuth::from_value(value),
+        _ => {}
     }
 }
 
@@ -1095,6 +1261,9 @@ pub(crate) fn form_from_connection(
             cfg.query_timeout_secs.to_string()
         },
         ssl: cfg.ssl,
+        ssl_ca_cert: cfg.ca_cert_path.clone(),
+        ssl_client_cert: cfg.client_cert_path.clone(),
+        ssl_client_key: cfg.client_key_path.clone(),
         read_only: cfg.read_only,
         color: cfg.color.clone().unwrap_or_default(),
         color_sel: color_sel_for(cfg.color.as_deref().unwrap_or("")),

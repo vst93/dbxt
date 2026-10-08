@@ -1460,15 +1460,21 @@ pub(crate) const HELP_ROWS: &[(&str, &str)] = &[    ("— 全局 —", ""),
         "打开 SQLite 文件（.db / .sqlite / .sqlite3）：当前目录起步，输入路径 / ↑↓ 选择 / Tab 补全，Enter 打开；顶部列出最近 5 个（Del 移除）。临时连接不写入配置，重启不残留",
     ),
     ("— 连接表单 —", ""),
-    ("↑ ↓ / Tab", "切换字段：db_type → name → host → port → user → password → database → query_timeout（开启 ssh_tunnel 后自动展开 SSH 段）"),
-    ("Enter", "编辑字段 / 切换开关 / 保存连接"),
+    ("分区", "连接 / 高级（query_timeout · ssl · read_only · color）/ SSH 隧道；开启 ssl 或 ssh_tunnel 后相关字段实时展开"),
+    ("↑ ↓ / Tab", "切换字段（按分区顺序；开启 ssh_tunnel 后自动展开 SSH 段）"),
+    ("Enter", "编辑文本字段 / 打开选项列表（db_type · ssh_auth）/ 切换开关 / 保存连接"),
+    ("db_type 选项", "Enter 打开可筛选列表（输入即过滤，↑↓ 选择，Enter 确定，Esc 取消）"),
     ("query_timeout", "查询超时秒数：留空=默认 60s，0=不限；PostgreSQL 同时以 statement_timeout 连接选项生效（连接级，不逐条查询）"),
     ("默认端口", "选定 db_type 即带出 MySQL 3306 / PG 5432 / Redis 6379 / Mongo 27017；手动改过 port 则不覆盖"),
     ("name 留空", "保存时按 host-db_type 自动生成连接名（如 localhost-postgres）"),
-    ("Space", "切换 ssh_tunnel / ssl / read_only / 登录方式"),
+    ("Space", "切换 ssh_tunnel / ssl / read_only；ssh 登录方式快速轮换"),
     (
         "color",
         "Space 循环预设颜色（无色→10 色→自定义），Enter 输入 #RRGGBB；色块为只读预览",
+    ),
+    (
+        "ssl",
+        "开启后展开 ssl_ca / ssl_cert / ssl_key（CA 证书 / 客户端证书 / 客户端私钥路径）；关闭即清除",
     ),
     (
         "ssh_tunnel",
@@ -1619,7 +1625,10 @@ pub(crate) const HELP_ROWS: &[(&str, &str)] = &[    ("— 全局 —", ""),
         "Shift+↑/↓",
         "在同一层内上 / 下移动连接或分组（改桌面分组顺序并写回 sidebar_layout；顶层未分组连接按名称排序）",
     ),
-    ("I", "导入 CSV 到当前表（预览 + 追加/覆盖确认）"),
+    (
+        "I",
+        "导入 CSV 到当前表：预览 + 追加/覆盖确认（预览里 m 切追加/覆盖 · s 遇错停止/跳过 · ↑↓ 滚动）",
+    ),
     (
         "d",
         "数据库 / 模式列表（PG 等支持 schema 的连接；浮层内 r 刷新）",
@@ -1639,7 +1648,7 @@ pub(crate) const HELP_ROWS: &[(&str, &str)] = &[    ("— 全局 —", ""),
     ("Ctrl-F / Ctrl-B", "下一页 / 上一页"),
     (
         "大表翻页",
-        "有主键时按主键续读（keyset），翻页耗时与页深无关",
+        "有主键且方言支持行值比较时按主键续读（keyset，MySQL / PostgreSQL / SQLite 及 PG 系），翻页耗时与页深无关；否则（含 SQL Server / Oracle）走 OFFSET，深翻页较慢",
     ),
     ("行数上限", "50 万行以上的表显示 >50万，不再每页 COUNT"),
     ("← → / h l", "单元格光标（列窗口跟随）"),
@@ -1673,7 +1682,7 @@ pub(crate) const HELP_ROWS: &[(&str, &str)] = &[    ("— 全局 —", ""),
     ),
     (
         "Ctrl-Y",
-        "导出当前结果（CSV / Excel (.xlsx) / JSON / NDJSON / Markdown / Text / INSERT）；导出弹层记忆上次目录",
+        "导出当前结果（CSV / Excel (.xlsx) / JSON / NDJSON / Markdown / Text / INSERT）；弹层内 ↑↓ 选择、1-6 快选格式，记忆上次目录",
     ),
     (
         "Ctrl-Y → A / S",
@@ -2523,6 +2532,21 @@ pub(crate) fn help_rows(app: &App) -> Vec<HelpRow> {
     rows
 }
 
+/// Pad a keycap to `width` display columns (never truncates). Unlike
+/// `format!("{:<width$}")`, which pads by `char` count, this keeps CJK labels
+/// like `Esc（执行中）` aligned without inflating the row: a double-width glyph
+/// would otherwise claim two display columns per padded space.
+pub(crate) fn pad_key_disp(s: &str, width: usize) -> String {
+    let w = disp_width(s);
+    if w >= width {
+        return s.to_string();
+    }
+    let mut out = String::with_capacity(s.len() + (width - w));
+    out.push_str(s);
+    out.push_str(&" ".repeat(width - w));
+    out
+}
+
 /// One keycap/description cell. `desc_w = None` leaves the description whole
 /// (single column); `Some(w)` truncates it to `w` columns and pads the cell to
 /// a fixed width so two-column packing lines up.
@@ -2540,7 +2564,7 @@ pub(crate) fn help_item_spans(
     } else {
         Style::default().fg(Color::Yellow)
     };
-    let keytext = format!("{:<key_w$}", t(key));
+    let keytext = pad_key_disp(t(key), key_w);
     let mut spans = vec![Span::styled(keytext, key_style), Span::raw(" ")];
     match desc_w {
         None => spans.push(Span::raw(t(desc))),
@@ -2590,6 +2614,9 @@ pub(crate) fn help_lines_two_col(
 ) -> Vec<Line<'static>> {
     let mut lines: Vec<Line<'static>> = Vec::with_capacity(rows.len() / 2 + 4);
     let mut pending: Option<Vec<Span<'static>>> = None;
+    // Two cells plus the two-space gutter — the width a full-width fallback row
+    // (a keycap too wide for the key column) may use.
+    let full_w = col_w.saturating_mul(2).saturating_add(2);
     let flush = |pending: &mut Option<Vec<Span<'static>>>, lines: &mut Vec<Line<'static>>| {
         if let Some(left) = pending.take() {
             lines.push(Line::from(left));
@@ -2602,6 +2629,29 @@ pub(crate) fn help_lines_two_col(
                 desc,
                 relevant,
             } => {
+                let key_disp = disp_width(t(key));
+                // A keycap wider than the key column would push its own
+                // description — and, in the left column, the whole right cell —
+                // past the overlay edge, silently hiding rows. Give it a
+                // full-width line so the keycap (and as much of the description
+                // as fits) is always visible.
+                if key_disp > key_w {
+                    flush(&mut pending, &mut lines);
+                    let key_style = if *relevant {
+                        Style::default()
+                            .fg(Color::LightYellow)
+                            .add_modifier(Modifier::BOLD)
+                    } else {
+                        Style::default().fg(Color::Yellow)
+                    };
+                    let desc_w = full_w.saturating_sub(key_disp + 1);
+                    lines.push(Line::from(vec![
+                        Span::styled(t(key).to_string(), key_style),
+                        Span::raw(" "),
+                        Span::raw(truncate_disp(t(desc), desc_w)),
+                    ]));
+                    continue;
+                }
                 let cell = help_item_spans(
                     key,
                     desc,

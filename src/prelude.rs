@@ -45,6 +45,7 @@ pub(crate) use dbx_mcp::backend::{
     new_connection_config, parse_database_type, BatchStatementResult, DbxBackend, LocalBackend,
 };
 pub(crate) use dbx_mcp::paths::storage_db_path;
+pub(crate) use futures::FutureExt;
 pub(crate) use futures::StreamExt;
 pub(crate) use ratatui::layout::{Constraint, Layout, Rect};
 pub(crate) use ratatui::style::{Color, Modifier, Style};

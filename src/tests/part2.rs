@@ -3838,6 +3838,43 @@ pub(crate) fn help_switches_between_two_columns_and_one_on_narrow_screens() {
     assert!(help_two_col_key_width(24, 10) < 10);
 }
 
+/// R121: a keycap wider than the two-column key column used to push its own
+/// description — and, in the left column, the whole right cell — past the
+/// overlay edge, silently hiding rows. Such rows must fall back to a full-width
+/// line that fits, and the keycap must stay intact.
+#[test]
+pub(crate) fn help_two_col_never_overflows_a_row() {
+    let rows = help_grouped_rows(&[]);
+    let col_w = 46usize;
+    let key_w = help_two_col_key_width(24, col_w);
+    let full_w = col_w * 2 + 2;
+    let lines = help_lines_two_col(&rows, key_w, col_w);
+    for line in &lines {
+        assert!(
+            line.width() <= full_w,
+            "help row overflows {full_w} cols ({}): {line:?}",
+            line.width()
+        );
+    }
+    // The long keycaps are present in full, not clipped away.
+    let flat: String = lines
+        .iter()
+        .map(|l| {
+            l.spans
+                .iter()
+                .map(|s| s.content.as_ref())
+                .collect::<String>()
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    for key in [
+        "F3 / Shift-F3 · Alt-N / Alt-B",
+        "Ctrl-Shift-D / Ctrl-Shift-X",
+    ] {
+        assert!(flat.contains(key), "long keycap {key:?} was clipped");
+    }
+}
+
 /// R60: `/` inside the full help opens the filter; Enter keeps the needle,
 /// Esc clears it, and closing the sheet resets everything.
 #[test]

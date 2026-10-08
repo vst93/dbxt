@@ -255,6 +255,42 @@ pub(crate) fn wire_hint_covers_all_wheel_encodings() {
     }
 }
 
+/// R121: a trackpad wheel burst is applied in one batch, and a key press in the
+/// middle of the burst drops the stale notches behind it so scrolling stops
+/// where the user took back control.
+#[test]
+pub(crate) fn wheel_burst_is_batched_and_a_key_interrupts_it() {
+    let (tx, _rx) = tokio::sync::mpsc::unbounded_channel::<OpResult>();
+    let mut app = test_app();
+    app.help_open = true;
+    app.help_scroll = 0;
+    let mut queue: VecDeque<Event> = VecDeque::new();
+    let wheel = || {
+        Event::Mouse(MouseEvent {
+            kind: MouseEventKind::ScrollDown,
+            column: 0,
+            row: 0,
+            modifiers: KeyModifiers::NONE,
+        })
+    };
+    for _ in 0..3 {
+        queue.push_back(wheel());
+    }
+    queue.push_back(Event::Key(KeyEvent::new(
+        KeyCode::Char('j'),
+        KeyModifiers::NONE,
+    )));
+    for _ in 0..2 {
+        queue.push_back(wheel());
+    }
+    crate::drain_ready_events(&mut app, &tx, || queue.pop_front());
+    // 3 wheel notches + `j` (one row) apply; the 2 stale notches are dropped.
+    assert_eq!(
+        app.help_scroll, 4,
+        "wheel burst was not batched / interrupted"
+    );
+}
+
 #[test]
 pub(crate) fn footer_keeps_help_visible_and_fits() {
     let hints: Vec<Hint> = vec![
@@ -2347,8 +2383,9 @@ pub(crate) fn default_port_tracks_type_until_the_user_edits_it() {
     assert_eq!(f.port, "15432");
 }
 
-/// R51: driving the real form keys, choosing a type refills the default
-/// port while the field is untouched, and typing a port marks it pinned.
+/// R51/R119: driving the real form keys, picking a type from the option list
+/// refills the default port while the field is untouched, and typing a port
+/// marks it pinned.
 #[test]
 pub(crate) fn form_keys_fill_default_port_and_pin_a_typed_one() {
     let (tx, _rx) = tokio::sync::mpsc::unbounded_channel::<OpResult>();
@@ -2364,17 +2401,23 @@ pub(crate) fn form_keys_fill_default_port_and_pin_a_typed_one() {
     let press = |app: &mut App, code: KeyCode| {
         form_key(app, &tx, KeyEvent::new(code, KeyModifiers::NONE));
     };
-    // Retype `db_type` to postgres: its port follows.
+    // R119: Enter on `db_type` opens the option list; picking postgres makes
+    // its default port follow.
     let dbtype_row = idx(&app, FormRow::DbType);
     app.form.field = dbtype_row;
     press(&mut app, KeyCode::Enter);
-    for _ in 0..5 {
-        press(&mut app, KeyCode::Backspace);
-    }
-    for c in "postgres".chars() {
-        press(&mut app, KeyCode::Char(c));
+    assert!(
+        app.form.picker.is_some(),
+        "Enter must open the db_type picker"
+    );
+    if let Some(p) = app.form.picker.as_mut() {
+        p.sel = p.items.iter().position(|(_, v)| v == "postgres").unwrap();
     }
     press(&mut app, KeyCode::Enter);
+    assert!(
+        app.form.picker.is_none(),
+        "Enter commits and closes the picker"
+    );
     assert_eq!(app.form.db_type, "postgres");
     assert_eq!(app.form.port, "5432");
     // Edit the port: it becomes the user's own value.
@@ -2394,15 +2437,75 @@ pub(crate) fn form_keys_fill_default_port_and_pin_a_typed_one() {
     let dbtype_row = idx(&app, FormRow::DbType);
     app.form.field = dbtype_row;
     press(&mut app, KeyCode::Enter);
-    for _ in 0..8 {
-        press(&mut app, KeyCode::Backspace);
-    }
-    for c in "mysql".chars() {
-        press(&mut app, KeyCode::Char(c));
+    if let Some(p) = app.form.picker.as_mut() {
+        p.sel = p.items.iter().position(|(_, v)| v == "mysql").unwrap();
     }
     press(&mut app, KeyCode::Enter);
     assert_eq!(app.form.db_type, "mysql");
     assert_eq!(app.form.port, "15432");
+}
+
+/// R119: typing in the open option list filters it and Enter commits the
+/// highlighted hit.
+#[test]
+pub(crate) fn form_picker_filters_and_commits() {
+    let (tx, _rx) = tokio::sync::mpsc::unbounded_channel::<OpResult>();
+    let mut app = test_app();
+    app.page = Page::NewConn;
+    app.form = ConnForm::default();
+    let press = |app: &mut App, code: KeyCode| {
+        form_key(app, &tx, KeyEvent::new(code, KeyModifiers::NONE));
+    };
+    let row = form_rows(&app.form)
+        .iter()
+        .position(|(r, _)| *r == FormRow::DbType)
+        .unwrap();
+    app.form.field = row;
+    press(&mut app, KeyCode::Enter);
+    for c in "postgres".chars() {
+        press(&mut app, KeyCode::Char(c));
+    }
+    let picker = app.form.picker.as_ref().unwrap();
+    let hits = picker.matches();
+    assert_eq!(picker.filter, "postgres");
+    assert!(
+        hits.iter().all(|(_, label, value)| {
+            label.to_ascii_lowercase().contains("postgres")
+                || value.to_ascii_lowercase().contains("postgres")
+        }),
+        "filter leaked a non-matching item: {hits:?}"
+    );
+    press(&mut app, KeyCode::Enter);
+    assert_eq!(app.form.db_type, "postgres");
+    assert_eq!(app.form.port, "5432");
+}
+
+/// R119: the SSL and SSH sections follow their toggles in real time — turning
+/// SSL on reveals the cert rows, turning it off hides them; the same for the
+/// SSH tunnel and its auth-dependent credentials.
+#[test]
+pub(crate) fn form_sections_follow_their_toggles() {
+    let mut f = ConnForm::default();
+    assert!(!form_rows(&f).iter().any(|(r, _)| *r == FormRow::SslCaCert));
+    f.ssl = true;
+    let rows = form_rows(&f);
+    assert!(rows.iter().any(|(r, _)| *r == FormRow::SslCaCert));
+    assert!(rows.iter().any(|(r, _)| *r == FormRow::SslClientCert));
+    assert!(rows.iter().any(|(r, _)| *r == FormRow::SslClientKey));
+    f.ssl = false;
+    assert!(!form_rows(&f).iter().any(|(r, _)| *r == FormRow::SslCaCert));
+
+    // Every SSH row shares one section header so the group renders as a block.
+    f.ssh_enabled = true;
+    for row in [
+        FormRow::SshEnabled,
+        FormRow::SshHost,
+        FormRow::SshAuth,
+        FormRow::SshPassword,
+    ] {
+        assert_eq!(form_section(row), form_section(FormRow::SshEnabled));
+    }
+    assert_eq!(form_section(FormRow::Ssl), form_section(FormRow::SslCaCert));
 }
 
 /// R51: a blank connection name is generated as `host-db_type`.
@@ -5284,6 +5387,12 @@ pub(crate) fn narrow_form_and_history_render_without_panicking() {
     app.page = Page::NewConn;
     app.form = ConnForm::default();
     app.form.ssh_enabled = true;
+    // R119: the form is grouped into sections, so put the cursor on the SSH
+    // host row to bring that section (and its abbreviated label) on screen.
+    app.form.field = form_rows(&app.form)
+        .iter()
+        .position(|(r, _)| *r == FormRow::SshHost)
+        .unwrap();
     let rows = draw(&mut app, 42, 22);
     assert!(
         rows.iter().any(|r| r.contains("ssh.host")),
